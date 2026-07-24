@@ -31,6 +31,8 @@ use crate::identity::{
 };
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
+use crate::udp_runtime::{UdpDispatchRequest, UdpIngress, UdpService, UdpServiceError};
+use crate::udp_state::UdpEndpointStateError;
 
 pub const ROOM_CAPACITY: usize = 8;
 pub(crate) const SESSION_OUTBOUND_CAPACITY: usize = 64;
@@ -168,6 +170,20 @@ pub enum WorldError {
     IdentityLimitReached { maximum: usize },
 }
 
+/// A terminal failure while publishing actor-owned state to a process sidecar.
+///
+/// Keeping this boundary distinct from [`WorldError`] lets request handlers
+/// continue to report ordinary command failures without hiding a world/sidecar
+/// divergence that requires the central runtime to stop.
+#[derive(Debug, Error)]
+pub enum WorldSidecarError {
+    #[error("world messenger sidecar failed: {0}")]
+    Messenger(#[from] MessengerServiceError),
+
+    #[error("world UDP sidecar failed: {0}")]
+    Udp(#[from] UdpServiceError),
+}
+
 #[derive(Debug)]
 enum WorldCommand {
     RegisterSession {
@@ -246,28 +262,97 @@ enum WorldCommand {
 #[derive(Debug, Clone)]
 pub struct WorldHandle {
     sender: mpsc::Sender<WorldCommand>,
+    udp_sender: Option<mpsc::Sender<UdpIngress>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorldSidecars {
+    messenger: Option<MessengerServiceHandle>,
+    udp: Option<UdpService>,
+}
+
+impl WorldSidecars {
+    fn identity_capacity(&self) -> Option<usize> {
+        self.messenger
+            .as_ref()
+            .map(MessengerServiceHandle::max_identities)
+            .into_iter()
+            .chain(self.udp.as_ref().map(UdpService::max_identities))
+            .min()
+    }
 }
 
 impl WorldHandle {
     #[must_use]
     pub fn spawn(mailbox_capacity: usize) -> (Self, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
-        let handle = Self { sender };
+        let handle = Self {
+            sender,
+            udp_sender: None,
+        };
         let task = tokio::spawn(async move {
-            let result = run_world(receiver, None).await;
+            let result = run_world(receiver, None, WorldSidecars::default()).await;
             debug_assert!(result.is_ok());
         });
         (handle, task)
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_with_messenger(
         mailbox_capacity: usize,
         messenger: MessengerServiceHandle,
     ) -> (Self, JoinHandle<Result<(), MessengerServiceError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
-        let handle = Self { sender };
-        let task = tokio::spawn(run_world(receiver, Some(messenger)));
+        let handle = Self {
+            sender,
+            udp_sender: None,
+        };
+        let sidecars = WorldSidecars {
+            messenger: Some(messenger),
+            udp: None,
+        };
+        let task = tokio::spawn(async move {
+            match run_world(receiver, None, sidecars).await {
+                Ok(()) => Ok(()),
+                Err(WorldSidecarError::Messenger(error)) => Err(error),
+                Err(WorldSidecarError::Udp(_)) => {
+                    unreachable!("messenger-only world cannot report a UDP sidecar failure")
+                }
+            }
+        });
         (handle, task)
+    }
+
+    pub(crate) fn spawn_with_services(
+        mailbox_capacity: usize,
+        udp_mailbox_capacity: usize,
+        messenger: MessengerServiceHandle,
+        udp: UdpService,
+    ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
+        let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let (udp_sender, udp_receiver) = mpsc::channel(udp_mailbox_capacity);
+        let handle = Self {
+            sender,
+            udp_sender: Some(udp_sender),
+        };
+        let sidecars = WorldSidecars {
+            messenger: Some(messenger),
+            udp: Some(udp),
+        };
+        let task = tokio::spawn(run_world(receiver, Some(udp_receiver), sidecars));
+        (handle, task)
+    }
+
+    /// Admits validated UDP traffic without allowing a saturated data plane to
+    /// delay control commands or shutdown.
+    pub(crate) fn try_udp_ingress(
+        &self,
+        ingress: UdpIngress,
+    ) -> Result<(), mpsc::error::TrySendError<UdpIngress>> {
+        let Some(sender) = &self.udp_sender else {
+            return Err(mpsc::error::TrySendError::Closed(ingress));
+        };
+        sender.try_send(ingress)
     }
 
     pub async fn register_session(&self, peer: SocketAddr) -> Result<SessionId, WorldError> {
@@ -880,6 +965,30 @@ impl World {
             .get(&session)
             .map(|state| state.peer.ip())
             .ok_or(WorldError::UnknownSession(session))
+    }
+
+    /// Resolves an exact-generation audience from actor-owned state.
+    ///
+    /// A protocol room is not a racing audience until its start transition has
+    /// committed. Observers receive race relays alongside players, while the
+    /// source is excluded because the legacy server does not echo slot packets
+    /// back to their sender.
+    fn racing_udp_targets(&self, source: UserNo) -> Vec<IdentityBinding> {
+        let Some(room_id) = self.protocol_room_by_user.get(&source) else {
+            return Vec::new();
+        };
+        let Some(room) = self.protocol_rooms.get(room_id) else {
+            return Vec::new();
+        };
+        if !room.settings.started {
+            return Vec::new();
+        }
+
+        room.user_nos()
+            .into_iter()
+            .filter(|user_no| *user_no != source)
+            .filter_map(|user_no| self.identities.active_identity_by_user_no(user_no))
+            .collect()
     }
 
     fn claim_identity(
@@ -1522,32 +1631,47 @@ fn messenger_identity_from_release(
 
 async fn flush_identity_lifecycle(
     world: &mut World,
-    messenger: Option<&MessengerServiceHandle>,
-) -> Result<(), MessengerServiceError> {
-    let Some(messenger) = messenger else {
+    sidecars: &WorldSidecars,
+) -> Result<(), WorldSidecarError> {
+    if sidecars.messenger.is_none() && sidecars.udp.is_none() {
         world.identity_lifecycle.clear();
         return Ok(());
-    };
+    }
 
     while let Some(event) = world.identity_lifecycle.front().cloned() {
-        match event {
-            IdentityLifecycleEvent::Announce(identity) => {
-                messenger
-                    .announce_identity(messenger_identity_from_binding(&identity)?)
-                    .await?;
+        if let Some(messenger) = &sidecars.messenger {
+            match &event {
+                IdentityLifecycleEvent::Announce(identity) => {
+                    messenger
+                        .announce_identity(messenger_identity_from_binding(identity)?)
+                        .await?;
+                }
+                IdentityLifecycleEvent::Advance { previous, next } => {
+                    messenger
+                        .advance_identity(
+                            messenger_identity_from_release(previous)?,
+                            messenger_identity_from_binding(next)?,
+                        )
+                        .await?;
+                }
+                IdentityLifecycleEvent::Release(identity) => {
+                    messenger
+                        .release_identity(messenger_identity_from_release(identity)?)
+                        .await?;
+                }
             }
-            IdentityLifecycleEvent::Advance { previous, next } => {
-                messenger
-                    .advance_identity(
-                        messenger_identity_from_release(&previous)?,
-                        messenger_identity_from_binding(&next)?,
-                    )
-                    .await?;
-            }
-            IdentityLifecycleEvent::Release(identity) => {
-                messenger
-                    .release_identity(messenger_identity_from_release(&identity)?)
-                    .await?;
+        }
+        if let Some(udp) = &sidecars.udp {
+            match event {
+                IdentityLifecycleEvent::Announce(identity) => {
+                    udp.advance_identity(identity).await?;
+                }
+                IdentityLifecycleEvent::Advance { next, .. } => {
+                    udp.advance_identity(next).await?;
+                }
+                IdentityLifecycleEvent::Release(identity) => {
+                    udp.release_identity(identity).await?;
+                }
             }
         }
         world.identity_lifecycle.pop_front();
@@ -1557,56 +1681,126 @@ async fn flush_identity_lifecycle(
 
 async fn reply_after_identity_lifecycle<T>(
     world: &mut World,
-    messenger: Option<&MessengerServiceHandle>,
+    sidecars: &WorldSidecars,
     reply: oneshot::Sender<T>,
     value: T,
-) -> Result<(), MessengerServiceError> {
-    flush_identity_lifecycle(world, messenger).await?;
+) -> Result<(), WorldSidecarError> {
+    flush_identity_lifecycle(world, sidecars).await?;
     let _ = reply.send(value);
     Ok(())
 }
 
+async fn receive_udp_ingress(
+    receiver: &mut Option<mpsc::Receiver<UdpIngress>>,
+) -> Option<UdpIngress> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn dispatch_udp_ingress(
+    world: &World,
+    udp: &UdpService,
+    ingress: UdpIngress,
+) -> Result<(), WorldSidecarError> {
+    let Some(user_no) = UserNo::new(ingress.account_id) else {
+        tracing::trace!(
+            source = %ingress.source,
+            "dropping UDP ingress with account ID zero"
+        );
+        return Ok(());
+    };
+    let Some(identity) = world.identities.active_identity_by_user_no(user_no) else {
+        tracing::trace!(
+            account_id = ingress.account_id,
+            source = %ingress.source,
+            "dropping UDP ingress without an active world identity"
+        );
+        return Ok(());
+    };
+    let account_id = ingress.account_id;
+    let source = ingress.source;
+    let request = UdpDispatchRequest {
+        ingress,
+        identity,
+        racing_targets: world.racing_udp_targets(user_no),
+        // MyRoom is a distinct feature and does not share protocol-room
+        // membership. Its audience remains empty until that state is ported.
+        room_targets: Vec::new(),
+    };
+
+    match udp.dispatch(request).await {
+        Ok(_) => Ok(()),
+        Err(
+            error @ UdpServiceError::EndpointState(
+                UdpEndpointStateError::InvalidSourceEndpoint { .. }
+                | UdpEndpointStateError::SourceIpMismatch { .. }
+                | UdpEndpointStateError::EndpointMismatch { .. },
+            ),
+        ) => {
+            tracing::trace!(
+                account_id,
+                %source,
+                %error,
+                "dropping rejected UDP source endpoint"
+            );
+            Ok(())
+        }
+        Err(error) => Err(WorldSidecarError::Udp(error)),
+    }
+}
+
 async fn run_world(
     mut receiver: mpsc::Receiver<WorldCommand>,
-    messenger: Option<MessengerServiceHandle>,
-) -> Result<(), MessengerServiceError> {
+    mut udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
+    sidecars: WorldSidecars,
+) -> Result<(), WorldSidecarError> {
     let mut world = World {
-        identity_capacity: messenger
-            .as_ref()
-            .map(MessengerServiceHandle::max_identities),
+        identity_capacity: sidecars.identity_capacity(),
         ..World::default()
     };
     let mut migration_expiry = tokio::time::interval(Duration::from_secs(1));
     migration_expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        let command = tokio::select! {
+        tokio::select! {
+            biased;
+
             command = receiver.recv() => {
                 let Some(command) = command else {
                     break;
                 };
-                command
+                if dispatch_command(&mut world, command, &sidecars).await? {
+                    break;
+                }
             }
             _ = migration_expiry.tick() => {
                 world.expire_migrations(Instant::now());
-                flush_identity_lifecycle(&mut world, messenger.as_ref()).await?;
-                continue;
+                flush_identity_lifecycle(&mut world, &sidecars).await?;
             }
-        };
-
-        if dispatch_command(&mut world, command, messenger.as_ref()).await? {
-            break;
+            ingress = receive_udp_ingress(&mut udp_receiver) => {
+                let Some(ingress) = ingress else {
+                    udp_receiver = None;
+                    continue;
+                };
+                let Some(udp) = sidecars.udp.as_ref() else {
+                    debug_assert!(false, "UDP ingress mailbox requires a UDP sidecar");
+                    continue;
+                };
+                dispatch_udp_ingress(&world, udp, ingress).await?;
+            }
         }
     }
-    flush_identity_lifecycle(&mut world, messenger.as_ref()).await?;
+    flush_identity_lifecycle(&mut world, &sidecars).await?;
     Ok(())
 }
 
 async fn dispatch_command(
     world: &mut World,
     command: WorldCommand,
-    messenger: Option<&MessengerServiceHandle>,
-) -> Result<bool, MessengerServiceError> {
+    sidecars: &WorldSidecars,
+) -> Result<bool, WorldSidecarError> {
     match command {
         WorldCommand::RegisterSession {
             peer,
@@ -1615,11 +1809,11 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.register_session(peer, cancellation, outbound);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::SessionClosed { id, reply } => {
             world.close_session(id, Instant::now());
-            flush_identity_lifecycle(world, messenger).await?;
+            flush_identity_lifecycle(world, sidecars).await?;
             if let Some(reply) = reply {
                 let _ = reply.send(());
             }
@@ -1630,14 +1824,14 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.claim_identity(session, &nickname);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::AuthorizeIdentity { session, reply } => {
             let result = world
                 .identities
                 .authorize(session)
                 .map_err(WorldError::from);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::BeginMigration {
             session,
@@ -1650,7 +1844,7 @@ async fn dispatch_command(
                 .identities
                 .begin_migration(session, channel, token, now)
                 .map_err(WorldError::from);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::CompleteMigration {
             destination,
@@ -1661,7 +1855,7 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.complete_migration(destination, user_no, channel_id, token, now);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::RoomProtocol {
             session,
@@ -1669,7 +1863,7 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.room_protocol(session, *payload);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::PublishRoomEquipment {
             session,
@@ -1677,9 +1871,9 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.publish_room_equipment(session, *snapshot);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
-        command => return dispatch_utility_command(world, command, messenger).await,
+        command => return dispatch_utility_command(world, command, sidecars).await,
     }
     Ok(false)
 }
@@ -1687,12 +1881,12 @@ async fn dispatch_command(
 async fn dispatch_utility_command(
     world: &mut World,
     command: WorldCommand,
-    messenger: Option<&MessengerServiceHandle>,
-) -> Result<bool, MessengerServiceError> {
+    sidecars: &WorldSidecars,
+) -> Result<bool, WorldSidecarError> {
     match command {
         WorldCommand::CreateRoom { reply } => {
             let result = world.create_room();
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::JoinRoom {
             room,
@@ -1700,7 +1894,7 @@ async fn dispatch_utility_command(
             reply,
         } => {
             let result = world.join_room(room, identity);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::JoinRoomForSession {
             room,
@@ -1708,22 +1902,22 @@ async fn dispatch_utility_command(
             reply,
         } => {
             let result = world.join_room_for_session(room, session);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::LeaveRoom { identity, reply } => {
             let result = world.leave_room(&identity);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::RoomSnapshot { room, reply } => {
             let result = world.room_snapshot(room);
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::SessionCount { reply } => {
             let result = world.sessions.len();
-            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::Shutdown { reply } => {
-            flush_identity_lifecycle(world, messenger).await?;
+            flush_identity_lifecycle(world, sidecars).await?;
             world.cancel_all_sessions();
             let _ = reply.send(());
             return Ok(true);
@@ -1758,7 +1952,10 @@ mod tests {
         },
         startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
     };
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::{
+        net::UdpSocket,
+        sync::{mpsc, oneshot},
+    };
 
     use super::{
         OutboundBatch, ROOM_CAPACITY, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
@@ -1766,7 +1963,9 @@ mod tests {
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
-        MessengerServiceError, MessengerServiceHandle, MigrationToken,
+        MessengerServiceError, MessengerServiceHandle, MigrationToken, UdpDispatchRequest,
+        UdpEndpointStateError, UdpIngress, UdpIngressBody, UdpRuntime, UdpRuntimeConfig,
+        UdpServiceError, UdpTransport,
     };
 
     struct TestChannelSession {
@@ -1928,6 +2127,75 @@ mod tests {
             adler32::packet_hash("ChGetRoomListReplyPacket")
         );
         i32::from_le_bytes(packet[8..12].try_into().unwrap())
+    }
+
+    fn game_slot_request(identity: &IdentityBinding, source_port: u16) -> UdpDispatchRequest {
+        UdpDispatchRequest {
+            ingress: UdpIngress {
+                transport: UdpTransport::Game,
+                source: SocketAddr::new(identity.source_ip, source_port),
+                iv: 0x5136_5136,
+                account_id: identity.user_no.get(),
+                route_hash: 0x1234_5678,
+                body: UdpIngressBody::GameSlotPacket(Vec::new()),
+            },
+            identity: identity.clone(),
+            racing_targets: Vec::new(),
+            room_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn racing_udp_targets_require_started_room_and_include_observers() {
+        let mut world = World::default();
+        let source = register_channel_session(&mut world, "Source", 67, 40_001, 64);
+        let player = register_channel_session(&mut world, "Player", 67, 40_011, 64);
+        let observer = register_channel_session(&mut world, "Observer", 67, 40_021, 64);
+
+        world
+            .room_protocol(
+                source.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Race", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let room_id = world.protocol_room_by_user[&source.identity.user_no];
+        world
+            .room_protocol(
+                player.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let mut observer_participant = room_participant();
+        observer_participant.observer = true;
+        world
+            .room_protocol(
+                observer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: observer_participant,
+                },
+            )
+            .unwrap();
+
+        assert!(world.racing_udp_targets(source.identity.user_no).is_empty());
+        world
+            .protocol_rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .settings
+            .started = true;
+
+        let targets = world.racing_udp_targets(source.identity.user_no);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&player.identity));
+        assert!(targets.contains(&observer.identity));
+        assert!(!targets.contains(&source.identity));
     }
 
     #[tokio::test]
@@ -2562,6 +2830,112 @@ mod tests {
 
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
+        messenger.shutdown().await.unwrap();
+        messenger_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_lifecycle_is_committed_before_replies_and_limits_world_capacity() {
+        let messenger_config = MessengerRuntimeConfig {
+            max_identities: 3,
+            ..MessengerRuntimeConfig::default()
+        };
+        let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config).unwrap();
+        let game_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let p2p_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let udp_config = UdpRuntimeConfig {
+            maximum_active_identities: 1,
+            ..UdpRuntimeConfig::default()
+        };
+        let udp_runtime = UdpRuntime::spawn(game_socket, p2p_socket, udp_config).unwrap();
+        let udp = udp_runtime.service();
+        let (world, world_task) =
+            WorldHandle::spawn_with_services(64, 64, messenger.clone(), udp.clone());
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let source = world
+            .register_session(SocketAddr::new(ip, 56_000))
+            .await
+            .unwrap();
+        let claimed = world.claim_identity(source, "UdpLifecycle").await.unwrap();
+        udp.dispatch(game_slot_request(&claimed, 58_000))
+            .await
+            .unwrap();
+
+        // The world must use the minimum of all sidecar capacities. The
+        // messenger allows three identities, but the UDP mirror allows one.
+        let destination = world
+            .register_session(SocketAddr::new(ip, 56_001))
+            .await
+            .unwrap();
+        assert!(matches!(
+            world.claim_identity(destination, "CapacityWaiter").await,
+            Err(WorldError::IdentityLimitReached { maximum: 1 })
+        ));
+
+        let channel = ChannelBinding {
+            channel_id: 7,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(778).unwrap();
+        world
+            .begin_migration(source, channel, token, Instant::now())
+            .await
+            .unwrap();
+        let migrated = world
+            .complete_migration(
+                destination,
+                claimed.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        // Completion replies only after the UDP mirror advances. The prior
+        // exact generation is fenced, while the replacement binds normally.
+        assert!(matches!(
+            udp.dispatch(game_slot_request(&claimed, 58_000)).await,
+            Err(UdpServiceError::EndpointState(
+                UdpEndpointStateError::StaleGeneration { .. }
+            ))
+        ));
+        udp.dispatch(game_slot_request(&migrated.binding, 58_000))
+            .await
+            .unwrap();
+
+        // Closing the stale transport cannot release the migrated owner.
+        world.session_closed(source).await.unwrap();
+        udp.dispatch(game_slot_request(&migrated.binding, 58_000))
+            .await
+            .unwrap();
+
+        // Closing the current owner publishes the exact release before reply.
+        world.session_closed(destination).await.unwrap();
+        assert!(matches!(
+            udp.dispatch(game_slot_request(&migrated.binding, 58_000))
+                .await,
+            Err(UdpServiceError::EndpointState(
+                UdpEndpointStateError::InactiveAccount { .. }
+            ))
+        ));
+
+        let replacement_session = world
+            .register_session(SocketAddr::new(ip, 56_002))
+            .await
+            .unwrap();
+        let replacement = world
+            .claim_identity(replacement_session, "CapacityWaiter")
+            .await
+            .unwrap();
+        udp.dispatch(game_slot_request(&replacement, 58_001))
+            .await
+            .unwrap();
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+        udp_runtime.shutdown().await;
         messenger.shutdown().await.unwrap();
         messenger_task.await.unwrap();
     }

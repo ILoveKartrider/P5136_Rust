@@ -10,8 +10,11 @@ use tokio::{
 
 use crate::{
     MessengerConnectionError, MessengerRuntimeConfig, MessengerServiceError,
-    MessengerServiceHandle, ServerConfig, ServerEndpoints, WorldError, WorldHandle,
+    MessengerServiceHandle, ServerClock, ServerConfig, ServerEndpoints, UdpRuntime,
+    UdpRuntimeConfig, UdpRuntimeEvent, UdpRuntimeFailure, UdpRuntimeStartError, UdpServiceError,
+    WorldError, WorldHandle,
     session::{ProfileCoordinator, run_login_session},
+    world::WorldSidecarError,
 };
 
 #[derive(Debug, Error)]
@@ -59,6 +62,18 @@ pub enum ServerError {
 
     #[error("world actor stopped after a messenger publication failure")]
     WorldActorMessenger(#[source] MessengerServiceError),
+
+    #[error("world actor stopped after a UDP publication or dispatch failure")]
+    WorldActorUdp(#[source] UdpServiceError),
+
+    #[error("failed to start the UDP runtime")]
+    UdpRuntimeStart(#[from] UdpRuntimeStartError),
+
+    #[error("UDP runtime stopped unexpectedly")]
+    UdpRuntimeStopped,
+
+    #[error("UDP runtime task stopped unexpectedly")]
+    UdpRuntime(#[source] UdpRuntimeFailure),
 
     #[error("messenger actor stopped unexpectedly")]
     MessengerActorStopped,
@@ -143,14 +158,36 @@ impl BoundServer {
 
     pub fn start(self) -> Result<ServerHandle, ServerError> {
         let endpoints = self.endpoints()?;
+        let BoundServer {
+            config,
+            catalog,
+            game_udp,
+            login_tcp,
+            p2p_udp,
+            messenger_tcp,
+        } = self;
         let (shutdown, shutdown_receiver) = watch::channel(false);
-        let messenger_config = messenger_runtime_config(&self.config);
+        let messenger_config = messenger_runtime_config(&config);
+        let udp_config = udp_runtime_config(&config);
+        let udp_mailbox_capacity = udp_config.admission_capacity;
+        let udp = UdpRuntime::spawn_with_clock(game_udp, p2p_udp, udp_config, ServerClock::new())?;
         let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config)?;
-        let (world, world_task) = WorldHandle::spawn_with_messenger(1_024, messenger.clone());
+        let (world, world_task) = WorldHandle::spawn_with_services(
+            1_024,
+            udp_mailbox_capacity,
+            messenger.clone(),
+            udp.service(),
+        );
         let supervisor_world = world.clone();
         let task = tokio::spawn(async move {
             run_supervisor(
-                self,
+                SupervisorTransports {
+                    config,
+                    catalog,
+                    login_tcp,
+                    messenger_tcp,
+                    udp,
+                },
                 shutdown_receiver,
                 supervisor_world,
                 world_task,
@@ -166,6 +203,13 @@ impl BoundServer {
             world,
             task,
         })
+    }
+}
+
+fn udp_runtime_config(config: &ServerConfig) -> UdpRuntimeConfig {
+    UdpRuntimeConfig {
+        maximum_active_identities: config.max_login_sessions,
+        ..UdpRuntimeConfig::default()
     }
 }
 
@@ -325,23 +369,19 @@ fn handle_messenger_accept(
     Ok(())
 }
 
-fn handle_ignored_udp(
-    datagram: io::Result<(usize, SocketAddr)>,
-    service: &'static str,
-) -> Result<(), ServerError> {
-    match datagram {
-        Ok((length, peer)) => {
-            tracing::trace!(%peer, length, service, "UDP packet ignored by milestone runtime");
-            Ok(())
-        }
-        Err(source) => Err(ServerError::ListenerIo { service, source }),
-    }
+struct SupervisorTransports {
+    config: ServerConfig,
+    catalog: Option<Arc<CatalogInventory>>,
+    login_tcp: TcpListener,
+    messenger_tcp: TcpListener,
+    udp: UdpRuntime,
 }
 
 struct CoreActors {
     world: WorldHandle,
-    world_task: JoinHandle<Result<(), MessengerServiceError>>,
+    world_task: JoinHandle<Result<(), WorldSidecarError>>,
     world_completed: bool,
+    udp: UdpRuntime,
     messenger: MessengerServiceHandle,
     messenger_task: JoinHandle<()>,
     messenger_completed: bool,
@@ -356,6 +396,7 @@ async fn finish_supervisor(
         world,
         world_task,
         world_completed,
+        udp,
         messenger,
         messenger_task,
         messenger_completed,
@@ -373,7 +414,7 @@ async fn finish_supervisor(
                 }
             }
             Ok(Err(source)) => {
-                cleanup_error = Some(ServerError::WorldActorMessenger(source));
+                cleanup_error = Some(world_sidecar_error(source));
             }
             Err(source) => {
                 cleanup_error = Some(ServerError::ActorTask {
@@ -383,6 +424,8 @@ async fn finish_supervisor(
             }
         }
     }
+
+    udp.shutdown().await;
 
     if !messenger_completed {
         let messenger_shutdown = messenger.shutdown().await;
@@ -410,16 +453,21 @@ async fn finish_supervisor(
     }
 }
 
-fn unexpected_world_exit(
-    result: Result<Result<(), MessengerServiceError>, JoinError>,
-) -> ServerError {
+fn unexpected_world_exit(result: Result<Result<(), WorldSidecarError>, JoinError>) -> ServerError {
     match result {
         Ok(Ok(())) => ServerError::WorldActorStopped,
-        Ok(Err(source)) => ServerError::WorldActorMessenger(source),
+        Ok(Err(source)) => world_sidecar_error(source),
         Err(source) => ServerError::ActorTask {
             service: "world",
             source,
         },
+    }
+}
+
+fn world_sidecar_error(error: WorldSidecarError) -> ServerError {
+    match error {
+        WorldSidecarError::Messenger(source) => ServerError::WorldActorMessenger(source),
+        WorldSidecarError::Udp(source) => ServerError::WorldActorUdp(source),
     }
 }
 
@@ -433,28 +481,50 @@ fn unexpected_messenger_exit(result: Result<(), JoinError>) -> ServerError {
     }
 }
 
+fn handle_udp_event(
+    world: &WorldHandle,
+    event: Option<UdpRuntimeEvent>,
+) -> Result<(), ServerError> {
+    match event {
+        Some(UdpRuntimeEvent::Ingress(ingress)) => match world.try_udp_ingress(ingress) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(ingress)) => {
+                tracing::trace!(
+                    transport = %ingress.transport,
+                    source = %ingress.source,
+                    account_id = ingress.account_id,
+                    "dropping UDP ingress because the world UDP mailbox is full"
+                );
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(ServerError::WorldActorStopped)
+            }
+        },
+        Some(UdpRuntimeEvent::Fatal(source)) => Err(ServerError::UdpRuntime(source)),
+        None => Err(ServerError::UdpRuntimeStopped),
+    }
+}
+
 async fn run_supervisor(
-    server: BoundServer,
+    transports: SupervisorTransports,
     mut shutdown: watch::Receiver<bool>,
     world: WorldHandle,
-    mut world_task: JoinHandle<Result<(), MessengerServiceError>>,
+    mut world_task: JoinHandle<Result<(), WorldSidecarError>>,
     messenger: MessengerServiceHandle,
     mut messenger_task: JoinHandle<()>,
 ) -> Result<(), ServerError> {
-    let BoundServer {
+    let SupervisorTransports {
         config,
         catalog,
-        game_udp,
         login_tcp,
-        p2p_udp,
         messenger_tcp,
-    } = server;
+        mut udp,
+    } = transports;
     let profiles = ProfileCoordinator::new(config.profile_root.clone(), catalog);
     let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let messenger_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let mut sessions = JoinSet::new();
-    let mut game_buffer = vec![0_u8; 65_535];
-    let mut p2p_buffer = vec![0_u8; 65_535];
     let mut world_completed = false;
     let mut messenger_completed = false;
 
@@ -478,13 +548,8 @@ async fn run_supervisor(
                     break Err(error);
                 }
             }
-            datagram = game_udp.recv_from(&mut game_buffer) => {
-                if let Err(error) = handle_ignored_udp(datagram, "game UDP") {
-                    break Err(error);
-                }
-            }
-            datagram = p2p_udp.recv_from(&mut p2p_buffer) => {
-                if let Err(error) = handle_ignored_udp(datagram, "P2P UDP") {
+            event = udp.next_event() => {
+                if let Err(error) = handle_udp_event(&world, event) {
                     break Err(error);
                 }
             }
@@ -521,6 +586,7 @@ async fn run_supervisor(
             world,
             world_task,
             world_completed,
+            udp,
             messenger,
             messenger_task,
             messenger_completed,
@@ -544,6 +610,7 @@ mod tests {
         adler32,
         bml::BmlNode,
         channel::serialize_pr_channel_move_in,
+        datagram::{DEFAULT_MAX_DATAGRAM_PAYLOAD, encode_datagram},
         equipment_protocol::{
             PlantPartEquipRequest, serialize_equip_tuning_failure, serialize_equip_tuning_success,
         },
@@ -560,6 +627,10 @@ mod tests {
             serialize_lo_rp_event_reward, serialize_pr_add_time_event_init,
             serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_login_vip_info,
         },
+        udp_protocol::{
+            PqUdpEchoBody, PqUdpTimeSyncBody, RoutedUdpPacket, UdpLogicalBody,
+            encode_routed_udp_packet,
+        },
     };
     use p5136_profile::{EquipmentExceptions, Profile, ProfileStore, rider_item_snapshot};
     use tokio::{
@@ -569,7 +640,10 @@ mod tests {
     };
 
     use super::{BoundServer, ServerError, ServerHandle, load_catalog};
-    use crate::{ServerConfig, read_encrypted_frame};
+    use crate::{
+        ServerConfig, UdpIngress, UdpIngressBody, UdpTransport, decode_udp_ingress,
+        read_encrypted_frame,
+    };
 
     struct LoginClient {
         stream: TcpStream,
@@ -683,6 +757,86 @@ mod tests {
                 .unwrap(),
             0
         );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_identity_drives_bound_udp_and_release_fences_the_generation() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (server, maximum) = start_test_server(profile_root.path(), None).await;
+        let endpoints = server.endpoints();
+        let world = server.world();
+        let login = authenticate_and_login(endpoints.login_tcp, maximum, "UdpRider").await;
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        let echo = PqUdpEchoBody {
+            value_1: i32::MIN + 5_136,
+            value_2: -123_456_789,
+        };
+        send_bound_udp_request(
+            &udp,
+            endpoints.game_udp,
+            login.user_no,
+            0x1111_2222,
+            UdpLogicalBody::PqUdpEcho(echo),
+            7,
+        )
+        .await;
+        let reply = receive_bound_udp(&udp, UdpTransport::Game).await;
+        assert_eq!(reply.account_id, login.user_no);
+        assert_eq!(reply.route_hash, 0x1111_2222);
+        assert_eq!(reply.body, UdpIngressBody::PrUdpEcho(echo.reply()));
+
+        let time_sync = PqUdpTimeSyncBody {
+            client_tick: i32::MAX - 5_136,
+        };
+        send_bound_udp_request(
+            &udp,
+            endpoints.game_udp,
+            login.user_no,
+            0x3333_4444,
+            UdpLogicalBody::PqUdpTimeSync(time_sync),
+            8,
+        )
+        .await;
+        let reply = receive_bound_udp(&udp, UdpTransport::Game).await;
+        let UdpIngressBody::PrUdpTimeSync(time_reply) = reply.body else {
+            panic!("bound time-sync request returned the wrong UDP packet");
+        };
+        assert_eq!(time_reply.client_tick, time_sync.client_tick);
+
+        let user_no = login.user_no;
+        drop(login);
+        wait_for_session_count(&world, 0).await;
+        send_bound_udp_request(
+            &udp,
+            endpoints.game_udp,
+            user_no,
+            0x5555_6666,
+            UdpLogicalBody::PqUdpEcho(echo),
+            9,
+        )
+        .await;
+        assert_no_bound_udp(&udp).await;
+
+        let replacement = authenticate_and_login(endpoints.login_tcp, maximum, "UdpRider").await;
+        assert_eq!(replacement.user_no, user_no);
+        send_bound_udp_request(
+            &udp,
+            endpoints.game_udp,
+            replacement.user_no,
+            0x7777_8888,
+            UdpLogicalBody::PqUdpEcho(echo),
+            10,
+        )
+        .await;
+        assert_eq!(
+            receive_bound_udp(&udp, UdpTransport::Game).await.body,
+            UdpIngressBody::PrUdpEcho(echo.reply())
+        );
+
+        // Exercise shutdown while an active generation still owns a UDP
+        // endpoint, rather than relying only on an empty-runtime fixture.
         server.shutdown().await.unwrap();
     }
 
@@ -1243,6 +1397,49 @@ mod tests {
             messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
         };
         (bound.start().unwrap(), maximum)
+    }
+
+    async fn send_bound_udp_request(
+        socket: &UdpSocket,
+        endpoint: SocketAddr,
+        account_id: u32,
+        route_hash: u32,
+        body: UdpLogicalBody<'_>,
+        iv: u32,
+    ) {
+        let logical = encode_routed_udp_packet(&RoutedUdpPacket {
+            account_id,
+            route_hash,
+            body,
+        })
+        .unwrap();
+        let wire = encode_datagram(&logical, iv, DEFAULT_MAX_DATAGRAM_PAYLOAD).unwrap();
+        socket.send_to(&wire, endpoint).await.unwrap();
+    }
+
+    async fn receive_bound_udp(socket: &UdpSocket, transport: UdpTransport) -> UdpIngress {
+        let mut wire = vec![0_u8; 65_535];
+        let (length, source) = time::timeout(Duration::from_secs(2), socket.recv_from(&mut wire))
+            .await
+            .expect("timed out waiting for the bound UDP runtime")
+            .unwrap();
+        decode_udp_ingress(
+            transport,
+            source,
+            &wire[..length],
+            DEFAULT_MAX_DATAGRAM_PAYLOAD,
+        )
+        .unwrap()
+    }
+
+    async fn assert_no_bound_udp(socket: &UdpSocket) {
+        let mut wire = vec![0_u8; 65_535];
+        assert!(
+            time::timeout(Duration::from_millis(100), socket.recv_from(&mut wire))
+                .await
+                .is_err(),
+            "released UDP generation unexpectedly received a response"
+        );
     }
 
     async fn migrate_login_client(
