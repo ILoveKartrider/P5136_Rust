@@ -12,8 +12,8 @@ pub use catalog::{
 };
 pub use equipment::{EquipmentExceptions, EquipmentStateError};
 pub use inventory::{
-    InventoryBuildError, build_inventory_snapshot, build_inventory_snapshot_with_equipment,
-    rider_item_snapshot,
+    InventoryBuildError, apply_rider_item_selection, build_inventory_snapshot,
+    build_inventory_snapshot_with_equipment, rider_item_snapshot,
 };
 pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,

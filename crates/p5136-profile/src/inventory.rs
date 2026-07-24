@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use p5136_core::inventory::{InventorySnapshot, RiderItemGroup, RiderItemRecord};
+use p5136_core::{
+    equipment_protocol::RiderItemSelection,
+    inventory::{InventorySnapshot, RiderItemGroup, RiderItemRecord},
+};
 use thiserror::Error;
 
 use crate::{CatalogInventory, EquipmentExceptions, Profile, RiderItems, is_grant_item};
@@ -73,6 +76,44 @@ pub fn rider_item_snapshot(items: &RiderItems) -> [u8; 65] {
     output[61..63].copy_from_slice(&items.kart_coating.to_le_bytes());
     output[63..65].copy_from_slice(&items.kart_tail_lamp.to_le_bytes());
     output
+}
+
+/// Applies the legacy 65-byte equipment selection without erasing profile
+/// fields introduced by later clients.
+pub fn apply_rider_item_selection(items: &mut RiderItems, selection: RiderItemSelection) {
+    items.character = selection.character;
+    items.paint = selection.paint;
+    items.kart = selection.kart;
+    items.plate = selection.plate;
+    items.goggle = selection.goggle;
+    items.balloon = selection.balloon;
+    items.unknown1 = selection.unknown1;
+    items.head_band = selection.head_band;
+    items.head_phone = selection.head_phone;
+    items.hand_gear_left = selection.hand_gear_left;
+    items.unknown2 = selection.unknown2;
+    items.uniform = selection.uniform;
+    items.decal = selection.decal;
+    items.pet = selection.pet;
+    items.flying_pet = selection.flying_pet;
+    items.aura = selection.aura;
+    items.skid_mark = selection.skid_mark;
+    items.special_kit = selection.special_kit;
+    items.rider_color = selection.rider_color;
+    items.bonus_card = selection.bonus_card;
+    items.boss_mode_card = selection.boss_mode_card;
+    items.kart_plant1 = selection.kart_plant1;
+    items.kart_plant2 = selection.kart_plant2;
+    items.kart_plant3 = selection.kart_plant3;
+    items.kart_plant4 = selection.kart_plant4;
+    items.unknown3 = selection.unknown3;
+    items.fishing_pole = selection.fishing_pole;
+    items.tachometer = selection.tachometer;
+    items.dye = selection.dye;
+    items.kart_serial = selection.kart_serial;
+    items.unknown4 = selection.unknown4;
+    items.kart_coating = selection.kart_coating;
+    items.kart_tail_lamp = selection.kart_tail_lamp;
 }
 
 /// Builds the complete catalog-backed rider-item portion of `PqGetRider`.
@@ -306,13 +347,17 @@ fn add_parts_group(
 mod tests {
     use std::{collections::BTreeMap, fmt::Write as _};
 
-    use p5136_core::inventory::{PartsExcRecord, PlantExcRecord, RiderItemGroup};
+    use p5136_core::{
+        equipment_protocol::{SET_RIDER_ITEMS_REQUEST_NAME, parse_set_rider_items},
+        inventory::{PartsExcRecord, PlantExcRecord, RiderItemGroup},
+        packet::PacketWriter,
+    };
 
-    use crate::{CatalogInventory, EquipmentExceptions, GrantedKart, Profile};
+    use crate::{CatalogInventory, EquipmentExceptions, GrantedKart, Profile, RiderItems};
 
     use super::{
-        InventoryBuildError, add_catalog_groups, build_inventory_snapshot_with_equipment,
-        rider_item_snapshot,
+        InventoryBuildError, add_catalog_groups, apply_rider_item_selection,
+        build_inventory_snapshot_with_equipment, rider_item_snapshot,
     };
 
     fn complete_catalog_xml() -> String {
@@ -488,5 +533,39 @@ mod tests {
             u16::from_le_bytes(snapshot[63..65].try_into().unwrap()),
             0xbcde
         );
+    }
+
+    #[test]
+    fn legacy_selection_updates_exact_snapshot_and_preserves_modern_fields() {
+        let mut request = PacketWriter::named(SET_RIDER_ITEMS_REQUEST_NAME);
+        for value in 1_u16..=30 {
+            request.write_u16(value);
+        }
+        request.write_u8(0xa5);
+        request.write_u16(0x1234);
+        request.write_u16(0x5678);
+        let selection = parse_set_rider_items(request.as_slice()).unwrap();
+
+        let mut items = RiderItems {
+            slot_background: 91,
+            kart_coating12: 92,
+            kart_tail_lamp12: 93,
+            kart_booster_effect12: 94,
+            unknown5: 95,
+            ..RiderItems::default()
+        };
+        items
+            .extra
+            .insert("FutureField".to_owned(), serde_json::json!(96));
+
+        apply_rider_item_selection(&mut items, selection);
+
+        assert_eq!(rider_item_snapshot(&items), request.as_slice()[4..]);
+        assert_eq!(items.slot_background, 91);
+        assert_eq!(items.kart_coating12, 92);
+        assert_eq!(items.kart_tail_lamp12, 93);
+        assert_eq!(items.kart_booster_effect12, 94);
+        assert_eq!(items.unknown5, 95);
+        assert_eq!(items.extra["FutureField"], serde_json::json!(96));
     }
 }

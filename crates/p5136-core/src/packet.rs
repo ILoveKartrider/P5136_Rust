@@ -54,6 +54,10 @@ impl PacketWriter {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    pub fn write_i16(&mut self, value: i16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
     pub fn write_u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -132,6 +136,11 @@ impl<'a> PacketReader<'a> {
     pub fn read_u16(&mut self) -> Result<u16, PacketError> {
         let bytes = self.take(2)?;
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    pub fn read_i16(&mut self) -> Result<i16, PacketError> {
+        let bytes = self.take(2)?;
+        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     pub fn read_u32(&mut self) -> Result<u32, PacketError> {
@@ -259,6 +268,7 @@ mod tests {
     #[test]
     fn raw_and_encoded_scalars_round_trip_in_little_endian_order() {
         let mut writer = PacketWriter::new();
+        writer.write_i16(-12_345);
         writer.write_f32(12.5);
         writer.write_encoded_u8(2);
         writer.write_encoded_u16(5_136);
@@ -267,6 +277,7 @@ mod tests {
         writer.write_encoded_f32(350.0);
 
         let mut reader = PacketReader::new(writer.as_slice());
+        assert_eq!(reader.read_i16().unwrap(), -12_345);
         assert_eq!(reader.read_f32().unwrap().to_bits(), 12.5_f32.to_bits());
         assert_eq!(reader.read_encoded_u8().unwrap(), 2);
         assert_eq!(reader.read_encoded_u16().unwrap(), 5_136);

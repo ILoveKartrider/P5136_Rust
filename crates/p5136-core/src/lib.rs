@@ -6,6 +6,7 @@ pub mod channel;
 pub mod crypto;
 pub mod datagram;
 pub mod encoded;
+pub mod equipment_protocol;
 pub mod frame;
 pub mod handshake;
 pub mod inventory;
