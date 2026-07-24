@@ -17,6 +17,8 @@ pub mod nickname;
 pub mod packet;
 pub mod ports;
 pub mod race_protocol;
+pub mod race_result_protocol;
+pub mod race_start_protocol;
 pub mod room_protocol;
 pub mod startup;
 pub mod udp_protocol;

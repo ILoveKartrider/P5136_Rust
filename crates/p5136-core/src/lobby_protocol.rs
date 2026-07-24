@@ -207,16 +207,13 @@ pub fn serialize_set_slot_state_reply(
     accepted: bool,
     player_id: i32,
     state: PlayerSlotState,
-    slot_positions: [i32; ROOM_SLOT_COUNT],
 ) -> Result<Vec<u8>, LobbyProtocolError> {
     validate_player_id(player_id)?;
-    validate_slot_positions(slot_positions)?;
     let mut packet = PacketWriter::named(SET_SLOT_STATE_REPLY_NAME);
     packet.write_u32(user_no);
     packet.write_u8(u8::from(accepted));
     packet.write_i32(player_id);
     packet.write_i32(state as i32);
-    write_slot_positions(&mut packet, slot_positions);
     Ok(packet.into_inner())
 }
 
@@ -369,14 +366,12 @@ mod tests {
     #[test]
     fn ready_stage_replies_match_csharp_field_order() {
         let positions = [5, 4, -1, -1, -1, -1, -1, -1];
+        let ready_reply =
+            serialize_set_slot_state_reply(17, true, 2, PlayerSlotState::Ready).unwrap();
+        assert_eq!(ready_reply.len(), 17);
         assert_eq!(
-            serialize_set_slot_state_reply(17, true, 2, PlayerSlotState::Ready, positions,)
-                .unwrap(),
-            decode_hex(concat!(
-                "EC099E7F11000000010200000003000000",
-                "0500000004000000FFFFFFFFFFFFFFFF",
-                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
-            ))
+            ready_reply,
+            decode_hex("EC099E7F11000000010200000003000000")
         );
         assert_eq!(
             serialize_change_team_reply(2, RoomTeam::Blue, positions).unwrap(),
@@ -444,17 +439,8 @@ mod tests {
             Err(LobbyProtocolError::InvalidPlayerId(16))
         ));
         assert!(matches!(
-            serialize_set_slot_state_reply(
-                1,
-                true,
-                0,
-                PlayerSlotState::Ready,
-                [8, -1, -1, -1, -1, -1, -1, -1],
-            ),
-            Err(LobbyProtocolError::InvalidSlotPosition {
-                index: 0,
-                position: 8,
-            })
+            serialize_set_slot_state_reply(1, true, 16, PlayerSlotState::Ready),
+            Err(LobbyProtocolError::InvalidPlayerId(16))
         ));
     }
 
