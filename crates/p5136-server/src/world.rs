@@ -15,6 +15,7 @@ use p5136_core::{
         serialize_start_room_reply,
     },
     nickname::canonical_nickname_key,
+    race_protocol::{AiGoalInRequest, GameControlRequest, TeamBoosterGaugeRequest},
     race_start_protocol::{
         AiRaceSpec, GrCommandStart, MAX_GR_COMMAND_START_PAYLOAD_LENGTH, P5136KartPhysicsBlock,
         RaceStartProtocolError, serialize_gr_command_start_bounded,
@@ -37,8 +38,9 @@ use tokio::{
 };
 
 use crate::identity::{
-    ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityRegistry,
-    MigrationCompletion, MigrationPermit, MigrationToken, ReleasedIdentity, UserNo,
+    ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
+    IdentityRegistry, MigrationCompletion, MigrationPermit, MigrationToken, ReleasedIdentity,
+    UserNo,
 };
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
@@ -191,6 +193,26 @@ pub(crate) enum LobbyCommandOutcome {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum RaceCommandPayload {
+    GameControl(GameControlRequest),
+    AiGoalIn(AiGoalInRequest),
+    TeamBoosterGauge(TeamBoosterGaugeRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaceCommandOutcome {
+    LoadingAwaiting {
+        room_id: RoomId,
+        race_epoch: u64,
+        expected_participants: usize,
+    },
+    IgnoredDuplicate {
+        room_id: RoomId,
+        race_epoch: u64,
+    },
+}
+
 /// Parsed request payloads carried by the next actor command layer. Keeping
 /// parsing outside the actor prevents untrusted byte processing from blocking
 /// unrelated world state.
@@ -282,6 +304,41 @@ pub enum LobbyError {
 }
 
 #[derive(Debug, Error)]
+pub enum RaceError {
+    #[error("identity is not in a protocol room")]
+    NotInRoom,
+
+    #[error("race loading command requires Loading; current phase is {actual:?}")]
+    WrongPhase { actual: RoomPhase },
+
+    #[error("identity is not an exact-generation participant in the frozen race roster")]
+    NotFrozenParticipant,
+
+    #[error("GameControl state {state} is unsupported during race loading")]
+    UnsupportedGameControlState { state: i32 },
+
+    #[error("race request requires Running; current phase is {actual:?}")]
+    NotRunning { actual: RoomPhase },
+
+    #[error("the monotonic race loading deadline overflowed")]
+    RaceDeadlineOverflow,
+}
+
+impl RaceError {
+    #[must_use]
+    pub(crate) const fn is_expected_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::NotInRoom
+                | Self::WrongPhase { .. }
+                | Self::NotFrozenParticipant
+                | Self::UnsupportedGameControlState { .. }
+                | Self::NotRunning { .. }
+        )
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum WorldError {
     #[error("world actor has stopped")]
     Stopped,
@@ -300,6 +357,9 @@ pub enum WorldError {
 
     #[error(transparent)]
     Lobby(#[from] LobbyError),
+
+    #[error(transparent)]
+    Race(#[from] RaceError),
 
     #[error("session {0:?} is not registered")]
     UnknownSession(SessionId),
@@ -372,6 +432,11 @@ enum WorldCommand {
         session: SessionId,
         payload: LobbyCommandPayload,
         reply: oneshot::Sender<Result<LobbyCommandOutcome, WorldError>>,
+    },
+    Race {
+        session: SessionId,
+        payload: RaceCommandPayload,
+        reply: oneshot::Sender<Result<RaceCommandOutcome, WorldError>>,
     },
     CreateRoom {
         reply: oneshot::Sender<RoomId>,
@@ -691,6 +756,23 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn race_command(
+        &self,
+        session: SessionId,
+        payload: RaceCommandPayload,
+    ) -> Result<RaceCommandOutcome, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::Race {
+                session,
+                payload,
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub async fn create_room(&self) -> Result<RoomId, WorldError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -842,6 +924,31 @@ struct FrozenRaceRoster {
     participants: Vec<FrozenRaceParticipant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FrozenParticipantStamp {
+    user_no: UserNo,
+    generation: IdentityGeneration,
+}
+
+impl From<&IdentityBinding> for FrozenParticipantStamp {
+    fn from(identity: &IdentityBinding) -> Self {
+        Self {
+            user_no: identity.user_no,
+            generation: identity.generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadingHandshake {
+    Dormant,
+    Awaiting {
+        expected: HashSet<FrozenParticipantStamp>,
+        ready: HashSet<FrozenParticipantStamp>,
+        deadline: Instant,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProtocolRoomState {
     id: RoomId,
@@ -849,6 +956,7 @@ struct ProtocolRoomState {
     phase: RoomPhase,
     race_epoch: u64,
     frozen_race: Option<FrozenRaceRoster>,
+    loading_handshake: LoadingHandshake,
     room_master: i32,
     members_by_id: [Option<ProtocolRoomMember>; ROOM_SLOT_COUNT],
     observers: [Option<ProtocolRoomMember>; ROOM_OBSERVER_COUNT],
@@ -870,6 +978,7 @@ impl ProtocolRoomState {
             phase: RoomPhase::Lobby,
             race_epoch: 0,
             frozen_race: None,
+            loading_handshake: LoadingHandshake::Dormant,
             room_master: 0,
             members_by_id: array::from_fn(|_| None),
             observers: array::from_fn(|_| None),
@@ -1414,6 +1523,90 @@ impl World {
         }
     }
 
+    fn race_command(
+        &mut self,
+        session: SessionId,
+        payload: RaceCommandPayload,
+        now: Instant,
+    ) -> Result<RaceCommandOutcome, WorldError> {
+        let identity = self.identities.authorize(session)?;
+        let room_id = self
+            .protocol_room_by_user
+            .get(&identity.user_no)
+            .copied()
+            .ok_or(RaceError::NotInRoom)?;
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("protocol membership always references an existing room");
+
+        let request = match payload {
+            RaceCommandPayload::GameControl(request) => request,
+            RaceCommandPayload::AiGoalIn(request) => {
+                tracing::trace!(
+                    player_id = request.player_id,
+                    race_time = request.race_time,
+                    "ignoring finish request before Running"
+                );
+                return Err(RaceError::NotRunning { actual: room.phase }.into());
+            }
+            RaceCommandPayload::TeamBoosterGauge(request) => {
+                tracing::trace!(
+                    team = ?request.team,
+                    contribution = request.contribution,
+                    "ignoring booster request before Running"
+                );
+                return Err(RaceError::NotRunning { actual: room.phase }.into());
+            }
+        };
+        if room.phase != RoomPhase::Loading {
+            return Err(RaceError::WrongPhase { actual: room.phase }.into());
+        }
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .expect("a Loading room always has a frozen roster");
+        if !frozen
+            .participants
+            .iter()
+            .any(|participant| participant.identity == identity)
+        {
+            return Err(RaceError::NotFrozenParticipant.into());
+        }
+        if request.state != 0 {
+            return Err(RaceError::UnsupportedGameControlState {
+                state: request.state,
+            }
+            .into());
+        }
+
+        if matches!(room.loading_handshake, LoadingHandshake::Awaiting { .. }) {
+            return Ok(RaceCommandOutcome::IgnoredDuplicate {
+                room_id,
+                race_epoch: room.race_epoch,
+            });
+        }
+        let deadline = now
+            .checked_add(Duration::from_secs(30))
+            .ok_or(RaceError::RaceDeadlineOverflow)?;
+        let expected = frozen
+            .participants
+            .iter()
+            .map(|participant| FrozenParticipantStamp::from(&participant.identity))
+            .collect::<HashSet<_>>();
+        let expected_participants = expected.len();
+        room.loading_handshake = LoadingHandshake::Awaiting {
+            expected,
+            ready: HashSet::new(),
+            deadline,
+        };
+        Ok(RaceCommandOutcome::LoadingAwaiting {
+            room_id,
+            race_epoch: room.race_epoch,
+            expected_participants,
+        })
+    }
+
     fn protocol_room_id(&self, identity: &IdentityBinding) -> Result<RoomId, LobbyError> {
         self.protocol_room_by_user
             .get(&identity.user_no)
@@ -1684,6 +1877,7 @@ impl World {
         next.phase = RoomPhase::Loading;
         next.race_epoch = race_epoch;
         next.frozen_race = Some(frozen);
+        next.loading_handshake = LoadingHandshake::Dormant;
         self.protocol_rooms.insert(room_id, next);
         Self::publish_reserved(reserved);
         self.debug_assert_invariants();
@@ -2355,6 +2549,7 @@ impl World {
                         }
                     }
                 }
+                debug_assert_loading_handshake_invariants(room);
             }
             debug_assert_eq!(seen_users.len(), self.protocol_room_by_user.len());
             for room_id in &self.free_protocol_room_ids {
@@ -2365,6 +2560,31 @@ impl World {
             }
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_loading_handshake_invariants(room: &ProtocolRoomState) {
+    let LoadingHandshake::Awaiting {
+        expected,
+        ready,
+        deadline: _,
+    } = &room.loading_handshake
+    else {
+        return;
+    };
+
+    debug_assert_eq!(room.phase, RoomPhase::Loading);
+    debug_assert!(ready.is_subset(expected));
+    let frozen = room
+        .frozen_race
+        .as_ref()
+        .expect("an awaiting room has a frozen roster");
+    let frozen_stamps = frozen
+        .participants
+        .iter()
+        .map(|participant| FrozenParticipantStamp::from(&participant.identity))
+        .collect::<HashSet<_>>();
+    debug_assert_eq!(expected, &frozen_stamps);
 }
 
 fn messenger_identity_from_binding(
@@ -2643,6 +2863,14 @@ async fn dispatch_command(
             let result = world.lobby_command(session, payload);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
+        WorldCommand::Race {
+            session,
+            payload,
+            reply,
+        } => {
+            let result = world.race_command(session, payload, Instant::now());
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
         command => return dispatch_utility_command(world, command, sidecars).await,
     }
     Ok(false)
@@ -2700,7 +2928,8 @@ async fn dispatch_utility_command(
         | WorldCommand::CompleteMigration { .. }
         | WorldCommand::RoomProtocol { .. }
         | WorldCommand::PublishRoomEquipment { .. }
-        | WorldCommand::Lobby { .. } => {
+        | WorldCommand::Lobby { .. }
+        | WorldCommand::Race { .. } => {
             unreachable!("identity-affecting commands are dispatched by dispatch_command")
         }
     }
@@ -2721,6 +2950,7 @@ mod tests {
             CHANGE_TEAM_REPLY_NAME, PlayerSlotState, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
         },
+        race_protocol::{AiGoalInRequest, GameControlRequest},
         race_start_protocol::{
             GR_COMMAND_START_PACKET_NAME, P5136KartPhysicsBlock, RaceStartProtocolError,
         },
@@ -2736,9 +2966,10 @@ mod tests {
     };
 
     use super::{
-        LobbyCommandOutcome, LobbyCommandPayload, LobbyError, OutboundBatch, ROOM_CAPACITY,
-        RoomCommandPayload, RoomError, RoomId, RoomParticipant, RoomPhase, SessionId,
-        StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
+        LoadingHandshake, LobbyCommandOutcome, LobbyCommandPayload, LobbyError, OutboundBatch,
+        ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload, RaceError, RoomCommandPayload,
+        RoomError, RoomId, RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World,
+        WorldCommand, WorldError, WorldHandle,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
@@ -2969,6 +3200,15 @@ mod tests {
         }
     }
 
+    fn game_control_request(state: i32) -> RaceCommandPayload {
+        RaceCommandPayload::GameControl(GameControlRequest {
+            state,
+            optional_pair: None,
+            value0: 0,
+            trailing: Vec::new(),
+        })
+    }
+
     #[test]
     fn racing_udp_targets_require_started_room_and_include_observers() {
         let mut world = World::default();
@@ -3152,6 +3392,141 @@ mod tests {
         assert_eq!(
             logical_packet_hash(&duplicate[0]),
             adler32::packet_hash(START_ROOM_REPLY_NAME)
+        );
+    }
+
+    #[test]
+    fn loading_game_control_arms_once_with_exact_frozen_participants() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "ControlOwner", 67, 41_201, 64);
+        let guest = register_channel_session(&mut world, "ControlGuest", 67, 41_211, 64);
+        let observer = register_channel_session(&mut world, "ControlObserver", 67, 41_221, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        join_protocol_room(&mut world, &observer, room_id, true);
+
+        let wrong_phase = world
+            .race_command(owner.session, game_control_request(0), Instant::now())
+            .unwrap_err();
+        assert!(matches!(
+            &wrong_phase,
+            WorldError::Race(RaceError::WrongPhase {
+                actual: RoomPhase::Lobby
+            })
+        ));
+        assert!(match &wrong_phase {
+            WorldError::Race(error) => error.is_expected_rejection(),
+            _ => false,
+        });
+        assert!(matches!(
+            world.race_command(
+                owner.session,
+                RaceCommandPayload::AiGoalIn(AiGoalInRequest {
+                    player_id: 0,
+                    race_time: 0,
+                }),
+                Instant::now()
+            ),
+            Err(WorldError::Race(RaceError::NotRunning {
+                actual: RoomPhase::Lobby
+            }))
+        ));
+
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+
+        let armed_at = Instant::now();
+        assert_eq!(
+            world
+                .race_command(owner.session, game_control_request(0), armed_at)
+                .unwrap(),
+            RaceCommandOutcome::LoadingAwaiting {
+                room_id,
+                race_epoch: 1,
+                expected_participants: 3,
+            }
+        );
+        let armed = world.protocol_rooms[&room_id].loading_handshake.clone();
+        match &armed {
+            LoadingHandshake::Awaiting {
+                expected,
+                ready,
+                deadline,
+            } => {
+                assert_eq!(expected.len(), 3);
+                assert!(ready.is_empty());
+                assert_eq!(*deadline, armed_at + Duration::from_secs(30));
+            }
+            LoadingHandshake::Dormant => panic!("state=0 did not arm loading"),
+        }
+
+        assert_eq!(
+            world
+                .race_command(
+                    observer.session,
+                    game_control_request(0),
+                    armed_at + Duration::from_secs(10)
+                )
+                .unwrap(),
+            RaceCommandOutcome::IgnoredDuplicate {
+                room_id,
+                race_epoch: 1,
+            }
+        );
+        assert_eq!(world.protocol_rooms[&room_id].loading_handshake, armed);
+        assert!(matches!(
+            world.race_command(guest.session, game_control_request(2), armed_at),
+            Err(WorldError::Race(RaceError::UnsupportedGameControlState {
+                state: 2
+            }))
+        ));
+        assert_eq!(world.protocol_rooms[&room_id].loading_handshake, armed);
+        assert!(!RaceError::RaceDeadlineOverflow.is_expected_rejection());
+    }
+
+    #[test]
+    fn loading_game_control_rejects_stale_and_replacement_generations() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "FenceOwner", 67, 41_301, 64);
+        let guest = register_channel_session(&mut world, "FenceGuest", 67, 41_311, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+
+        let replacement = migrate_channel_session(&mut world, &guest, 41_401, 64);
+        assert!(matches!(
+            world.race_command(replacement.session, game_control_request(0), Instant::now()),
+            Err(WorldError::Race(RaceError::NotFrozenParticipant))
+        ));
+        assert!(matches!(
+            world.race_command(guest.session, game_control_request(0), Instant::now()),
+            Err(WorldError::Identity(IdentityError::StaleSession(session)))
+                if session == guest.session
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id].loading_handshake,
+            LoadingHandshake::Dormant
         );
     }
 

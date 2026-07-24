@@ -35,6 +35,10 @@ use p5136_core::{
         serialize_pr_login,
     },
     packet::PacketError,
+    race_protocol::{
+        RaceProtocolError, RaceRequest, classify_race_request, parse_ai_goal_in_request,
+        parse_game_control_request, parse_team_booster_request,
+    },
     race_start_protocol::P5136KartPhysicsBlock,
     room_protocol::{
         RoomPlayer, RoomProtocolError, RoomProtocolRequest, classify_room_protocol_request,
@@ -66,8 +70,8 @@ use crate::{
     ChannelBinding, IdentityBinding, MigrationToken, ServerConfig, SessionId, UserNo, WorldError,
     WorldHandle,
     world::{
-        LobbyCommandPayload, LobbyError, OutboundBatch, RoomCommandPayload, RoomParticipant,
-        StartRoomPlan,
+        LobbyCommandPayload, LobbyError, OutboundBatch, RaceCommandPayload, RoomCommandPayload,
+        RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -145,6 +149,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     LobbyProtocol(#[from] LobbyProtocolError),
+
+    #[error(transparent)]
+    RaceProtocol(#[from] RaceProtocolError),
 
     #[error(transparent)]
     KartPhysicsBuild(#[from] KartPhysicsBuildError),
@@ -888,6 +895,10 @@ async fn dispatch_packet(
         return handle_lobby_request(services.world, services.session_id, request, packet).await;
     }
 
+    if let Some(request) = classify_race_request(hash) {
+        return handle_race_request(services.world, services.session_id, request, packet).await;
+    }
+
     if let Some(request) = classify_equipment_request(hash) {
         return dispatch_equipment_request(services, request, packet, context).await;
     }
@@ -1081,6 +1092,35 @@ async fn handle_lobby_request(
                 %error,
                 session_id = session_id.get(),
                 "rejected a lobby command without terminating the session"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Vec::new())
+}
+
+async fn handle_race_request(
+    world: &WorldHandle,
+    session_id: SessionId,
+    request: RaceRequest,
+    packet: &[u8],
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let payload = match request {
+        RaceRequest::GameControl => {
+            RaceCommandPayload::GameControl(parse_game_control_request(packet)?)
+        }
+        RaceRequest::AiGoalIn => RaceCommandPayload::AiGoalIn(parse_ai_goal_in_request(packet)?),
+        RaceRequest::TeamBoosterGauge => {
+            RaceCommandPayload::TeamBoosterGauge(parse_team_booster_request(packet)?)
+        }
+    };
+    match world.race_command(session_id, payload).await {
+        Ok(_) => {}
+        Err(WorldError::Race(error)) if error.is_expected_rejection() => {
+            tracing::debug!(
+                %error,
+                session_id = session_id.get(),
+                "rejected a race command without terminating the session"
             );
         }
         Err(error) => return Err(error.into()),
@@ -1494,6 +1534,9 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         packet::PacketWriter,
+        race_protocol::{
+            GameControlRequest, RaceProtocolError, RaceRequest, parse_game_control_request,
+        },
         room_protocol::{
             ChCreateRoomRequest, ChJoinRoomRequest, ROOM_CONNECTION_CONTEXT_LENGTH,
             ROOM_DATA_LENGTH, RoomProtocolError, RoomProtocolRequest,
@@ -1511,15 +1554,15 @@ mod tests {
     use super::{
         BlockingUpdateHook, LoginSessionError, MAX_OUTBOUND_BATCH_BURST, ProfileCoordinator,
         SessionContext, SessionReadEvent, SessionServices, dispatch_packet,
-        handle_equipment_request, handle_lobby_request, handle_room_request, read_encrypted_frame,
-        read_session_frame, room_participant_from_profile, room_physics_metadata,
-        select_session_read_event, update_game_options, validate_rider_item_selection,
-        write_session_bytes,
+        handle_equipment_request, handle_lobby_request, handle_race_request, handle_room_request,
+        read_encrypted_frame, read_session_frame, room_participant_from_profile,
+        room_physics_metadata, select_session_read_event, update_game_options,
+        validate_rider_item_selection, write_session_bytes,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
         WorldError, WorldHandle,
-        world::{OutboundBatch, RoomCommandPayload},
+        world::{OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload},
     };
 
     fn test_catalog() -> Arc<CatalogInventory> {
@@ -1734,6 +1777,64 @@ mod tests {
         let mut packet = PacketWriter::named("GrRequestSetSlotStatePacket");
         packet.write_i32(state as i32);
         packet.into_inner()
+    }
+
+    fn game_control_packet(state: i32, value0: u32) -> Vec<u8> {
+        let mut packet = PacketWriter::named("GameControlPacket");
+        packet.write_i32(state);
+        packet.write_u8(0);
+        packet.write_u32(value0);
+        packet.into_inner()
+    }
+
+    fn ai_goal_in_packet(player_id: i32, race_time: u32) -> Vec<u8> {
+        let mut packet = PacketWriter::named("GameAiGoalinPacket");
+        packet.write_i32(player_id);
+        packet.write_u32(race_time);
+        packet.into_inner()
+    }
+
+    fn team_booster_packet(team: u8, contribution: f32) -> Vec<u8> {
+        let mut packet = PacketWriter::named("GameTeamBoosterRequestAddGaugePacket");
+        packet.write_u8(team);
+        packet.write_f32(contribution);
+        packet.into_inner()
+    }
+
+    async fn create_and_start_solo_loading(
+        world: &WorldHandle,
+        rider: &mut TestLobbySession,
+        room_name: &str,
+    ) {
+        let profile = Profile::default();
+        world
+            .room_protocol(
+                rider.session,
+                RoomCommandPayload::Create {
+                    request: create_room_request(room_name),
+                    participant: room_participant_from_profile(&rider.identity, &profile).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let create_packets = rider.outbound.recv().await.unwrap().into_packets();
+        assert_eq!(create_packets.len(), 1);
+
+        let mut start = PacketWriter::named("GrRequestStartPacket");
+        start.write_i32(0);
+        assert_eq!(
+            handle_lobby_request(
+                world,
+                rider.session,
+                LobbyRequest::StartRoom,
+                start.as_slice(),
+            )
+            .await
+            .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        let start_packets = rider.outbound.recv().await.unwrap().into_packets();
+        assert_eq!(start_packets.len(), 2);
     }
 
     #[tokio::test]
@@ -2167,6 +2268,225 @@ mod tests {
         let plant = room_physics_metadata(&profile).unwrap();
         assert!(plant.physics_fallback);
         assert_eq!(plant.block, baseline);
+    }
+
+    #[tokio::test]
+    async fn authenticated_dispatch_classifies_all_race_requests() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4);
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_760))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "RaceClassifier")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = SessionContext::default();
+
+        let mut truncated_control = PacketWriter::named("GameControlPacket");
+        truncated_control.write_i32(0);
+        truncated_control.write_u8(0);
+        let invalid_ai = ai_goal_in_packet(16, 100);
+        let invalid_team = team_booster_packet(3, 1.0);
+
+        for packet in [truncated_control.into_inner(), invalid_ai, invalid_team] {
+            assert!(matches!(
+                dispatch_packet(&services, &packet, &mut context).await,
+                Err(LoginSessionError::RaceProtocol(_))
+            ));
+        }
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_race_packets_cannot_mutate_actor_state() {
+        let (world, world_task) = WorldHandle::spawn(16);
+        let mut rider = register_lobby_session(&world, "MalformedRace", 49_770).await;
+        create_and_start_solo_loading(&world, &mut rider, "MalformedRace").await;
+
+        let mut oversized_control = game_control_packet(0, 100);
+        oversized_control.extend_from_slice(&[0; 257]);
+        assert!(matches!(
+            handle_race_request(
+                &world,
+                rider.session,
+                RaceRequest::GameControl,
+                &oversized_control,
+            )
+            .await,
+            Err(LoginSessionError::RaceProtocol(
+                RaceProtocolError::GameControlTailTooLarge {
+                    actual: 257,
+                    maximum: 256,
+                }
+            ))
+        ));
+
+        let mut trailing_ai = ai_goal_in_packet(0, 100);
+        trailing_ai.push(0xff);
+        assert!(matches!(
+            handle_race_request(&world, rider.session, RaceRequest::AiGoalIn, &trailing_ai,).await,
+            Err(LoginSessionError::RaceProtocol(
+                RaceProtocolError::TrailingBytes { count: 1, .. }
+            ))
+        ));
+
+        let mut trailing_booster = team_booster_packet(1, 1.0);
+        trailing_booster.push(0xff);
+        assert!(matches!(
+            handle_race_request(
+                &world,
+                rider.session,
+                RaceRequest::TeamBoosterGauge,
+                &trailing_booster,
+            )
+            .await,
+            Err(LoginSessionError::RaceProtocol(
+                RaceProtocolError::TrailingBytes { count: 1, .. }
+            ))
+        ));
+        assert!(matches!(
+            rider.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(matches!(
+            world
+                .race_command(
+                    rider.session,
+                    RaceCommandPayload::GameControl(GameControlRequest {
+                        state: 0,
+                        optional_pair: None,
+                        value0: 100,
+                        trailing: Vec::new(),
+                    }),
+                )
+                .await
+                .unwrap(),
+            RaceCommandOutcome::LoadingAwaiting {
+                expected_participants: 1,
+                ..
+            }
+        ));
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn game_control_state_zero_reaches_actor_without_direct_response() {
+        let (world, world_task) = WorldHandle::spawn(16);
+        let mut rider = register_lobby_session(&world, "RaceStateZero", 49_780).await;
+        create_and_start_solo_loading(&world, &mut rider, "RaceStateZero").await;
+        let packet = game_control_packet(0, 0x1234_5678);
+
+        assert_eq!(
+            handle_race_request(&world, rider.session, RaceRequest::GameControl, &packet,)
+                .await
+                .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert!(matches!(
+            rider.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            world
+                .race_command(
+                    rider.session,
+                    RaceCommandPayload::GameControl(parse_game_control_request(&packet).unwrap()),
+                )
+                .await
+                .unwrap(),
+            RaceCommandOutcome::IgnoredDuplicate { .. }
+        ));
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_generation_is_rejected_before_race_mutation() {
+        let (world, world_task) = WorldHandle::spawn(8);
+        let rider = register_lobby_session(&world, "StaleRace", 49_790).await;
+        let packet = game_control_packet(0, 100);
+
+        assert!(matches!(
+            handle_race_request(
+                &world,
+                rider.source_session,
+                RaceRequest::GameControl,
+                &packet,
+            )
+            .await,
+            Err(LoginSessionError::World(WorldError::Identity(
+                IdentityError::StaleSession(id)
+            ))) if id == rider.source_session
+        ));
+        assert_eq!(
+            world.authorize_identity(rider.session).await.unwrap(),
+            rider.identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expected_race_rejections_do_not_terminate_the_session() {
+        let (world, world_task) = WorldHandle::spawn(16);
+        let mut rider = register_lobby_session(&world, "RaceRejection", 49_800).await;
+        let profile = Profile::default();
+        world
+            .room_protocol(
+                rider.session,
+                RoomCommandPayload::Create {
+                    request: create_room_request("RaceRejection"),
+                    participant: room_participant_from_profile(&rider.identity, &profile).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = rider.outbound.recv().await.unwrap();
+
+        for (request, packet) in [
+            (RaceRequest::GameControl, game_control_packet(0, 100)),
+            (RaceRequest::AiGoalIn, ai_goal_in_packet(0, 100)),
+            (RaceRequest::TeamBoosterGauge, team_booster_packet(1, 1.0)),
+        ] {
+            assert_eq!(
+                handle_race_request(&world, rider.session, request, &packet)
+                    .await
+                    .unwrap(),
+                Vec::<Vec<u8>>::new()
+            );
+        }
+        assert!(matches!(
+            rider.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            world.authorize_identity(rider.session).await.unwrap(),
+            rider.identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
     }
 
     #[tokio::test]
