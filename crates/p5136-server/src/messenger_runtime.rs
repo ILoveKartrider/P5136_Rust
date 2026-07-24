@@ -24,7 +24,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -39,7 +42,7 @@ use p5136_core::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Notify, mpsc, oneshot},
+    sync::{Notify, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time,
 };
@@ -52,13 +55,23 @@ use crate::messenger_hub::{
 
 pub const DEFAULT_MESSENGER_MAILBOX_CAPACITY: usize = 1_024;
 pub const DEFAULT_MESSENGER_CONNECTION_CAPACITY: usize = 256;
+pub const DEFAULT_MESSENGER_IDENTITY_CAPACITY: usize = 256;
 pub const DEFAULT_MESSENGER_OUTBOUND_CAPACITY: usize = 64;
 pub const DEFAULT_MAX_MESSENGER_PAYLOAD: usize = 64 * 1_024;
+
+const SHUTDOWN_RUNNING: u8 = 0;
+const SHUTDOWN_REQUESTED: u8 = 1;
+const SHUTDOWN_COMPLETE: u8 = 2;
+const SHUTDOWN_FAILED: u8 = 3;
+const COMMAND_PENDING: u8 = 0;
+const COMMAND_CLAIMED: u8 = 1;
+const COMMAND_CANCELLED: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessengerRuntimeConfig {
     pub mailbox_capacity: usize,
     pub max_connections: usize,
+    pub max_identities: usize,
     pub outbound_capacity: usize,
     pub max_frame_payload: usize,
     pub max_string_utf16_units: usize,
@@ -73,6 +86,7 @@ impl Default for MessengerRuntimeConfig {
         Self {
             mailbox_capacity: DEFAULT_MESSENGER_MAILBOX_CAPACITY,
             max_connections: DEFAULT_MESSENGER_CONNECTION_CAPACITY,
+            max_identities: DEFAULT_MESSENGER_IDENTITY_CAPACITY,
             outbound_capacity: DEFAULT_MESSENGER_OUTBOUND_CAPACITY,
             max_frame_payload: DEFAULT_MAX_MESSENGER_PAYLOAD,
             max_string_utf16_units: DEFAULT_MAX_MESSENGER_STRING_UNITS,
@@ -132,6 +146,15 @@ pub enum MessengerServiceError {
 
     #[error("messenger connection limit {maximum} reached")]
     ConnectionLimitReached { maximum: usize },
+
+    #[error("messenger active identity limit {maximum} reached")]
+    IdentityLimitReached { maximum: usize },
+
+    #[error("messenger Enter command reached the actor after its deadline")]
+    EnterDeadlineElapsed,
+
+    #[error("messenger command was cancelled before its actor commit point")]
+    CommandCancelled,
 
     #[error("messenger session ID space is exhausted")]
     SessionIdExhausted,
@@ -213,6 +236,8 @@ pub enum MessengerConnectionError {
 pub struct MessengerServiceHandle {
     sender: mpsc::Sender<MessengerCommand>,
     config: Arc<MessengerRuntimeConfig>,
+    connection_permits: Arc<Semaphore>,
+    shutdown: Arc<MessengerShutdownState>,
 }
 
 #[derive(Debug)]
@@ -239,11 +264,14 @@ enum MessengerCommand {
     Enter {
         session: MessengerSessionId,
         claim: EnterClaim,
+        deadline: time::Instant,
+        gate: Arc<MessengerCommitGate>,
         reply: oneshot::Sender<Result<(), MessengerServiceError>>,
     },
     Dispatch {
         session: MessengerSessionId,
         request: MessengerRequest,
+        gate: Arc<MessengerCommitGate>,
         reply: oneshot::Sender<Result<(), MessengerServiceError>>,
     },
     Disconnect {
@@ -252,9 +280,7 @@ enum MessengerCommand {
     Snapshot {
         reply: oneshot::Sender<MessengerServiceSnapshot>,
     },
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -271,14 +297,47 @@ struct MessengerActor {
     hub: MessengerHub,
     identities_by_key: HashMap<String, MessengerIdentity>,
     identity_key_by_user_no: HashMap<NonZeroU32, String>,
+    last_advance_by_key: HashMap<String, AppliedGenerationAdvance>,
     transports: HashMap<MessengerSessionId, MessengerTransport>,
     next_session_id: Option<MessengerSessionId>,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedGenerationAdvance {
+    previous: MessengerIdentity,
+    next: MessengerIdentity,
+    retained_session: Option<MessengerSessionId>,
 }
 
 #[derive(Debug)]
 struct MessengerCleanupQueue {
     pending: Mutex<HashSet<MessengerSessionId>>,
     wake: Notify,
+}
+
+#[derive(Debug)]
+struct MessengerShutdownState {
+    phase: AtomicU8,
+    wake: Notify,
+}
+
+struct MessengerActorLifecycle {
+    shutdown: Arc<MessengerShutdownState>,
+}
+
+struct MessengerShutdownRequest {
+    shutdown: Arc<MessengerShutdownState>,
+    enqueued: bool,
+}
+
+#[derive(Debug)]
+struct MessengerCommitGate {
+    state: AtomicU8,
+}
+
+struct MessengerCommitLease {
+    gate: Arc<MessengerCommitGate>,
+    completed: bool,
 }
 
 #[derive(Debug)]
@@ -337,6 +396,108 @@ impl MessengerCleanupQueue {
     }
 }
 
+impl MessengerShutdownState {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(SHUTDOWN_RUNNING),
+            wake: Notify::new(),
+        }
+    }
+
+    fn complete(&self) {
+        self.phase.store(SHUTDOWN_COMPLETE, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    fn fail_if_incomplete(&self) {
+        let mut current = self.phase.load(Ordering::Acquire);
+        while current != SHUTDOWN_COMPLETE && current != SHUTDOWN_FAILED {
+            match self.phase.compare_exchange_weak(
+                current,
+                SHUTDOWN_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.wake.notify_waiters();
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for MessengerActorLifecycle {
+    fn drop(&mut self) {
+        self.shutdown.fail_if_incomplete();
+    }
+}
+
+impl Drop for MessengerShutdownRequest {
+    fn drop(&mut self) {
+        if !self.enqueued
+            && self
+                .shutdown
+                .phase
+                .compare_exchange(
+                    SHUTDOWN_REQUESTED,
+                    SHUTDOWN_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            self.shutdown.wake.notify_waiters();
+        }
+    }
+}
+
+impl MessengerCommitGate {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(COMMAND_PENDING),
+        }
+    }
+
+    fn claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                COMMAND_PENDING,
+                COMMAND_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+impl MessengerCommitLease {
+    fn new(gate: Arc<MessengerCommitGate>) -> Self {
+        Self {
+            gate,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for MessengerCommitLease {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.gate.state.compare_exchange(
+                COMMAND_PENDING,
+                COMMAND_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 impl MessengerRegistrationLease {
     fn new(session: MessengerSessionId, cleanup: Arc<MessengerCleanupQueue>) -> Self {
         Self {
@@ -364,6 +525,7 @@ impl MessengerRuntimeConfig {
         for (name, value) in [
             ("mailbox_capacity", self.mailbox_capacity),
             ("max_connections", self.max_connections),
+            ("max_identities", self.max_identities),
             ("outbound_capacity", self.outbound_capacity),
             ("max_string_utf16_units", self.max_string_utf16_units),
         ] {
@@ -395,6 +557,11 @@ impl MessengerRuntimeConfig {
 }
 
 impl MessengerServiceHandle {
+    #[must_use]
+    pub(crate) fn max_identities(&self) -> usize {
+        self.config.max_identities
+    }
+
     /// Starts the messenger actor.
     ///
     /// Identity publishing is deliberately one-way: the messenger actor never
@@ -413,19 +580,23 @@ impl MessengerServiceHandle {
         let hub = MessengerHub::new(config.hub_limits)?;
         let (sender, receiver) = mpsc::channel(config.mailbox_capacity);
         let cleanup = Arc::new(MessengerCleanupQueue::new());
+        let shutdown = Arc::new(MessengerShutdownState::new());
         let handle = Self {
             sender,
             config: Arc::clone(&config),
+            connection_permits: Arc::new(Semaphore::new(config.max_connections)),
+            shutdown: Arc::clone(&shutdown),
         };
         let actor = MessengerActor {
             config,
             hub,
             identities_by_key: HashMap::new(),
             identity_key_by_user_no: HashMap::new(),
+            last_advance_by_key: HashMap::new(),
             transports: HashMap::new(),
             next_session_id: MessengerSessionId::new(1),
         };
-        let task = tokio::spawn(run_messenger_actor(actor, receiver, cleanup));
+        let task = tokio::spawn(run_messenger_actor(actor, receiver, cleanup, shutdown));
         Ok((handle, task))
     }
 
@@ -505,6 +676,12 @@ impl MessengerServiceHandle {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let _connection_permit = Arc::clone(&self.connection_permits)
+            .try_acquire_owned()
+            .map_err(|_| MessengerServiceError::ConnectionLimitReached {
+                maximum: self.config.max_connections,
+            })?;
+        let deadline = time::Instant::now() + self.config.enter_timeout;
         let registered = self.register_connection(peer.ip()).await?;
         let session = registered.registration.lease.session;
         let result = run_registered_connection(
@@ -513,6 +690,7 @@ impl MessengerServiceHandle {
             self,
             registered.cancellation,
             registered.outbound,
+            deadline,
         )
         .await;
         let close_result = registered.registration.close().await;
@@ -524,12 +702,39 @@ impl MessengerServiceHandle {
     }
 
     pub async fn shutdown(&self) -> Result<(), MessengerServiceError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(MessengerCommand::Shutdown { reply })
-            .await
-            .map_err(|_| MessengerServiceError::Stopped)?;
-        response.await.map_err(|_| MessengerServiceError::Stopped)
+        loop {
+            let notified = self.shutdown.wake.notified();
+            match self.shutdown.phase.load(Ordering::Acquire) {
+                SHUTDOWN_COMPLETE => return Ok(()),
+                SHUTDOWN_FAILED => return Err(MessengerServiceError::Stopped),
+                SHUTDOWN_REQUESTED => notified.await,
+                SHUTDOWN_RUNNING => {
+                    if self
+                        .shutdown
+                        .phase
+                        .compare_exchange(
+                            SHUTDOWN_RUNNING,
+                            SHUTDOWN_REQUESTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let mut request = MessengerShutdownRequest {
+                        shutdown: Arc::clone(&self.shutdown),
+                        enqueued: false,
+                    };
+                    if self.sender.send(MessengerCommand::Shutdown).await.is_err() {
+                        self.shutdown.fail_if_incomplete();
+                        return Err(MessengerServiceError::Stopped);
+                    }
+                    request.enqueued = true;
+                }
+                _ => unreachable!("messenger shutdown phase is internally bounded"),
+            }
+        }
     }
 
     async fn register_connection(
@@ -565,17 +770,24 @@ impl MessengerServiceHandle {
         &self,
         session: MessengerSessionId,
         claim: EnterClaim,
+        deadline: time::Instant,
     ) -> Result<(), MessengerServiceError> {
         let (reply, response) = oneshot::channel();
+        let gate = Arc::new(MessengerCommitGate::new());
+        let mut commit = MessengerCommitLease::new(Arc::clone(&gate));
         self.sender
             .send(MessengerCommand::Enter {
                 session,
                 claim,
+                deadline,
+                gate,
                 reply,
             })
             .await
             .map_err(|_| MessengerServiceError::Stopped)?;
-        response.await.map_err(|_| MessengerServiceError::Stopped)?
+        let result = response.await.map_err(|_| MessengerServiceError::Stopped)?;
+        commit.complete();
+        result
     }
 
     async fn dispatch(
@@ -584,15 +796,20 @@ impl MessengerServiceHandle {
         request: MessengerRequest,
     ) -> Result<(), MessengerServiceError> {
         let (reply, response) = oneshot::channel();
+        let gate = Arc::new(MessengerCommitGate::new());
+        let mut commit = MessengerCommitLease::new(Arc::clone(&gate));
         self.sender
             .send(MessengerCommand::Dispatch {
                 session,
                 request,
+                gate,
                 reply,
             })
             .await
             .map_err(|_| MessengerServiceError::Stopped)?;
-        response.await.map_err(|_| MessengerServiceError::Stopped)?
+        let result = response.await.map_err(|_| MessengerServiceError::Stopped)?;
+        commit.complete();
+        result
     }
 
     async fn disconnect(&self, session: MessengerSessionId) -> Result<(), MessengerServiceError> {
@@ -639,8 +856,14 @@ impl MessengerActor {
         {
             return Err(MessengerServiceError::IdentityConflict);
         }
+        if self.identities_by_key.len() >= self.config.max_identities {
+            return Err(MessengerServiceError::IdentityLimitReached {
+                maximum: self.config.max_identities,
+            });
+        }
         self.identity_key_by_user_no
             .insert(identity.user_no, key.clone());
+        self.last_advance_by_key.remove(&key);
         self.identities_by_key.insert(key, identity);
         Ok(())
     }
@@ -668,13 +891,18 @@ impl MessengerActor {
             .map(String::as_str)
             == Some(key);
         if self.identities_by_key.get(key) == Some(&next) && index_is_current {
+            let transition = self
+                .last_advance_by_key
+                .get(key)
+                .filter(|transition| transition.previous == *previous && transition.next == next)
+                .ok_or(MessengerServiceError::StaleIdentityGeneration)?;
             return Ok(MessengerGenerationAdvanceOutcome {
                 applied: false,
                 hub: GenerationAdvance {
                     endpoint_updated: false,
                     room_members_updated: 0,
                 },
-                retained_session: self.hub.session_for_identity(&next.nickname),
+                retained_session: transition.retained_session,
                 cancelled_session: None,
             });
         }
@@ -687,7 +915,15 @@ impl MessengerActor {
             .endpoint_updated
             .then(|| self.hub.session_for_identity(&next.nickname))
             .flatten();
-        self.identities_by_key.insert(key.to_owned(), next);
+        self.identities_by_key.insert(key.to_owned(), next.clone());
+        self.last_advance_by_key.insert(
+            key.to_owned(),
+            AppliedGenerationAdvance {
+                previous: previous.clone(),
+                next,
+                retained_session,
+            },
+        );
         Ok(MessengerGenerationAdvanceOutcome {
             applied: true,
             hub,
@@ -714,6 +950,7 @@ impl MessengerActor {
         }
 
         self.identities_by_key.remove(key);
+        self.last_advance_by_key.remove(key);
         if self
             .identity_key_by_user_no
             .get(&identity.user_no)
@@ -768,7 +1005,11 @@ impl MessengerActor {
         &mut self,
         session: MessengerSessionId,
         claim: &EnterClaim,
+        deadline: time::Instant,
     ) -> Result<(), MessengerServiceError> {
+        if time::Instant::now() >= deadline {
+            return Err(MessengerServiceError::EnterDeadlineElapsed);
+        }
         let transport = self
             .transports
             .get(&session)
@@ -991,7 +1232,11 @@ async fn run_messenger_actor(
     mut actor: MessengerActor,
     mut receiver: mpsc::Receiver<MessengerCommand>,
     cleanup: Arc<MessengerCleanupQueue>,
+    shutdown: Arc<MessengerShutdownState>,
 ) {
+    let _lifecycle = MessengerActorLifecycle {
+        shutdown: Arc::clone(&shutdown),
+    };
     loop {
         let command = tokio::select! {
             biased;
@@ -1037,17 +1282,30 @@ async fn run_messenger_actor(
             MessengerCommand::Enter {
                 session,
                 claim,
+                deadline,
+                gate,
                 reply,
             } => {
-                let _ = reply.send(actor.enter(session, &claim));
+                let result = if gate.claim() {
+                    actor.enter(session, &claim, deadline)
+                } else {
+                    Err(MessengerServiceError::CommandCancelled)
+                };
+                let _ = reply.send(result);
                 false
             }
             MessengerCommand::Dispatch {
                 session,
                 request,
+                gate,
                 reply,
             } => {
-                let _ = reply.send(actor.dispatch(session, request));
+                let result = if gate.claim() {
+                    actor.dispatch(session, request)
+                } else {
+                    Err(MessengerServiceError::CommandCancelled)
+                };
+                let _ = reply.send(result);
                 false
             }
             MessengerCommand::Disconnect { session } => {
@@ -1058,9 +1316,9 @@ async fn run_messenger_actor(
                 let _ = reply.send(actor.snapshot());
                 false
             }
-            MessengerCommand::Shutdown { reply } => {
+            MessengerCommand::Shutdown => {
                 actor.shutdown();
-                let _ = reply.send(());
+                shutdown.complete();
                 true
             }
         };
@@ -1140,43 +1398,51 @@ async fn run_registered_connection<S>(
     service: &MessengerServiceHandle,
     mut cancellation: oneshot::Receiver<MessengerCancellation>,
     mut outbound: mpsc::Receiver<Arc<[u8]>>,
+    enter_deadline: time::Instant,
 ) -> Result<(), MessengerConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let config = Arc::clone(&service.config);
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let bootstrap = async {
-        let logical = read_messenger_frame(&mut reader, config.max_frame_payload).await?;
-        let request = parse_request(&logical, config.max_string_utf16_units)?;
-        let MessengerRequest::EnterChatServer {
-            user_no,
-            chat_type,
-            nickname,
-        } = request
-        else {
-            return Err(MessengerConnectionError::FirstFrameWasNotEnter);
-        };
-        service
-            .enter(
-                session,
-                EnterClaim {
-                    user_no,
-                    chat_type,
-                    nickname,
-                },
-            )
-            .await?;
-        Ok(())
-    };
-    tokio::select! {
+    let logical = tokio::select! {
         biased;
         cancelled = &mut cancellation => {
             return Err(cancellation_error(&cancelled));
         }
-        result = time::timeout(config.enter_timeout, bootstrap) => {
-            result.map_err(|_| MessengerConnectionError::EnterTimeout)??;
+        result = time::timeout_at(
+            enter_deadline,
+            read_messenger_frame(&mut reader, config.max_frame_payload),
+        ) => {
+            result.map_err(|_| MessengerConnectionError::EnterTimeout)??
         }
+    };
+    let request = parse_request(&logical, config.max_string_utf16_units)?;
+    let MessengerRequest::EnterChatServer {
+        user_no,
+        chat_type,
+        nickname,
+    } = request
+    else {
+        return Err(MessengerConnectionError::FirstFrameWasNotEnter);
+    };
+    match service
+        .enter(
+            session,
+            EnterClaim {
+                user_no,
+                chat_type,
+                nickname,
+            },
+            enter_deadline,
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(MessengerServiceError::EnterDeadlineElapsed) => {
+            return Err(MessengerConnectionError::EnterTimeout);
+        }
+        Err(error) => return Err(error.into()),
     }
 
     loop {
@@ -1216,13 +1482,7 @@ where
         if matches!(request, MessengerRequest::EnterChatServer { .. }) {
             return Err(MessengerConnectionError::DuplicateEnter);
         }
-        tokio::select! {
-            biased;
-            cancelled = &mut cancellation => {
-                return Err(cancellation_error(&cancelled));
-            }
-            result = service.dispatch(session, request) => result?,
-        }
+        service.dispatch(session, request).await?;
     }
 }
 
@@ -1298,12 +1558,13 @@ mod tests {
     };
 
     use super::{
-        MessengerCancellation, MessengerCleanupQueue, MessengerCommand, MessengerConnectionError,
-        MessengerRegistrationLease, MessengerRuntimeConfig, MessengerServiceHandle,
-        MessengerServiceSnapshot, read_messenger_frame,
+        MessengerCancellation, MessengerCleanupQueue, MessengerCommand, MessengerCommitGate,
+        MessengerCommitLease, MessengerConnectionError, MessengerRegistrationLease,
+        MessengerRuntimeConfig, MessengerServiceHandle, MessengerServiceSnapshot,
+        read_messenger_frame,
     };
     use crate::messenger_hub::{
-        MessengerHubError, MessengerHubLimits, MessengerIdentity, MessengerSessionId,
+        EnterClaim, MessengerHubError, MessengerHubLimits, MessengerIdentity, MessengerSessionId,
     };
 
     const MAXIMUM: usize = 16 * 1_024;
@@ -1313,6 +1574,7 @@ mod tests {
         MessengerRuntimeConfig {
             mailbox_capacity: 64,
             max_connections: 16,
+            max_identities: 32,
             outbound_capacity: 8,
             max_frame_payload: MAXIMUM,
             max_string_utf16_units: 128,
@@ -1503,6 +1765,19 @@ mod tests {
 
         service.shutdown().await.unwrap();
         actor_task.await.unwrap();
+    }
+
+    #[test]
+    fn cancelled_actor_commit_gate_has_a_single_linearization_winner() {
+        let cancelled = Arc::new(MessengerCommitGate::new());
+        drop(MessengerCommitLease::new(Arc::clone(&cancelled)));
+        assert!(!cancelled.claim());
+
+        let claimed = Arc::new(MessengerCommitGate::new());
+        let lease = MessengerCommitLease::new(Arc::clone(&claimed));
+        assert!(claimed.claim());
+        drop(lease);
+        assert!(!claimed.claim());
     }
 
     #[tokio::test]
@@ -1882,6 +2157,10 @@ mod tests {
                 .unwrap(),
             Err(MessengerConnectionError::ActorStopped)
         ));
+        assert!(matches!(
+            service.shutdown().await,
+            Err(super::MessengerServiceError::Stopped)
+        ));
     }
 
     #[tokio::test]
@@ -1959,5 +2238,134 @@ mod tests {
 
         service.shutdown().await.unwrap();
         actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_mirror_and_pre_actor_connection_admission_are_bounded() {
+        let mut config = test_config();
+        config.max_identities = 1;
+        config.max_connections = 1;
+        let (service, actor_task) = MessengerServiceHandle::spawn(config).unwrap();
+        let first = identity(17, "One", 1);
+        service.announce_identity(first.clone()).await.unwrap();
+        service.announce_identity(first).await.unwrap();
+        assert!(matches!(
+            service.announce_identity(identity(18, "Two", 1)).await,
+            Err(super::MessengerServiceError::IdentityLimitReached { maximum: 1 })
+        ));
+
+        let (_first_client, first_task) = spawn_duplex_connection(&service, 64, 44_001);
+        wait_for_snapshot(&service, |state| state.connections == 1).await;
+        let (_second_client, second_server) = duplex(64);
+        assert!(matches!(
+            service
+                .serve_connection(second_server, SocketAddr::new(LOOPBACK, 44_002))
+                .await,
+            Err(MessengerConnectionError::Service(
+                super::MessengerServiceError::ConnectionLimitReached { maximum: 1 }
+            ))
+        ));
+
+        service.shutdown().await.unwrap();
+        assert!(matches!(
+            first_task.await.unwrap(),
+            Err(MessengerConnectionError::Cancelled(
+                MessengerCancellation::Shutdown
+            ))
+        ));
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_enter_cannot_replace_a_healthy_endpoint() {
+        let (service, actor_task) = MessengerServiceHandle::spawn(test_config()).unwrap();
+        service
+            .announce_identity(identity(17, "Rider", 1))
+            .await
+            .unwrap();
+        let (mut healthy, healthy_task) = spawn_tcp_connection(&service).await;
+        send_logical(&mut healthy, &enter_packet(17, 1, "Rider")).await;
+        wait_for_snapshot(&service, |state| state.entered_sessions == 1).await;
+
+        let expired = service.register_connection(LOOPBACK).await.unwrap();
+        let expired_session = expired.registration.lease.session;
+        assert!(matches!(
+            service
+                .enter(
+                    expired_session,
+                    EnterClaim {
+                        user_no: 17,
+                        chat_type: 2,
+                        nickname: "Rider".to_owned(),
+                    },
+                    time::Instant::now(),
+                )
+                .await,
+            Err(super::MessengerServiceError::EnterDeadlineElapsed)
+        ));
+        expired.registration.close().await.unwrap();
+
+        send_logical(&mut healthy, &guild_packet("Rider", "still-healthy")).await;
+        assert_eq!(
+            receive_logical(&mut healthy).await,
+            serialize_guild_chat("Rider", "still-healthy").unwrap()
+        );
+        service.shutdown().await.unwrap();
+        assert!(matches!(
+            healthy_task.await.unwrap(),
+            Err(MessengerConnectionError::Cancelled(
+                MessengerCancellation::Shutdown
+            ))
+        ));
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generation_retry_requires_the_exact_recorded_transition() {
+        let (service, actor_task) = MessengerServiceHandle::spawn(test_config()).unwrap();
+        let v1 = identity(17, "Rider", 1);
+        let v2 = identity(17, "Rider", 2);
+        let v3 = identity(17, "Rider", 3);
+
+        service.announce_identity(v2.clone()).await.unwrap();
+        assert!(matches!(
+            service.advance_identity(v1.clone(), v2.clone()).await,
+            Err(super::MessengerServiceError::StaleIdentityGeneration)
+        ));
+        service.release_identity(v2.clone()).await.unwrap();
+
+        service.announce_identity(v1.clone()).await.unwrap();
+        service
+            .advance_identity(v1.clone(), v2.clone())
+            .await
+            .unwrap();
+        service
+            .advance_identity(v2.clone(), v3.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.advance_identity(v1, v3).await,
+            Err(super::MessengerServiceError::StaleIdentityGeneration)
+        ));
+
+        service.release_identity(v2).await.unwrap();
+        assert_eq!(service.snapshot().await.unwrap().announced_identities, 1);
+        service.shutdown().await.unwrap();
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_repeated_shutdown_is_idempotent() {
+        let (service, actor_task) = MessengerServiceHandle::spawn(test_config()).unwrap();
+        let first = service.clone();
+        let second = service.clone();
+        let (first_result, second_result) =
+            tokio::join!(async move { first.shutdown().await }, async move {
+                second.shutdown().await
+            });
+        first_result.unwrap();
+        second_result.unwrap();
+        actor_task.await.unwrap();
+        service.shutdown().await.unwrap();
     }
 }

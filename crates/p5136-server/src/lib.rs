@@ -22,10 +22,10 @@ pub use messenger_hub::{
 };
 pub use messenger_runtime::{
     DEFAULT_MAX_MESSENGER_PAYLOAD, DEFAULT_MESSENGER_CONNECTION_CAPACITY,
-    DEFAULT_MESSENGER_MAILBOX_CAPACITY, DEFAULT_MESSENGER_OUTBOUND_CAPACITY, MessengerCancellation,
-    MessengerConnectionError, MessengerGenerationAdvanceOutcome, MessengerIdentityReleaseOutcome,
-    MessengerRuntimeConfig, MessengerServiceError, MessengerServiceHandle,
-    MessengerServiceSnapshot, read_messenger_frame,
+    DEFAULT_MESSENGER_IDENTITY_CAPACITY, DEFAULT_MESSENGER_MAILBOX_CAPACITY,
+    DEFAULT_MESSENGER_OUTBOUND_CAPACITY, MessengerCancellation, MessengerConnectionError,
+    MessengerGenerationAdvanceOutcome, MessengerIdentityReleaseOutcome, MessengerRuntimeConfig,
+    MessengerServiceError, MessengerServiceHandle, MessengerServiceSnapshot, read_messenger_frame,
 };
 pub use runtime::{BoundServer, ServerError, ServerHandle};
 pub use session::{LoginSessionError, read_encrypted_frame};

@@ -173,6 +173,7 @@ fn messenger_runtime_config(config: &ServerConfig) -> MessengerRuntimeConfig {
     let defaults = MessengerRuntimeConfig::default();
     MessengerRuntimeConfig {
         max_connections: config.max_login_sessions,
+        max_identities: config.max_login_sessions,
         max_frame_payload: config.max_messenger_payload,
         enter_timeout: config.login_timeout,
         idle_timeout: config.session_idle_timeout,

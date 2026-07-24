@@ -163,6 +163,9 @@ pub enum WorldError {
 
     #[error("session {0:?} is not registered")]
     UnknownSession(SessionId),
+
+    #[error("active identity limit {maximum} reached")]
+    IdentityLimitReached { maximum: usize },
 }
 
 #[derive(Debug)]
@@ -550,6 +553,7 @@ struct World {
     protocol_room_by_user: HashMap<UserNo, RoomId>,
     free_protocol_room_ids: BTreeSet<u16>,
     identity_lifecycle: VecDeque<IdentityLifecycleEvent>,
+    identity_capacity: Option<usize>,
     next_session_id: u64,
     next_room_id: u32,
 }
@@ -844,6 +848,7 @@ impl Default for World {
             protocol_room_by_user: HashMap::new(),
             free_protocol_room_ids: BTreeSet::new(),
             identity_lifecycle: VecDeque::new(),
+            identity_capacity: None,
             next_session_id: 1,
             next_room_id: 1,
         }
@@ -883,6 +888,11 @@ impl World {
         nickname: &str,
     ) -> Result<IdentityBinding, WorldError> {
         let source_ip = self.session_ip(session)?;
+        if let Some(maximum) = self.identity_capacity
+            && self.identities.active_count() >= maximum
+        {
+            return Err(WorldError::IdentityLimitReached { maximum });
+        }
         let binding = self.identities.claim(session, source_ip, nickname)?;
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Announce(binding.clone()));
@@ -1560,7 +1570,12 @@ async fn run_world(
     mut receiver: mpsc::Receiver<WorldCommand>,
     messenger: Option<MessengerServiceHandle>,
 ) -> Result<(), MessengerServiceError> {
-    let mut world = World::default();
+    let mut world = World {
+        identity_capacity: messenger
+            .as_ref()
+            .map(MessengerServiceHandle::max_identities),
+        ..World::default()
+    };
     let mut migration_expiry = tokio::time::interval(Duration::from_secs(1));
     migration_expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -2579,6 +2594,40 @@ mod tests {
         ));
         assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 0);
 
+        messenger.shutdown().await.unwrap();
+        messenger_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn world_rejects_identity_capacity_before_sidecar_divergence() {
+        let config = MessengerRuntimeConfig {
+            max_identities: 1,
+            ..MessengerRuntimeConfig::default()
+        };
+        let (messenger, messenger_task) = MessengerServiceHandle::spawn(config).unwrap();
+        let (world, world_task) = WorldHandle::spawn_with_messenger(8, messenger.clone());
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let first = world
+            .register_session(SocketAddr::new(ip, 55_000))
+            .await
+            .unwrap();
+        world.claim_identity(first, "First").await.unwrap();
+        let second = world
+            .register_session(SocketAddr::new(ip, 55_001))
+            .await
+            .unwrap();
+        assert!(matches!(
+            world.claim_identity(second, "Second").await,
+            Err(WorldError::IdentityLimitReached { maximum: 1 })
+        ));
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+        assert_eq!(world.session_count().await.unwrap(), 2);
+
+        world.session_closed(first).await.unwrap();
+        world.claim_identity(second, "Second").await.unwrap();
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
         messenger.shutdown().await.unwrap();
         messenger_task.await.unwrap();
     }
