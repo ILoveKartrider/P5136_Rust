@@ -509,15 +509,17 @@ impl IdentityRegistry {
     #[must_use]
     pub fn active_identity(&self, nickname: &str) -> Option<IdentityBinding> {
         let active = self.active_by_name.get(&canonical_nickname_key(nickname))?;
-        let owner = active.owner?;
-        Some(IdentityBinding {
-            nickname: active.known.nickname.clone(),
-            user_no: active.known.user_no,
-            generation: active.generation,
-            owner,
-            source_ip: active.owner_ip,
-            channel: active.channel,
-        })
+        active_identity_binding(active)
+    }
+
+    /// Resolves a numeric UDP account header only when it still has a current
+    /// owner. A disconnected migration source remains known, but is not active
+    /// until its destination completes the generation transfer.
+    #[must_use]
+    pub fn active_identity_by_user_no(&self, user_no: UserNo) -> Option<IdentityBinding> {
+        let key = self.name_by_user_no.get(&user_no)?;
+        let active = self.active_by_name.get(key)?;
+        active_identity_binding(active)
     }
 
     #[must_use]
@@ -553,6 +555,18 @@ fn released_identity(active: &ActiveIdentity) -> ReleasedIdentity {
         generation: active.generation,
         channel: active.channel,
     }
+}
+
+fn active_identity_binding(active: &ActiveIdentity) -> Option<IdentityBinding> {
+    let owner = active.owner?;
+    Some(IdentityBinding {
+        nickname: active.known.nickname.clone(),
+        user_no: active.known.user_no,
+        generation: active.generation,
+        owner,
+        source_ip: active.owner_ip,
+        channel: active.channel,
+    })
 }
 
 #[cfg(test)]
@@ -625,6 +639,64 @@ mod tests {
         assert_eq!(replacement.nickname, "Rider");
         assert_eq!(replacement.user_no, first.user_no);
         assert!(replacement.generation.get() > first.generation.get());
+    }
+
+    #[test]
+    fn user_number_lookup_only_returns_the_current_owned_generation() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        assert_eq!(UserNo::new(0), None);
+        assert!(
+            identities
+                .active_identity_by_user_no(UserNo::new(u32::MAX).unwrap())
+                .is_none()
+        );
+
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        assert_eq!(
+            identities.active_identity_by_user_no(source.user_no),
+            Some(source.clone())
+        );
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(350), now)
+            .unwrap();
+        assert!(matches!(
+            identities.disconnect(session(1), now),
+            DisconnectOutcome::Deferred { .. }
+        ));
+        assert!(
+            identities
+                .active_identity_by_user_no(source.user_no)
+                .is_none(),
+            "an ownerless migration generation must not authorize UDP"
+        );
+
+        let destination = identities
+            .complete_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap()
+            .binding;
+        assert!(destination.generation.get() > source.generation.get());
+        assert_eq!(
+            identities.active_identity_by_user_no(source.user_no),
+            Some(destination.clone())
+        );
+
+        assert!(matches!(
+            identities.disconnect(session(2), now),
+            DisconnectOutcome::Released(_)
+        ));
+        assert!(
+            identities
+                .active_identity_by_user_no(source.user_no)
+                .is_none()
+        );
     }
 
     #[test]
