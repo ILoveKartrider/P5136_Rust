@@ -16,8 +16,13 @@ use p5136_core::{
     },
     nickname::canonical_nickname_key,
     race_protocol::{
-        AiGoalInRequest, GameControlRequest, ServerGameControl, TeamBoosterGaugeRequest,
-        serialize_ai_master_notice, serialize_game_control,
+        AiGoalInRequest, GameControlRequest, RaceProtocolError, RaceTeam, ServerGameControl,
+        TeamBoosterGaugeRequest, serialize_ai_master_notice, serialize_game_control,
+        serialize_game_next_stage, serialize_race_time, serialize_team_booster_gauge,
+    },
+    race_result_protocol::{
+        AiRaceResult, GameResult, HumanRaceResult, RaceResultProtocolError, ResultTeam,
+        serialize_game_result,
     },
     race_start_protocol::{
         AiRaceSpec, GrCommandStart, MAX_GR_COMMAND_START_PAYLOAD_LENGTH, P5136KartPhysicsBlock,
@@ -59,6 +64,10 @@ const LOADING_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RACE_START_DELAY: Duration = Duration::from_secs(1);
 const LOADING_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const RACE_START_TICK_LEAD: u32 = 3_000;
+const SETTLEMENT_DELAY: Duration = Duration::from_secs(10);
+const SETTLEMENT_TICK_LEAD: u32 = 10_000;
+const FINAL_STAGE_TICK_LEAD: u32 = 6_000;
+const TEAM_POINTS_BY_RANK: [i32; ROOM_SLOT_COUNT] = [10, 8, 6, 5, 4, 3, 2, 1];
 
 /// One ordered write unit for a login session. A batch consumes one bounded
 /// queue slot even when a protocol response contains many logical packets.
@@ -221,6 +230,18 @@ pub(crate) enum RaceCommandOutcome {
         room_id: RoomId,
         race_epoch: u64,
     },
+    FinishRecorded {
+        room_id: RoomId,
+        race_epoch: u64,
+        player_id: i32,
+        began_settlement: bool,
+    },
+    BoosterGaugeUpdated {
+        room_id: RoomId,
+        race_epoch: u64,
+        team: RaceTeam,
+        reached_full: bool,
+    },
 }
 
 /// Parsed request payloads carried by the next actor command layer. Keeping
@@ -288,6 +309,9 @@ pub enum LobbyError {
     #[error("at least one human racer is required to start")]
     NoRacers,
 
+    #[error("AI participants are unsupported until they are frozen into the race roster")]
+    AiParticipantsUnsupported,
+
     #[error("non-master racer {user_no} is not ready")]
     RacerNotReady { user_no: u32 },
 
@@ -330,8 +354,44 @@ pub enum RaceError {
     #[error("race request requires Running; current phase is {actual:?}")]
     NotRunning { actual: RoomPhase },
 
+    #[error("only a frozen human racer may perform this race command")]
+    HumanRacerRequired,
+
+    #[error("frozen race roster has no AI participant in player slot {player_id}")]
+    NoFrozenAiParticipant { player_id: i32 },
+
+    #[error("team booster requires game type 3 or 4")]
+    TeamModeRequired,
+
+    #[error("team booster request claims {claimed:?}, but sender belongs to wire team {actual}")]
+    TeamSpoof { claimed: RaceTeam, actual: u8 },
+
+    #[error("frozen racer has invalid wire team {team}")]
+    InvalidFrozenTeam { team: u8 },
+
+    #[error("session {session:?} has no available outbound queue slot")]
+    OutboundUnavailable { session: SessionId },
+
     #[error("the monotonic race loading deadline overflowed")]
     RaceDeadlineOverflow,
+
+    #[error("the monotonic settlement deadline overflowed")]
+    SettlementDeadlineOverflow,
+
+    #[error("the settlement deadline has closed this race")]
+    SettlementClosed,
+
+    #[error("the bounded pending race fan-out is full")]
+    PendingRaceFanoutFull,
+
+    #[error("frozen settlement roster contains {racers} racers; expected 1 through 8")]
+    InvalidSettlementRoster { racers: usize },
+
+    #[error(transparent)]
+    Protocol(#[from] RaceProtocolError),
+
+    #[error(transparent)]
+    ResultProtocol(#[from] RaceResultProtocolError),
 }
 
 impl RaceError {
@@ -344,6 +404,13 @@ impl RaceError {
                 | Self::NotFrozenParticipant
                 | Self::UnsupportedGameControlState { .. }
                 | Self::NotRunning { .. }
+                | Self::HumanRacerRequired
+                | Self::NoFrozenAiParticipant { .. }
+                | Self::TeamModeRequired
+                | Self::TeamSpoof { .. }
+                | Self::InvalidFrozenTeam { .. }
+                | Self::OutboundUnavailable { .. }
+                | Self::SettlementClosed
         )
     }
 }
@@ -927,6 +994,43 @@ struct FrozenRaceParticipant {
     player_id: i32,
     observer: bool,
     team: u8,
+    result: Option<FrozenHumanResultSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrozenHumanResultSnapshot {
+    kart_id: u16,
+    character_id: u16,
+    club_mark_logo: i32,
+    economy: FrozenResultEconomy,
+}
+
+/// Result economics are deliberately frozen without persistence for this
+/// tranche. A later profile transaction replaces these explicit zero fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrozenResultEconomy {
+    current_rp: u32,
+    earned_rp_without_persistence: u32,
+    earned_lucci_without_persistence: u32,
+    current_lucci_without_persistence: u32,
+}
+
+impl FrozenResultEconomy {
+    const fn pending_persistence(current_rp: u32) -> Self {
+        Self {
+            current_rp,
+            earned_rp_without_persistence: 0,
+            earned_lucci_without_persistence: 0,
+            current_lucci_without_persistence: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrozenAiRaceParticipant {
+    player_id: i32,
+    team: u8,
+    kart_id: i16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -934,6 +1038,84 @@ struct FrozenRaceRoster {
     epoch: u64,
     concrete_track: u32,
     participants: Vec<FrozenRaceParticipant>,
+    ais: Vec<FrozenAiRaceParticipant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettlementState {
+    end_tick: u32,
+    deadline: Instant,
+    finalization: SettlementFinalization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SettlementFinalization {
+    AwaitingDeadline,
+    Ready { packets: Vec<Vec<u8>> },
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRaceTime {
+    player_id: i32,
+    race_time: u32,
+    packet: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingBeginSettlement {
+    end_tick: u32,
+    excluded_user: Option<UserNo>,
+    packet: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRaceFanout {
+    race_time: Option<PendingRaceTime>,
+    begin_settlement: Option<PendingBeginSettlement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RaceProgress {
+    finish_times: HashMap<i32, u32>,
+    settlement: Option<SettlementState>,
+    pending_fanouts: VecDeque<PendingRaceFanout>,
+    team_gauge_bits: [u32; 2],
+}
+
+impl Default for RaceProgress {
+    fn default() -> Self {
+        Self {
+            finish_times: HashMap::new(),
+            settlement: None,
+            pending_fanouts: VecDeque::new(),
+            team_gauge_bits: [0.0_f32.to_bits(); 2],
+        }
+    }
+}
+
+impl RaceProgress {
+    fn team_gauge(&self, team: RaceTeam) -> f32 {
+        f32::from_bits(self.team_gauge_bits[team_index(team)])
+    }
+
+    fn set_team_gauge(&mut self, team: RaceTeam, gauge: f32) {
+        self.team_gauge_bits[team_index(team)] = gauge.to_bits();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RankedRaceResult {
+    finish_time: u32,
+    rank: i32,
+    team: Option<ResultTeam>,
+    team_points: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettlementRanking {
+    winning_team: Option<ResultTeam>,
+    by_player_id: HashMap<i32, RankedRaceResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -978,6 +1160,7 @@ struct ProtocolRoomState {
     phase: RoomPhase,
     race_epoch: u64,
     frozen_race: Option<FrozenRaceRoster>,
+    race_progress: RaceProgress,
     loading_handshake: LoadingHandshake,
     room_master: i32,
     members_by_id: [Option<ProtocolRoomMember>; ROOM_SLOT_COUNT],
@@ -1000,6 +1183,7 @@ impl ProtocolRoomState {
             phase: RoomPhase::Lobby,
             race_epoch: 0,
             frozen_race: None,
+            race_progress: RaceProgress::default(),
             loading_handshake: LoadingHandshake::Dormant,
             room_master: 0,
             members_by_id: array::from_fn(|_| None),
@@ -1319,6 +1503,28 @@ const fn race_start_tick(server_tick: u32) -> u32 {
     server_tick.wrapping_add(RACE_START_TICK_LEAD)
 }
 
+const fn team_index(team: RaceTeam) -> usize {
+    match team {
+        RaceTeam::Red => 0,
+        RaceTeam::Blue => 1,
+    }
+}
+
+const fn result_team(team: RaceTeam) -> ResultTeam {
+    match team {
+        RaceTeam::Red => ResultTeam::Red,
+        RaceTeam::Blue => ResultTeam::Blue,
+    }
+}
+
+fn race_team_from_wire(team: u8) -> Result<RaceTeam, RaceError> {
+    match team {
+        1 => Ok(RaceTeam::Red),
+        2 => Ok(RaceTeam::Blue),
+        _ => Err(RaceError::InvalidFrozenTeam { team }),
+    }
+}
+
 impl Default for World {
     fn default() -> Self {
         Self {
@@ -1402,9 +1608,7 @@ impl World {
             .iter()
             .filter(|participant| participant.identity.user_no != source)
             .filter_map(|participant| {
-                self.identities
-                    .active_identity_by_user_no(participant.identity.user_no)
-                    .filter(|active| active == &participant.identity)
+                self.exact_identity_in_protocol_room(*room_id, &participant.identity)
             })
             .collect()
     }
@@ -1504,6 +1708,36 @@ impl World {
         for room_id in loading_rooms {
             self.advance_loading_room(room_id, now, clock);
         }
+        let running_rooms = self
+            .protocol_rooms
+            .iter()
+            .filter_map(|(room_id, room)| (room.phase == RoomPhase::Running).then_some(*room_id))
+            .collect::<Vec<_>>();
+        for room_id in running_rooms {
+            self.reconcile_running_room(room_id, now, clock);
+        }
+        let active_race_rooms = self
+            .protocol_rooms
+            .iter()
+            .filter_map(|(room_id, room)| {
+                matches!(room.phase, RoomPhase::Running | RoomPhase::Settling).then_some(*room_id)
+            })
+            .collect::<Vec<_>>();
+        for room_id in active_race_rooms {
+            let deadline_reached = self.protocol_rooms.get(&room_id).is_some_and(|room| {
+                room.phase == RoomPhase::Settling
+                    && room
+                        .race_progress
+                        .settlement
+                        .as_ref()
+                        .is_some_and(|settlement| now >= settlement.deadline)
+            });
+            if deadline_reached {
+                self.try_finalize_settlement(room_id);
+            } else {
+                self.try_flush_pending_race_fanouts(room_id);
+            }
+        }
         self.debug_assert_invariants();
     }
 
@@ -1517,6 +1751,42 @@ impl World {
 
         self.reconcile_loading_handshake(room_id, &active_stamps, now);
         self.try_start_scheduled_room(room_id, now, clock);
+    }
+
+    fn reconcile_running_room(&mut self, room_id: RoomId, now: Instant, clock: &ServerClock) {
+        let (_, active_human_count) = self.active_frozen_participant_stamps(room_id);
+        if active_human_count != 0 {
+            return;
+        }
+
+        let end_tick = clock.tick().wrapping_add(SETTLEMENT_TICK_LEAD);
+        let deadline = now.checked_add(SETTLEMENT_DELAY).unwrap_or_else(|| {
+            tracing::error!(
+                room_id = room_id.0,
+                "settlement deadline overflowed while reconciling an abandoned Running room"
+            );
+            now
+        });
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("the running room list contains existing rooms");
+        room.phase = RoomPhase::Settling;
+        room.race_progress.settlement = Some(SettlementState {
+            end_tick,
+            deadline,
+            finalization: SettlementFinalization::AwaitingDeadline,
+        });
+        room.race_progress
+            .pending_fanouts
+            .push_back(PendingRaceFanout {
+                race_time: None,
+                begin_settlement: Some(PendingBeginSettlement {
+                    end_tick,
+                    excluded_user: None,
+                    packet: serialize_game_control(ServerGameControl::BeginSettlement, end_tick),
+                }),
+            });
     }
 
     fn active_frozen_participant_stamps(
@@ -1535,10 +1805,8 @@ impl World {
         let mut active_human_count = 0;
         for participant in &frozen.participants {
             if self
-                .identities
-                .active_identity_by_user_no(participant.identity.user_no)
-                .as_ref()
-                == Some(&participant.identity)
+                .exact_identity_in_protocol_room(room_id, &participant.identity)
+                .is_some()
             {
                 active_stamps.insert(FrozenParticipantStamp::from(&participant.identity));
                 active_human_count += usize::from(!participant.observer);
@@ -1554,6 +1822,7 @@ impl World {
             .expect("the loading room list contains existing rooms");
         room.phase = RoomPhase::Lobby;
         room.frozen_race = None;
+        room.race_progress = RaceProgress::default();
         room.loading_handshake = LoadingHandshake::Dormant;
         for member in room.members_by_id.iter_mut().flatten() {
             member.player.player_type = PlayerSlotState::NotReady as i32;
@@ -1614,9 +1883,7 @@ impl World {
                 .participants
                 .iter()
                 .filter_map(|participant| {
-                    self.identities
-                        .active_identity_by_user_no(participant.identity.user_no)
-                        .filter(|active| active == &participant.identity)
+                    self.exact_identity_in_protocol_room(room_id, &participant.identity)
                         .map(|identity| (identity.owner, batch.clone()))
                 })
                 .collect()
@@ -1644,6 +1911,358 @@ impl World {
         room.phase = RoomPhase::Running;
         room.loading_handshake = LoadingHandshake::Dormant;
         Self::publish_reserved(reserved);
+    }
+
+    fn try_flush_pending_race_fanouts(&mut self, room_id: RoomId) -> bool {
+        let deliveries = {
+            let room = self
+                .protocol_rooms
+                .get(&room_id)
+                .expect("the active race room list contains existing rooms");
+            if room.race_progress.pending_fanouts.is_empty() {
+                return true;
+            }
+            self.active_frozen_recipient_sessions(room)
+                .into_iter()
+                .filter_map(|(participant, session)| {
+                    let packets = room
+                        .race_progress
+                        .pending_fanouts
+                        .iter()
+                        .flat_map(|fanout| {
+                            let race_time = fanout
+                                .race_time
+                                .as_ref()
+                                .map(|race_time| race_time.packet.clone());
+                            let begin_settlement =
+                                fanout.begin_settlement.as_ref().and_then(|begin| {
+                                    (begin.excluded_user != Some(participant.identity.user_no))
+                                        .then(|| begin.packet.clone())
+                                });
+                            race_time.into_iter().chain(begin_settlement)
+                        })
+                        .collect::<Vec<_>>();
+                    (!packets.is_empty()).then(|| (session, OutboundBatch::ordered(packets)))
+                })
+                .collect()
+        };
+        let reserved = match self.reserve_race_outbound(deliveries) {
+            Ok(reserved) => reserved,
+            Err(RaceError::OutboundUnavailable { session }) => {
+                tracing::trace!(
+                    room_id = room_id.0,
+                    session = session.get(),
+                    "race event fan-out is blocked; retaining it for heartbeat retry"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::error!(
+                    room_id = room_id.0,
+                    %error,
+                    "race event fan-out reservation failed"
+                );
+                return false;
+            }
+        };
+
+        self.protocol_rooms
+            .get_mut(&room_id)
+            .expect("the active race room list contains existing rooms")
+            .race_progress
+            .pending_fanouts
+            .clear();
+        Self::publish_reserved(reserved);
+        true
+    }
+
+    fn freeze_settlement_packets(&mut self, room_id: RoomId) {
+        let should_freeze = self.protocol_rooms.get(&room_id).is_some_and(|room| {
+            room.race_progress
+                .settlement
+                .as_ref()
+                .is_some_and(|settlement| {
+                    matches!(
+                        settlement.finalization,
+                        SettlementFinalization::AwaitingDeadline
+                    )
+                })
+        });
+        if !should_freeze {
+            return;
+        }
+
+        let serialized = {
+            let room = self
+                .protocol_rooms
+                .get(&room_id)
+                .expect("the settlement room list contains existing rooms");
+            Self::settlement_packets(room)
+        };
+        let settlement = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("the settlement room list contains existing rooms")
+            .race_progress
+            .settlement
+            .as_mut()
+            .expect("a Settling room has settlement timing");
+        match serialized {
+            Ok(packets) => {
+                settlement.finalization = SettlementFinalization::Ready { packets };
+            }
+            Err(error) => {
+                settlement.finalization = SettlementFinalization::Failed;
+                tracing::error!(
+                    room_id = room_id.0,
+                    %error,
+                    "frozen race settlement could not be serialized; terminally retaining Settling"
+                );
+            }
+        }
+    }
+
+    fn try_finalize_settlement(&mut self, room_id: RoomId) {
+        self.freeze_settlement_packets(room_id);
+        if !self.try_flush_pending_race_fanouts(room_id) {
+            return;
+        }
+        let packets = {
+            let room = self
+                .protocol_rooms
+                .get(&room_id)
+                .expect("the settlement room list contains existing rooms");
+            let settlement = room
+                .race_progress
+                .settlement
+                .as_ref()
+                .expect("a Settling room has settlement timing");
+            match &settlement.finalization {
+                SettlementFinalization::Ready { packets } => packets.clone(),
+                SettlementFinalization::AwaitingDeadline | SettlementFinalization::Failed => {
+                    return;
+                }
+            }
+        };
+        let deliveries = {
+            let room = self
+                .protocol_rooms
+                .get(&room_id)
+                .expect("the settlement room list contains existing rooms");
+            self.active_frozen_recipient_sessions(room)
+                .into_iter()
+                .map(|(_, session)| (session, OutboundBatch::ordered(packets.clone())))
+                .collect()
+        };
+        let reserved = match self.reserve_race_outbound(deliveries) {
+            Ok(reserved) => reserved,
+            Err(RaceError::OutboundUnavailable { session }) => {
+                tracing::trace!(
+                    room_id = room_id.0,
+                    session = session.get(),
+                    "settlement fan-out is blocked; retaining Settling for heartbeat retry"
+                );
+                return;
+            }
+            Err(error) => {
+                self.protocol_rooms
+                    .get_mut(&room_id)
+                    .expect("the settlement room list contains existing rooms")
+                    .race_progress
+                    .settlement
+                    .as_mut()
+                    .expect("a Settling room has settlement timing")
+                    .finalization = SettlementFinalization::Failed;
+                tracing::error!(
+                    room_id = room_id.0,
+                    %error,
+                    "settlement reservation failed; terminally retaining Settling"
+                );
+                return;
+            }
+        };
+
+        let remove_room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("the settlement room list contains existing rooms")
+            .is_empty();
+        if remove_room {
+            self.protocol_rooms.remove(&room_id);
+            self.free_protocol_room_ids
+                .insert(u16::try_from(room_id.0).expect("protocol room ID fits in u16"));
+        } else {
+            let room = self
+                .protocol_rooms
+                .get_mut(&room_id)
+                .expect("the settlement room list contains existing rooms");
+            room.phase = RoomPhase::Lobby;
+            room.frozen_race = None;
+            room.race_progress = RaceProgress::default();
+            room.loading_handshake = LoadingHandshake::Dormant;
+            for member in room.members_by_id.iter_mut().flatten() {
+                member.player.player_type = PlayerSlotState::NotReady as i32;
+            }
+        }
+        Self::publish_reserved(reserved);
+    }
+
+    fn settlement_packets(room: &ProtocolRoomState) -> Result<Vec<Vec<u8>>, RaceError> {
+        let settlement = room
+            .race_progress
+            .settlement
+            .as_ref()
+            .expect("a Settling room has settlement timing");
+        let result = Self::serialize_settlement_result(room)?;
+        Ok(vec![
+            serialize_game_next_stage(room.settings.game_type),
+            result,
+            serialize_game_control(
+                ServerGameControl::FinalStage,
+                settlement.end_tick.wrapping_add(FINAL_STAGE_TICK_LEAD),
+            ),
+        ])
+    }
+
+    fn serialize_settlement_result(room: &ProtocolRoomState) -> Result<Vec<u8>, RaceError> {
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .expect("a Settling room has a frozen roster");
+        let ranking = Self::settlement_ranking(room)?;
+        let team_mode = matches!(room.settings.game_type, 3 | 4);
+        let humans = frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer)
+            .map(|participant| {
+                let ranked = ranking.by_player_id[&participant.player_id];
+                let snapshot = participant
+                    .result
+                    .expect("a frozen human racer has result admission fields");
+                HumanRaceResult {
+                    player_id: participant.player_id,
+                    finish_time: ranked.finish_time,
+                    kart_id: snapshot.kart_id,
+                    rank: ranked.rank,
+                    current_rp: snapshot.economy.current_rp,
+                    earned_rp: snapshot.economy.earned_rp_without_persistence,
+                    earned_lucci: snapshot.economy.earned_lucci_without_persistence,
+                    current_lucci: snapshot.economy.current_lucci_without_persistence,
+                    team: team_mode.then_some(ranked.team).flatten(),
+                    team_points: ranked.team_points,
+                    character_id: snapshot.character_id,
+                    club_mark_logo: snapshot.club_mark_logo,
+                }
+            })
+            .collect::<Vec<_>>();
+        let ais = frozen
+            .ais
+            .iter()
+            .map(|participant| {
+                let ranked = ranking.by_player_id[&participant.player_id];
+                AiRaceResult {
+                    player_id: participant.player_id,
+                    finish_time: ranked.finish_time,
+                    kart_id: participant.kart_id,
+                    rank: ranked.rank,
+                    team: team_mode.then_some(ranked.team).flatten(),
+                    team_points: ranked.team_points,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(serialize_game_result(&GameResult {
+            winning_team: ranking.winning_team,
+            humans: &humans,
+            ais: &ais,
+        })?)
+    }
+
+    fn settlement_ranking(room: &ProtocolRoomState) -> Result<SettlementRanking, RaceError> {
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .expect("a Settling room has a frozen roster");
+        let mut racers = frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer)
+            .map(|participant| (participant.player_id, participant.team))
+            .chain(
+                frozen
+                    .ais
+                    .iter()
+                    .map(|participant| (participant.player_id, participant.team)),
+            )
+            .map(|(player_id, team)| {
+                (
+                    room.race_progress
+                        .finish_times
+                        .get(&player_id)
+                        .copied()
+                        .unwrap_or(u32::MAX),
+                    player_id,
+                    team,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !(1..=ROOM_SLOT_COUNT).contains(&racers.len()) {
+            return Err(RaceError::InvalidSettlementRoster {
+                racers: racers.len(),
+            });
+        }
+        racers.sort_unstable_by_key(|&(finish_time, player_id, _)| (finish_time, player_id));
+        let team_mode = matches!(room.settings.game_type, 3 | 4);
+        let mut team_scores = [0_i32; 2];
+        let mut by_player_id = HashMap::with_capacity(racers.len());
+        for (rank, (finish_time, player_id, wire_team)) in racers.iter().copied().enumerate() {
+            let team = team_mode
+                .then(|| race_team_from_wire(wire_team).map(result_team))
+                .transpose()?;
+            let team_points = if team_mode && finish_time != u32::MAX {
+                TEAM_POINTS_BY_RANK.get(rank).copied().ok_or(
+                    RaceError::InvalidSettlementRoster {
+                        racers: racers.len(),
+                    },
+                )?
+            } else {
+                0
+            };
+            if let Some(team) = team {
+                let index = usize::from(team == ResultTeam::Blue);
+                team_scores[index] += team_points;
+            }
+            by_player_id.insert(
+                player_id,
+                RankedRaceResult {
+                    finish_time,
+                    rank: i32::try_from(rank).expect("at most eight race ranks fit in i32"),
+                    team,
+                    team_points,
+                },
+            );
+        }
+        let winning_team = if team_mode {
+            let first_player_id = racers
+                .first()
+                .ok_or(RaceError::InvalidSettlementRoster { racers: 0 })?
+                .1;
+            let first_team = by_player_id[&first_player_id]
+                .team
+                .expect("team mode rankings carry a team");
+            Some(match room.settings.game_type {
+                3 if team_scores[0] > team_scores[1] => ResultTeam::Red,
+                3 if team_scores[1] > team_scores[0] => ResultTeam::Blue,
+                3 | 4 => first_team,
+                _ => unreachable!("team mode contains only game type 3 or 4"),
+            })
+        } else {
+            None
+        };
+        Ok(SettlementRanking {
+            winning_team,
+            by_player_id,
+        })
     }
 
     fn claim_identity(
@@ -1786,11 +2405,22 @@ impl World {
         }
     }
 
+    #[cfg(test)]
     fn race_command(
         &mut self,
         session: SessionId,
         payload: RaceCommandPayload,
         now: Instant,
+    ) -> Result<RaceCommandOutcome, WorldError> {
+        self.race_command_with_clock(session, payload, now, &ServerClock::new())
+    }
+
+    fn race_command_with_clock(
+        &mut self,
+        session: SessionId,
+        payload: RaceCommandPayload,
+        now: Instant,
+        clock: &ServerClock,
     ) -> Result<RaceCommandOutcome, WorldError> {
         let identity = self.identities.authorize(session)?;
         let room_id = self
@@ -1798,32 +2428,34 @@ impl World {
             .get(&identity.user_no)
             .copied()
             .ok_or(RaceError::NotInRoom)?;
+        match payload {
+            RaceCommandPayload::GameControl(request) => match request.state {
+                0 => self.arm_loading(room_id, &identity, now),
+                2 => self.record_human_finish(room_id, &identity, request.value0, now, clock),
+                state => Err(RaceError::UnsupportedGameControlState { state }),
+            },
+            RaceCommandPayload::AiGoalIn(request) => {
+                self.record_ai_finish(room_id, &identity, request, now, clock)
+            }
+            RaceCommandPayload::TeamBoosterGauge(request) => {
+                self.update_team_booster(room_id, &identity, request)
+            }
+        }
+        .map_err(Into::into)
+    }
+
+    fn arm_loading(
+        &mut self,
+        room_id: RoomId,
+        identity: &IdentityBinding,
+        now: Instant,
+    ) -> Result<RaceCommandOutcome, RaceError> {
         let room = self
             .protocol_rooms
             .get_mut(&room_id)
             .expect("protocol membership always references an existing room");
-
-        let request = match payload {
-            RaceCommandPayload::GameControl(request) => request,
-            RaceCommandPayload::AiGoalIn(request) => {
-                tracing::trace!(
-                    player_id = request.player_id,
-                    race_time = request.race_time,
-                    "ignoring finish request before Running"
-                );
-                return Err(RaceError::NotRunning { actual: room.phase }.into());
-            }
-            RaceCommandPayload::TeamBoosterGauge(request) => {
-                tracing::trace!(
-                    team = ?request.team,
-                    contribution = request.contribution,
-                    "ignoring booster request before Running"
-                );
-                return Err(RaceError::NotRunning { actual: room.phase }.into());
-            }
-        };
         if room.phase != RoomPhase::Loading {
-            return Err(RaceError::WrongPhase { actual: room.phase }.into());
+            return Err(RaceError::WrongPhase { actual: room.phase });
         }
         let frozen = room
             .frozen_race
@@ -1832,15 +2464,9 @@ impl World {
         if !frozen
             .participants
             .iter()
-            .any(|participant| participant.identity == identity)
+            .any(|participant| participant.identity == *identity)
         {
-            return Err(RaceError::NotFrozenParticipant.into());
-        }
-        if request.state != 0 {
-            return Err(RaceError::UnsupportedGameControlState {
-                state: request.state,
-            }
-            .into());
+            return Err(RaceError::NotFrozenParticipant);
         }
 
         if matches!(
@@ -1871,6 +2497,296 @@ impl World {
             race_epoch: room.race_epoch,
             expected_participants,
         })
+    }
+
+    fn record_human_finish(
+        &mut self,
+        room_id: RoomId,
+        identity: &IdentityBinding,
+        race_time: u32,
+        now: Instant,
+        clock: &ServerClock,
+    ) -> Result<RaceCommandOutcome, RaceError> {
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("protocol membership always references an existing room");
+        if !matches!(room.phase, RoomPhase::Running | RoomPhase::Settling) {
+            return Err(RaceError::NotRunning { actual: room.phase });
+        }
+        let participant = room
+            .frozen_race
+            .as_ref()
+            .expect("an active race has a frozen roster")
+            .participants
+            .iter()
+            .find(|participant| participant.identity == *identity)
+            .ok_or(RaceError::NotFrozenParticipant)?;
+        if participant.observer {
+            return Err(RaceError::HumanRacerRequired);
+        }
+        self.record_finish(
+            room_id,
+            participant.player_id,
+            race_time,
+            Some(identity.user_no),
+            now,
+            clock,
+        )
+    }
+
+    fn record_ai_finish(
+        &mut self,
+        room_id: RoomId,
+        identity: &IdentityBinding,
+        request: AiGoalInRequest,
+        now: Instant,
+        clock: &ServerClock,
+    ) -> Result<RaceCommandOutcome, RaceError> {
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("protocol membership always references an existing room");
+        if !matches!(room.phase, RoomPhase::Running | RoomPhase::Settling) {
+            return Err(RaceError::NotRunning { actual: room.phase });
+        }
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .expect("an active race has a frozen roster");
+        if !frozen
+            .participants
+            .iter()
+            .any(|participant| participant.identity == *identity)
+        {
+            return Err(RaceError::NotFrozenParticipant);
+        }
+        if !frozen
+            .ais
+            .iter()
+            .any(|participant| participant.player_id == request.player_id)
+        {
+            return Err(RaceError::NoFrozenAiParticipant {
+                player_id: request.player_id,
+            });
+        }
+        self.record_finish(
+            room_id,
+            request.player_id,
+            request.race_time,
+            None,
+            now,
+            clock,
+        )
+    }
+
+    fn record_finish(
+        &mut self,
+        room_id: RoomId,
+        player_id: i32,
+        race_time: u32,
+        exclude_begin_for: Option<UserNo>,
+        now: Instant,
+        clock: &ServerClock,
+    ) -> Result<RaceCommandOutcome, RaceError> {
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("protocol membership always references an existing room");
+        if room.phase == RoomPhase::Settling
+            && room
+                .race_progress
+                .settlement
+                .as_ref()
+                .is_some_and(|settlement| {
+                    now >= settlement.deadline
+                        || !matches!(
+                            settlement.finalization,
+                            SettlementFinalization::AwaitingDeadline
+                        )
+                })
+        {
+            return Err(RaceError::SettlementClosed);
+        }
+        if room.race_progress.finish_times.contains_key(&player_id) {
+            return Ok(RaceCommandOutcome::IgnoredDuplicate {
+                room_id,
+                race_epoch: room.race_epoch,
+            });
+        }
+        let began_settlement = room.phase == RoomPhase::Running;
+        let settlement = if began_settlement {
+            Some(SettlementState {
+                end_tick: clock.tick().wrapping_add(SETTLEMENT_TICK_LEAD),
+                deadline: now
+                    .checked_add(SETTLEMENT_DELAY)
+                    .ok_or(RaceError::SettlementDeadlineOverflow)?,
+                finalization: SettlementFinalization::AwaitingDeadline,
+            })
+        } else {
+            None
+        };
+        let race_time_packet = serialize_race_time(player_id, race_time)?;
+        let pending_begin = settlement
+            .as_ref()
+            .map(|settlement| PendingBeginSettlement {
+                end_tick: settlement.end_tick,
+                excluded_user: exclude_begin_for,
+                packet: serialize_game_control(
+                    ServerGameControl::BeginSettlement,
+                    settlement.end_tick,
+                ),
+            });
+        if room
+            .race_progress
+            .pending_fanouts
+            .iter()
+            .filter(|fanout| fanout.race_time.is_some())
+            .count()
+            >= ROOM_SLOT_COUNT
+        {
+            return Err(RaceError::PendingRaceFanoutFull);
+        }
+
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("protocol membership always references an existing room");
+        room.race_progress.finish_times.insert(player_id, race_time);
+        if let Some(settlement) = settlement {
+            room.phase = RoomPhase::Settling;
+            room.race_progress.settlement = Some(settlement);
+        }
+        room.race_progress
+            .pending_fanouts
+            .push_back(PendingRaceFanout {
+                race_time: Some(PendingRaceTime {
+                    player_id,
+                    race_time,
+                    packet: race_time_packet,
+                }),
+                begin_settlement: pending_begin,
+            });
+        let race_epoch = room.race_epoch;
+        self.try_flush_pending_race_fanouts(room_id);
+        Ok(RaceCommandOutcome::FinishRecorded {
+            room_id,
+            race_epoch,
+            player_id,
+            began_settlement,
+        })
+    }
+
+    fn update_team_booster(
+        &mut self,
+        room_id: RoomId,
+        identity: &IdentityBinding,
+        request: TeamBoosterGaugeRequest,
+    ) -> Result<RaceCommandOutcome, RaceError> {
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("protocol membership always references an existing room");
+        if room.phase != RoomPhase::Running {
+            return Err(RaceError::NotRunning { actual: room.phase });
+        }
+        if !matches!(room.settings.game_type, 3 | 4) {
+            return Err(RaceError::TeamModeRequired);
+        }
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .expect("a Running room has a frozen roster");
+        let sender = frozen
+            .participants
+            .iter()
+            .find(|participant| participant.identity == *identity)
+            .ok_or(RaceError::NotFrozenParticipant)?;
+        if sender.observer {
+            return Err(RaceError::HumanRacerRequired);
+        }
+        let sender_team = race_team_from_wire(sender.team)?;
+        if sender_team != request.team {
+            return Err(RaceError::TeamSpoof {
+                claimed: request.team,
+                actual: sender.team,
+            });
+        }
+        let team_count = frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer && participant.team == sender.team)
+            .count();
+        debug_assert_ne!(team_count, 0);
+        let contribution = request.contribution * 0.000_125
+            / f32::from(u16::try_from(team_count).expect("a room team count fits in u16"));
+        let wire_gauge = (room.race_progress.team_gauge(request.team) + contribution).min(1.0);
+        let packet = serialize_team_booster_gauge(request.team, wire_gauge)?;
+        let deliveries = self
+            .active_frozen_recipient_sessions(room)
+            .into_iter()
+            .filter(|(participant, _)| participant.observer || participant.team == sender.team)
+            .map(|(_, session)| (session, OutboundBatch::single(packet.clone())))
+            .collect();
+        let reserved = self.reserve_race_outbound(deliveries)?;
+
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("protocol membership always references an existing room");
+        let reached_full = wire_gauge >= 1.0;
+        room.race_progress
+            .set_team_gauge(request.team, if reached_full { 0.0 } else { wire_gauge });
+        let race_epoch = room.race_epoch;
+        Self::publish_reserved(reserved);
+        Ok(RaceCommandOutcome::BoosterGaugeUpdated {
+            room_id,
+            race_epoch,
+            team: request.team,
+            reached_full,
+        })
+    }
+
+    fn active_frozen_recipient_sessions<'a>(
+        &self,
+        room: &'a ProtocolRoomState,
+    ) -> Vec<(&'a FrozenRaceParticipant, SessionId)> {
+        room.frozen_race
+            .as_ref()
+            .expect("a non-Lobby room has a frozen roster")
+            .participants
+            .iter()
+            .filter_map(|participant| {
+                self.exact_identity_in_protocol_room(room.id, &participant.identity)
+                    .map(|identity| (participant, identity.owner))
+            })
+            .collect()
+    }
+
+    fn exact_identity_in_protocol_room(
+        &self,
+        room_id: RoomId,
+        frozen_identity: &IdentityBinding,
+    ) -> Option<IdentityBinding> {
+        if self.protocol_room_by_user.get(&frozen_identity.user_no) != Some(&room_id) {
+            return None;
+        }
+        self.identities
+            .active_identity_by_user_no(frozen_identity.user_no)
+            .filter(|active| active == frozen_identity)
+    }
+
+    fn reserve_race_outbound(
+        &self,
+        deliveries: Vec<OutboundDelivery>,
+    ) -> Result<Vec<ReservedOutbound>, RaceError> {
+        self.reserve_outbound(deliveries)
+            .map_err(|error| match error {
+                LobbyError::OutboundUnavailable { session } => {
+                    RaceError::OutboundUnavailable { session }
+                }
+                error => unreachable!("outbound reservation returned {error}"),
+            })
     }
 
     fn protocol_room_id(&self, identity: &IdentityBinding) -> Result<RoomId, LobbyError> {
@@ -2078,6 +2994,9 @@ impl World {
         if room.room_master != i32::try_from(requester_id).expect("room member ID fits in i32") {
             return Err(LobbyError::NotRoomMaster);
         }
+        if !plan.ai_specs.is_empty() {
+            return Err(LobbyError::AiParticipantsUnsupported);
+        }
 
         let racer_count = room.members_by_id.iter().flatten().count();
         if racer_count == 0 {
@@ -2143,6 +3062,7 @@ impl World {
         next.phase = RoomPhase::Loading;
         next.race_epoch = race_epoch;
         next.frozen_race = Some(frozen);
+        next.race_progress = RaceProgress::default();
         next.loading_handshake = LoadingHandshake::Dormant;
         self.protocol_rooms.insert(room_id, next);
         Self::publish_reserved(reserved);
@@ -2181,6 +3101,20 @@ impl World {
                     .expect("the fixed room member ID always fits in i32"),
                 observer: false,
                 team: member.player.team,
+                result: Some(FrozenHumanResultSnapshot {
+                    kart_id: u16::from_le_bytes(
+                        member.player.rider_item_snapshot[4..6]
+                            .try_into()
+                            .expect("the kart field is a fixed two-byte slice"),
+                    ),
+                    character_id: u16::from_le_bytes(
+                        member.player.rider_item_snapshot[..2]
+                            .try_into()
+                            .expect("the character field is a fixed two-byte slice"),
+                    ),
+                    club_mark_logo: member.player.club_mark_logo,
+                    economy: FrozenResultEconomy::pending_persistence(member.player.rp),
+                }),
             });
         }
         for (observer_id, member) in room
@@ -2201,12 +3135,14 @@ impl World {
                     .expect("the fixed observer player ID always fits in i32"),
                 observer: true,
                 team: 0,
+                result: None,
             });
         }
         Ok(FrozenRaceRoster {
             epoch,
             concrete_track,
             participants,
+            ais: Vec::new(),
         })
     }
 
@@ -2468,9 +3404,9 @@ impl World {
         if let Some(room) = self.protocol_rooms.get_mut(&room_id) {
             let removed = room.remove_user(user_no);
             debug_assert!(removed, "protocol membership map and room state diverged");
-            if room.is_empty() {
+            if room.is_empty() && matches!(room.phase, RoomPhase::Lobby | RoomPhase::Loading) {
                 remove_room = true;
-            } else {
+            } else if !room.is_empty() {
                 let packet = serialize_gr_slot_data(&room.slot_data())
                     .expect("validated protocol room state remains serializable after removal");
                 broadcast = Some((room.user_nos(), packet));
@@ -2805,6 +3741,7 @@ impl World {
                             debug_assert!(frozen_users.insert(participant.identity.user_no));
                             debug_assert!(frozen_player_ids.insert(participant.player_id));
                             debug_assert_eq!(participant.observer, participant.player_id >= 8);
+                            debug_assert_eq!(participant.observer, participant.result.is_none());
                             debug_assert!(if participant.observer {
                                 participant.team == 0
                             } else if matches!(room.settings.game_type, 3 | 4) {
@@ -2813,9 +3750,15 @@ impl World {
                                 participant.team == 0
                             });
                         }
+                        for participant in &frozen.ais {
+                            debug_assert!((0..8).contains(&participant.player_id));
+                            debug_assert!(frozen_player_ids.insert(participant.player_id));
+                        }
+                        debug_assert!(frozen_player_ids.len() <= ROOM_SLOT_COUNT);
                     }
                 }
                 debug_assert_loading_handshake_invariants(room);
+                debug_assert_race_progress_invariants(room);
             }
             debug_assert_eq!(seen_users.len(), self.protocol_room_by_user.len());
             for room_id in &self.free_protocol_room_ids {
@@ -2825,6 +3768,61 @@ impl World {
                 debug_assert!(!self.protocol_rooms.contains_key(&room_id));
             }
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_race_progress_invariants(room: &ProtocolRoomState) {
+    match room.phase {
+        RoomPhase::Lobby | RoomPhase::Loading | RoomPhase::Running => {
+            debug_assert!(room.race_progress.settlement.is_none());
+        }
+        RoomPhase::Settling => {
+            debug_assert!(room.race_progress.settlement.is_some());
+        }
+    }
+    if matches!(room.phase, RoomPhase::Lobby | RoomPhase::Loading) {
+        debug_assert!(room.race_progress.finish_times.is_empty());
+        debug_assert!(room.race_progress.pending_fanouts.is_empty());
+        debug_assert_eq!(room.race_progress.team_gauge_bits, [0.0_f32.to_bits(); 2]);
+    }
+    let pending_finish_count = room
+        .race_progress
+        .pending_fanouts
+        .iter()
+        .filter(|fanout| fanout.race_time.is_some())
+        .count();
+    debug_assert!(pending_finish_count <= ROOM_SLOT_COUNT);
+    for fanout in &room.race_progress.pending_fanouts {
+        if let Some(race_time) = &fanout.race_time {
+            debug_assert_eq!(
+                room.race_progress.finish_times.get(&race_time.player_id),
+                Some(&race_time.race_time)
+            );
+        }
+        if let Some(begin) = &fanout.begin_settlement {
+            let settlement = room
+                .race_progress
+                .settlement
+                .as_ref()
+                .expect("a pending BeginSettlement has settlement timing");
+            debug_assert_eq!(begin.end_tick, settlement.end_tick);
+        }
+    }
+    if let Some(frozen) = &room.frozen_race {
+        let racer_ids = frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer)
+            .map(|participant| participant.player_id)
+            .chain(frozen.ais.iter().map(|participant| participant.player_id))
+            .collect::<HashSet<_>>();
+        debug_assert!(
+            room.race_progress
+                .finish_times
+                .keys()
+                .all(|player_id| racer_ids.contains(player_id))
+        );
     }
 }
 
@@ -3032,7 +4030,8 @@ async fn run_world(
                     break;
                 };
                 world.advance_loading(Instant::now(), &clock);
-                let should_stop = dispatch_command(&mut world, command, &sidecars).await?;
+                let should_stop =
+                    dispatch_command(&mut world, command, &sidecars, &clock).await?;
                 world.advance_loading(Instant::now(), &clock);
                 if should_stop {
                     break;
@@ -3072,6 +4071,7 @@ async fn dispatch_command(
     world: &mut World,
     command: WorldCommand,
     sidecars: &WorldSidecars,
+    clock: &ServerClock,
 ) -> Result<bool, WorldSidecarError> {
     match command {
         WorldCommand::RegisterSession {
@@ -3158,7 +4158,7 @@ async fn dispatch_command(
             payload,
             reply,
         } => {
-            let result = world.race_command(session, payload, Instant::now());
+            let result = world.race_command_with_clock(session, payload, Instant::now(), clock);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         command => return dispatch_utility_command(world, command, sidecars).await,
@@ -3242,10 +4242,12 @@ mod tests {
         },
         race_protocol::{
             AiGoalInRequest, GAME_AI_MASTER_NOTICE_NAME, GAME_CONTROL_PACKET_NAME,
-            GameControlRequest,
+            GAME_NEXT_STAGE_PACKET_NAME, GAME_RACE_TIME_PACKET_NAME, GameControlRequest, RaceTeam,
+            TEAM_BOOSTER_REPLY_NAME, TeamBoosterGaugeRequest,
         },
+        race_result_protocol::{GAME_RESULT_PACKET_NAME, ResultTeam},
         race_start_protocol::{
-            GR_COMMAND_START_PACKET_NAME, P5136KartPhysicsBlock, RaceStartProtocolError,
+            AiRaceSpec, GR_COMMAND_START_PACKET_NAME, P5136KartPhysicsBlock, RaceStartProtocolError,
         },
         room_protocol::{
             ChCreateRoomRequest, ChGetRoomListRequest, ChJoinRoomRequest,
@@ -3495,12 +4497,62 @@ mod tests {
     }
 
     fn game_control_request(state: i32) -> RaceCommandPayload {
+        game_control_request_with_value(state, 0)
+    }
+
+    fn game_control_request_with_value(state: i32, value0: u32) -> RaceCommandPayload {
         RaceCommandPayload::GameControl(GameControlRequest {
             state,
             optional_pair: None,
-            value0: 0,
+            value0,
             trailing: Vec::new(),
         })
+    }
+
+    fn ai_goal_in_request(player_id: i32, race_time: u32) -> RaceCommandPayload {
+        RaceCommandPayload::AiGoalIn(AiGoalInRequest {
+            player_id,
+            race_time,
+        })
+    }
+
+    fn booster_request(team: RaceTeam, contribution: f32) -> RaceCommandPayload {
+        RaceCommandPayload::TeamBoosterGauge(TeamBoosterGaugeRequest { team, contribution })
+    }
+
+    fn force_running(world: &mut World, room_id: RoomId) {
+        let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+        assert!(room.frozen_race.is_some());
+        room.phase = RoomPhase::Running;
+        room.loading_handshake = LoadingHandshake::Dormant;
+        room.race_progress = super::RaceProgress::default();
+    }
+
+    fn set_result_admission(
+        world: &mut World,
+        room_id: RoomId,
+        player_id: usize,
+        character_id: u16,
+        kart_id: u16,
+        current_rp: u32,
+        club_mark_logo: i32,
+    ) {
+        let player = &mut world
+            .protocol_rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .members_by_id[player_id]
+            .as_mut()
+            .unwrap()
+            .player;
+        player.rider_item_snapshot[..2].copy_from_slice(&character_id.to_le_bytes());
+        player.rider_item_snapshot[4..6].copy_from_slice(&kart_id.to_le_bytes());
+        player.rp = current_rp;
+        player.club_mark_logo = club_mark_logo;
+    }
+
+    fn take_packets(receiver: &mut mpsc::Receiver<OutboundBatch>) -> Vec<Vec<u8>> {
+        receiver.try_recv().unwrap().into_packets()
     }
 
     fn udp_dispatch_outcome(
@@ -3537,6 +4589,8 @@ mod tests {
         let source = register_channel_session(&mut world, "Source", 67, 40_001, 64);
         let player = register_channel_session(&mut world, "Player", 67, 40_011, 64);
         let observer = register_channel_session(&mut world, "Observer", 67, 40_021, 64);
+        let destination_owner = register_channel_session(&mut world, "Destination", 67, 40_031, 64);
+        let destination_room = create_protocol_room(&mut world, &destination_owner, 1);
 
         world
             .room_protocol(
@@ -3588,6 +4642,13 @@ mod tests {
         assert!(targets.contains(&player.identity));
         assert!(targets.contains(&observer.identity));
         assert!(!targets.contains(&source.identity));
+
+        world
+            .room_protocol(player.session, RoomCommandPayload::Leave)
+            .unwrap();
+        join_protocol_room(&mut world, &player, destination_room, false);
+        let targets = world.racing_udp_targets(source.identity.user_no);
+        assert_eq!(targets, vec![observer.identity]);
     }
 
     #[test]
@@ -3810,8 +4871,8 @@ mod tests {
         assert_eq!(world.protocol_rooms[&room_id].loading_handshake, armed);
         assert!(matches!(
             world.race_command(guest.session, game_control_request(2), armed_at),
-            Err(WorldError::Race(RaceError::UnsupportedGameControlState {
-                state: 2
+            Err(WorldError::Race(RaceError::NotRunning {
+                actual: RoomPhase::Loading
             }))
         ));
         assert_eq!(world.protocol_rooms[&room_id].loading_handshake, armed);
@@ -4096,6 +5157,1026 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn running_finish_is_exact_atomic_idempotent_and_starts_settlement() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "FinishOwner", 67, 41_801, 64);
+        let mut guest = register_channel_session(&mut world, "FinishGuest", 67, 41_811, 1);
+        let mut observer = register_channel_session(&mut world, "FinishObserver", 67, 41_821, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        join_protocol_room(&mut world, &observer, room_id, true);
+        set_result_admission(&mut world, room_id, 0, 101, 201, 301, 401);
+        set_result_admission(&mut world, room_id, 1, 102, 202, 302, 402);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        drain_batches(&mut observer.outbound);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        drain_batches(&mut observer.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        drain_batches(&mut observer.outbound);
+        force_running(&mut world, room_id);
+
+        assert!(matches!(
+            world.race_command(
+                owner.session,
+                booster_request(RaceTeam::Red, 1.0),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::TeamModeRequired))
+        ));
+        let guest_sender = world.sessions[&guest.session].outbound.clone().unwrap();
+        guest_sender
+            .try_send(OutboundBatch::single(vec![0xBB]))
+            .unwrap();
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        assert_eq!(
+            world
+                .race_command_with_clock(
+                    owner.session,
+                    game_control_request_with_value(2, 1_234),
+                    now,
+                    &clock,
+                )
+                .unwrap(),
+            RaceCommandOutcome::FinishRecorded {
+                room_id,
+                race_epoch: 1,
+                player_id: 0,
+                began_settlement: true,
+            }
+        );
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.phase, RoomPhase::Settling);
+        assert_eq!(room.race_progress.finish_times.get(&0), Some(&1_234));
+        assert_eq!(room.race_progress.pending_fanouts.len(), 1);
+        let settlement = room.race_progress.settlement.as_ref().unwrap().clone();
+        assert_eq!(settlement.deadline, now + Duration::from_secs(10));
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(observer.outbound.try_recv().is_err());
+        assert_eq!(
+            guest.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xBB]]
+        );
+
+        world.advance_loading(now + Duration::from_millis(1), &clock);
+        assert!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .pending_fanouts
+                .is_empty()
+        );
+
+        let owner_packets = take_packets(&mut owner.outbound);
+        assert_eq!(owner_packets.len(), 1);
+        assert_eq!(
+            logical_packet_hash(&owner_packets[0]),
+            adler32::packet_hash(GAME_RACE_TIME_PACKET_NAME)
+        );
+        assert_eq!(
+            i32::from_le_bytes(owner_packets[0][4..8].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(owner_packets[0][8..12].try_into().unwrap()),
+            1_234
+        );
+        for receiver in [&mut guest.outbound, &mut observer.outbound] {
+            let packets = take_packets(receiver);
+            assert_eq!(packets.len(), 2);
+            assert_eq!(
+                logical_packet_hash(&packets[0]),
+                adler32::packet_hash(GAME_RACE_TIME_PACKET_NAME)
+            );
+            assert_eq!(
+                logical_packet_hash(&packets[1]),
+                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+            );
+            assert_eq!(i32::from_le_bytes(packets[1][4..8].try_into().unwrap()), 3);
+            assert_eq!(
+                u32::from_le_bytes(packets[1][9..13].try_into().unwrap()),
+                settlement.end_tick
+            );
+        }
+
+        assert_eq!(
+            world
+                .race_command_with_clock(
+                    owner.session,
+                    game_control_request_with_value(2, 9_999),
+                    now,
+                    &clock,
+                )
+                .unwrap(),
+            RaceCommandOutcome::IgnoredDuplicate {
+                room_id,
+                race_epoch: 1
+            }
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(guest.outbound.try_recv().is_err());
+        assert!(observer.outbound.try_recv().is_err());
+
+        assert!(matches!(
+            world
+                .race_command_with_clock(
+                    guest.session,
+                    game_control_request_with_value(2, 1_000),
+                    now,
+                    &clock,
+                )
+                .unwrap(),
+            RaceCommandOutcome::FinishRecorded {
+                player_id: 1,
+                began_settlement: false,
+                ..
+            }
+        ));
+        for receiver in [
+            &mut owner.outbound,
+            &mut guest.outbound,
+            &mut observer.outbound,
+        ] {
+            let packets = take_packets(receiver);
+            assert_eq!(packets.len(), 1);
+            assert_eq!(
+                logical_packet_hash(&packets[0]),
+                adler32::packet_hash(GAME_RACE_TIME_PACKET_NAME)
+            );
+        }
+
+        assert!(matches!(
+            world.race_command_with_clock(
+                observer.session,
+                game_control_request_with_value(2, 500),
+                now,
+                &clock,
+            ),
+            Err(WorldError::Race(RaceError::HumanRacerRequired))
+        ));
+        assert!(matches!(
+            world.race_command_with_clock(owner.session, game_control_request(0), now, &clock,),
+            Err(WorldError::Race(RaceError::WrongPhase {
+                actual: RoomPhase::Settling
+            }))
+        ));
+        assert!(matches!(
+            world.race_command_with_clock(owner.session, ai_goal_in_request(7, 500), now, &clock,),
+            Err(WorldError::Race(RaceError::NoFrozenAiParticipant {
+                player_id: 7
+            }))
+        ));
+        assert!(matches!(
+            world.race_command_with_clock(owner.session, game_control_request(7), now, &clock,),
+            Err(WorldError::Race(RaceError::UnsupportedGameControlState {
+                state: 7
+            }))
+        ));
+    }
+
+    #[test]
+    fn pending_finish_recomputes_current_room_audience_after_move() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "PendingOwner", 67, 41_851, 64);
+        let mut mover = register_channel_session(&mut world, "PendingMover", 67, 41_861, 1);
+        let mut destination =
+            register_channel_session(&mut world, "PendingDestination", 67, 41_871, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        let destination_room = create_protocol_room(&mut world, &destination, 1);
+        join_protocol_room(&mut world, &mover, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut mover.outbound);
+        drain_batches(&mut destination.outbound);
+        world
+            .lobby_command(
+                mover.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut mover.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut mover.outbound);
+        force_running(&mut world, room_id);
+
+        let mover_sender = world.sessions[&mover.session].outbound.clone().unwrap();
+        mover_sender
+            .try_send(OutboundBatch::single(vec![0xE1]))
+            .unwrap();
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        assert!(matches!(
+            world
+                .race_command_with_clock(
+                    owner.session,
+                    game_control_request_with_value(2, 321),
+                    now,
+                    &clock,
+                )
+                .unwrap(),
+            RaceCommandOutcome::FinishRecorded {
+                began_settlement: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            mover.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xE1]]
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        world
+            .room_protocol(mover.session, RoomCommandPayload::Leave)
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut mover.outbound);
+        join_protocol_room(&mut world, &mover, destination_room, false);
+        drain_batches(&mut mover.outbound);
+        drain_batches(&mut destination.outbound);
+        mover_sender
+            .try_send(OutboundBatch::single(vec![0xE2]))
+            .unwrap();
+
+        world.advance_loading(now + Duration::from_millis(1), &clock);
+        let packets = take_packets(&mut owner.outbound);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            logical_packet_hash(&packets[0]),
+            adler32::packet_hash(GAME_RACE_TIME_PACKET_NAME)
+        );
+        assert_eq!(
+            mover.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xE2]]
+        );
+        assert!(mover.outbound.try_recv().is_err());
+        assert!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .pending_fanouts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn settlement_never_overtakes_a_pending_finish_fanout() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "OrderOwner", 67, 41_881, 64);
+        let mut guest = register_channel_session(&mut world, "OrderGuest", 67, 41_891, 1);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        force_running(&mut world, room_id);
+
+        let guest_sender = world.sessions[&guest.session].outbound.clone().unwrap();
+        guest_sender
+            .try_send(OutboundBatch::single(vec![0xE4]))
+            .unwrap();
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 777),
+                now,
+                &clock,
+            )
+            .unwrap();
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        assert!(owner.outbound.try_recv().is_err());
+        assert_eq!(
+            guest.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xE4]]
+        );
+
+        world.advance_loading(deadline + Duration::from_millis(1), &clock);
+        let owner_finish = take_packets(&mut owner.outbound);
+        assert_eq!(owner_finish.len(), 1);
+        assert_eq!(
+            logical_packet_hash(&owner_finish[0]),
+            adler32::packet_hash(GAME_RACE_TIME_PACKET_NAME)
+        );
+        let guest_finish = take_packets(&mut guest.outbound);
+        assert_eq!(guest_finish.len(), 2);
+        assert_eq!(
+            logical_packet_hash(&guest_finish[0]),
+            adler32::packet_hash(GAME_RACE_TIME_PACKET_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&guest_finish[1]),
+            adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+        );
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Settling);
+
+        world.advance_loading(deadline + Duration::from_millis(2), &clock);
+        for receiver in [&mut owner.outbound, &mut guest.outbound] {
+            let packets = take_packets(receiver);
+            assert_eq!(packets.len(), 3);
+            assert_eq!(
+                logical_packet_hash(&packets[0]),
+                adler32::packet_hash(GAME_NEXT_STAGE_PACKET_NAME)
+            );
+            assert_eq!(
+                logical_packet_hash(&packets[1]),
+                adler32::packet_hash(GAME_RESULT_PACKET_NAME)
+            );
+            assert_eq!(
+                logical_packet_hash(&packets[2]),
+                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+            );
+        }
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Lobby);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn running_team_booster_fences_team_and_reserves_observers_atomically() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "BoostOwner", 68, 41_901, 64);
+        let mut ally = register_channel_session(&mut world, "BoostAlly", 68, 41_911, 1);
+        let mut opponent = register_channel_session(&mut world, "BoostOpponent", 68, 41_921, 64);
+        let mut observer = register_channel_session(&mut world, "BoostObserver", 68, 41_931, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 3);
+        join_protocol_room(&mut world, &ally, room_id, false);
+        join_protocol_room(&mut world, &opponent, room_id, false);
+        join_protocol_room(&mut world, &observer, room_id, true);
+        {
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            room.members_by_id[0].as_mut().unwrap().player.team = 1;
+            room.members_by_id[1].as_mut().unwrap().player.team = 1;
+            room.members_by_id[2].as_mut().unwrap().player.team = 2;
+        }
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut ally.outbound);
+        drain_batches(&mut opponent.outbound);
+        drain_batches(&mut observer.outbound);
+        for session in [ally.session, opponent.session] {
+            world
+                .lobby_command(
+                    session,
+                    LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+                )
+                .unwrap();
+            drain_batches(&mut owner.outbound);
+            drain_batches(&mut ally.outbound);
+            drain_batches(&mut opponent.outbound);
+            drain_batches(&mut observer.outbound);
+        }
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut ally.outbound);
+        drain_batches(&mut opponent.outbound);
+        drain_batches(&mut observer.outbound);
+        force_running(&mut world, room_id);
+
+        let ally_sender = world.sessions[&ally.session].outbound.clone().unwrap();
+        ally_sender
+            .try_send(OutboundBatch::single(vec![0xCC]))
+            .unwrap();
+        let before = world.protocol_rooms[&room_id].race_progress.clone();
+        assert!(matches!(
+            world.race_command(
+                owner.session,
+                booster_request(RaceTeam::Red, 8_000.0),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::OutboundUnavailable {
+                session
+            })) if session == ally.session
+        ));
+        assert_eq!(world.protocol_rooms[&room_id].race_progress, before);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(opponent.outbound.try_recv().is_err());
+        assert!(observer.outbound.try_recv().is_err());
+        assert_eq!(
+            ally.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xCC]]
+        );
+
+        assert_eq!(
+            world
+                .race_command(
+                    owner.session,
+                    booster_request(RaceTeam::Red, 8_000.0),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::BoosterGaugeUpdated {
+                room_id,
+                race_epoch: 1,
+                team: RaceTeam::Red,
+                reached_full: false,
+            }
+        );
+        for receiver in [
+            &mut owner.outbound,
+            &mut ally.outbound,
+            &mut observer.outbound,
+        ] {
+            let packets = take_packets(receiver);
+            assert_eq!(packets.len(), 1);
+            assert_eq!(
+                logical_packet_hash(&packets[0]),
+                adler32::packet_hash(TEAM_BOOSTER_REPLY_NAME)
+            );
+            assert_eq!(packets[0][4], RaceTeam::Red as u8);
+            assert_eq!(
+                f32::from_le_bytes(packets[0][5..9].try_into().unwrap()).to_bits(),
+                0.5_f32.to_bits()
+            );
+        }
+        assert!(opponent.outbound.try_recv().is_err());
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .team_gauge(RaceTeam::Red)
+                .to_bits(),
+            0.5_f32.to_bits()
+        );
+
+        let before = world.protocol_rooms[&room_id].race_progress.clone();
+        assert!(matches!(
+            world.race_command(
+                owner.session,
+                booster_request(RaceTeam::Blue, 1.0),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::TeamSpoof {
+                claimed: RaceTeam::Blue,
+                actual: 1
+            }))
+        ));
+        assert_eq!(world.protocol_rooms[&room_id].race_progress, before);
+
+        assert!(matches!(
+            world
+                .race_command(
+                    owner.session,
+                    booster_request(RaceTeam::Red, 8_000.0),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::BoosterGaugeUpdated {
+                reached_full: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .team_gauge(RaceTeam::Red)
+                .to_bits(),
+            0.0_f32.to_bits()
+        );
+        for receiver in [
+            &mut owner.outbound,
+            &mut ally.outbound,
+            &mut observer.outbound,
+        ] {
+            let packets = take_packets(receiver);
+            assert_eq!(
+                f32::from_le_bytes(packets[0][5..9].try_into().unwrap()).to_bits(),
+                1.0_f32.to_bits()
+            );
+        }
+        assert!(matches!(
+            world.race_command(
+                observer.session,
+                booster_request(RaceTeam::Red, 1.0),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::HumanRacerRequired))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn settlement_deadline_ranks_dnf_and_retries_ordered_result_atomically() {
+        let mut world = World::default();
+        let mut p0 = register_channel_session(&mut world, "ResultP0", 68, 42_001, 64);
+        let mut p1 = register_channel_session(&mut world, "ResultP1", 68, 42_011, 64);
+        let mut p2 = register_channel_session(&mut world, "ResultP2", 68, 42_021, 1);
+        let mut p3 = register_channel_session(&mut world, "ResultP3", 68, 42_031, 64);
+        let mut observer = register_channel_session(&mut world, "ResultObserver", 68, 42_041, 64);
+        let room_id = create_protocol_room(&mut world, &p0, 3);
+        for session in [&p1, &p2, &p3] {
+            join_protocol_room(&mut world, session, room_id, false);
+        }
+        join_protocol_room(&mut world, &observer, room_id, true);
+        {
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            for (player_id, team) in [1_u8, 2, 1, 2].into_iter().enumerate() {
+                room.members_by_id[player_id].as_mut().unwrap().player.team = team;
+            }
+        }
+        for player_id in 0..4 {
+            let value = u16::try_from(player_id).unwrap();
+            set_result_admission(
+                &mut world,
+                room_id,
+                player_id,
+                1_010 + value,
+                2_010 + value,
+                3_010 + u32::from(value),
+                4_010 + i32::from(value),
+            );
+        }
+        drain_batches(&mut p0.outbound);
+        drain_batches(&mut p1.outbound);
+        drain_batches(&mut p2.outbound);
+        drain_batches(&mut p3.outbound);
+        drain_batches(&mut observer.outbound);
+        for session in [p1.session, p2.session, p3.session] {
+            world
+                .lobby_command(
+                    session,
+                    LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+                )
+                .unwrap();
+            drain_batches(&mut p0.outbound);
+            drain_batches(&mut p1.outbound);
+            drain_batches(&mut p2.outbound);
+            drain_batches(&mut p3.outbound);
+            drain_batches(&mut observer.outbound);
+        }
+        world
+            .lobby_command(
+                p0.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut p0.outbound);
+        drain_batches(&mut p1.outbound);
+        drain_batches(&mut p2.outbound);
+        drain_batches(&mut p3.outbound);
+        drain_batches(&mut observer.outbound);
+        force_running(&mut world, room_id);
+
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        for (session, time) in [(p1.session, 100_u32), (p0.session, 100), (p3.session, 200)] {
+            world
+                .race_command_with_clock(
+                    session,
+                    game_control_request_with_value(2, time),
+                    now,
+                    &clock,
+                )
+                .unwrap();
+            drain_batches(&mut p0.outbound);
+            drain_batches(&mut p1.outbound);
+            drain_batches(&mut p2.outbound);
+            drain_batches(&mut p3.outbound);
+            drain_batches(&mut observer.outbound);
+        }
+        let frozen = world.protocol_rooms[&room_id].frozen_race.clone();
+        let progress = world.protocol_rooms[&room_id].race_progress.clone();
+        let settlement = progress.settlement.as_ref().unwrap().clone();
+
+        world.close_session(p0.session, now);
+        drain_batches(&mut p1.outbound);
+        drain_batches(&mut p2.outbound);
+        drain_batches(&mut p3.outbound);
+        drain_batches(&mut observer.outbound);
+        assert_eq!(world.protocol_rooms[&room_id].frozen_race, frozen);
+        assert_eq!(world.protocol_rooms[&room_id].race_progress, progress);
+
+        world.advance_loading(
+            settlement
+                .deadline
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+            &clock,
+        );
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Settling);
+        let p2_sender = world.sessions[&p2.session].outbound.clone().unwrap();
+        p2_sender
+            .try_send(OutboundBatch::single(vec![0xDD]))
+            .unwrap();
+        world.advance_loading(settlement.deadline, &clock);
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Settling);
+        assert_eq!(world.protocol_rooms[&room_id].frozen_race, frozen);
+        assert_eq!(
+            world.protocol_rooms[&room_id].race_progress.finish_times,
+            progress.finish_times
+        );
+        let frozen_final_packets = match &world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .finalization
+        {
+            super::SettlementFinalization::Ready { packets } => packets.clone(),
+            state => panic!("deadline must freeze final packets once, got {state:?}"),
+        };
+        assert!(p1.outbound.try_recv().is_err());
+        assert!(p3.outbound.try_recv().is_err());
+        assert!(observer.outbound.try_recv().is_err());
+        assert_eq!(
+            p2.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xDD]]
+        );
+        assert!(matches!(
+            world.race_command_with_clock(
+                p2.session,
+                game_control_request_with_value(2, 50),
+                settlement.deadline,
+                &clock,
+            ),
+            Err(WorldError::Race(RaceError::SettlementClosed))
+        ));
+        assert!(RaceError::SettlementClosed.is_expected_rejection());
+        assert_eq!(
+            match &world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization
+            {
+                super::SettlementFinalization::Ready { packets } => packets,
+                state => panic!("blocked finalization changed state to {state:?}"),
+            },
+            &frozen_final_packets
+        );
+
+        world.advance_loading(settlement.deadline + Duration::from_millis(1), &clock);
+        let mut expected_packets = None;
+        for receiver in [
+            &mut p1.outbound,
+            &mut p2.outbound,
+            &mut p3.outbound,
+            &mut observer.outbound,
+        ] {
+            let packets = take_packets(receiver);
+            assert_eq!(packets.len(), 3);
+            assert_eq!(
+                logical_packet_hash(&packets[0]),
+                adler32::packet_hash(GAME_NEXT_STAGE_PACKET_NAME)
+            );
+            assert_eq!(
+                logical_packet_hash(&packets[1]),
+                adler32::packet_hash(GAME_RESULT_PACKET_NAME)
+            );
+            assert_eq!(
+                logical_packet_hash(&packets[2]),
+                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+            );
+            assert_eq!(i32::from_le_bytes(packets[2][4..8].try_into().unwrap()), 4);
+            assert_eq!(
+                u32::from_le_bytes(packets[2][9..13].try_into().unwrap()),
+                settlement.end_tick.wrapping_add(6_000)
+            );
+            if let Some(expected) = &expected_packets {
+                assert_eq!(&packets, expected);
+            } else {
+                expected_packets = Some(packets);
+            }
+        }
+        let packets = expected_packets.unwrap();
+        assert_eq!(packets, frozen_final_packets);
+        let result = &packets[1];
+        assert_eq!(result[4], ResultTeam::Blue as u8);
+        assert_eq!(i32::from_le_bytes(result[5..9].try_into().unwrap()), 4);
+        let record_start = |player_id: usize| 9 + player_id * 217;
+        let p0_record = record_start(0);
+        assert_eq!(
+            u32::from_le_bytes(result[p0_record + 4..p0_record + 8].try_into().unwrap()),
+            100
+        );
+        assert_eq!(
+            u16::from_le_bytes(result[p0_record + 9..p0_record + 11].try_into().unwrap()),
+            2_010
+        );
+        assert_eq!(
+            i32::from_le_bytes(result[p0_record + 11..p0_record + 15].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(result[p0_record + 18..p0_record + 22].try_into().unwrap()),
+            3_010
+        );
+        for offset in [22, 26, 30] {
+            assert_eq!(
+                u32::from_le_bytes(
+                    result[p0_record + offset..p0_record + offset + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            i32::from_le_bytes(result[p0_record + 63..p0_record + 67].try_into().unwrap()),
+            10
+        );
+        assert_eq!(
+            u16::from_le_bytes(result[p0_record + 85..p0_record + 87].try_into().unwrap()),
+            1_010
+        );
+        assert_eq!(
+            i32::from_le_bytes(result[p0_record + 174..p0_record + 178].try_into().unwrap()),
+            4_010
+        );
+        let p2_record = record_start(2);
+        assert_eq!(
+            u32::from_le_bytes(result[p2_record + 4..p2_record + 8].try_into().unwrap()),
+            u32::MAX
+        );
+        assert_eq!(
+            i32::from_le_bytes(result[p2_record + 11..p2_record + 15].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            i32::from_le_bytes(result[p2_record + 63..p2_record + 67].try_into().unwrap()),
+            0
+        );
+
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.phase, RoomPhase::Lobby);
+        assert!(room.frozen_race.is_none());
+        assert_eq!(room.race_progress, super::RaceProgress::default());
+        assert_eq!(room.race_epoch, 1);
+        assert!(
+            room.members_by_id
+                .iter()
+                .flatten()
+                .all(|member| member.player.player_type == PlayerSlotState::NotReady as i32)
+        );
+    }
+
+    #[test]
+    fn settlement_team_tie_and_item_mode_use_first_ranked_team() {
+        let mut world = World::default();
+        let sessions = (0..6)
+            .map(|index| {
+                register_channel_session(
+                    &mut world,
+                    &format!("Tie{index}"),
+                    68,
+                    42_101 + index * 10,
+                    64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let room_id = create_protocol_room(&mut world, &sessions[0], 3);
+        for session in &sessions[1..] {
+            join_protocol_room(&mut world, session, room_id, false);
+        }
+        {
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            for (player_id, team) in [1_u8, 1, 2, 2, 2, 2].into_iter().enumerate() {
+                room.members_by_id[player_id].as_mut().unwrap().player.team = team;
+            }
+        }
+        let lobby_snapshot = world.protocol_rooms[&room_id].clone();
+        let frozen = world
+            .freeze_race_roster(&lobby_snapshot, 1, 0x1111_2222)
+            .unwrap();
+        let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+        room.phase = RoomPhase::Settling;
+        room.race_epoch = 1;
+        room.frozen_race = Some(frozen);
+        room.race_progress.settlement = Some(super::SettlementState {
+            end_tick: 10_000,
+            deadline: Instant::now(),
+            finalization: super::SettlementFinalization::AwaitingDeadline,
+        });
+        for player_id in 0..6 {
+            room.race_progress
+                .finish_times
+                .insert(player_id, 100 + u32::try_from(player_id).unwrap());
+        }
+
+        let ranking = World::settlement_ranking(room).unwrap();
+        assert_eq!(ranking.winning_team, Some(ResultTeam::Red));
+        let red_points = [0, 1]
+            .into_iter()
+            .map(|player_id| ranking.by_player_id[&player_id].team_points)
+            .sum::<i32>();
+        let blue_points = [2, 3, 4, 5]
+            .into_iter()
+            .map(|player_id| ranking.by_player_id[&player_id].team_points)
+            .sum::<i32>();
+        assert_eq!((red_points, blue_points), (18, 18));
+
+        room.settings.game_type = 4;
+        room.frozen_race.as_mut().unwrap().participants[0].team = 2;
+        assert_eq!(
+            World::settlement_ranking(room).unwrap().winning_team,
+            Some(ResultTeam::Blue)
+        );
+    }
+
+    #[test]
+    fn running_finish_rejects_stale_and_replacement_generations() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "RunFenceOwner", 67, 42_201, 64);
+        let guest = register_channel_session(&mut world, "RunFenceGuest", 67, 42_211, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        force_running(&mut world, room_id);
+        let before = world.protocol_rooms[&room_id].clone();
+        let replacement = migrate_channel_session(&mut world, &guest, 42_221, 64);
+        assert!(matches!(
+            world.race_command(
+                replacement.session,
+                game_control_request_with_value(2, 100),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::NotFrozenParticipant))
+        ));
+        assert!(matches!(
+            world.race_command(
+                guest.session,
+                game_control_request_with_value(2, 100),
+                Instant::now(),
+            ),
+            Err(WorldError::Identity(IdentityError::StaleSession(session)))
+                if session == guest.session
+        ));
+        assert_eq!(world.protocol_rooms[&room_id], before);
+    }
+
+    #[test]
+    fn running_room_without_exact_human_reconciles_to_all_dnf_settlement() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "OrphanOwner", 67, 42_251, 64);
+        let mut observer = register_channel_session(&mut world, "OrphanObserver", 67, 42_261, 1);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &observer, room_id, true);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut observer.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut observer.outbound);
+        force_running(&mut world, room_id);
+
+        let mut replacement = migrate_channel_session(&mut world, &owner, 42_271, 64);
+        let observer_sender = world.sessions[&observer.session].outbound.clone().unwrap();
+        observer_sender
+            .try_send(OutboundBatch::single(vec![0xE3]))
+            .unwrap();
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world.advance_loading(now, &clock);
+
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.phase, RoomPhase::Settling);
+        assert!(room.race_progress.finish_times.is_empty());
+        assert_eq!(room.race_progress.pending_fanouts.len(), 1);
+        let settlement = room.race_progress.settlement.as_ref().unwrap();
+        assert_eq!(settlement.deadline, now + Duration::from_secs(10));
+        assert!(matches!(
+            settlement.finalization,
+            super::SettlementFinalization::AwaitingDeadline
+        ));
+        assert_eq!(
+            observer.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xE3]]
+        );
+        assert!(replacement.outbound.try_recv().is_err());
+
+        world.advance_loading(now + Duration::from_millis(1), &clock);
+        let packets = take_packets(&mut observer.outbound);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            logical_packet_hash(&packets[0]),
+            adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+        );
+        assert_eq!(i32::from_le_bytes(packets[0][4..8].try_into().unwrap()), 3);
+        assert!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .pending_fanouts
+                .is_empty()
+        );
+        assert!(replacement.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_running_room_id_is_tombstoned_until_terminal_settlement() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "TombstoneOwner", 67, 42_281, 64);
+        let mut second = register_channel_session(&mut world, "TombstoneSecond", 67, 42_291, 64);
+        let third = register_channel_session(&mut world, "TombstoneThird", 67, 42_301, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, room_id);
+
+        world
+            .room_protocol(owner.session, RoomCommandPayload::Leave)
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let room = &world.protocol_rooms[&room_id];
+        assert!(room.is_empty());
+        assert_eq!(room.phase, RoomPhase::Running);
+        assert!(
+            !world
+                .free_protocol_room_ids
+                .contains(&u16::try_from(room_id.0).unwrap())
+        );
+
+        let second_room = create_protocol_room(&mut world, &second, 1);
+        assert_ne!(second_room, room_id);
+        drain_batches(&mut second.outbound);
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world.advance_loading(now, &clock);
+        let room = &world.protocol_rooms[&room_id];
+        assert!(room.is_empty());
+        assert_eq!(room.phase, RoomPhase::Settling);
+        let deadline = room.race_progress.settlement.as_ref().unwrap().deadline;
+        assert!(
+            !world
+                .free_protocol_room_ids
+                .contains(&u16::try_from(room_id.0).unwrap())
+        );
+
+        world.advance_loading(deadline, &clock);
+        assert!(!world.protocol_rooms.contains_key(&room_id));
+        assert!(
+            world
+                .free_protocol_room_ids
+                .contains(&u16::try_from(room_id.0).unwrap())
+        );
+        assert_eq!(create_protocol_room(&mut world, &third, 1), room_id);
+    }
+
+    #[test]
     fn team_full_and_server_owned_states_leave_the_room_unchanged() {
         let mut world = World::default();
         let mut sessions = (0..6)
@@ -4269,6 +6350,22 @@ mod tests {
         }
 
         let before = world.protocol_rooms[&room_id].clone();
+        let ai_plan = StartRoomPlan::new(
+            candidates.clone(),
+            vec![AiRaceSpec::try_from([1.0; 6]).unwrap()],
+        );
+        assert!(matches!(
+            world.lobby_command(owner.session, LobbyCommandPayload::StartRoom(ai_plan)),
+            Err(WorldError::Lobby(LobbyError::AiParticipantsUnsupported))
+        ));
+        assert_eq!(world.protocol_rooms[&room_id], before);
+        let failure = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(failure.len(), 1);
+        assert_eq!(
+            logical_packet_hash(&failure[0]),
+            adler32::packet_hash(START_ROOM_REPLY_NAME)
+        );
+
         let bounded =
             StartRoomPlan::new(candidates.clone(), Vec::new()).with_maximum_payload_length(1);
         assert!(matches!(

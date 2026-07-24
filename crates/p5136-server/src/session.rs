@@ -1099,6 +1099,7 @@ async fn handle_lobby_request(
             | LobbyError::TeamModeRequired
             | LobbyError::TeamFull { .. }
             | LobbyError::NoRacers
+            | LobbyError::AiParticipantsUnsupported
             | LobbyError::RacerNotReady { .. }
             | LobbyError::MissingTrackCandidates),
         )) => {
