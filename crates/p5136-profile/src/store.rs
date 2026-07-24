@@ -112,6 +112,54 @@ impl ProfileStore {
         self.load_or_create_locked(&nickname)
     }
 
+    /// Checks whether an operator-provisioned profile directory or cached
+    /// profile already exists without creating a per-nickname lock or any
+    /// filesystem state.
+    pub fn profile_exists(&self, nickname: &str) -> Result<bool, ProfileStoreError> {
+        let nickname = normalize_nickname(nickname)?;
+        if self.cached_profile(&nickname)?.is_some() {
+            return Ok(true);
+        }
+
+        let requested_key = canonical_nickname_key(&nickname);
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(ProfileStoreError::Io {
+                    operation: "list profile root",
+                    path: self.root.clone(),
+                    source,
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| ProfileStoreError::Io {
+                operation: "read profile root entry",
+                path: self.root.clone(),
+                source,
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|source| ProfileStoreError::Io {
+                    operation: "inspect profile root entry",
+                    path: entry.path(),
+                    source,
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if canonical_nickname_key(&name) == requested_key {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Drops one cached snapshot. The next load re-reads immutable revisions
     /// from disk, which is useful after an administrator restores files.
     pub fn invalidate(&self, nickname: &str) -> Result<(), ProfileStoreError> {
@@ -318,8 +366,9 @@ impl ProfileStore {
                 }
             }
 
-            match fs::rename(&temporary_path, &final_path) {
-                Ok(()) => {
+            match publish_new_file(&temporary_path, &final_path) {
+                Ok(true) => {
+                    let _ = fs::remove_file(&temporary_path);
                     sync_directory(&directory)?;
                     self.cache_profile(nickname, profile, Some(revision), final_path.clone())?;
                     return Ok(SavedProfile {
@@ -328,7 +377,7 @@ impl ProfileStore {
                         path: final_path,
                     });
                 }
-                Err(_source) if final_path.exists() => {
+                Ok(false) => {
                     let _ = fs::remove_file(&temporary_path);
                     revision = revision
                         .checked_add(1)
@@ -514,6 +563,19 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Publishes a fully synced temporary file without ever replacing an existing
+/// immutable revision. A same-directory hard link is an atomic create-if-absent
+/// primitive on both Unix and Windows.
+fn publish_new_file(temporary: &Path, destination: &Path) -> io::Result<bool> {
+    match fs::hard_link(temporary, destination) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists || destination.exists() => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<(), ProfileStoreError> {
     File::open(directory)
@@ -542,7 +604,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{ProfileStore, ProfileStoreError};
+    use super::{ProfileStore, ProfileStoreError, publish_new_file};
 
     #[test]
     fn creates_and_loads_an_immutable_first_revision() {
@@ -557,6 +619,36 @@ mod tests {
         assert!(!loaded.created);
         assert_eq!(loaded.revision, Some(1));
         assert_eq!(loaded.profile, created.profile);
+    }
+
+    #[test]
+    fn existence_probe_is_case_insensitive_and_does_not_allocate_for_unknown_names() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+
+        assert!(!store.profile_exists("Unknown").unwrap());
+        assert!(store.profile_locks.lock().unwrap().is_empty());
+        assert!(store.cache.lock().unwrap().is_empty());
+
+        store.load_or_create("Rider").unwrap();
+        assert!(store.profile_exists("rIDER").unwrap());
+    }
+
+    #[test]
+    fn immutable_revision_publish_never_replaces_an_existing_destination() {
+        let root = tempdir().unwrap();
+        let temporary = root.path().join(".revision.tmp");
+        let destination = root.path().join("Launcher.v1.json");
+        fs::write(&temporary, b"new revision").unwrap();
+        fs::write(&destination, b"existing revision").unwrap();
+
+        assert!(!publish_new_file(&temporary, &destination).unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), b"existing revision");
+        assert_eq!(fs::read(&temporary).unwrap(), b"new revision");
+
+        fs::remove_file(&destination).unwrap();
+        assert!(publish_new_file(&temporary, &destination).unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), b"new revision");
     }
 
     #[test]

@@ -12,7 +12,7 @@ Thumbs.db
 # Local work, unrelated simulations, and historical reverse-engineering notes
 /_scratch/
 /scratch/
-/analysis/
+/[Aa]nalysis/
 /_analysis/
 /past-analysis/
 /research/
@@ -20,10 +20,9 @@ Thumbs.db
 /KartRider-P5136/
 
 # Runtime profiles and proprietary client material must remain external
-/Profile/
-/profile/
-/client/
-/game/
+/[Pp][Rr][Oo][Ff][Ii][Ll][Ee]/
+/[Cc]lient/
+/[Gg]ame/
 *.exe
 *.dll
 *.pin

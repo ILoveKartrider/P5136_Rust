@@ -1,6 +1,6 @@
 [package]
 name = "p5136-cli"
-description = "Command-line entry point for the KartRider P5136 Rust port"
+description = "Desktop and command-line entry point for the KartRider P5136 Rust port"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -13,12 +13,21 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 p5136-connector = { path = "../p5136-connector" }
 p5136-core = { path = "../p5136-core" }
 p5136-server = { path = "../p5136-server" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
 
 [lints]
 workspace = true

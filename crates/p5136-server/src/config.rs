@@ -1,17 +1,30 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     time::Duration,
 };
 
 use p5136_core::{frame::DEFAULT_MAX_PAYLOAD, ports::PortTopology};
+
+pub const DEFAULT_MAX_LOGIN_SESSIONS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_address: IpAddr,
     pub advertised_address: Ipv4Addr,
     pub ports: PortTopology,
+    pub profile_root: PathBuf,
+    pub catalog_path: Option<PathBuf>,
     pub first_message_delay: Duration,
     pub login_timeout: Duration,
+    pub session_idle_timeout: Duration,
+    pub session_write_timeout: Duration,
+    pub max_login_sessions: usize,
+    /// Permit a non-loopback peer to create a previously unknown profile.
+    ///
+    /// Existing remote profiles can always log in. Keeping creation opt-in
+    /// prevents unauthenticated nicknames from growing disk and cache state.
+    pub allow_remote_profile_creation: bool,
     pub max_login_payload: usize,
     pub max_messenger_payload: usize,
 }
@@ -19,11 +32,17 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             advertised_address: Ipv4Addr::LOCALHOST,
             ports: PortTopology::default(),
+            profile_root: PathBuf::from("Profile"),
+            catalog_path: None,
             first_message_delay: Duration::from_millis(250),
             login_timeout: Duration::from_secs(12),
+            session_idle_timeout: Duration::from_secs(5 * 60),
+            session_write_timeout: Duration::from_secs(15),
+            max_login_sessions: DEFAULT_MAX_LOGIN_SESSIONS,
+            allow_remote_profile_creation: false,
             max_login_payload: DEFAULT_MAX_PAYLOAD,
             max_messenger_payload: 256 * 1024,
         }

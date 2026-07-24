@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 p5136-core = { path = "../p5136-core" }
+quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

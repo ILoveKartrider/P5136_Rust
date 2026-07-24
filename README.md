@@ -13,32 +13,50 @@ server. The implemented foundation provides:
 - P5136 TCP and UDP checksum/encryption with bounded frame decoders;
 - the Korean P5136 first-message payload;
 - authentication, login, identity fencing, and channel migration over real TCP;
-- an actor-owned room roster with stale-session cancellation;
+- request-driven startup replies plus catalog-backed rider inventory/equipment;
+- an actor-owned room-state foundation with stale-session cancellation;
+- bounded login concurrency and opt-in remote profile creation;
 - PIN/BML patching with immutable backups, a process lock, and atomic writes;
-- executable/PIN build detection and native, Wine, and CrossOver launch specs;
+- executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
 - versioned JSON profile persistence compatible with legacy `Launcher.json`;
-- one `p5136` command-line entry point.
+- a no-argument desktop connector GUI and an equivalent headless CLI.
 
-Post-login startup codecs are present, but the full inventory stream, room and
-race protocols, live connector launch, and desktop GUI still need integration.
+Room wire codecs and modern P5136 UDP codecs are present. Room runtime state,
+UDP/P2P relay, messenger, and race/gameplay flows still need integration.
 
 ## Build
 
 ```text
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p p5136-cli -- server --configured-port 39311
+cargo run -p p5136-cli
+cargo run -p p5136-cli -- server --catalog /path/to/KartCatalog.xml
 ```
 
 The configured port follows the original topology: login TCP is base `+ 1`,
 game UDP is base `+ 0`, P2P UDP is base `+ 1`, and messenger TCP is base `+ 2`.
 
-## Connector direction
+`KartCatalog.xml` is runtime data exported from a client installation and is
+never committed. Without `--catalog`, login and channel startup remain
+available, but `PqGetRider` is deliberately rejected rather than serving an
+incomplete inventory. Profiles default to `./Profile`; use `--profile-root` to
+change that location.
 
-The planned desktop connector is native Rust on each host. It launches only
-`KartRider.exe` through Wine or CrossOver on macOS/Linux; on Windows it launches
-the executable directly. CLI arguments select headless behavior. A no-argument
-launch will become the GUI entry point after PIN/XML patching is ported.
+The server binds to `127.0.0.1` by default. To serve another machine, set both
+`--bind` and `--advertise`. Existing profiles may log in remotely, but creating
+new profiles from non-loopback clients additionally requires the explicit
+`--allow-remote-profile-creation` option.
+
+## Connector
+
+The connector itself is a native Rust application on each host. With no
+arguments it opens the desktop GUI. On macOS/Linux it launches only
+`KartRider.exe` through Wine or CrossOver; on Windows, `auto` uses a UAC-backed
+native launch and refuses elevation unless the executable still has the known
+stock P5136 SHA-256. Use `p5136 connect --help` for the headless equivalent and
+`--dry-run` to inspect the complete plan without touching files, sockets, or
+processes. Closing the GUI cancels any uncommitted probe or launch; an atomic
+file preparation already in progress is allowed to finish safely.
 
 ## Provenance
 

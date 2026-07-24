@@ -14,8 +14,10 @@ not completion evidence.
 - [x] transactional four-socket bind and controlled shutdown
 - [x] fragmented and coalesced TCP frame coverage
 - [x] encoded primitive substitution table
-- [ ] game UDP framing and relay crypto
-- [ ] messenger framing
+- [x] game UDP envelope, routed header, control, and opaque-relay codecs
+- [x] messenger logical packet codecs
+- [ ] generation-bound UDP runtime and relay routing
+- [ ] messenger length-prefixed stream runtime
 
 ## Connector
 
@@ -29,16 +31,16 @@ not completion evidence.
 - [x] endpoint replacement and NGS toggle
 - [x] immutable pristine backup and absent-marker transaction
 - [x] process-wide patch lock and atomic same-directory replacement
-- [ ] Windows `runas` launch
-- [ ] live Wine/CrossOver launch
-- [ ] no-argument desktop GUI
+- [x] Windows UAC launch
+- [x] live Wine/CrossOver launch
+- [x] no-argument desktop GUI
 
 ## Login and identity
 
 - [x] `PqCnAuthenLogin` / `PrCnAuthenLogin`
 - [x] BML-backed `PqLogin` parser
 - [x] duplicate nickname rejection and stable user number
-- [ ] `PrLogin` and startup response sequence
+- [x] `PrLogin` and request-paired startup responses
 - [x] session generation and stale-owner rejection
 - [x] channel-switch permit creation
 - [x] `PqChannelMovein` ownership transfer
@@ -48,8 +50,9 @@ not completion evidence.
 
 - [x] actor-owned state mutation baseline
 - [x] atomic eight-slot concurrent room admission
-- [ ] channel catalog and channel membership
-- [ ] complete room create/list/join/leave protocol
+- [x] static channel catalog and migration membership binding
+- [x] room create/list/join/leave wire codecs
+- [ ] room create/list/join/leave runtime integration
 - [ ] ready/team/master/observer/AI state
 - [ ] generation-bound game UDP endpoint registration
 - [ ] generation-bound P2P endpoint registration
@@ -59,8 +62,8 @@ not completion evidence.
 ## Profile and gameplay
 
 - [x] profile load/cache/versioned atomic writer
-- [ ] rider/account initialization packets
-- [ ] inventory and equipment
+- [x] rider/account initialization packets
+- [x] catalog-backed inventory and equipment preload
 - [ ] kart grant/tuning/upgrades
 - [ ] quests, rewards, attendance, and progression
 - [ ] MyRoom state

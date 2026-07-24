@@ -26,6 +26,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libxcb-render0-dev
+          libxcb-shape0-dev
+          libxcb-xfixes0-dev
+          libxkbcommon-dev
+          libssl-dev
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:

@@ -9,10 +9,14 @@ version.workspace = true
 [dependencies]
 chrono.workspace = true
 p5136-core = { path = "../p5136-core" }
+p5136-profile = { path = "../p5136-profile" }
 rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
 
 [lints]
 workspace = true

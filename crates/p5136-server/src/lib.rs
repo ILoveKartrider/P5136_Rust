@@ -6,7 +6,7 @@ mod runtime;
 mod session;
 mod world;
 
-pub use config::{ServerConfig, ServerEndpoints};
+pub use config::{DEFAULT_MAX_LOGIN_SESSIONS, ServerConfig, ServerEndpoints};
 pub use identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
     IdentityRegistry, MIGRATION_TTL, MigrationCompletion, MigrationPermit, MigrationToken,

@@ -4,6 +4,7 @@ mod bml;
 mod codec_error;
 mod detection;
 mod encoded_block;
+mod execution;
 mod file_safety;
 mod identity;
 mod installation;
@@ -26,6 +27,11 @@ pub use encoded_block::{
     BlockEncoding, DEFAULT_KART_CRYPTO_KEY, DecodedBlock, EncodedBlockError, FLAG_KART_CRYPTO,
     FLAG_ZLIB, decode as decode_encoded_block, encode as encode_encoded_block,
 };
+pub use execution::{
+    ConnectorCancellation, ConnectorExecution, ConnectorExecutionError, ConnectorPlan,
+    ConnectorPlanError, ConnectorRequest, ConnectorStage, execute_connector,
+    execute_connector_with_progress, execute_connector_with_progress_and_cancellation,
+};
 pub use file_safety::{
     ConnectorFileError, PersistentFilePreparation, PristineAction, PristineState,
 };
@@ -34,7 +40,9 @@ pub use installation::{
     DEFAULT_INSTALLATION_LOCK_TIMEOUT, DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES, InstallationError,
     InstallationOptions, PreparedInstallation, prepare_installation,
 };
-pub use launch::{LaunchError, LaunchRequest, LaunchSpec, Runner};
+pub use launch::{
+    LaunchError, LaunchRequest, LaunchSpec, LaunchStatus, LaunchedProcess, Runner, RunnerBackend,
+};
 pub use limits::CodecLimits;
 pub use pin::{
     AuthMethod, P5136_MINOR_VERSION, P5136_PIN_MAGIC, PinDocument, PinHeader, PinPatchOptions,

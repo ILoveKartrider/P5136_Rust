@@ -1,16 +1,23 @@
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc};
 
+use p5136_profile::{CatalogInventory, CatalogInventoryError};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UdpSocket},
-    sync::watch,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinError, JoinHandle, JoinSet},
 };
 
-use crate::{ServerConfig, ServerEndpoints, WorldError, WorldHandle, session::run_login_session};
+use crate::{
+    ServerConfig, ServerEndpoints, WorldError, WorldHandle,
+    session::{ProfileCoordinator, run_login_session},
+};
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("maximum concurrent login sessions must be greater than zero")]
+    InvalidLoginSessionLimit,
+
     #[error("failed to bind game UDP listener")]
     BindGameUdp(#[source] io::Error),
 
@@ -25,6 +32,16 @@ pub enum ServerError {
 
     #[error("failed to inspect a bound listener address")]
     LocalAddress(#[source] io::Error),
+
+    #[error("failed to load inventory catalog {path}")]
+    LoadCatalog {
+        path: PathBuf,
+        #[source]
+        source: CatalogInventoryError,
+    },
+
+    #[error("inventory catalog loader task failed")]
+    CatalogTask(#[source] JoinError),
 
     #[error("{service} listener failed")]
     ListenerIo {
@@ -43,6 +60,7 @@ pub enum ServerError {
 #[derive(Debug)]
 pub struct BoundServer {
     config: ServerConfig,
+    catalog: Option<Arc<CatalogInventory>>,
     game_udp: UdpSocket,
     login_tcp: TcpListener,
     p2p_udp: UdpSocket,
@@ -53,6 +71,10 @@ impl BoundServer {
     /// Transactionally binds all four P5136 transports. If any bind fails,
     /// already-created sockets are dropped before the error is returned.
     pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
+        if config.max_login_sessions == 0 {
+            return Err(ServerError::InvalidLoginSessionLimit);
+        }
+        let catalog = load_catalog(config.catalog_path.clone()).await?;
         let bind_address = config.bind_address;
         let game_udp = UdpSocket::bind(SocketAddr::new(bind_address, config.ports.game_udp()))
             .await
@@ -70,6 +92,7 @@ impl BoundServer {
 
         Ok(Self {
             config,
+            catalog,
             game_udp,
             login_tcp,
             p2p_udp,
@@ -141,6 +164,64 @@ impl ServerHandle {
     }
 }
 
+async fn load_catalog(path: Option<PathBuf>) -> Result<Option<Arc<CatalogInventory>>, ServerError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let worker_path = path.clone();
+    let catalog = tokio::task::spawn_blocking(move || CatalogInventory::load(worker_path))
+        .await
+        .map_err(ServerError::CatalogTask)?
+        .map_err(|source| ServerError::LoadCatalog { path, source })?;
+    Ok(Some(Arc::new(catalog)))
+}
+
+fn spawn_login_session(
+    sessions: &mut JoinSet<()>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    permit: OwnedSemaphorePermit,
+    config: &ServerConfig,
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+) {
+    let world = world.clone();
+    let config = config.clone();
+    let profiles = profiles.clone();
+    sessions.spawn(async move {
+        let _permit = permit;
+        if let Err(error) = run_login_session(stream, peer, config, world, profiles).await {
+            tracing::debug!(%peer, %error, "login session closed");
+        }
+    });
+}
+
+fn try_login_session_permit(
+    permits: &Arc<Semaphore>,
+    maximum: usize,
+    peer: SocketAddr,
+) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(permits).try_acquire_owned().ok().or_else(|| {
+        tracing::debug!(%peer, maximum, "login session limit reached; rejecting connection");
+        None
+    })
+}
+
+async fn finish_supervisor(
+    mut sessions: JoinSet<()>,
+    world: WorldHandle,
+    world_task: JoinHandle<()>,
+    transport_result: Result<(), ServerError>,
+) -> Result<(), ServerError> {
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+    let world_shutdown = world.shutdown().await;
+    let world_join = world_task.await;
+    transport_result?;
+    world_shutdown?;
+    world_join.map_err(ServerError::SupervisorTask)
+}
+
 async fn run_supervisor(
     server: BoundServer,
     mut shutdown: watch::Receiver<bool>,
@@ -149,11 +230,14 @@ async fn run_supervisor(
 ) -> Result<(), ServerError> {
     let BoundServer {
         config,
+        catalog,
         game_udp,
         login_tcp,
         p2p_udp,
         messenger_tcp,
     } = server;
+    let profiles = ProfileCoordinator::new(config.profile_root.clone(), catalog);
+    let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let mut sessions = JoinSet::new();
     let mut game_buffer = vec![0_u8; 65_535];
     let mut p2p_buffer = vec![0_u8; 65_535];
@@ -168,13 +252,23 @@ async fn run_supervisor(
             accepted = login_tcp.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
-                        let world = world.clone();
-                        let config = config.clone();
-                        sessions.spawn(async move {
-                            if let Err(error) = run_login_session(stream, peer, config, world).await {
-                                tracing::debug!(%peer, %error, "login session closed");
-                            }
-                        });
+                        let Some(permit) = try_login_session_permit(
+                            &login_session_permits,
+                            config.max_login_sessions,
+                            peer,
+                        ) else {
+                            drop(stream);
+                            continue;
+                        };
+                        spawn_login_session(
+                            &mut sessions,
+                            stream,
+                            peer,
+                            permit,
+                            &config,
+                            &world,
+                            &profiles,
+                        );
                     }
                     Err(source) => {
                         break Err(ServerError::ListenerIo {
@@ -232,21 +326,16 @@ async fn run_supervisor(
         }
     };
 
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
-
-    let world_shutdown = world.shutdown().await;
-    let world_join = world_task.await;
-    transport_result?;
-    world_shutdown?;
-    world_join.map_err(ServerError::SupervisorTask)?;
-    Ok(())
+    finish_supervisor(sessions, world, world_task, transport_result).await
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt::Write as _,
+        fs,
         net::{IpAddr, Ipv4Addr},
+        path::Path,
         time::Duration,
     };
 
@@ -255,30 +344,48 @@ mod tests {
         bml::BmlNode,
         channel::serialize_pr_channel_move_in,
         frame, handshake,
-        login::serialize_pr_cn_authen_login,
+        login::{LegacyTime, serialize_pr_cn_authen_login},
         packet::{PacketReader, PacketWriter},
+        startup::{
+            GameOptions, PrGetRiderFields, serialize_channel_static_reply,
+            serialize_lo_rp_event_reward, serialize_pr_add_time_event_init,
+            serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_login_vip_info,
+        },
     };
+    use p5136_profile::{Profile, ProfileStore, rider_item_snapshot};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
         time,
     };
 
-    use super::BoundServer;
+    use super::{BoundServer, ServerError, ServerHandle, load_catalog};
     use crate::{ServerConfig, read_encrypted_frame};
+
+    struct LoginClient {
+        stream: TcpStream,
+        send_iv: u32,
+        receive_iv: u32,
+        user_no: u32,
+        pmap: u32,
+        screen: u8,
+    }
 
     #[tokio::test]
     async fn full_runtime_sends_exact_server_first_handshake_and_shuts_down() {
         let loopback = Ipv4Addr::LOCALHOST;
+        let profile_root = tempfile::tempdir().unwrap();
         let config = ServerConfig {
             bind_address: IpAddr::V4(loopback),
             advertised_address: loopback,
+            profile_root: profile_root.path().to_owned(),
             first_message_delay: Duration::ZERO,
             login_timeout: Duration::from_secs(2),
             ..ServerConfig::default()
         };
         let bound = BoundServer {
             config,
+            catalog: None,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
@@ -315,18 +422,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_auth_login_and_channel_migration_complete_over_real_tcp() {
+    async fn invalid_configured_catalog_fails_before_any_listener_is_bound() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let catalog_path = profile_root.path().join("invalid-catalog.xml");
+        fs::write(&catalog_path, b"<not-a-kart-catalog />").unwrap();
+        let config = ServerConfig {
+            profile_root: profile_root.path().to_owned(),
+            catalog_path: Some(catalog_path.clone()),
+            ..ServerConfig::default()
+        };
+
+        let error = BoundServer::bind(config).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ServerError::LoadCatalog { path, .. } if path == &catalog_path
+            ),
+            "unexpected bind error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_login_session_limit_is_rejected_before_binding() {
+        let error = BoundServer::bind(ServerConfig {
+            max_login_sessions: 0,
+            ..ServerConfig::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::InvalidLoginSessionLimit));
+    }
+
+    #[tokio::test]
+    async fn concurrent_login_session_limit_rejects_excess_connections() {
         let loopback = Ipv4Addr::LOCALHOST;
+        let profile_root = tempfile::tempdir().unwrap();
         let config = ServerConfig {
             bind_address: IpAddr::V4(loopback),
             advertised_address: loopback,
+            profile_root: profile_root.path().to_owned(),
             first_message_delay: Duration::ZERO,
             login_timeout: Duration::from_secs(2),
+            max_login_sessions: 1,
             ..ServerConfig::default()
         };
-        let maximum = config.max_login_payload;
         let bound = BoundServer {
             config,
+            catalog: None,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
@@ -335,12 +477,213 @@ mod tests {
         let server = bound.start().unwrap();
         let endpoints = server.endpoints();
 
-        let (mut source, mut source_send_iv, mut source_receive_iv, user_no) =
-            authenticate_and_login(endpoints.login_tcp, maximum).await;
+        let (first, _, _) = connect_login_client(endpoints.login_tcp).await;
+        wait_for_session_count(&server.world(), 1).await;
+        let mut excess = TcpStream::connect(endpoints.login_tcp).await.unwrap();
+        assert_login_socket_closed(&mut excess).await;
+        assert_eq!(server.world().session_count().await.unwrap(), 1);
+
+        drop(first);
+        wait_for_session_count(&server.world(), 0).await;
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_backed_startup_pairs_and_updates_flow_over_real_tcp() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let mut profile = Profile::default();
+        profile.rider.pmap = 0xaabb_ccdd;
+        profile.rider.premium = 9;
+        let mut initial_options = fixture_game_options(1);
+        initial_options.set_screen = 7;
+        apply_fixture_options(&mut profile, &initial_options);
+        ProfileStore::new(profile_root.path())
+            .save("ProfileRider", &profile)
+            .unwrap();
+
+        let (server, maximum) = start_test_server(profile_root.path(), None).await;
+        let mut client =
+            authenticate_and_login(server.endpoints().login_tcp, maximum, "ProfileRider").await;
+        assert_eq!(client.pmap, 0xaabb_ccdd);
+        assert_eq!(client.screen, 7);
+        assert_no_login_data(&mut client.stream).await;
+
+        assert_eq!(
+            request_named(&mut client, "PqLoginVipInfo", maximum).await,
+            serialize_pr_login_vip_info(9)
+        );
+        assert_no_login_data(&mut client.stream).await;
+        assert_eq!(
+            request_named(&mut client, "LoRqEventRewardPacket", maximum).await,
+            serialize_lo_rp_event_reward()
+        );
+        assert_no_login_data(&mut client.stream).await;
+
+        let add_time = request_named(&mut client, "PqAddTimeEventInitPacket", maximum).await;
+        let response_time = LegacyTime {
+            days_since_1900: u16::from_le_bytes([add_time[56], add_time[57]]),
+            quarter_seconds: u16::from_le_bytes([add_time[58], add_time[59]]),
+        };
+        assert_eq!(add_time, serialize_pr_add_time_event_init(response_time));
+        assert_eq!(
+            request_named(&mut client, "ChRequestChStaticRequestPacket", maximum).await,
+            serialize_channel_static_reply()
+        );
+        assert_eq!(
+            request_named(&mut client, "PqGetGameOption", maximum).await,
+            serialize_pr_get_game_option(&initial_options)
+        );
+
+        let updated_options = fixture_game_options(31);
+        send_game_option_update(&mut client, &updated_options, maximum).await;
+        assert_eq!(
+            request_named(&mut client, "PqGetGameOption", maximum).await,
+            serialize_pr_get_game_option(&updated_options)
+        );
+
+        let get_rider = PacketWriter::named("PqGetRider").into_inner();
+        send_packet(&mut client.stream, &get_rider, &mut client.send_iv, maximum).await;
+        assert_login_socket_closed(&mut client.stream).await;
+        wait_for_session_count(&server.world(), 0).await;
+        server.shutdown().await.unwrap();
+
+        let persisted = ProfileStore::new(profile_root.path())
+            .load_or_create("ProfileRider")
+            .unwrap();
+        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(
+            persisted.profile.game_option.video_quality,
+            updated_options.video_quality
+        );
+        assert_eq!(
+            persisted.profile.game_option.screen,
+            updated_options.set_screen
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_inventory_precedes_get_rider_and_late_request_is_a_noop() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let catalog_path = profile_root.path().join("KartCatalog.xml");
+        fs::write(&catalog_path, complete_catalog_xml()).unwrap();
+
+        let nickname = "InventoryRider";
+        let mut profile = Profile::default();
+        profile.rider.emblem1 = -12_345;
+        profile.rider.emblem2 = 23_456;
+        profile.rider.lucci = 0xdead_beef;
+        profile.rider.rp = 0xfedc_ba98;
+        profile.rider.premium = 17;
+        profile.rider_item.character = 0x0102;
+        profile.rider_item.paint = 0x0304;
+        profile.rider_item.kart = 1_450;
+        profile.rider_item.pet = 0x0506;
+        profile.rider_item.dye = 0x0708;
+        profile.rider_item.kart_serial = 0;
+        profile.rider_item.unknown4 = 0xa5;
+        profile.rider_item.kart_coating = 0x090a;
+        profile.rider_item.kart_tail_lamp = 0x0b0c;
+        ProfileStore::new(profile_root.path())
+            .save(nickname, &profile)
+            .unwrap();
+
+        let expected_rider = serialize_pr_get_rider(&PrGetRiderFields {
+            nickname: nickname.to_owned(),
+            emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
+            emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
+            rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
+            lucci: profile.rider.lucci,
+            rp: i32::from_le_bytes(profile.rider.rp.to_le_bytes()),
+        })
+        .unwrap();
+
+        let (server, maximum) = start_test_server(profile_root.path(), Some(&catalog_path)).await;
+        let mut client =
+            authenticate_and_login(server.endpoints().login_tcp, maximum, nickname).await;
+        let get_rider = PacketWriter::named("PqGetRider").into_inner();
+        send_packet(&mut client.stream, &get_rider, &mut client.send_iv, maximum).await;
+
+        let mut final_rider = None;
+        let mut response_count = 0_usize;
+        while response_count < 256 {
+            let packet = time::timeout(
+                Duration::from_secs(5),
+                read_encrypted_frame(&mut client.stream, &mut client.receive_iv, maximum),
+            )
+            .await
+            .expect("timed out waiting for the catalog inventory sequence")
+            .unwrap();
+            response_count += 1;
+            let mut reader = PacketReader::new(&packet);
+            let hash = reader.read_u32().unwrap();
+            if response_count == 1 {
+                assert_eq!(hash, adler32::packet_hash("LoRpGetRiderItemPacket"));
+                assert_eq!(reader.read_i32().unwrap(), 1);
+                assert_eq!(reader.read_i32().unwrap(), 1);
+                assert_eq!(reader.read_i32().unwrap(), 100);
+                assert_eq!(reader.read_u16().unwrap(), 21);
+                assert_eq!(reader.read_u16().unwrap(), 1);
+            }
+            if hash == adler32::packet_hash("PrGetRider") {
+                final_rider = Some(packet);
+                break;
+            }
+        }
+
+        assert!(response_count > 1);
+        assert_eq!(
+            final_rider.expect("inventory sequence omitted final PrGetRider"),
+            expected_rider
+        );
+
+        let late_request = PacketWriter::named("LoRqGetRiderItemPacket").into_inner();
+        send_packet(
+            &mut client.stream,
+            &late_request,
+            &mut client.send_iv,
+            maximum,
+        )
+        .await;
+        assert_no_login_data(&mut client.stream).await;
+        assert_eq!(
+            request_named(&mut client, "PqLoginVipInfo", maximum).await,
+            serialize_pr_login_vip_info(17)
+        );
+
+        drop(client);
+        wait_for_session_count(&server.world(), 0).await;
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn encrypted_auth_login_and_channel_migration_complete_over_real_tcp() {
+        let loopback = Ipv4Addr::LOCALHOST;
+        let profile_root = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            bind_address: IpAddr::V4(loopback),
+            advertised_address: loopback,
+            profile_root: profile_root.path().to_owned(),
+            first_message_delay: Duration::ZERO,
+            login_timeout: Duration::from_secs(2),
+            ..ServerConfig::default()
+        };
+        let maximum = config.max_login_payload;
+        let bound = BoundServer {
+            config,
+            catalog: None,
+            game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
+            login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
+            messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+        };
+        let server = bound.start().unwrap();
+        let endpoints = server.endpoints();
+
+        let mut source = authenticate_and_login(endpoints.login_tcp, maximum, "Yany2").await;
         let (selected_channel, migration_token) = request_channel_switch(
-            &mut source,
-            &mut source_send_iv,
-            &mut source_receive_iv,
+            &mut source.stream,
+            &mut source.send_iv,
+            &mut source.receive_iv,
             maximum,
             12,
         )
@@ -350,9 +693,9 @@ mod tests {
         // A second request replaces the first permit. Completing the older
         // token must neither transfer ownership nor cancel the source socket.
         let (latest_channel, latest_token) = request_channel_switch(
-            &mut source,
-            &mut source_send_iv,
-            &mut source_receive_iv,
+            &mut source.stream,
+            &mut source.send_iv,
+            &mut source.receive_iv,
             maximum,
             11,
         )
@@ -362,7 +705,7 @@ mod tests {
         let (mut stale_destination, mut stale_send_iv, _) =
             connect_login_client(endpoints.login_tcp).await;
         let mut stale_move_in = PacketWriter::named("PqChannelMovein");
-        stale_move_in.write_u32(user_no);
+        stale_move_in.write_u32(source.user_no);
         stale_move_in.write_u16(selected_channel);
         stale_move_in.write_u16(migration_token);
         send_packet(
@@ -374,12 +717,12 @@ mod tests {
         .await;
         assert_login_socket_closed(&mut stale_destination).await;
         wait_for_session_count(&server.world(), 1).await;
-        assert_login_socket_open(&mut source).await;
+        assert_login_socket_open(&mut source.stream).await;
 
         let (mut destination, mut destination_send_iv, mut destination_receive_iv) =
             connect_login_client(endpoints.login_tcp).await;
         let mut move_in = PacketWriter::named("PqChannelMovein");
-        move_in.write_u32(user_no);
+        move_in.write_u32(source.user_no);
         move_in.write_u16(latest_channel);
         move_in.write_u16(latest_token);
         send_packet(
@@ -395,17 +738,229 @@ mod tests {
                 .unwrap();
         assert_eq!(move_in_reply, serialize_pr_channel_move_in(39_311, 39_312));
 
-        assert_login_socket_closed(&mut source).await;
+        let vip_request = PacketWriter::named("PqLoginVipInfo").into_inner();
+        send_packet(
+            &mut destination,
+            &vip_request,
+            &mut destination_send_iv,
+            maximum,
+        )
+        .await;
+        let vip_reply =
+            read_encrypted_frame(&mut destination, &mut destination_receive_iv, maximum)
+                .await
+                .unwrap();
+        assert_eq!(vip_reply, serialize_pr_login_vip_info(5));
+
+        assert_login_socket_closed(&mut source.stream).await;
         wait_for_session_count(&server.world(), 1).await;
         drop(destination);
         wait_for_session_count(&server.world(), 0).await;
         server.shutdown().await.unwrap();
     }
 
+    async fn start_test_server(
+        profile_root: &Path,
+        catalog_path: Option<&Path>,
+    ) -> (ServerHandle, usize) {
+        let loopback = Ipv4Addr::LOCALHOST;
+        let config = ServerConfig {
+            bind_address: IpAddr::V4(loopback),
+            advertised_address: loopback,
+            profile_root: profile_root.to_owned(),
+            catalog_path: catalog_path.map(Path::to_owned),
+            first_message_delay: Duration::ZERO,
+            login_timeout: Duration::from_secs(2),
+            ..ServerConfig::default()
+        };
+        let maximum = config.max_login_payload;
+        let catalog = load_catalog(config.catalog_path.clone()).await.unwrap();
+        let bound = BoundServer {
+            config,
+            catalog,
+            game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
+            login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
+            messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+        };
+        (bound.start().unwrap(), maximum)
+    }
+
+    async fn request_named(
+        client: &mut LoginClient,
+        request_name: &str,
+        maximum: usize,
+    ) -> Vec<u8> {
+        let request = PacketWriter::named(request_name).into_inner();
+        send_packet(&mut client.stream, &request, &mut client.send_iv, maximum).await;
+        read_encrypted_frame(&mut client.stream, &mut client.receive_iv, maximum)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_no_login_data(stream: &mut TcpStream) {
+        let mut byte = [0_u8; 1];
+        assert!(
+            time::timeout(Duration::from_millis(50), stream.read(&mut byte))
+                .await
+                .is_err(),
+            "server sent a startup reply before the matching request"
+        );
+    }
+
+    async fn send_game_option_update(
+        client: &mut LoginClient,
+        options: &GameOptions,
+        maximum: usize,
+    ) {
+        let mut request = PacketWriter::named("PqUpdateGameOption");
+        request.write_f32(options.bgm_volume);
+        request.write_f32(options.sound_volume);
+        request.write_bytes(&[
+            options.main_bgm,
+            options.sound_effect,
+            options.full_screen,
+            options.show_mirror,
+            options.show_other_player_names,
+            options.show_outlines,
+            options.show_shadows,
+            options.high_level_effect,
+            options.motion_blur_effect,
+            options.motion_distortion_effect,
+            options.high_end_optimization,
+            options.auto_ready,
+            options.prop_description,
+            options.video_quality,
+            options.bgm_check,
+            options.sound_check,
+            options.show_hit_info,
+            options.auto_boost,
+            options.game_type,
+            options.set_ghost,
+            options.speed_type,
+            options.room_chat,
+            options.driving_chat,
+            options.show_all_player_hit_info,
+            options.show_team_color,
+            options.set_screen,
+            options.hide_competitive_rank,
+        ]);
+        send_packet(
+            &mut client.stream,
+            request.as_slice(),
+            &mut client.send_iv,
+            maximum,
+        )
+        .await;
+    }
+
+    fn fixture_game_options(offset: u8) -> GameOptions {
+        GameOptions {
+            bgm_volume: f32::from(offset) / 100.0,
+            sound_volume: f32::from(offset) / 200.0,
+            main_bgm: offset,
+            sound_effect: offset + 1,
+            full_screen: offset + 2,
+            show_mirror: offset + 3,
+            show_other_player_names: offset + 4,
+            show_outlines: offset + 5,
+            show_shadows: offset + 6,
+            high_level_effect: offset + 7,
+            motion_blur_effect: offset + 8,
+            motion_distortion_effect: offset + 9,
+            high_end_optimization: offset + 10,
+            auto_ready: offset + 11,
+            prop_description: offset + 12,
+            video_quality: offset + 13,
+            bgm_check: offset + 14,
+            sound_check: offset + 15,
+            show_hit_info: offset + 16,
+            auto_boost: offset + 17,
+            game_type: offset + 18,
+            set_ghost: offset + 19,
+            speed_type: offset + 20,
+            room_chat: offset + 21,
+            driving_chat: offset + 22,
+            show_all_player_hit_info: offset + 23,
+            show_team_color: offset + 24,
+            set_screen: offset + 25,
+            hide_competitive_rank: offset + 26,
+        }
+    }
+
+    fn apply_fixture_options(profile: &mut Profile, options: &GameOptions) {
+        let destination = &mut profile.game_option;
+        destination.bgm_volume = options.bgm_volume;
+        destination.sound_volume = options.sound_volume;
+        destination.main_bgm = options.main_bgm;
+        destination.sound_effect = options.sound_effect;
+        destination.full_screen = options.full_screen;
+        destination.show_mirror = options.show_mirror;
+        destination.show_other_player_names = options.show_other_player_names;
+        destination.show_outlines = options.show_outlines;
+        destination.show_shadows = options.show_shadows;
+        destination.high_level_effect = options.high_level_effect;
+        destination.motion_blur_effect = options.motion_blur_effect;
+        destination.motion_distortion_effect = options.motion_distortion_effect;
+        destination.high_end_optimization = options.high_end_optimization;
+        destination.auto_ready = options.auto_ready;
+        destination.prop_description = options.prop_description;
+        destination.video_quality = options.video_quality;
+        destination.bgm_check = options.bgm_check;
+        destination.sound_check = options.sound_check;
+        destination.show_hit_info = options.show_hit_info;
+        destination.auto_boost = options.auto_boost;
+        destination.game_type = options.game_type;
+        destination.set_ghost = options.set_ghost;
+        destination.speed_type = options.speed_type;
+        destination.room_chat = options.room_chat;
+        destination.driving_chat = options.driving_chat;
+        destination.show_all_player_hit_info = options.show_all_player_hit_info;
+        destination.show_team_color = options.show_team_color;
+        destination.screen = options.set_screen;
+        destination.hide_competitive_rank = options.hide_competitive_rank;
+    }
+
+    fn complete_catalog_xml() -> String {
+        const GRANT_CATEGORIES: &[u16] = &[
+            1, 2, 3, 4, 7, 8, 9, 11, 12, 13, 14, 16, 18, 20, 21, 22, 23, 26, 27, 28, 30, 31, 32,
+            36, 37, 38, 39, 43, 44, 45, 46, 49, 52, 53, 55, 59, 61, 67, 68, 69, 70,
+        ];
+        const OTHER_CATEGORIES: &[u16] = &[
+            5, 6, 10, 15, 17, 19, 24, 25, 29, 33, 34, 35, 40, 41, 42, 47, 48, 50, 51,
+        ];
+
+        let mut items = Vec::new();
+        for &category in GRANT_CATEGORIES {
+            let count = if category == 3 { 1_300 } else { 120 };
+            for id in 1..=count {
+                items.push((category, id));
+            }
+        }
+        items.push((3, 1_450));
+        items.push((3, 1_453));
+        for &category in OTHER_CATEGORIES {
+            for id in 1..=40 {
+                items.push((category, id));
+            }
+        }
+
+        let mut xml = format!(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr"><Inventory total="{}" categories="60">"#,
+            items.len()
+        );
+        for (category, id) in items {
+            write!(xml, r#"<Item category="{category}" id="{id}" />"#).unwrap();
+        }
+        xml.push_str("</Inventory></KartCatalog>");
+        xml
+    }
+
     async fn authenticate_and_login(
         endpoint: std::net::SocketAddr,
         maximum: usize,
-    ) -> (TcpStream, u32, u32, u32) {
+        nickname: &str,
+    ) -> LoginClient {
         let (mut source, mut send_iv, mut receive_iv) = connect_login_client(endpoint).await;
         let auth_request = PacketWriter::named("PqCnAuthenLogin").into_inner();
         send_packet(&mut source, &auth_request, &mut send_iv, maximum).await;
@@ -414,7 +969,7 @@ mod tests {
             .unwrap();
         assert_eq!(auth_reply, serialize_pr_cn_authen_login().unwrap());
 
-        let login_request = build_login_request("Yany2");
+        let login_request = build_login_request(nickname);
         send_packet(&mut source, &login_request, &mut send_iv, maximum).await;
         let login_reply = read_encrypted_frame(&mut source, &mut receive_iv, maximum)
             .await
@@ -426,8 +981,32 @@ mod tests {
         let _quarter_seconds = reader.read_u16().unwrap();
         let user_no = reader.read_u32().unwrap();
         assert_eq!(user_no, 1);
-        assert_eq!(reader.read_utf16().unwrap(), "Yany2");
-        (source, send_iv, receive_iv, user_no)
+        assert_eq!(reader.read_utf16().unwrap(), nickname);
+        reader.read_bytes(12).unwrap();
+        let pmap = reader.read_u32().unwrap();
+        reader.read_bytes(45).unwrap();
+        reader.read_bytes(12).unwrap();
+        reader.read_i32().unwrap();
+        assert!(reader.read_utf16().unwrap().is_empty());
+        reader.read_i32().unwrap();
+        reader.read_u8().unwrap();
+        assert_eq!(reader.read_utf16().unwrap(), "content");
+        reader.read_i32().unwrap();
+        reader.read_i32().unwrap();
+        assert_eq!(reader.read_utf16().unwrap(), "cc");
+        assert_eq!(reader.read_utf16().unwrap(), "kr");
+        reader.read_i32().unwrap();
+        reader.read_u8().unwrap();
+        let screen = reader.read_u8().unwrap();
+        assert!(reader.remaining().is_empty());
+        LoginClient {
+            stream: source,
+            send_iv,
+            receive_iv,
+            user_no,
+            pmap,
+            screen,
+        }
     }
 
     async fn request_channel_switch(
