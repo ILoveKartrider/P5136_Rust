@@ -22,4 +22,5 @@ pub mod race_result_protocol;
 pub mod race_start_protocol;
 pub mod room_protocol;
 pub mod startup;
+pub mod track;
 pub mod udp_protocol;
