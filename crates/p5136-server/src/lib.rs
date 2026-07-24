@@ -4,6 +4,7 @@ mod config;
 mod identity;
 mod messenger_hub;
 mod messenger_runtime;
+mod myroom_hub;
 mod runtime;
 mod session;
 mod udp_runtime;

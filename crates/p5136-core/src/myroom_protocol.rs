@@ -367,7 +367,7 @@ pub fn serialize_enter_reply(
         owner_nickname,
         MAX_RIDER_NICKNAME_UTF16_UNITS,
     )?;
-    validate_info(info)?;
+    validate_myroom_info(info)?;
     let mut packet = PacketWriter::named(ENTER_MYROOM_REPLY_NAME);
     packet.write_utf16(owner_nickname)?;
     packet.write_u8(status as u8);
@@ -380,7 +380,7 @@ pub fn serialize_enter_error(status: EnterMyRoomStatus) -> Result<Vec<u8>, MyRoo
 }
 
 pub fn serialize_myroom_info(info: &MyRoomInfo) -> Result<Vec<u8>, MyRoomProtocolError> {
-    validate_info(info)?;
+    validate_myroom_info(info)?;
     let mut packet = PacketWriter::named(NOTIFY_MYROOM_INFO_NAME);
     write_myroom_info(&mut packet, info)?;
     Ok(packet.into_inner())
@@ -457,16 +457,7 @@ pub fn serialize_slot_data(slots: &[MyRoomSlot]) -> Result<Vec<u8>, MyRoomProtoc
     }
     for slot in slots {
         if let MyRoomSlot::Player(player) = slot {
-            validate_string(
-                "MyRoom rider nickname",
-                &player.nickname,
-                MAX_RIDER_NICKNAME_UTF16_UNITS,
-            )?;
-            validate_string(
-                "MyRoom club name",
-                &player.club_name,
-                MAX_CLUB_NAME_UTF16_UNITS,
-            )?;
+            validate_myroom_player_slot(player)?;
         }
     }
 
@@ -733,7 +724,9 @@ fn write_myroom_info(
     Ok(())
 }
 
-fn validate_info(info: &MyRoomInfo) -> Result<(), MyRoomProtocolError> {
+/// Validates every variable-length field in a `MyRoom` info snapshot without
+/// allocating or serializing it.
+pub fn validate_myroom_info(info: &MyRoomInfo) -> Result<(), MyRoomProtocolError> {
     validate_string(
         "MyRoom room password",
         &info.room_password,
@@ -743,6 +736,21 @@ fn validate_info(info: &MyRoomInfo) -> Result<(), MyRoomProtocolError> {
         "MyRoom item password",
         &info.item_password,
         MAX_MYROOM_PASSWORD_UTF16_UNITS,
+    )
+}
+
+/// Validates every variable-length field in a `MyRoom` player snapshot without
+/// allocating or serializing it.
+pub fn validate_myroom_player_slot(player: &MyRoomPlayerSlot) -> Result<(), MyRoomProtocolError> {
+    validate_string(
+        "MyRoom rider nickname",
+        &player.nickname,
+        MAX_RIDER_NICKNAME_UTF16_UNITS,
+    )?;
+    validate_string(
+        "MyRoom club name",
+        &player.club_name,
+        MAX_CLUB_NAME_UTF16_UNITS,
     )
 }
 
@@ -833,7 +841,7 @@ mod tests {
         serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
         serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
         serialize_rider_echo, serialize_secede_reply, serialize_slot_data,
-        serialize_update_main_emblem_reply,
+        serialize_update_main_emblem_reply, validate_myroom_info, validate_myroom_player_slot,
     };
     use crate::{
         adler32,
@@ -1328,6 +1336,13 @@ mod tests {
 
         let mut oversized_nickname = base.clone();
         oversized_nickname.nickname = "x".repeat(MAX_RIDER_NICKNAME_UTF16_UNITS + 1);
+        assert!(matches!(
+            validate_myroom_player_slot(&oversized_nickname),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom rider nickname",
+                ..
+            })
+        ));
         slots[0] = MyRoomSlot::Player(oversized_nickname);
         assert!(matches!(
             serialize_slot_data(&slots),
@@ -1340,6 +1355,13 @@ mod tests {
 
         let mut oversized_club = base;
         oversized_club.club_name = "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1);
+        assert!(matches!(
+            validate_myroom_player_slot(&oversized_club),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom club name",
+                ..
+            })
+        ));
         slots[0] = MyRoomSlot::Player(oversized_club);
         assert!(matches!(
             serialize_slot_data(&slots),
@@ -1391,6 +1413,13 @@ mod tests {
         let oversized_password = "x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1);
         let mut info = sample_info();
         info.room_password = oversized_password;
+        assert!(matches!(
+            validate_myroom_info(&info),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom room password",
+                ..
+            })
+        ));
         assert!(matches!(
             serialize_myroom_info(&info),
             Err(MyRoomProtocolError::StringTooLong { .. })
