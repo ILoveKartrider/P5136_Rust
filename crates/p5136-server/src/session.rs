@@ -1,4 +1,10 @@
-use std::{io, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use chrono::{Local, NaiveDate, Timelike};
 use p5136_core::{
@@ -15,6 +21,11 @@ use p5136_core::{
         serialize_pr_login,
     },
     packet::PacketError,
+    room_protocol::{
+        RoomPlayer, RoomProtocolError, RoomProtocolRequest, classify_room_protocol_request,
+        parse_ch_create_room_request, parse_ch_get_room_list_request, parse_ch_join_room_request,
+        parse_ch_leave_room_request, parse_gr_first_request,
+    },
     startup::{
         self, PrGetRiderFields, StartupError, StartupRequest, classify_startup_request,
         is_startup_noop, parse_pq_update_game_option,
@@ -29,7 +40,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, OwnedMutexGuard, oneshot},
+    sync::{Mutex, OwnedMutexGuard, mpsc, oneshot},
     task::JoinError,
     time,
 };
@@ -37,6 +48,7 @@ use tokio::{
 use crate::{
     ChannelBinding, IdentityBinding, MigrationToken, ServerConfig, SessionId, UserNo, WorldError,
     WorldHandle,
+    world::{OutboundBatch, RoomCommandPayload, RoomParticipant},
 };
 
 #[derive(Debug, Error)]
@@ -70,6 +82,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     InventoryProtocol(#[from] InventoryError),
+
+    #[error(transparent)]
+    RoomProtocol(#[from] RoomProtocolError),
 
     #[error("profile worker task failed")]
     ProfileWorker(#[from] JoinError),
@@ -105,6 +120,9 @@ pub enum LoginSessionError {
 
     #[error("login session was superseded by a newer channel generation")]
     Superseded,
+
+    #[error("the world actor closed the login session's outbound queue")]
+    OutboundClosed,
 
     #[error("the session has no profile bound to its current identity generation")]
     ProfileNotBound,
@@ -371,7 +389,7 @@ pub(crate) async fn run_login_session(
     world: WorldHandle,
     profiles: ProfileCoordinator,
 ) -> Result<(), LoginSessionError> {
-    let (session_id, mut cancellation) = world.register_login_session(peer).await?;
+    let (session_id, mut cancellation, mut outbound) = world.register_login_session(peer).await?;
     let registration = SessionRegistration {
         id: session_id,
         world: world.clone(),
@@ -384,6 +402,7 @@ pub(crate) async fn run_login_session(
         &profiles,
         session_id,
         &mut cancellation,
+        &mut outbound,
     )
     .await;
     let close_result = registration.close().await;
@@ -424,7 +443,9 @@ async fn run_registered_session(
     profiles: &ProfileCoordinator,
     session_id: SessionId,
     cancellation: &mut oneshot::Receiver<()>,
+    outbound: &mut mpsc::Receiver<OutboundBatch>,
 ) -> Result<(), LoginSessionError> {
+    let peer = peer_label(stream);
     tokio::select! {
         biased;
         _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
@@ -454,50 +475,49 @@ async fn run_registered_session(
     // absolute deadline. A client cannot hold a slot forever by trickling
     // harmless pre-login frames.
     let login_deadline = time::Instant::now() + config.login_timeout;
-    let first = tokio::select! {
-        biased;
-        _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
-        result = read_session_frame(
-            stream,
+    let (mut reader, mut writer) = stream.split();
+    loop {
+        // Keep this exact future alive while broadcasts are written. Dropping a
+        // partially completed read_exact would consume bytes and desynchronize
+        // the next encrypted frame.
+        let frame = read_session_frame(
+            &mut reader,
             &mut receive_iv,
             config.max_login_payload,
-            false,
+            context.is_authenticated(),
             login_deadline,
             config.session_idle_timeout,
-        ) => result?,
-    };
-    trace_packet(peer_label(stream), &first)?;
-    tokio::select! {
-        biased;
-        _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
-        result = process_and_write(
-            stream,
-            &services,
-            &first,
-            &mut context,
-            &mut send_iv,
-        ) => result?,
-    }
-
-    loop {
-        let packet = tokio::select! {
-            biased;
-            _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
-            result = read_session_frame(
-                stream,
-                &mut receive_iv,
-                config.max_login_payload,
-                context.is_authenticated(),
-                login_deadline,
-                config.session_idle_timeout,
-            ) => result?,
+        );
+        tokio::pin!(frame);
+        let packet = loop {
+            tokio::select! {
+                biased;
+                _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
+                batch = outbound.recv() => {
+                    let batch = batch.ok_or(LoginSessionError::OutboundClosed)?;
+                    tokio::select! {
+                        biased;
+                        _ = &mut *cancellation => {
+                            return Err(LoginSessionError::Superseded);
+                        }
+                        result = write_outbound_batch(
+                            &mut writer,
+                            batch,
+                            &mut send_iv,
+                            config,
+                        ) => result?,
+                    }
+                }
+                result = &mut frame => break result?,
+            }
         };
-        trace_packet(peer_label(stream), &packet)?;
+
+        trace_packet(peer, &packet)?;
         tokio::select! {
             biased;
             _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
             result = process_and_write(
-                stream,
+                &mut writer,
                 &services,
                 &packet,
                 &mut context,
@@ -507,19 +527,49 @@ async fn run_registered_session(
     }
 }
 
-async fn process_and_write(
-    stream: &mut TcpStream,
+async fn process_and_write<W>(
+    writer: &mut W,
     services: &SessionServices<'_>,
     packet: &[u8],
     context: &mut SessionContext,
     send_iv: &mut u32,
-) -> Result<(), LoginSessionError> {
+) -> Result<(), LoginSessionError>
+where
+    W: AsyncWrite + Unpin,
+{
     let responses = dispatch_packet(services, packet, context).await?;
     for response in responses {
-        let wire = frame::encode_encrypted(&response, send_iv, services.config.max_login_payload)?;
-        write_session_bytes(stream, &wire, services.config.session_write_timeout).await?;
+        write_logical_packet(writer, &response, send_iv, services.config).await?;
     }
     Ok(())
+}
+
+async fn write_outbound_batch<W>(
+    writer: &mut W,
+    batch: OutboundBatch,
+    send_iv: &mut u32,
+    config: &ServerConfig,
+) -> Result<(), LoginSessionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    for packet in batch.into_packets() {
+        write_logical_packet(writer, &packet, send_iv, config).await?;
+    }
+    Ok(())
+}
+
+async fn write_logical_packet<W>(
+    writer: &mut W,
+    packet: &[u8],
+    send_iv: &mut u32,
+    config: &ServerConfig,
+) -> Result<(), LoginSessionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let wire = frame::encode_encrypted(packet, send_iv, config.max_login_payload)?;
+    write_session_bytes(writer, &wire, config.session_write_timeout).await
 }
 
 async fn dispatch_packet(
@@ -580,6 +630,17 @@ async fn dispatch_packet(
             services.world,
             services.profiles,
             services.session_id,
+            packet,
+            context,
+        )
+        .await;
+    }
+
+    if let Some(request) = classify_room_protocol_request(hash) {
+        return handle_room_request(
+            services.world,
+            services.session_id,
+            request,
             packet,
             context,
         )
@@ -687,6 +748,81 @@ async fn handle_channel_move_in(
         config.ports.game_udp(),
         config.ports.p2p_udp(),
     )])
+}
+
+async fn handle_room_request(
+    world: &WorldHandle,
+    session_id: SessionId,
+    request: RoomProtocolRequest,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let payload = match request {
+        RoomProtocolRequest::RoomList => {
+            RoomCommandPayload::List(parse_ch_get_room_list_request(packet)?)
+        }
+        RoomProtocolRequest::CreateRoom => {
+            let request = parse_ch_create_room_request(packet)?;
+            let identity = world.authorize_identity(session_id).await?;
+            let profile = context.profile_for(&identity)?;
+            RoomCommandPayload::Create {
+                request,
+                participant: room_participant_from_profile(&identity, profile),
+            }
+        }
+        RoomProtocolRequest::JoinRoom => {
+            let request = parse_ch_join_room_request(packet)?;
+            let identity = world.authorize_identity(session_id).await?;
+            let profile = context.profile_for(&identity)?;
+            RoomCommandPayload::Join {
+                request,
+                participant: room_participant_from_profile(&identity, profile),
+            }
+        }
+        RoomProtocolRequest::LeaveRoom => {
+            let _ = parse_ch_leave_room_request(packet)?;
+            RoomCommandPayload::Leave
+        }
+        RoomProtocolRequest::FirstRoomState => {
+            parse_gr_first_request(packet)?;
+            RoomCommandPayload::FirstState
+        }
+    };
+    world.room_protocol(session_id, payload).await?;
+    Ok(Vec::new())
+}
+
+fn room_participant_from_profile(identity: &IdentityBinding, profile: &Profile) -> RoomParticipant {
+    let observer = matches!(profile.rider.pmap, 590 | 718);
+    let p2p_address = match identity.source_ip {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+    };
+    let club_name = if profile.rider.club_mark_logo == 0 {
+        String::new()
+    } else {
+        profile.rider.club_name.clone()
+    };
+    RoomParticipant {
+        player: RoomPlayer {
+            player_type: if observer { 4 } else { 2 },
+            user_no: identity.user_no.get(),
+            p2p_address,
+            p2p_port: u16::try_from(profile.rider.p2p_port).unwrap_or_default(),
+            nickname: identity.nickname.clone(),
+            emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
+            emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
+            rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
+            card: profile.rider.card.clone(),
+            rp: profile.rider.rp,
+            team: 0,
+            ranking: 0,
+            rider_school_level: 0,
+            club_name,
+            club_mark_logo: profile.rider.club_mark_logo,
+        },
+        observer,
+    }
 }
 
 async fn handle_startup_request(
@@ -907,6 +1043,7 @@ mod tests {
     use p5136_core::{
         frame::{DEFAULT_MAX_PAYLOAD, encode_encrypted},
         packet::PacketWriter,
+        room_protocol::{RoomProtocolError, RoomProtocolRequest},
         startup::GameOptions,
     };
     use p5136_profile::ProfileStore;
@@ -916,9 +1053,12 @@ mod tests {
 
     use super::{
         BlockingUpdateHook, LoginSessionError, ProfileCoordinator, SessionContext,
-        read_encrypted_frame, read_session_frame, update_game_options, write_session_bytes,
+        handle_room_request, read_encrypted_frame, read_session_frame, update_game_options,
+        write_session_bytes,
     };
-    use crate::{ChannelBinding, IdentityError, MigrationToken, WorldError, WorldHandle};
+    use crate::{
+        ChannelBinding, IdentityError, MigrationToken, SessionId, WorldError, WorldHandle,
+    };
 
     #[tokio::test]
     async fn fragmented_and_coalesced_frames_decode_in_order() {
@@ -1008,6 +1148,51 @@ mod tests {
         let (mut writer, _reader) = duplex(1);
         let result = write_session_bytes(&mut writer, &[0_u8; 64], Duration::from_millis(20)).await;
         assert!(matches!(result, Err(LoginSessionError::WriteTimeout)));
+    }
+
+    #[tokio::test]
+    async fn malformed_room_packets_are_rejected_before_world_authorization() {
+        let (world, world_task) = WorldHandle::spawn(4);
+        let context = SessionContext::default();
+        let mut trailing = PacketWriter::named("ChGetRoomListRequestPacket");
+        trailing.write_i32(0);
+        trailing.write_u8(1);
+        trailing.write_u8(0);
+        trailing.write_u8(0xff);
+        assert!(matches!(
+            handle_room_request(
+                &world,
+                SessionId::new(999),
+                RoomProtocolRequest::RoomList,
+                trailing.as_slice(),
+                &context,
+            )
+            .await,
+            Err(LoginSessionError::RoomProtocol(
+                RoomProtocolError::TrailingBytes { count: 1, .. }
+            ))
+        ));
+
+        let mut invalid_page = PacketWriter::named("ChGetRoomListRequestPacket");
+        invalid_page.write_i32(-1);
+        invalid_page.write_u8(1);
+        invalid_page.write_u8(0);
+        assert!(matches!(
+            handle_room_request(
+                &world,
+                SessionId::new(999),
+                RoomProtocolRequest::RoomList,
+                invalid_page.as_slice(),
+                &context,
+            )
+            .await,
+            Err(LoginSessionError::RoomProtocol(
+                RoomProtocolError::InvalidPage { page: -1, .. }
+            ))
+        ));
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
     }
 
     #[tokio::test]

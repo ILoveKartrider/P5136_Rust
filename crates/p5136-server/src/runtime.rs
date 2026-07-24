@@ -334,7 +334,7 @@ mod tests {
     use std::{
         fmt::Write as _,
         fs,
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::Path,
         time::Duration,
     };
@@ -346,6 +346,10 @@ mod tests {
         frame, handshake,
         login::{LegacyTime, serialize_pr_cn_authen_login},
         packet::{PacketReader, PacketWriter},
+        room_protocol::{
+            CreateRoomOutcome, JoinRoomStatus, serialize_ch_create_room_reply,
+            serialize_ch_join_room_reply, serialize_ch_leave_room_reply,
+        },
         startup::{
             GameOptions, PrGetRiderFields, serialize_channel_static_reply,
             serialize_lo_rp_event_reward, serialize_pr_add_time_event_init,
@@ -759,6 +763,117 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn two_real_tcp_clients_create_list_join_first_and_leave_a_room() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (server, maximum) = start_test_server(profile_root.path(), None).await;
+        let endpoint = server.endpoints().login_tcp;
+
+        let owner_source = authenticate_and_login(endpoint, maximum, "Owner").await;
+        let owner_user_no = owner_source.user_no;
+        let mut owner = migrate_login_client(owner_source, endpoint, maximum).await;
+        let joiner_source = authenticate_and_login(endpoint, maximum, "Joiner").await;
+        let joiner_user_no = joiner_source.user_no;
+        let mut joiner = migrate_login_client(joiner_source, endpoint, maximum).await;
+        assert_ne!(owner_user_no, joiner_user_no);
+        wait_for_session_count(&server.world(), 2).await;
+
+        let create = build_create_room_request();
+        send_packet(&mut owner.stream, &create, &mut owner.send_iv, maximum).await;
+        assert_eq!(
+            read_login_packet(&mut owner, maximum).await,
+            serialize_ch_create_room_reply(CreateRoomOutcome::Created, 1)
+        );
+
+        let list = build_room_list_request();
+        send_packet(&mut joiner.stream, &list, &mut joiner.send_iv, maximum).await;
+        let list_reply = read_login_packet(&mut joiner, maximum).await;
+        let mut reader = PacketReader::new(&list_reply);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("ChGetRoomListReplyPacket")
+        );
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        let room_id = u16::from_le_bytes(reader.read_i16().unwrap().to_le_bytes());
+        assert_ne!(room_id, 0);
+        assert_eq!(reader.read_utf16().unwrap(), "Room");
+        assert_eq!(reader.read_u32().unwrap(), 0);
+        assert_eq!(reader.read_u8().unwrap(), 0);
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        assert_eq!(reader.read_u8().unwrap(), 7);
+        assert_eq!(reader.read_u8().unwrap(), 0);
+        assert_eq!(reader.read_u8().unwrap(), 8);
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        assert_eq!(reader.read_bytes(2).unwrap(), [0, 0]);
+        assert!(reader.remaining().is_empty());
+
+        let join = build_join_room_request(room_id);
+        send_packet(&mut joiner.stream, &join, &mut joiner.send_iv, maximum).await;
+        assert_eq!(
+            read_login_packet(&mut joiner, maximum).await,
+            serialize_ch_join_room_reply(JoinRoomStatus::Success, 1)
+        );
+        assert_no_login_data(&mut owner.stream).await;
+
+        let first = PacketWriter::named("GrFirstRequestPacket").into_inner();
+        let owner_first_wire =
+            frame::encode_encrypted(&first, &mut owner.send_iv, maximum).unwrap();
+        let split = owner_first_wire.len() / 2;
+        owner
+            .stream
+            .write_all(&owner_first_wire[..split])
+            .await
+            .unwrap();
+        time::sleep(Duration::from_millis(10)).await;
+        send_packet(&mut joiner.stream, &first, &mut joiner.send_iv, maximum).await;
+        let session_data = read_login_packet(&mut joiner, maximum).await;
+        assert_eq!(
+            u32::from_le_bytes(session_data[..4].try_into().unwrap()),
+            adler32::packet_hash("GrSessionDataPacket")
+        );
+        let joiner_slots = read_login_packet(&mut joiner, maximum).await;
+        let owner_slots = read_login_packet(&mut owner, maximum).await;
+        assert_eq!(
+            u32::from_le_bytes(joiner_slots[..4].try_into().unwrap()),
+            adler32::packet_hash("GrSlotDataPacket")
+        );
+        assert_eq!(owner_slots, joiner_slots);
+
+        // The owner session had already consumed half of this encrypted frame
+        // when the joiner's slot broadcast arrived. Finishing it proves the
+        // read future remained pinned across the outbound write.
+        owner
+            .stream
+            .write_all(&owner_first_wire[split..])
+            .await
+            .unwrap();
+        let owner_session_data = read_login_packet(&mut owner, maximum).await;
+        let owner_own_slots = read_login_packet(&mut owner, maximum).await;
+        let joiner_peer_slots = read_login_packet(&mut joiner, maximum).await;
+        assert_eq!(owner_session_data, session_data);
+        assert_eq!(owner_own_slots, joiner_slots);
+        assert_eq!(joiner_peer_slots, joiner_slots);
+
+        let leave = build_leave_room_request();
+        send_packet(&mut joiner.stream, &leave, &mut joiner.send_iv, maximum).await;
+        assert_eq!(
+            read_login_packet(&mut joiner, maximum).await,
+            serialize_ch_leave_room_reply(true)
+        );
+        let owner_after_leave = read_login_packet(&mut owner, maximum).await;
+        assert_eq!(
+            u32::from_le_bytes(owner_after_leave[..4].try_into().unwrap()),
+            adler32::packet_hash("GrSlotDataPacket")
+        );
+        assert_ne!(owner_after_leave, owner_slots);
+
+        drop(joiner);
+        drop(owner);
+        wait_for_session_count(&server.world(), 0).await;
+        server.shutdown().await.unwrap();
+    }
+
     async fn start_test_server(
         profile_root: &Path,
         catalog_path: Option<&Path>,
@@ -784,6 +899,94 @@ mod tests {
             messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
         };
         (bound.start().unwrap(), maximum)
+    }
+
+    async fn migrate_login_client(
+        mut source: LoginClient,
+        endpoint: SocketAddr,
+        maximum: usize,
+    ) -> LoginClient {
+        let (channel, token) = request_channel_switch(
+            &mut source.stream,
+            &mut source.send_iv,
+            &mut source.receive_iv,
+            maximum,
+            12,
+        )
+        .await;
+        let (mut stream, mut send_iv, mut receive_iv) = connect_login_client(endpoint).await;
+        let mut move_in = PacketWriter::named("PqChannelMovein");
+        move_in.write_u32(source.user_no);
+        move_in.write_u16(channel);
+        move_in.write_u16(token);
+        send_packet(&mut stream, move_in.as_slice(), &mut send_iv, maximum).await;
+        assert_eq!(
+            read_encrypted_frame(&mut stream, &mut receive_iv, maximum)
+                .await
+                .unwrap(),
+            serialize_pr_channel_move_in(39_311, 39_312)
+        );
+        assert_login_socket_closed(&mut source.stream).await;
+        LoginClient {
+            stream,
+            send_iv,
+            receive_iv,
+            user_no: source.user_no,
+            pmap: source.pmap,
+            screen: source.screen,
+        }
+    }
+
+    fn build_room_list_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named("ChGetRoomListRequestPacket");
+        packet.write_i32(0);
+        packet.write_u8(1);
+        packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    fn build_create_room_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named("ChCreateRoomRequestPacket");
+        packet.write_utf16("Room").unwrap();
+        packet.write_utf16("").unwrap();
+        packet.write_encoded_u8(1);
+        packet.write_i32(0);
+        packet.write_i32(0);
+        packet.write_u32(0xaabb_ccdd);
+        packet.write_bytes(&[0; 32]);
+        packet.write_bytes(&[0; 28]);
+        packet.write_u8(0);
+        packet.write_i32(0);
+        packet.write_u8(0);
+        packet.write_u8(0);
+        packet.write_i32(0);
+        packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    fn build_join_room_request(room_id: u16) -> Vec<u8> {
+        let mut packet = PacketWriter::named("ChJoinRoomRequestPacket");
+        packet.write_u16(room_id);
+        packet.write_utf16("").unwrap();
+        packet.write_u8(0);
+        packet.write_bytes(&[0; 28]);
+        packet.into_inner()
+    }
+
+    fn build_leave_room_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named("ChLeaveRoomRequestPacket");
+        packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    async fn read_login_packet(client: &mut LoginClient, maximum: usize) -> Vec<u8> {
+        time::timeout(
+            Duration::from_secs(2),
+            read_encrypted_frame(&mut client.stream, &mut client.receive_iv, maximum),
+        )
+        .await
+        .expect("timed out waiting for a login-server packet")
+        .unwrap()
     }
 
     async fn request_named(
@@ -980,7 +1183,7 @@ mod tests {
         let _days = reader.read_u16().unwrap();
         let _quarter_seconds = reader.read_u16().unwrap();
         let user_no = reader.read_u32().unwrap();
-        assert_eq!(user_no, 1);
+        assert_ne!(user_no, 0);
         assert_eq!(reader.read_utf16().unwrap(), nickname);
         reader.read_bytes(12).unwrap();
         let pmap = reader.read_u32().unwrap();
