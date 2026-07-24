@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod equipment;
 pub mod inventory;
 pub mod model;
+pub mod myroom_items;
 pub mod progression;
 pub mod store;
 
@@ -18,6 +19,10 @@ pub use inventory::{
 };
 pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,
+};
+pub use myroom_items::{
+    MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_ITEM_STATE_BYTES, MyRoomItemStateError,
+    MyRoomOwnerInventory,
 };
 pub use progression::{
     AppliedTimeReward, DEFAULT_RP, MAX_TIME_REWARD_LUCCI_ROLL, MAX_TIME_REWARD_RP_ROLL,
