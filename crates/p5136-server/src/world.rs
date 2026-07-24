@@ -29,6 +29,8 @@ use crate::identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityRegistry,
     MigrationCompletion, MigrationPermit, MigrationToken, ReleasedIdentity, UserNo,
 };
+use crate::messenger_hub::MessengerIdentity;
+use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 
 pub const ROOM_CAPACITY: usize = 8;
 pub(crate) const SESSION_OUTBOUND_CAPACITY: usize = 64;
@@ -173,6 +175,7 @@ enum WorldCommand {
     },
     SessionClosed {
         id: SessionId,
+        reply: Option<oneshot::Sender<()>>,
     },
     ClaimIdentity {
         session: SessionId,
@@ -247,7 +250,20 @@ impl WorldHandle {
     pub fn spawn(mailbox_capacity: usize) -> (Self, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
         let handle = Self { sender };
-        let task = tokio::spawn(run_world(receiver));
+        let task = tokio::spawn(async move {
+            let result = run_world(receiver, None).await;
+            debug_assert!(result.is_ok());
+        });
+        (handle, task)
+    }
+
+    pub(crate) fn spawn_with_messenger(
+        mailbox_capacity: usize,
+        messenger: MessengerServiceHandle,
+    ) -> (Self, JoinHandle<Result<(), MessengerServiceError>>) {
+        let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let handle = Self { sender };
+        let task = tokio::spawn(run_world(receiver, Some(messenger)));
         (handle, task)
     }
 
@@ -294,14 +310,22 @@ impl WorldHandle {
     }
 
     pub async fn session_closed(&self, id: SessionId) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
         self.sender
-            .send(WorldCommand::SessionClosed { id })
+            .send(WorldCommand::SessionClosed {
+                id,
+                reply: Some(reply),
+            })
             .await
-            .map_err(|_| WorldError::Stopped)
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)
     }
 
     pub(crate) fn try_session_closed(&self, id: SessionId) {
-        match self.sender.try_send(WorldCommand::SessionClosed { id }) {
+        match self
+            .sender
+            .try_send(WorldCommand::SessionClosed { id, reply: None })
+        {
             Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
             Err(mpsc::error::TrySendError::Full(command)) => {
                 let sender = self.sender.clone();
@@ -525,8 +549,19 @@ struct World {
     protocol_rooms: HashMap<RoomId, ProtocolRoomState>,
     protocol_room_by_user: HashMap<UserNo, RoomId>,
     free_protocol_room_ids: BTreeSet<u16>,
+    identity_lifecycle: VecDeque<IdentityLifecycleEvent>,
     next_session_id: u64,
     next_room_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityLifecycleEvent {
+    Announce(IdentityBinding),
+    Advance {
+        previous: ReleasedIdentity,
+        next: IdentityBinding,
+    },
+    Release(ReleasedIdentity),
 }
 
 #[derive(Debug)]
@@ -808,6 +843,7 @@ impl Default for World {
             protocol_rooms: HashMap::new(),
             protocol_room_by_user: HashMap::new(),
             free_protocol_room_ids: BTreeSet::new(),
+            identity_lifecycle: VecDeque::new(),
             next_session_id: 1,
             next_room_id: 1,
         }
@@ -847,7 +883,10 @@ impl World {
         nickname: &str,
     ) -> Result<IdentityBinding, WorldError> {
         let source_ip = self.session_ip(session)?;
-        Ok(self.identities.claim(session, source_ip, nickname)?)
+        let binding = self.identities.claim(session, source_ip, nickname)?;
+        self.identity_lifecycle
+            .push_back(IdentityLifecycleEvent::Announce(binding.clone()));
+        Ok(binding)
     }
 
     fn complete_migration(
@@ -867,6 +906,11 @@ impl World {
             token,
             now,
         )?;
+        self.identity_lifecycle
+            .push_back(IdentityLifecycleEvent::Advance {
+                previous: completion.previous_identity.clone(),
+                next: completion.binding.clone(),
+            });
         let changed_room_channel = self
             .protocol_room_by_user
             .get(&completion.binding.user_no)
@@ -1282,6 +1326,8 @@ impl World {
     }
 
     fn release_identity_state(&mut self, identity: &ReleasedIdentity) -> Vec<OutboundDelivery> {
+        self.identity_lifecycle
+            .push_back(IdentityLifecycleEvent::Release(identity.clone()));
         if let Some(room_id) = self.room_by_identity.remove(&identity.nickname)
             && let Some(room) = self.rooms.get_mut(&room_id)
             && let Some(slot) = room
@@ -1440,7 +1486,80 @@ impl World {
     }
 }
 
-async fn run_world(mut receiver: mpsc::Receiver<WorldCommand>) {
+fn messenger_identity_from_binding(
+    identity: &IdentityBinding,
+) -> Result<MessengerIdentity, MessengerServiceError> {
+    MessengerIdentity::new(
+        identity.user_no.get(),
+        identity.nickname.clone(),
+        identity.generation.get(),
+        identity.source_ip,
+    )
+    .map_err(MessengerServiceError::from)
+}
+
+fn messenger_identity_from_release(
+    identity: &ReleasedIdentity,
+) -> Result<MessengerIdentity, MessengerServiceError> {
+    MessengerIdentity::new(
+        identity.user_no.get(),
+        identity.nickname.clone(),
+        identity.generation.get(),
+        identity.source_ip,
+    )
+    .map_err(MessengerServiceError::from)
+}
+
+async fn flush_identity_lifecycle(
+    world: &mut World,
+    messenger: Option<&MessengerServiceHandle>,
+) -> Result<(), MessengerServiceError> {
+    let Some(messenger) = messenger else {
+        world.identity_lifecycle.clear();
+        return Ok(());
+    };
+
+    while let Some(event) = world.identity_lifecycle.front().cloned() {
+        match event {
+            IdentityLifecycleEvent::Announce(identity) => {
+                messenger
+                    .announce_identity(messenger_identity_from_binding(&identity)?)
+                    .await?;
+            }
+            IdentityLifecycleEvent::Advance { previous, next } => {
+                messenger
+                    .advance_identity(
+                        messenger_identity_from_release(&previous)?,
+                        messenger_identity_from_binding(&next)?,
+                    )
+                    .await?;
+            }
+            IdentityLifecycleEvent::Release(identity) => {
+                messenger
+                    .release_identity(messenger_identity_from_release(&identity)?)
+                    .await?;
+            }
+        }
+        world.identity_lifecycle.pop_front();
+    }
+    Ok(())
+}
+
+async fn reply_after_identity_lifecycle<T>(
+    world: &mut World,
+    messenger: Option<&MessengerServiceHandle>,
+    reply: oneshot::Sender<T>,
+    value: T,
+) -> Result<(), MessengerServiceError> {
+    flush_identity_lifecycle(world, messenger).await?;
+    let _ = reply.send(value);
+    Ok(())
+}
+
+async fn run_world(
+    mut receiver: mpsc::Receiver<WorldCommand>,
+    messenger: Option<MessengerServiceHandle>,
+) -> Result<(), MessengerServiceError> {
     let mut world = World::default();
     let mut migration_expiry = tokio::time::interval(Duration::from_secs(1));
     migration_expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1455,17 +1574,24 @@ async fn run_world(mut receiver: mpsc::Receiver<WorldCommand>) {
             }
             _ = migration_expiry.tick() => {
                 world.expire_migrations(Instant::now());
+                flush_identity_lifecycle(&mut world, messenger.as_ref()).await?;
                 continue;
             }
         };
 
-        if dispatch_command(&mut world, command) {
+        if dispatch_command(&mut world, command, messenger.as_ref()).await? {
             break;
         }
     }
+    flush_identity_lifecycle(&mut world, messenger.as_ref()).await?;
+    Ok(())
 }
 
-fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
+async fn dispatch_command(
+    world: &mut World,
+    command: WorldCommand,
+    messenger: Option<&MessengerServiceHandle>,
+) -> Result<bool, MessengerServiceError> {
     match command {
         WorldCommand::RegisterSession {
             peer,
@@ -1473,22 +1599,30 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
             outbound,
             reply,
         } => {
-            let _ = reply.send(world.register_session(peer, cancellation, outbound));
+            let result = world.register_session(peer, cancellation, outbound);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
-        WorldCommand::SessionClosed { id } => world.close_session(id, Instant::now()),
+        WorldCommand::SessionClosed { id, reply } => {
+            world.close_session(id, Instant::now());
+            flush_identity_lifecycle(world, messenger).await?;
+            if let Some(reply) = reply {
+                let _ = reply.send(());
+            }
+        }
         WorldCommand::ClaimIdentity {
             session,
             nickname,
             reply,
         } => {
-            let _ = reply.send(world.claim_identity(session, &nickname));
+            let result = world.claim_identity(session, &nickname);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::AuthorizeIdentity { session, reply } => {
             let result = world
                 .identities
                 .authorize(session)
                 .map_err(WorldError::from);
-            let _ = reply.send(result);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::BeginMigration {
             session,
@@ -1501,7 +1635,7 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
                 .identities
                 .begin_migration(session, channel, token, now)
                 .map_err(WorldError::from);
-            let _ = reply.send(result);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::CompleteMigration {
             destination,
@@ -1512,7 +1646,7 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
             reply,
         } => {
             let result = world.complete_migration(destination, user_no, channel_id, token, now);
-            let _ = reply.send(result);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::RoomProtocol {
             session,
@@ -1520,7 +1654,7 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
             reply,
         } => {
             let result = world.room_protocol(session, *payload);
-            let _ = reply.send(result);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::PublishRoomEquipment {
             session,
@@ -1528,41 +1662,69 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
             reply,
         } => {
             let result = world.publish_room_equipment(session, *snapshot);
-            let _ = reply.send(result);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
+        command => return dispatch_utility_command(world, command, messenger).await,
+    }
+    Ok(false)
+}
+
+async fn dispatch_utility_command(
+    world: &mut World,
+    command: WorldCommand,
+    messenger: Option<&MessengerServiceHandle>,
+) -> Result<bool, MessengerServiceError> {
+    match command {
         WorldCommand::CreateRoom { reply } => {
-            let _ = reply.send(world.create_room());
+            let result = world.create_room();
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::JoinRoom {
             room,
             identity,
             reply,
         } => {
-            let _ = reply.send(world.join_room(room, identity));
+            let result = world.join_room(room, identity);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::JoinRoomForSession {
             room,
             session,
             reply,
         } => {
-            let _ = reply.send(world.join_room_for_session(room, session));
+            let result = world.join_room_for_session(room, session);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::LeaveRoom { identity, reply } => {
-            let _ = reply.send(world.leave_room(&identity));
+            let result = world.leave_room(&identity);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::RoomSnapshot { room, reply } => {
-            let _ = reply.send(world.room_snapshot(room));
+            let result = world.room_snapshot(room);
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::SessionCount { reply } => {
-            let _ = reply.send(world.sessions.len());
+            let result = world.sessions.len();
+            reply_after_identity_lifecycle(world, messenger, reply, result).await?;
         }
         WorldCommand::Shutdown { reply } => {
+            flush_identity_lifecycle(world, messenger).await?;
             world.cancel_all_sessions();
             let _ = reply.send(());
-            return true;
+            return Ok(true);
+        }
+        WorldCommand::RegisterSession { .. }
+        | WorldCommand::SessionClosed { .. }
+        | WorldCommand::ClaimIdentity { .. }
+        | WorldCommand::AuthorizeIdentity { .. }
+        | WorldCommand::BeginMigration { .. }
+        | WorldCommand::CompleteMigration { .. }
+        | WorldCommand::RoomProtocol { .. }
+        | WorldCommand::PublishRoomEquipment { .. } => {
+            unreachable!("identity-affecting commands are dispatched by dispatch_command")
         }
     }
-    false
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1587,7 +1749,10 @@ mod tests {
         OutboundBatch, ROOM_CAPACITY, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
         SessionId, World, WorldCommand, WorldError, WorldHandle,
     };
-    use crate::{ChannelBinding, IdentityBinding, IdentityError, MigrationToken};
+    use crate::{
+        ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
+        MessengerServiceError, MessengerServiceHandle, MigrationToken,
+    };
 
     struct TestChannelSession {
         session: SessionId,
@@ -2331,5 +2496,90 @@ mod tests {
                 .active_identity_by_user_no(joiner.identity.user_no)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn messenger_identity_lifecycle_is_committed_before_world_replies() {
+        let (messenger, messenger_task) =
+            MessengerServiceHandle::spawn(MessengerRuntimeConfig::default()).unwrap();
+        let (world, world_task) = WorldHandle::spawn_with_messenger(64, messenger.clone());
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let source = world
+            .register_session(SocketAddr::new(ip, 53_000))
+            .await
+            .unwrap();
+        let claimed = world.claim_identity(source, "Lifecycle").await.unwrap();
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+
+        let channel = ChannelBinding {
+            channel_id: 7,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(777).unwrap();
+        world
+            .begin_migration(source, channel, token, Instant::now())
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(ip, 53_001))
+            .await
+            .unwrap();
+        let migrated = world
+            .complete_migration(
+                destination,
+                claimed.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert!(migrated.binding.generation.get() > claimed.generation.get());
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+
+        // The old login transport closes after ownership moved. Its stale
+        // generation must not release the newly published messenger identity.
+        world.session_closed(source).await.unwrap();
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+        world.session_closed(destination).await.unwrap();
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 0);
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+        messenger.shutdown().await.unwrap();
+        messenger_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_messenger_publication_stops_the_world_before_replying() {
+        let defaults = MessengerRuntimeConfig::default();
+        let config = MessengerRuntimeConfig {
+            max_string_utf16_units: 3,
+            hub_limits: MessengerHubLimits {
+                max_message_utf16_units: 3,
+                ..defaults.hub_limits
+            },
+            ..defaults
+        };
+        let (messenger, messenger_task) = MessengerServiceHandle::spawn(config).unwrap();
+        let (world, world_task) = WorldHandle::spawn_with_messenger(8, messenger.clone());
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54_000))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            world.claim_identity(session, "TooLong").await,
+            Err(WorldError::Stopped)
+        ));
+        assert!(matches!(
+            world_task.await.unwrap(),
+            Err(MessengerServiceError::IdentityConflict)
+        ));
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 0);
+
+        messenger.shutdown().await.unwrap();
+        messenger_task.await.unwrap();
     }
 }

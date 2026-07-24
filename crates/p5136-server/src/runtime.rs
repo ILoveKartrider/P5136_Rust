@@ -9,7 +9,8 @@ use tokio::{
 };
 
 use crate::{
-    ServerConfig, ServerEndpoints, WorldError, WorldHandle,
+    MessengerConnectionError, MessengerRuntimeConfig, MessengerServiceError,
+    MessengerServiceHandle, ServerConfig, ServerEndpoints, WorldError, WorldHandle,
     session::{ProfileCoordinator, run_login_session},
 };
 
@@ -52,6 +53,25 @@ pub enum ServerError {
 
     #[error("server supervisor task failed")]
     SupervisorTask(#[from] JoinError),
+
+    #[error("world actor stopped unexpectedly")]
+    WorldActorStopped,
+
+    #[error("world actor stopped after a messenger publication failure")]
+    WorldActorMessenger(#[source] MessengerServiceError),
+
+    #[error("messenger actor stopped unexpectedly")]
+    MessengerActorStopped,
+
+    #[error("{service} actor task failed")]
+    ActorTask {
+        service: &'static str,
+        #[source]
+        source: JoinError,
+    },
+
+    #[error(transparent)]
+    Messenger(#[from] MessengerServiceError),
 
     #[error(transparent)]
     World(#[from] WorldError),
@@ -124,10 +144,20 @@ impl BoundServer {
     pub fn start(self) -> Result<ServerHandle, ServerError> {
         let endpoints = self.endpoints()?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
-        let (world, world_task) = WorldHandle::spawn(1_024);
+        let messenger_config = messenger_runtime_config(&self.config);
+        let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config)?;
+        let (world, world_task) = WorldHandle::spawn_with_messenger(1_024, messenger.clone());
         let supervisor_world = world.clone();
         let task = tokio::spawn(async move {
-            run_supervisor(self, shutdown_receiver, supervisor_world, world_task).await
+            run_supervisor(
+                self,
+                shutdown_receiver,
+                supervisor_world,
+                world_task,
+                messenger,
+                messenger_task,
+            )
+            .await
         });
 
         Ok(ServerHandle {
@@ -136,6 +166,22 @@ impl BoundServer {
             world,
             task,
         })
+    }
+}
+
+fn messenger_runtime_config(config: &ServerConfig) -> MessengerRuntimeConfig {
+    let defaults = MessengerRuntimeConfig::default();
+    MessengerRuntimeConfig {
+        max_connections: config.max_login_sessions,
+        max_frame_payload: config.max_messenger_payload,
+        enter_timeout: config.login_timeout,
+        idle_timeout: config.session_idle_timeout,
+        write_timeout: config.session_write_timeout,
+        hub_limits: crate::MessengerHubLimits {
+            max_sessions: config.max_login_sessions,
+            ..defaults.hub_limits
+        },
+        ..defaults
     }
 }
 
@@ -196,6 +242,26 @@ fn spawn_login_session(
     });
 }
 
+fn spawn_messenger_session(
+    sessions: &mut JoinSet<()>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    permit: OwnedSemaphorePermit,
+    messenger: &MessengerServiceHandle,
+) {
+    let messenger = messenger.clone();
+    sessions.spawn(async move {
+        let _permit = permit;
+        if let Err(error) = messenger.serve_connection(stream, peer).await {
+            if let MessengerConnectionError::Cancelled(_) = error {
+                tracing::trace!(%peer, %error, "messenger session cancelled");
+            } else {
+                tracing::debug!(%peer, %error, "messenger session closed");
+            }
+        }
+    });
+}
+
 fn try_login_session_permit(
     permits: &Arc<Semaphore>,
     maximum: usize,
@@ -207,26 +273,172 @@ fn try_login_session_permit(
     })
 }
 
+fn try_messenger_session_permit(
+    permits: &Arc<Semaphore>,
+    maximum: usize,
+    peer: SocketAddr,
+) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(permits).try_acquire_owned().ok().or_else(|| {
+        tracing::debug!(%peer, maximum, "messenger session limit reached; rejecting connection");
+        None
+    })
+}
+
+fn handle_login_accept(
+    accepted: io::Result<(tokio::net::TcpStream, SocketAddr)>,
+    sessions: &mut JoinSet<()>,
+    permits: &Arc<Semaphore>,
+    maximum: usize,
+    config: &ServerConfig,
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+) -> Result<(), ServerError> {
+    let (stream, peer) = accepted.map_err(|source| ServerError::ListenerIo {
+        service: "login TCP",
+        source,
+    })?;
+    let Some(permit) = try_login_session_permit(permits, maximum, peer) else {
+        drop(stream);
+        return Ok(());
+    };
+    spawn_login_session(sessions, stream, peer, permit, config, world, profiles);
+    Ok(())
+}
+
+fn handle_messenger_accept(
+    accepted: io::Result<(tokio::net::TcpStream, SocketAddr)>,
+    sessions: &mut JoinSet<()>,
+    permits: &Arc<Semaphore>,
+    maximum: usize,
+    messenger: &MessengerServiceHandle,
+) -> Result<(), ServerError> {
+    let (stream, peer) = accepted.map_err(|source| ServerError::ListenerIo {
+        service: "messenger TCP",
+        source,
+    })?;
+    let Some(permit) = try_messenger_session_permit(permits, maximum, peer) else {
+        drop(stream);
+        return Ok(());
+    };
+    spawn_messenger_session(sessions, stream, peer, permit, messenger);
+    Ok(())
+}
+
+fn handle_ignored_udp(
+    datagram: io::Result<(usize, SocketAddr)>,
+    service: &'static str,
+) -> Result<(), ServerError> {
+    match datagram {
+        Ok((length, peer)) => {
+            tracing::trace!(%peer, length, service, "UDP packet ignored by milestone runtime");
+            Ok(())
+        }
+        Err(source) => Err(ServerError::ListenerIo { service, source }),
+    }
+}
+
+struct CoreActors {
+    world: WorldHandle,
+    world_task: JoinHandle<Result<(), MessengerServiceError>>,
+    world_completed: bool,
+    messenger: MessengerServiceHandle,
+    messenger_task: JoinHandle<()>,
+    messenger_completed: bool,
+}
+
 async fn finish_supervisor(
     mut sessions: JoinSet<()>,
-    world: WorldHandle,
-    world_task: JoinHandle<()>,
+    actors: CoreActors,
     transport_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
+    let CoreActors {
+        world,
+        world_task,
+        world_completed,
+        messenger,
+        messenger_task,
+        messenger_completed,
+    } = actors;
     sessions.abort_all();
     while sessions.join_next().await.is_some() {}
-    let world_shutdown = world.shutdown().await;
-    let world_join = world_task.await;
-    transport_result?;
-    world_shutdown?;
-    world_join.map_err(ServerError::SupervisorTask)
+
+    let mut cleanup_error = None;
+    if !world_completed {
+        let world_shutdown = world.shutdown().await;
+        match world_task.await {
+            Ok(Ok(())) => {
+                if let Err(error) = world_shutdown {
+                    cleanup_error = Some(error.into());
+                }
+            }
+            Ok(Err(source)) => {
+                cleanup_error = Some(ServerError::WorldActorMessenger(source));
+            }
+            Err(source) => {
+                cleanup_error = Some(ServerError::ActorTask {
+                    service: "world",
+                    source,
+                });
+            }
+        }
+    }
+
+    if !messenger_completed {
+        let messenger_shutdown = messenger.shutdown().await;
+        match messenger_task.await {
+            Ok(()) => {
+                if let Err(error) = messenger_shutdown
+                    && cleanup_error.is_none()
+                {
+                    cleanup_error = Some(error.into());
+                }
+            }
+            Err(source) if cleanup_error.is_none() => {
+                cleanup_error = Some(ServerError::ActorTask {
+                    service: "messenger",
+                    source,
+                });
+            }
+            Err(_) => {}
+        }
+    }
+
+    match transport_result {
+        Err(error) => Err(error),
+        Ok(()) => cleanup_error.map_or(Ok(()), Err),
+    }
+}
+
+fn unexpected_world_exit(
+    result: Result<Result<(), MessengerServiceError>, JoinError>,
+) -> ServerError {
+    match result {
+        Ok(Ok(())) => ServerError::WorldActorStopped,
+        Ok(Err(source)) => ServerError::WorldActorMessenger(source),
+        Err(source) => ServerError::ActorTask {
+            service: "world",
+            source,
+        },
+    }
+}
+
+fn unexpected_messenger_exit(result: Result<(), JoinError>) -> ServerError {
+    match result {
+        Ok(()) => ServerError::MessengerActorStopped,
+        Err(source) => ServerError::ActorTask {
+            service: "messenger",
+            source,
+        },
+    }
 }
 
 async fn run_supervisor(
     server: BoundServer,
     mut shutdown: watch::Receiver<bool>,
     world: WorldHandle,
-    world_task: JoinHandle<()>,
+    mut world_task: JoinHandle<Result<(), MessengerServiceError>>,
+    messenger: MessengerServiceHandle,
+    mut messenger_task: JoinHandle<()>,
 ) -> Result<(), ServerError> {
     let BoundServer {
         config,
@@ -238,9 +450,12 @@ async fn run_supervisor(
     } = server;
     let profiles = ProfileCoordinator::new(config.profile_root.clone(), catalog);
     let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
+    let messenger_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let mut sessions = JoinSet::new();
     let mut game_buffer = vec![0_u8; 65_535];
     let mut p2p_buffer = vec![0_u8; 65_535];
+    let mut world_completed = false;
+    let mut messenger_completed = false;
 
     let transport_result = loop {
         tokio::select! {
@@ -250,83 +465,68 @@ async fn run_supervisor(
                 }
             }
             accepted = login_tcp.accept() => {
-                match accepted {
-                    Ok((stream, peer)) => {
-                        let Some(permit) = try_login_session_permit(
-                            &login_session_permits,
-                            config.max_login_sessions,
-                            peer,
-                        ) else {
-                            drop(stream);
-                            continue;
-                        };
-                        spawn_login_session(
-                            &mut sessions,
-                            stream,
-                            peer,
-                            permit,
-                            &config,
-                            &world,
-                            &profiles,
-                        );
-                    }
-                    Err(source) => {
-                        break Err(ServerError::ListenerIo {
-                            service: "login TCP",
-                            source,
-                        });
-                    }
+                if let Err(error) = handle_login_accept(
+                    accepted,
+                    &mut sessions,
+                    &login_session_permits,
+                    config.max_login_sessions,
+                    &config,
+                    &world,
+                    &profiles,
+                ) {
+                    break Err(error);
                 }
             }
             datagram = game_udp.recv_from(&mut game_buffer) => {
-                match datagram {
-                    Ok((length, peer)) => {
-                        tracing::trace!(%peer, length, "game UDP packet ignored by milestone runtime");
-                    }
-                    Err(source) => {
-                        break Err(ServerError::ListenerIo {
-                            service: "game UDP",
-                            source,
-                        });
-                    }
+                if let Err(error) = handle_ignored_udp(datagram, "game UDP") {
+                    break Err(error);
                 }
             }
             datagram = p2p_udp.recv_from(&mut p2p_buffer) => {
-                match datagram {
-                    Ok((length, peer)) => {
-                        tracing::trace!(%peer, length, "P2P UDP packet ignored by milestone runtime");
-                    }
-                    Err(source) => {
-                        break Err(ServerError::ListenerIo {
-                            service: "P2P UDP",
-                            source,
-                        });
-                    }
+                if let Err(error) = handle_ignored_udp(datagram, "P2P UDP") {
+                    break Err(error);
                 }
             }
             accepted = messenger_tcp.accept() => {
-                match accepted {
-                    Ok((stream, peer)) => {
-                        tracing::debug!(%peer, "messenger protocol is not implemented; closing connection");
-                        drop(stream);
-                    }
-                    Err(source) => {
-                        break Err(ServerError::ListenerIo {
-                            service: "messenger TCP",
-                            source,
-                        });
-                    }
+                if let Err(error) = handle_messenger_accept(
+                    accepted,
+                    &mut sessions,
+                    &messenger_session_permits,
+                    config.max_login_sessions,
+                    &messenger,
+                ) {
+                    break Err(error);
                 }
             }
             completed = sessions.join_next(), if !sessions.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    tracing::error!(%error, "login session task panicked");
+                    tracing::error!(%error, "transport session task panicked");
                 }
+            }
+            result = &mut world_task => {
+                world_completed = true;
+                break Err(unexpected_world_exit(result));
+            }
+            result = &mut messenger_task => {
+                messenger_completed = true;
+                break Err(unexpected_messenger_exit(result));
             }
         }
     };
 
-    finish_supervisor(sessions, world, world_task, transport_result).await
+    finish_supervisor(
+        sessions,
+        CoreActors {
+            world,
+            world_task,
+            world_completed,
+            messenger,
+            messenger_task,
+            messenger_completed,
+        },
+        transport_result,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -348,6 +548,7 @@ mod tests {
         },
         frame, handshake,
         login::{LegacyTime, serialize_pr_cn_authen_login},
+        messenger::{encode_frame as encode_messenger_frame, serialize_guild_chat},
         packet::{PacketReader, PacketWriter},
         room_protocol::{
             CreateRoomOutcome, JoinRoomStatus, serialize_ch_create_room_reply,
@@ -425,6 +626,62 @@ mod tests {
         .await
         .unwrap();
 
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_identity_drives_the_bound_messenger_listener() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (server, maximum) = start_test_server(profile_root.path(), None).await;
+        let endpoints = server.endpoints();
+        let login = authenticate_and_login(endpoints.login_tcp, maximum, "MessengerRider").await;
+
+        let mut messenger = TcpStream::connect(endpoints.messenger_tcp).await.unwrap();
+        let mut enter = PacketWriter::named("PqEnterChatServer");
+        enter.write_u32(login.user_no);
+        enter.write_u32(2);
+        enter.write_utf16("MessengerRider").unwrap();
+        messenger
+            .write_all(
+                &encode_messenger_frame(enter.as_slice(), 256 * 1024)
+                    .expect("the fixture enter frame is bounded"),
+            )
+            .await
+            .unwrap();
+
+        let mut guild = PacketWriter::named("PqGuildChat");
+        guild.write_utf16("MessengerRider").unwrap();
+        guild.write_utf16("through-bound-server").unwrap();
+        messenger
+            .write_all(
+                &encode_messenger_frame(guild.as_slice(), 256 * 1024)
+                    .expect("the fixture guild frame is bounded"),
+            )
+            .await
+            .unwrap();
+
+        let mut length = [0_u8; 4];
+        time::timeout(Duration::from_secs(1), messenger.read_exact(&mut length))
+            .await
+            .expect("timed out waiting for messenger guild echo")
+            .unwrap();
+        let length = usize::try_from(i32::from_le_bytes(length)).unwrap();
+        let mut logical = vec![0_u8; length];
+        messenger.read_exact(&mut logical).await.unwrap();
+        assert_eq!(
+            logical,
+            serialize_guild_chat("MessengerRider", "through-bound-server").unwrap()
+        );
+
+        drop(login);
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), messenger.read(&mut byte))
+                .await
+                .expect("messenger endpoint was not cancelled after identity release")
+                .unwrap(),
+            0
+        );
         server.shutdown().await.unwrap();
     }
 
