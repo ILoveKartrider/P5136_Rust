@@ -8,7 +8,7 @@ pub mod store;
 
 pub use catalog::{
     CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogInventoryStats,
-    is_grant_category, is_grant_item,
+    CatalogKartSpecStats, P5136KartSpecSnapshot, is_grant_category, is_grant_item,
 };
 pub use equipment::{EquipmentExceptions, EquipmentStateError};
 pub use inventory::{

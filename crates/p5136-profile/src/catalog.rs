@@ -5,13 +5,14 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     fs::File,
     io::{BufRead, BufReader, Read},
     path::Path,
 };
 
+pub use p5136_core::kart_physics::P5136KartSpecSnapshot;
 use quick_xml::{
     Reader, XmlVersion,
     events::{BytesStart, Event},
@@ -22,6 +23,12 @@ use thiserror::Error;
 pub const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_CATALOG_ITEMS: usize = 100_000;
 pub const MAX_ITEM_NAME_BYTES: usize = 1_024;
+pub const MAX_KART_NAMES: usize = 10_000;
+pub const MAX_KART_SPECS: usize = 10_000;
+pub const MAX_KART_NAME_BYTES: usize = 256;
+pub const MAX_XML_TEXT_BYTES: usize = 4 * 1024;
+pub const MAX_XML_ATTRIBUTE_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_XML_ATTRIBUTES_PER_ELEMENT: usize = 256;
 
 const CATALOG_FORMAT_VERSION: &str = "3";
 const CATALOG_PROTOCOL_VERSION: &str = "5136";
@@ -70,11 +77,41 @@ impl fmt::Display for CatalogInventoryStats {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogKartSpecStats {
+    pub names: usize,
+    pub specs: usize,
+    pub resolved_names: usize,
+    pub unresolved_names: usize,
+    pub unreferenced_specs: usize,
+}
+
+impl fmt::Display for CatalogKartSpecStats {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "names={}, specs={}, resolved={}, unresolved={}, unreferenced={}",
+            self.names,
+            self.specs,
+            self.resolved_names,
+            self.unresolved_names,
+            self.unreferenced_specs
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatalogInventory {
     items: Vec<CatalogInventoryItem>,
     stats: CatalogInventoryStats,
+    kart_names: BTreeMap<u16, String>,
+    kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
+    kart_spec_stats: CatalogKartSpecStats,
 }
+
+// Catalog parsing rejects non-finite values, so the floating-point snapshots
+// retained here satisfy the reflexivity requirement of `Eq`.
+impl Eq for CatalogInventory {}
 
 impl CatalogInventory {
     /// Loads and fully validates the inventory portion of a Korean P5136
@@ -116,6 +153,34 @@ impl CatalogInventory {
     #[must_use]
     pub const fn stats(&self) -> CatalogInventoryStats {
         self.stats
+    }
+
+    /// Returns the exported parameter name associated with a kart ID.
+    #[must_use]
+    pub fn kart_name(&self, kart_id: u16) -> Option<&str> {
+        self.kart_names.get(&kart_id).map(String::as_str)
+    }
+
+    /// Resolves a kart ID through `<Names>` to its parsed `<Specs>` snapshot.
+    ///
+    /// Some legitimate P5136 catalog names do not have a corresponding
+    /// `BodyParam`; those IDs intentionally return `None`.
+    #[must_use]
+    pub fn kart_spec(&self, kart_id: u16) -> Option<&P5136KartSpecSnapshot> {
+        self.kart_name(kart_id)
+            .and_then(|name| self.kart_spec_by_name(name))
+    }
+
+    /// Looks up a parsed spec using the reference server's ASCII
+    /// case-insensitive name behavior.
+    #[must_use]
+    pub fn kart_spec_by_name(&self, name: &str) -> Option<&P5136KartSpecSnapshot> {
+        self.kart_specs.get(&normalize_spec_name(name))
+    }
+
+    #[must_use]
+    pub const fn kart_spec_stats(&self) -> CatalogKartSpecStats {
+        self.kart_spec_stats
     }
 
     pub fn category(&self, category: u16) -> impl Iterator<Item = &CatalogInventoryItem> {
@@ -181,6 +246,15 @@ pub enum CatalogInventoryError {
     #[error("kart catalog XML contains a prohibited document type declaration")]
     DocumentType,
 
+    #[error("kart catalog XML text exceeds {maximum} bytes")]
+    TextTooLong { maximum: usize },
+
+    #[error("kart catalog XML element contains more than {maximum} attributes")]
+    TooManyAttributes { maximum: usize },
+
+    #[error("kart catalog XML attribute value exceeds {maximum} bytes")]
+    AttributeValueTooLong { maximum: usize },
+
     #[error("kart catalog XML has no KartCatalog root element")]
     MissingRoot,
 
@@ -202,6 +276,45 @@ pub enum CatalogInventoryError {
 
     #[error("kart catalog XML has more than one Inventory element")]
     MultipleInventories,
+
+    #[error("kart catalog XML has more than one Names element")]
+    MultipleNames,
+
+    #[error("kart catalog XML has more than one Specs element")]
+    MultipleSpecs,
+
+    #[error("kart catalog XML has incomplete kart metadata (names={names}, specs={specs})")]
+    PartialKartMetadata { names: usize, specs: usize },
+
+    #[error("kart catalog Names contains more than {maximum} entries")]
+    TooManyKartNames { maximum: usize },
+
+    #[error("kart catalog Specs contains more than {maximum} entries")]
+    TooManyKartSpecs { maximum: usize },
+
+    #[error("kart catalog XML has an invalid Names/Kart {attribute}")]
+    InvalidKartNameAttribute { attribute: &'static str },
+
+    #[error("kart catalog kart/spec name exceeds {maximum} bytes")]
+    KartNameTooLong { maximum: usize },
+
+    #[error("kart catalog XML has duplicate kart ID {id}")]
+    DuplicateKartId { id: u16 },
+
+    #[error("kart catalog XML has an invalid Specs/Spec name")]
+    InvalidKartSpecName,
+
+    #[error("kart catalog XML has duplicate spec name {name:?}")]
+    DuplicateKartSpecName { name: String },
+
+    #[error("kart catalog spec {name:?} has no BodyParam")]
+    MissingBodyParam { name: String },
+
+    #[error("kart catalog spec {name:?} has more than one BodyParam")]
+    MultipleBodyParams { name: String },
+
+    #[error("kart catalog spec {spec:?} has an invalid {field} value")]
+    InvalidBodyParamValue { spec: String, field: &'static str },
 
     #[error("kart catalog inventory has a missing or invalid {attribute} attribute")]
     InvalidInventoryAttribute { attribute: &'static str },
@@ -272,28 +385,53 @@ impl ValidationPolicy {
 #[derive(Debug)]
 struct CatalogParser {
     policy: ValidationPolicy,
-    root_seen: bool,
-    inventory_seen: bool,
-    in_inventory: bool,
+    sections_seen: u8,
+    active_section: Option<CatalogSection>,
     depth: usize,
     declared_items: Option<usize>,
     declared_categories: Option<usize>,
     keys: HashSet<(u16, u16)>,
     items: Vec<CatalogInventoryItem>,
+    kart_names: BTreeMap<u16, String>,
+    spec_keys: HashSet<String>,
+    kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
+    active_spec: Option<PendingKartSpec>,
 }
+
+#[derive(Debug)]
+struct PendingKartSpec {
+    name: String,
+    normalized_name: String,
+    body: Option<P5136KartSpecSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogSection {
+    Inventory,
+    Names,
+    Specs,
+}
+
+const ROOT_SEEN: u8 = 1 << 0;
+const INVENTORY_SEEN: u8 = 1 << 1;
+const NAMES_SEEN: u8 = 1 << 2;
+const SPECS_SEEN: u8 = 1 << 3;
 
 impl CatalogParser {
     fn new(policy: ValidationPolicy) -> Self {
         Self {
             policy,
-            root_seen: false,
-            inventory_seen: false,
-            in_inventory: false,
+            sections_seen: 0,
+            active_section: None,
             depth: 0,
             declared_items: None,
             declared_categories: None,
             keys: HashSet::new(),
             items: Vec::new(),
+            kart_names: BTreeMap::new(),
+            spec_keys: HashSet::new(),
+            kart_specs: BTreeMap::new(),
+            active_spec: None,
         }
     }
 
@@ -305,24 +443,29 @@ impl CatalogParser {
         loop {
             match reader.read_event_into(&mut buffer)? {
                 Event::Start(element) => {
+                    validate_element_bounds(&reader, &element)?;
                     self.open_element(&reader, &element)?;
                     self.depth = self.depth.saturating_add(1);
                 }
-                Event::Empty(element) => self.empty_element(&reader, &element)?,
+                Event::Empty(element) => {
+                    validate_element_bounds(&reader, &element)?;
+                    self.empty_element(&reader, &element)?;
+                }
                 Event::End(element) => {
                     self.depth = self.depth.saturating_sub(1);
-                    if self.depth == 1 && element.name() == QName(b"Inventory") {
-                        self.in_inventory = false;
+                    if self.depth == 1
+                        && matches!(element.name().as_ref(), b"Inventory" | b"Names" | b"Specs")
+                    {
+                        self.active_section = None;
+                    } else if self.depth == 2 && element.name() == QName(b"Spec") {
+                        self.finish_spec()?;
                     }
                 }
                 Event::DocType(_) => return Err(CatalogInventoryError::DocumentType),
                 Event::Eof => break,
-                Event::Decl(_)
-                | Event::Text(_)
-                | Event::CData(_)
-                | Event::Comment(_)
-                | Event::PI(_)
-                | Event::GeneralRef(_) => {}
+                Event::Text(text) => validate_text_bound(text.len())?,
+                Event::CData(text) => validate_text_bound(text.len())?,
+                Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::GeneralRef(_) => {}
             }
             buffer.clear();
         }
@@ -339,9 +482,30 @@ impl CatalogParser {
             self.read_root(reader, element)?;
         } else if self.depth == 1 && element.name() == QName(b"Inventory") {
             self.read_inventory_header(reader, element)?;
-            self.in_inventory = true;
-        } else if self.depth == 2 && self.in_inventory && element.name() == QName(b"Item") {
+            self.active_section = Some(CatalogSection::Inventory);
+        } else if self.depth == 1 && element.name() == QName(b"Names") {
+            self.read_names_header()?;
+            self.active_section = Some(CatalogSection::Names);
+        } else if self.depth == 1 && element.name() == QName(b"Specs") {
+            self.read_specs_header()?;
+            self.active_section = Some(CatalogSection::Specs);
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Inventory)
+            && element.name() == QName(b"Item")
+        {
             self.read_item(reader, element)?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Names)
+            && element.name() == QName(b"Kart")
+        {
+            self.read_kart_name(reader, element)?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Specs)
+            && element.name() == QName(b"Spec")
+        {
+            self.start_spec(reader, element)?;
+        } else if self.active_spec.is_some() && element.name() == QName(b"BodyParam") {
+            self.read_body_param(reader, element)?;
         }
         Ok(())
     }
@@ -355,8 +519,28 @@ impl CatalogParser {
             self.read_root(reader, element)?;
         } else if self.depth == 1 && element.name() == QName(b"Inventory") {
             self.read_inventory_header(reader, element)?;
-        } else if self.depth == 2 && self.in_inventory && element.name() == QName(b"Item") {
+        } else if self.depth == 1 && element.name() == QName(b"Names") {
+            self.read_names_header()?;
+        } else if self.depth == 1 && element.name() == QName(b"Specs") {
+            self.read_specs_header()?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Inventory)
+            && element.name() == QName(b"Item")
+        {
             self.read_item(reader, element)?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Names)
+            && element.name() == QName(b"Kart")
+        {
+            self.read_kart_name(reader, element)?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Specs)
+            && element.name() == QName(b"Spec")
+        {
+            self.start_spec(reader, element)?;
+            self.finish_spec()?;
+        } else if self.active_spec.is_some() && element.name() == QName(b"BodyParam") {
+            self.read_body_param(reader, element)?;
         }
         Ok(())
     }
@@ -366,10 +550,10 @@ impl CatalogParser {
         reader: &Reader<R>,
         element: &BytesStart<'_>,
     ) -> Result<(), CatalogInventoryError> {
-        if self.root_seen {
+        if self.sections_seen & ROOT_SEEN != 0 {
             return Err(CatalogInventoryError::MultipleRoots);
         }
-        self.root_seen = true;
+        self.sections_seen |= ROOT_SEEN;
 
         let format_version = attribute(reader, element, b"formatVersion")?;
         let protocol_version = attribute(reader, element, b"protocolVersion")?;
@@ -393,10 +577,10 @@ impl CatalogParser {
         reader: &Reader<R>,
         element: &BytesStart<'_>,
     ) -> Result<(), CatalogInventoryError> {
-        if self.inventory_seen {
+        if self.sections_seen & INVENTORY_SEEN != 0 {
             return Err(CatalogInventoryError::MultipleInventories);
         }
-        self.inventory_seen = true;
+        self.sections_seen |= INVENTORY_SEEN;
         self.declared_items = Some(parse_usize_attribute(reader, element, b"total", "total")?);
         self.declared_categories = Some(parse_usize_attribute(
             reader,
@@ -404,6 +588,111 @@ impl CatalogParser {
             b"categories",
             "categories",
         )?);
+        Ok(())
+    }
+
+    fn read_names_header(&mut self) -> Result<(), CatalogInventoryError> {
+        if self.sections_seen & NAMES_SEEN != 0 {
+            return Err(CatalogInventoryError::MultipleNames);
+        }
+        self.sections_seen |= NAMES_SEEN;
+        Ok(())
+    }
+
+    fn read_specs_header(&mut self) -> Result<(), CatalogInventoryError> {
+        if self.sections_seen & SPECS_SEEN != 0 {
+            return Err(CatalogInventoryError::MultipleSpecs);
+        }
+        self.sections_seen |= SPECS_SEEN;
+        Ok(())
+    }
+
+    fn read_kart_name<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), CatalogInventoryError> {
+        if self.kart_names.len() >= MAX_KART_NAMES {
+            return Err(CatalogInventoryError::TooManyKartNames {
+                maximum: MAX_KART_NAMES,
+            });
+        }
+
+        let id = attribute(reader, element, b"id")?
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(CatalogInventoryError::InvalidKartNameAttribute { attribute: "id" })?;
+        let name = attribute(reader, element, b"name")?
+            .filter(|name| !name.trim().is_empty())
+            .ok_or(CatalogInventoryError::InvalidKartNameAttribute { attribute: "name" })?;
+        validate_kart_name_length(&name)?;
+
+        if self.kart_names.insert(id, name).is_some() {
+            return Err(CatalogInventoryError::DuplicateKartId { id });
+        }
+        Ok(())
+    }
+
+    fn start_spec<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), CatalogInventoryError> {
+        if self.active_spec.is_some() {
+            return Err(CatalogInventoryError::InvalidKartSpecName);
+        }
+        if self.kart_specs.len() >= MAX_KART_SPECS {
+            return Err(CatalogInventoryError::TooManyKartSpecs {
+                maximum: MAX_KART_SPECS,
+            });
+        }
+
+        let name = attribute(reader, element, b"name")?
+            .filter(|name| !name.trim().is_empty())
+            .ok_or(CatalogInventoryError::InvalidKartSpecName)?;
+        validate_kart_name_length(&name)?;
+        let normalized_name = normalize_spec_name(&name);
+        if !self.spec_keys.insert(normalized_name.clone()) {
+            return Err(CatalogInventoryError::DuplicateKartSpecName { name });
+        }
+
+        self.active_spec = Some(PendingKartSpec {
+            name,
+            normalized_name,
+            body: None,
+        });
+        Ok(())
+    }
+
+    fn read_body_param<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), CatalogInventoryError> {
+        let pending = self
+            .active_spec
+            .as_mut()
+            .ok_or(CatalogInventoryError::InvalidKartSpecName)?;
+        if pending.body.is_some() {
+            return Err(CatalogInventoryError::MultipleBodyParams {
+                name: pending.name.clone(),
+            });
+        }
+        pending.body = Some(parse_body_param(reader, element, &pending.name)?);
+        Ok(())
+    }
+
+    fn finish_spec(&mut self) -> Result<(), CatalogInventoryError> {
+        let pending = self
+            .active_spec
+            .take()
+            .ok_or(CatalogInventoryError::InvalidKartSpecName)?;
+        let body = pending
+            .body
+            .ok_or_else(|| CatalogInventoryError::MissingBodyParam {
+                name: pending.name.clone(),
+            })?;
+        self.kart_specs.insert(pending.normalized_name, body);
         Ok(())
     }
 
@@ -447,12 +736,24 @@ impl CatalogParser {
         Ok(())
     }
 
+    // Keep the cross-section validation together so publication remains one
+    // auditable all-or-nothing operation.
+    #[allow(clippy::too_many_lines)]
     fn finish(&mut self) -> Result<CatalogInventory, CatalogInventoryError> {
-        if !self.root_seen {
+        if self.sections_seen & ROOT_SEEN == 0 {
             return Err(CatalogInventoryError::MissingRoot);
         }
-        if !self.inventory_seen {
+        if self.sections_seen & INVENTORY_SEEN == 0 {
             return Err(CatalogInventoryError::MissingInventory);
+        }
+        if self.active_spec.is_some() {
+            return Err(CatalogInventoryError::InvalidKartSpecName);
+        }
+        if self.kart_names.is_empty() != self.kart_specs.is_empty() {
+            return Err(CatalogInventoryError::PartialKartMetadata {
+                names: self.kart_names.len(),
+                specs: self.kart_specs.len(),
+            });
         }
 
         let declared_items = self
@@ -520,10 +821,1177 @@ impl CatalogParser {
             }
         }
 
+        let referenced_specs = self
+            .kart_names
+            .values()
+            .map(|name| normalize_spec_name(name))
+            .collect::<BTreeSet<_>>();
+        let resolved_names = self
+            .kart_names
+            .values()
+            .filter(|name| self.kart_specs.contains_key(&normalize_spec_name(name)))
+            .count();
+        let kart_spec_stats = CatalogKartSpecStats {
+            names: self.kart_names.len(),
+            specs: self.kart_specs.len(),
+            resolved_names,
+            unresolved_names: self.kart_names.len() - resolved_names,
+            unreferenced_specs: self
+                .kart_specs
+                .keys()
+                .filter(|name| !referenced_specs.contains(*name))
+                .count(),
+        };
+
         Ok(CatalogInventory {
             items: std::mem::take(&mut self.items),
             stats,
+            kart_names: std::mem::take(&mut self.kart_names),
+            kart_specs: std::mem::take(&mut self.kart_specs),
+            kart_spec_stats,
         })
+    }
+}
+
+fn normalize_spec_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn validate_kart_name_length(name: &str) -> Result<(), CatalogInventoryError> {
+    if name.len() > MAX_KART_NAME_BYTES {
+        Err(CatalogInventoryError::KartNameTooLong {
+            maximum: MAX_KART_NAME_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_text_bound(length: usize) -> Result<(), CatalogInventoryError> {
+    if length > MAX_XML_TEXT_BYTES {
+        Err(CatalogInventoryError::TextTooLong {
+            maximum: MAX_XML_TEXT_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_element_bounds<R: BufRead>(
+    reader: &Reader<R>,
+    element: &BytesStart<'_>,
+) -> Result<(), CatalogInventoryError> {
+    let mut count = 0_usize;
+    for result in element.attributes() {
+        let attribute = result.map_err(quick_xml::Error::from)?;
+        count = count.saturating_add(1);
+        if count > MAX_XML_ATTRIBUTES_PER_ELEMENT {
+            return Err(CatalogInventoryError::TooManyAttributes {
+                maximum: MAX_XML_ATTRIBUTES_PER_ELEMENT,
+            });
+        }
+        let value: Cow<'_, str> =
+            attribute.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?;
+        if value.len() > MAX_XML_ATTRIBUTE_VALUE_BYTES {
+            return Err(CatalogInventoryError::AttributeValueTooLong {
+                maximum: MAX_XML_ATTRIBUTE_VALUE_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
+// This deliberately mirrors the ordered C# KartSpecConfigs table one field at
+// a time. Splitting it would make default/fallback/scale drift harder to audit.
+#[allow(clippy::too_many_lines)]
+fn parse_body_param<R: BufRead>(
+    reader: &Reader<R>,
+    element: &BytesStart<'_>,
+    spec_name: &str,
+) -> Result<P5136KartSpecSnapshot, CatalogInventoryError> {
+    let mut attributes = HashMap::new();
+    for result in element.attributes() {
+        let attribute = result.map_err(quick_xml::Error::from)?;
+        let Some(field) = known_body_param_field(attribute.key.as_ref()) else {
+            continue;
+        };
+        let value: Cow<'_, str> =
+            attribute.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())?;
+        attributes.insert(field, value.into_owned());
+    }
+
+    let mut snapshot = P5136KartSpecSnapshot::csharp_default();
+
+    macro_rules! float_field {
+        ($member:ident, $xml:literal, $fallback:expr, $default:expr, $scale:expr) => {
+            snapshot.$member =
+                resolve_decimal_field(&attributes, $xml, $fallback, $default, $scale, spec_name)?
+                    .to_f32();
+        };
+    }
+    macro_rules! int_field {
+        ($member:ident, $xml:literal, $fallback:expr, $default:expr, $scale:expr) => {
+            snapshot.$member =
+                resolve_decimal_field(&attributes, $xml, $fallback, $default, $scale, spec_name)?
+                    .to_i32()
+                    .ok_or_else(|| CatalogInventoryError::InvalidBodyParamValue {
+                        spec: spec_name.to_owned(),
+                        field: $xml,
+                    })?;
+        };
+    }
+    macro_rules! byte_field {
+        ($member:ident, $xml:literal, $fallback:expr, $default:expr, $scale:expr) => {
+            snapshot.$member =
+                resolve_decimal_field(&attributes, $xml, $fallback, $default, $scale, spec_name)?
+                    .to_u8()
+                    .ok_or_else(|| CatalogInventoryError::InvalidBodyParamValue {
+                        spec: spec_name.to_owned(),
+                        field: $xml,
+                    })?;
+        };
+    }
+    macro_rules! bool_field {
+        ($member:ident, $xml:literal, $default:expr) => {
+            snapshot.$member = resolve_bool_field(&attributes, $xml, $default);
+        };
+    }
+
+    float_field!(
+        draft_mul_accel_factor,
+        "draftMulAccelFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ONE,
+        DECIMAL_ONE
+    );
+    int_field!(
+        draft_tick,
+        "draftTick",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_boost_mul_accel_factor,
+        "driftBoostMulAccelFactor",
+        DECIMAL_ZERO,
+        Decimal96::new(131, 2, false),
+        DECIMAL_ONE
+    );
+    int_field!(
+        drift_boost_tick,
+        "driftBoostTick",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        charge_boost_by_speed,
+        "chargeBoostBySpeed",
+        DECIMAL_ZERO,
+        Decimal96::new(2, 0, false),
+        DECIMAL_ONE
+    );
+    byte_field!(
+        speed_slot_capacity,
+        "SpeedSlotCapacity",
+        DECIMAL_ZERO,
+        Decimal96::new(2, 0, false),
+        DECIMAL_ONE
+    );
+    byte_field!(
+        item_slot_capacity,
+        "ItemSlotCapacity",
+        DECIMAL_ZERO,
+        Decimal96::new(2, 0, false),
+        DECIMAL_ONE
+    );
+    byte_field!(
+        special_slot_capacity,
+        "SpecialSlotCapacity",
+        DECIMAL_ZERO,
+        DECIMAL_ONE,
+        DECIMAL_ONE
+    );
+    bool_field!(use_transform_booster, "UseTransformBooster", false);
+    bool_field!(motorcycle_type, "motorcycleType", false);
+    bool_field!(bike_rear_wheel, "BikeRearWheel", true);
+    float_field!(mass, "Mass", DECIMAL_ZERO, DECIMAL_ZERO, DECIMAL_ONE);
+    float_field!(
+        air_friction,
+        "AirFriction",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drag_factor,
+        "DragFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        forward_accel_force,
+        "ForwardAccelForce",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        backward_accel_force,
+        "BackwardAccelForce",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        grip_brake_force,
+        "GripBrakeForce",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        slip_brake_force,
+        "SlipBrakeForce",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        max_steer_angle,
+        "MaxSteerAngle",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        steer_constraint,
+        "SteerConstraint",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        front_grip_factor,
+        "FrontGripFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        rear_grip_factor,
+        "RearGripFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_trigger_factor,
+        "DriftTriggerFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_trigger_time,
+        "DriftTriggerTime",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_slip_factor,
+        "DriftSlipFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_escape_force,
+        "DriftEscapeForce",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        corner_draw_factor,
+        "CornerDrawFactor",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_lean_factor,
+        "DriftLeanFactor",
+        Decimal96::new(7, 2, false),
+        Decimal96::new(7, 2, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        steer_lean_factor,
+        "SteerLeanFactor",
+        Decimal96::new(1, 2, false),
+        Decimal96::new(1, 2, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_max_gauge,
+        "DriftMaxGauge",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        normal_booster_time,
+        "NormalBoosterTime",
+        Decimal96::new(3_000, 0, false),
+        Decimal96::new(3_000, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        item_booster_time,
+        "ItemBoosterTime",
+        Decimal96::new(3_000, 0, false),
+        Decimal96::new(3_000, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        team_booster_time,
+        "TeamBoosterTime",
+        Decimal96::new(4_500, 0, false),
+        Decimal96::new(4_500, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        animal_booster_time,
+        "AnimalBoosterTime",
+        Decimal96::new(4_000, 0, false),
+        Decimal96::new(4_000, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        super_booster_time,
+        "SuperBoosterTime",
+        Decimal96::new(3_500, 0, false),
+        Decimal96::new(3_500, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        trans_accel_factor,
+        "TransAccelFactor",
+        DECIMAL_ZERO,
+        Decimal96::new(15, 1, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        boost_accel_factor,
+        "BoostAccelFactor",
+        DECIMAL_ZERO,
+        Decimal96::new(15, 1, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        start_booster_time_item,
+        "StartBoosterTimeItem",
+        DECIMAL_ZERO,
+        Decimal96::new(1_000, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        start_booster_time_speed,
+        "StartBoosterTimeSpeed",
+        DECIMAL_ZERO,
+        Decimal96::new(1_000, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        start_forward_accel_factor_item,
+        "StartForwardAccelFactorItem",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        start_forward_accel_factor_speed,
+        "StartForwardAccelFactorSpeed",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    float_field!(
+        drift_gauge_preserve_percent,
+        "DriftGaguePreservePercent",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_ONE
+    );
+    bool_field!(use_extended_after_booster, "UseExtendedAfterBooster", false);
+    float_field!(
+        boost_accel_factor_only_item,
+        "BoostAccelFactorOnlyItem",
+        DECIMAL_ZERO,
+        Decimal96::new(15, 1, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        anti_collide_balance,
+        "antiCollideBalance",
+        DECIMAL_ZERO,
+        DECIMAL_ONE,
+        DECIMAL_ONE
+    );
+    bool_field!(dual_booster_set_auto, "dualBoosterSetAuto", false);
+    int_field!(
+        dual_booster_tick_min,
+        "dualBoosterTickMin",
+        DECIMAL_ZERO,
+        Decimal96::new(40, 0, false),
+        DECIMAL_ONE
+    );
+    int_field!(
+        dual_booster_tick_max,
+        "dualBoosterTickMax",
+        DECIMAL_ZERO,
+        Decimal96::new(60, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        dual_mul_accel_factor,
+        "dualMulAccelFactor",
+        DECIMAL_ZERO,
+        Decimal96::new(11, 1, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        dual_trans_low_speed,
+        "dualTransLowSpeed",
+        DECIMAL_ZERO,
+        Decimal96::new(100, 0, false),
+        DECIMAL_ONE
+    );
+    bool_field!(parts_engine_lock, "PartsEngineLock", false);
+    bool_field!(parts_wheel_lock, "PartsWheelLock", false);
+    bool_field!(parts_steering_lock, "PartsSteeringLock", false);
+    bool_field!(parts_booster_lock, "PartsBoosterLock", false);
+    bool_field!(parts_coating_lock, "PartsCoatingLock", false);
+    bool_field!(parts_tail_lamp_lock, "PartsTailLampLock", false);
+    float_field!(
+        charge_inst_accel_gauge_by_boost,
+        "chargeInstAccelGaugeByBoost",
+        DECIMAL_ZERO,
+        Decimal96::new(2, 2, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        charge_inst_accel_gauge_by_grip,
+        "chargeInstAccelGaugeByGrip",
+        DECIMAL_ZERO,
+        Decimal96::new(2, 2, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        charge_inst_accel_gauge_by_wall,
+        "chargeInstAccelGaugeByWall",
+        DECIMAL_ZERO,
+        Decimal96::new(2, 1, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        inst_accel_factor,
+        "instAccelFactor",
+        DECIMAL_ZERO,
+        Decimal96::new(125, 2, false),
+        DECIMAL_ONE
+    );
+    int_field!(
+        inst_accel_gauge_cooldown_time,
+        "instAccelGaugeCooldownTime",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_THOUSAND
+    );
+    float_field!(
+        inst_accel_gauge_length,
+        "instAccelGaugeLength",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_THOUSAND
+    );
+
+    let raw_length = attributes
+        .get("instAccelGaugeLength")
+        .and_then(|value| parse_decimal(value))
+        .unwrap_or(DECIMAL_ZERO);
+    let minimum_usable_scale = DECIMAL_THOUSAND.checked_mul(raw_length).ok_or_else(|| {
+        CatalogInventoryError::InvalidBodyParamValue {
+            spec: spec_name.to_owned(),
+            field: "instAccelGaugeMinUsable",
+        }
+    })?;
+    snapshot.inst_accel_gauge_min_usable = resolve_decimal_field(
+        &attributes,
+        "instAccelGaugeMinUsable",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        minimum_usable_scale,
+        spec_name,
+    )?
+    .to_f32();
+
+    float_field!(
+        inst_accel_gauge_min_vel_bound,
+        "instAccelGaugeMinVelBound",
+        DECIMAL_ZERO,
+        Decimal96::new(200, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        inst_accel_gauge_min_vel_loss,
+        "instAccelGaugeMinVelLoss",
+        DECIMAL_ZERO,
+        Decimal96::new(50, 0, false),
+        DECIMAL_ONE
+    );
+    bool_field!(
+        use_extended_after_booster_more,
+        "useExtendedAfterBoosterMore",
+        false
+    );
+    int_field!(
+        wall_coll_gauge_cooldown_time,
+        "wallCollGaugeCooldownTime",
+        DECIMAL_ZERO,
+        DECIMAL_ZERO,
+        DECIMAL_THOUSAND
+    );
+    float_field!(
+        wall_coll_gauge_max_vel_loss,
+        "wallCollGaugeMaxVelLoss",
+        DECIMAL_ZERO,
+        Decimal96::new(200, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        wall_coll_gauge_min_vel_bound,
+        "wallCollGaugeMinVelBound",
+        DECIMAL_ZERO,
+        Decimal96::new(200, 0, false),
+        DECIMAL_ONE
+    );
+    float_field!(
+        wall_coll_gauge_min_vel_loss,
+        "wallCollGaugeMinVelLoss",
+        DECIMAL_ZERO,
+        Decimal96::new(50, 0, false),
+        DECIMAL_ONE
+    );
+
+    Ok(snapshot)
+}
+
+fn known_body_param_field(name: &[u8]) -> Option<&'static str> {
+    Some(match name {
+        b"draftMulAccelFactor" => "draftMulAccelFactor",
+        b"draftTick" => "draftTick",
+        b"driftBoostMulAccelFactor" => "driftBoostMulAccelFactor",
+        b"driftBoostTick" => "driftBoostTick",
+        b"chargeBoostBySpeed" => "chargeBoostBySpeed",
+        b"SpeedSlotCapacity" => "SpeedSlotCapacity",
+        b"ItemSlotCapacity" => "ItemSlotCapacity",
+        b"SpecialSlotCapacity" => "SpecialSlotCapacity",
+        b"UseTransformBooster" => "UseTransformBooster",
+        b"motorcycleType" => "motorcycleType",
+        b"BikeRearWheel" => "BikeRearWheel",
+        b"Mass" => "Mass",
+        b"AirFriction" => "AirFriction",
+        b"DragFactor" => "DragFactor",
+        b"ForwardAccelForce" => "ForwardAccelForce",
+        b"BackwardAccelForce" => "BackwardAccelForce",
+        b"GripBrakeForce" => "GripBrakeForce",
+        b"SlipBrakeForce" => "SlipBrakeForce",
+        b"MaxSteerAngle" => "MaxSteerAngle",
+        b"SteerConstraint" => "SteerConstraint",
+        b"FrontGripFactor" => "FrontGripFactor",
+        b"RearGripFactor" => "RearGripFactor",
+        b"DriftTriggerFactor" => "DriftTriggerFactor",
+        b"DriftTriggerTime" => "DriftTriggerTime",
+        b"DriftSlipFactor" => "DriftSlipFactor",
+        b"DriftEscapeForce" => "DriftEscapeForce",
+        b"CornerDrawFactor" => "CornerDrawFactor",
+        b"DriftLeanFactor" => "DriftLeanFactor",
+        b"SteerLeanFactor" => "SteerLeanFactor",
+        b"DriftMaxGauge" => "DriftMaxGauge",
+        b"NormalBoosterTime" => "NormalBoosterTime",
+        b"ItemBoosterTime" => "ItemBoosterTime",
+        b"TeamBoosterTime" => "TeamBoosterTime",
+        b"AnimalBoosterTime" => "AnimalBoosterTime",
+        b"SuperBoosterTime" => "SuperBoosterTime",
+        b"TransAccelFactor" => "TransAccelFactor",
+        b"BoostAccelFactor" => "BoostAccelFactor",
+        b"StartBoosterTimeItem" => "StartBoosterTimeItem",
+        b"StartBoosterTimeSpeed" => "StartBoosterTimeSpeed",
+        b"StartForwardAccelFactorItem" => "StartForwardAccelFactorItem",
+        b"StartForwardAccelFactorSpeed" => "StartForwardAccelFactorSpeed",
+        b"DriftGaguePreservePercent" => "DriftGaguePreservePercent",
+        b"UseExtendedAfterBooster" => "UseExtendedAfterBooster",
+        b"BoostAccelFactorOnlyItem" => "BoostAccelFactorOnlyItem",
+        b"antiCollideBalance" => "antiCollideBalance",
+        b"dualBoosterSetAuto" => "dualBoosterSetAuto",
+        b"dualBoosterTickMin" => "dualBoosterTickMin",
+        b"dualBoosterTickMax" => "dualBoosterTickMax",
+        b"dualMulAccelFactor" => "dualMulAccelFactor",
+        b"dualTransLowSpeed" => "dualTransLowSpeed",
+        b"PartsEngineLock" => "PartsEngineLock",
+        b"PartsWheelLock" => "PartsWheelLock",
+        b"PartsSteeringLock" => "PartsSteeringLock",
+        b"PartsBoosterLock" => "PartsBoosterLock",
+        b"PartsCoatingLock" => "PartsCoatingLock",
+        b"PartsTailLampLock" => "PartsTailLampLock",
+        b"chargeInstAccelGaugeByBoost" => "chargeInstAccelGaugeByBoost",
+        b"chargeInstAccelGaugeByGrip" => "chargeInstAccelGaugeByGrip",
+        b"chargeInstAccelGaugeByWall" => "chargeInstAccelGaugeByWall",
+        b"instAccelFactor" => "instAccelFactor",
+        b"instAccelGaugeCooldownTime" => "instAccelGaugeCooldownTime",
+        b"instAccelGaugeLength" => "instAccelGaugeLength",
+        b"instAccelGaugeMinUsable" => "instAccelGaugeMinUsable",
+        b"instAccelGaugeMinVelBound" => "instAccelGaugeMinVelBound",
+        b"instAccelGaugeMinVelLoss" => "instAccelGaugeMinVelLoss",
+        b"useExtendedAfterBoosterMore" => "useExtendedAfterBoosterMore",
+        b"wallCollGaugeCooldownTime" => "wallCollGaugeCooldownTime",
+        b"wallCollGaugeMaxVelLoss" => "wallCollGaugeMaxVelLoss",
+        b"wallCollGaugeMinVelBound" => "wallCollGaugeMinVelBound",
+        b"wallCollGaugeMinVelLoss" => "wallCollGaugeMinVelLoss",
+        _ => return None,
+    })
+}
+
+fn resolve_bool_field(
+    attributes: &HashMap<&'static str, String>,
+    field: &'static str,
+    default: bool,
+) -> u8 {
+    let value = attributes.get(field).map_or(default, |value| {
+        if value.trim().eq_ignore_ascii_case("true") {
+            true
+        } else if value.trim().eq_ignore_ascii_case("false") {
+            false
+        } else {
+            default
+        }
+    });
+    u8::from(value)
+}
+
+fn resolve_decimal_field(
+    attributes: &HashMap<&'static str, String>,
+    field: &'static str,
+    fallback: Decimal96,
+    default: Decimal96,
+    scale: Decimal96,
+    spec_name: &str,
+) -> Result<Decimal96, CatalogInventoryError> {
+    let Some(value) = attributes.get(field).and_then(|value| parse_decimal(value)) else {
+        return Ok(default);
+    };
+    value
+        .checked_mul(scale)
+        .and_then(|value| value.checked_add(fallback))
+        .ok_or_else(|| CatalogInventoryError::InvalidBodyParamValue {
+            spec: spec_name.to_owned(),
+            field,
+        })
+}
+
+const DECIMAL_MAX_MANTISSA: u128 = (1_u128 << 96) - 1;
+const DECIMAL_ZERO: Decimal96 = Decimal96::new(0, 0, false);
+const DECIMAL_ONE: Decimal96 = Decimal96::new(1, 0, false);
+const DECIMAL_THOUSAND: Decimal96 = Decimal96::new(1_000, 0, false);
+
+/// The subset of `System.Decimal` needed by `KartSpec.GetScaledValue`.
+///
+/// Keeping the value as a 96-bit mantissa plus scale preserves the C# order:
+/// parse decimal, multiply the scale, add the fallback, then cast once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Decimal96 {
+    mantissa: u128,
+    scale: u32,
+    negative: bool,
+}
+
+impl Decimal96 {
+    const fn new(mantissa: u128, scale: u32, negative: bool) -> Self {
+        Self {
+            mantissa,
+            scale,
+            negative,
+        }
+    }
+
+    fn checked_mul(self, other: Self) -> Option<Self> {
+        let product = U256::multiply_u128(self.mantissa, other.mantissa);
+        Self::from_wide(
+            product,
+            self.scale + other.scale,
+            self.negative ^ other.negative,
+        )
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        let scale = self.scale.max(other.scale);
+        let left = U256::from_u128(self.mantissa).checked_mul_power_of_ten(scale - self.scale)?;
+        let right =
+            U256::from_u128(other.mantissa).checked_mul_power_of_ten(scale - other.scale)?;
+        let (magnitude, negative) = if self.negative == other.negative {
+            (left.checked_add(right)?, self.negative)
+        } else {
+            match left.magnitude_cmp(right) {
+                std::cmp::Ordering::Less => (right.checked_sub(left)?, other.negative),
+                std::cmp::Ordering::Equal => return Some(DECIMAL_ZERO),
+                std::cmp::Ordering::Greater => (left.checked_sub(right)?, self.negative),
+            }
+        };
+        Self::from_wide(magnitude, scale, negative)
+    }
+
+    fn from_wide(value: U256, scale: u32, negative: bool) -> Option<Self> {
+        let minimum_removed = scale.saturating_sub(28);
+        for removed in minimum_removed..=scale {
+            let rounded = value.round_div_power_of_ten(removed)?;
+            if rounded.fits_decimal_mantissa() {
+                let mantissa = rounded.to_u128();
+                return if mantissa == 0 {
+                    Some(DECIMAL_ZERO)
+                } else {
+                    Some(Self::new(mantissa, scale - removed, negative))
+                };
+            }
+        }
+        None
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    fn to_f32(self) -> f32 {
+        if self.mantissa == 0 {
+            return 0.0;
+        }
+
+        let numerator = U256::from_u128(self.mantissa);
+        let denominator = U256::from_u128(10_u128.pow(self.scale));
+        let mut exponent = numerator.bit_length() as i32 - denominator.bit_length() as i32;
+        let below_power = if exponent >= 0 {
+            numerator.magnitude_cmp(
+                denominator
+                    .checked_shift_left(exponent as u32)
+                    .expect("decimal exponent comparison fits U256"),
+            ) == std::cmp::Ordering::Less
+        } else {
+            numerator
+                .checked_shift_left((-exponent) as u32)
+                .expect("decimal exponent comparison fits U256")
+                .magnitude_cmp(denominator)
+                == std::cmp::Ordering::Less
+        };
+        if below_power {
+            exponent -= 1;
+        }
+
+        let significand_shift = 23 - exponent;
+        let (scaled_numerator, scaled_denominator) = if significand_shift >= 0 {
+            (
+                numerator
+                    .checked_shift_left(significand_shift as u32)
+                    .expect("decimal-to-f32 numerator fits U256"),
+                denominator,
+            )
+        } else {
+            (
+                numerator,
+                denominator
+                    .checked_shift_left((-significand_shift) as u32)
+                    .expect("decimal-to-f32 denominator fits U256"),
+            )
+        };
+        let (mut significand, remainder) =
+            scaled_numerator.div_rem_u32_quotient(scaled_denominator);
+        let doubled_remainder = remainder
+            .checked_mul_u64(2)
+            .expect("decimal-to-f32 remainder fits U256");
+        if doubled_remainder.magnitude_cmp(scaled_denominator) == std::cmp::Ordering::Greater
+            || (doubled_remainder == scaled_denominator && !significand.is_multiple_of(2))
+        {
+            significand += 1;
+        }
+        if significand == 1 << 24 {
+            significand >>= 1;
+            exponent += 1;
+        }
+
+        debug_assert!((1 << 23..1 << 24).contains(&significand));
+        let biased_exponent = (exponent + 127) as u32;
+        debug_assert!((1..0xff).contains(&biased_exponent));
+        let sign = u32::from(self.negative) << 31;
+        f32::from_bits(sign | (biased_exponent << 23) | (significand - (1 << 23)))
+    }
+
+    fn to_i32(self) -> Option<i32> {
+        let magnitude = self.mantissa / 10_u128.pow(self.scale);
+        if self.negative {
+            if magnitude == 1_u128 << 31 {
+                Some(i32::MIN)
+            } else {
+                i32::try_from(magnitude).ok().map(|value| -value)
+            }
+        } else {
+            i32::try_from(magnitude).ok()
+        }
+    }
+
+    fn to_u8(self) -> Option<u8> {
+        if self.negative {
+            return None;
+        }
+        u8::try_from(self.mantissa / 10_u128.pow(self.scale)).ok()
+    }
+}
+
+/// Parses the practical `NumberStyles.Any` grammar used by
+/// `decimal.TryParse(..., InvariantCulture)`.
+///
+/// Exported catalogs use plain invariant decimals, while accepting signs,
+/// grouping, exponents, parentheses, and the invariant currency symbol keeps
+/// fallback behavior aligned with the reference parser.
+fn parse_decimal(input: &str) -> Option<Decimal96> {
+    let mut value = input.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut negative = false;
+    let mut sign_seen = false;
+    if value.starts_with('(') && value.ends_with(')') {
+        negative = true;
+        sign_seen = true;
+        value = value[1..value.len() - 1].trim();
+    } else if value.contains(['(', ')']) {
+        return None;
+    }
+
+    value = trim_invariant_currency(value);
+    if let Some(rest) = value.strip_prefix(['+', '-']) {
+        if sign_seen {
+            return None;
+        }
+        negative = value.starts_with('-');
+        sign_seen = true;
+        value = trim_invariant_currency(rest.trim_start());
+    }
+    if let Some(rest) = value.strip_suffix(['+', '-']) {
+        if sign_seen {
+            return None;
+        }
+        negative = value.ends_with('-');
+        value = trim_invariant_currency(rest.trim_end());
+    }
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut exponent = 0_i64;
+    if let Some(index) = value.find(['e', 'E']) {
+        if value[index + 1..].contains(['e', 'E']) {
+            return None;
+        }
+        exponent = value[index + 1..].trim().parse::<i64>().ok()?;
+        value = value[..index].trim_end();
+    }
+
+    let mut digits = String::with_capacity(value.len());
+    let mut fractional_digits = 0_i64;
+    let mut decimal_seen = false;
+    let mut digit_seen = false;
+    for character in value.chars() {
+        match character {
+            '0'..='9' => {
+                digit_seen = true;
+                digits.push(character);
+                if decimal_seen {
+                    fractional_digits = fractional_digits.checked_add(1)?;
+                }
+            }
+            '.' if !decimal_seen => decimal_seen = true,
+            ',' => {}
+            _ => return None,
+        }
+    }
+    if !digit_seen {
+        return None;
+    }
+
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Some(DECIMAL_ZERO);
+    }
+    let scale = fractional_digits.checked_sub(exponent)?;
+    decimal_from_digits(significant, scale, negative)
+}
+
+fn trim_invariant_currency(mut value: &str) -> &str {
+    loop {
+        let trimmed = value.trim();
+        if let Some(rest) = trimmed.strip_prefix('¤') {
+            value = rest;
+        } else if let Some(rest) = trimmed.strip_suffix('¤') {
+            value = rest;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn decimal_from_digits(digits: &str, scale: i64, negative: bool) -> Option<Decimal96> {
+    if scale < 0 {
+        let appended = usize::try_from(scale.checked_neg()?).ok()?;
+        if digits.len().checked_add(appended)? > 29 {
+            return None;
+        }
+        let mut expanded = String::with_capacity(digits.len() + appended);
+        expanded.push_str(digits);
+        expanded.extend(std::iter::repeat_n('0', appended));
+        let mantissa = expanded.parse::<u128>().ok()?;
+        return (mantissa <= DECIMAL_MAX_MANTISSA).then_some(Decimal96::new(mantissa, 0, negative));
+    }
+
+    let scale = usize::try_from(scale).ok()?;
+    if scale > digits.len().saturating_add(28) {
+        return Some(DECIMAL_ZERO);
+    }
+    let minimum_removed = scale
+        .saturating_sub(28)
+        .max(digits.len().saturating_sub(29));
+    if minimum_removed > scale {
+        return None;
+    }
+    for removed in minimum_removed..=scale {
+        let mantissa = rounded_decimal_digits(digits, removed)?;
+        if mantissa <= DECIMAL_MAX_MANTISSA {
+            return if mantissa == 0 {
+                Some(DECIMAL_ZERO)
+            } else {
+                Some(Decimal96::new(
+                    mantissa,
+                    u32::try_from(scale - removed).ok()?,
+                    negative,
+                ))
+            };
+        }
+    }
+    None
+}
+
+fn rounded_decimal_digits(digits: &str, removed: usize) -> Option<u128> {
+    if removed == 0 {
+        return digits.parse::<u128>().ok();
+    }
+    if removed > digits.len() {
+        return Some(0);
+    }
+
+    let retained_length = digits.len() - removed;
+    let retained = &digits[..retained_length];
+    let discarded = digits.as_bytes().get(retained_length..)?;
+    let mut value = if retained.is_empty() {
+        0
+    } else {
+        retained.parse::<u128>().ok()?
+    };
+    let round_digit = discarded[0] - b'0';
+    let sticky = discarded[1..].iter().any(|digit| *digit != b'0');
+    if round_digit > 5 || (round_digit == 5 && (sticky || value % 2 != 0)) {
+        value = value.checked_add(1)?;
+    }
+    Some(value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct U256([u64; 4]);
+
+#[allow(clippy::cast_possible_truncation)]
+impl U256 {
+    const fn from_u128(value: u128) -> Self {
+        Self([value as u64, (value >> 64) as u64, 0, 0])
+    }
+
+    fn multiply_u128(left: u128, right: u128) -> Self {
+        let left = [left as u64, (left >> 64) as u64];
+        let right = [right as u64, (right >> 64) as u64];
+        let mut product = [0_u64; 4];
+
+        for (left_index, left_limb) in left.into_iter().enumerate() {
+            let mut carry = 0_u128;
+            for (right_index, right_limb) in right.into_iter().enumerate() {
+                let index = left_index + right_index;
+                let value = u128::from(product[index])
+                    + u128::from(left_limb) * u128::from(right_limb)
+                    + carry;
+                product[index] = value as u64;
+                carry = value >> 64;
+            }
+
+            let mut index = left_index + 2;
+            while carry != 0 {
+                let value = u128::from(product[index]) + carry;
+                product[index] = value as u64;
+                carry = value >> 64;
+                index += 1;
+            }
+        }
+        Self(product)
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        let mut result = [0_u64; 4];
+        let mut carry = false;
+        for (index, output) in result.iter_mut().enumerate() {
+            let (partial, first_carry) = self.0[index].overflowing_add(other.0[index]);
+            let (sum, second_carry) = partial.overflowing_add(u64::from(carry));
+            *output = sum;
+            carry = first_carry || second_carry;
+        }
+        (!carry).then_some(Self(result))
+    }
+
+    fn checked_sub(self, other: Self) -> Option<Self> {
+        if self.magnitude_cmp(other) == std::cmp::Ordering::Less {
+            return None;
+        }
+
+        let mut result = [0_u64; 4];
+        let mut borrow = false;
+        for (index, output) in result.iter_mut().enumerate() {
+            let (partial, first_borrow) = self.0[index].overflowing_sub(other.0[index]);
+            let (difference, second_borrow) = partial.overflowing_sub(u64::from(borrow));
+            *output = difference;
+            borrow = first_borrow || second_borrow;
+        }
+        debug_assert!(!borrow);
+        Some(Self(result))
+    }
+
+    fn checked_mul_u64(self, multiplier: u64) -> Option<Self> {
+        let mut result = [0_u64; 4];
+        let mut carry = 0_u128;
+        for (limb, output) in self.0.into_iter().zip(result.iter_mut()) {
+            let value = u128::from(limb) * u128::from(multiplier) + carry;
+            *output = value as u64;
+            carry = value >> 64;
+        }
+        (carry == 0).then_some(Self(result))
+    }
+
+    fn checked_mul_power_of_ten(mut self, power: u32) -> Option<Self> {
+        for _ in 0..power {
+            self = self.checked_mul_u64(10)?;
+        }
+        Some(self)
+    }
+
+    fn checked_shift_left(mut self, shift: u32) -> Option<Self> {
+        for _ in 0..shift {
+            self = self.checked_mul_u64(2)?;
+        }
+        Some(self)
+    }
+
+    fn div_rem_u64(self, divisor: u64) -> (Self, u64) {
+        let mut quotient = [0_u64; 4];
+        let mut remainder = 0_u128;
+        for index in (0..4).rev() {
+            let value = (remainder << 64) | u128::from(self.0[index]);
+            quotient[index] = (value / u128::from(divisor)) as u64;
+            remainder = value % u128::from(divisor);
+        }
+        (Self(quotient), remainder as u64)
+    }
+
+    fn round_div_power_of_ten(self, power: u32) -> Option<Self> {
+        if power == 0 {
+            return Some(self);
+        }
+
+        let mut quotient = self;
+        let mut sticky = false;
+        let mut round_digit = 0_u64;
+        for digit in 0..power {
+            let (next, remainder) = quotient.div_rem_u64(10);
+            quotient = next;
+            if digit + 1 == power {
+                round_digit = remainder;
+            } else {
+                sticky |= remainder != 0;
+            }
+        }
+
+        if round_digit > 5 || (round_digit == 5 && (sticky || quotient.0[0] & 1 != 0)) {
+            quotient = quotient.checked_add(Self::from_u128(1))?;
+        }
+        Some(quotient)
+    }
+
+    fn div_rem_u32_quotient(self, divisor: Self) -> (u32, Self) {
+        let mut lower = 0_u32;
+        let mut upper = 1_u32 << 25;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            let product = divisor
+                .checked_mul_u64(u64::from(middle))
+                .expect("bounded decimal-to-f32 quotient fits U256");
+            if product.magnitude_cmp(self) == std::cmp::Ordering::Greater {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        let product = divisor
+            .checked_mul_u64(u64::from(lower))
+            .expect("bounded decimal-to-f32 quotient fits U256");
+        (
+            lower,
+            self.checked_sub(product)
+                .expect("the quotient product does not exceed the dividend"),
+        )
+    }
+
+    fn magnitude_cmp(self, other: Self) -> std::cmp::Ordering {
+        for index in (0..4).rev() {
+            match self.0[index].cmp(&other.0[index]) {
+                std::cmp::Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    fn bit_length(self) -> u32 {
+        for index in (0..4).rev() {
+            if self.0[index] != 0 {
+                return index as u32 * 64 + (64 - self.0[index].leading_zeros());
+            }
+        }
+        0
+    }
+
+    fn fits_decimal_mantissa(self) -> bool {
+        self.0[2] == 0 && self.0[3] == 0 && u32::try_from(self.0[1]).is_ok()
+    }
+
+    fn to_u128(self) -> u128 {
+        u128::from(self.0[0]) | (u128::from(self.0[1]) << 64)
     }
 }
 
@@ -578,13 +2046,14 @@ fn parse_u16_attribute<R: BufRead>(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, fs::File};
+    use std::{fmt::Write as _, fs, fs::File};
 
     use tempfile::tempdir;
 
     use super::{
         CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogParser,
-        ValidationPolicy, is_grant_category, is_grant_item,
+        MAX_KART_NAME_BYTES, MAX_XML_ATTRIBUTE_VALUE_BYTES, MAX_XML_ATTRIBUTES_PER_ELEMENT,
+        MAX_XML_TEXT_BYTES, ValidationPolicy, is_grant_category, is_grant_item,
     };
 
     fn parse_structural(xml: &str) -> Result<CatalogInventory, CatalogInventoryError> {
@@ -650,6 +2119,257 @@ mod tests {
             name: String::new(),
         }));
         assert_eq!(catalog.grant_items().count(), 2);
+        assert_eq!(catalog.kart_spec_stats().names, 0);
+        assert!(catalog.kart_spec(1450).is_none());
+    }
+
+    #[test]
+    fn resolves_generated_names_and_specs_with_exact_csharp_defaults_and_scales() {
+        let catalog = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names>
+                    <Kart id="1450" name="SHURIKENV1" />
+                    <Kart id="1451" name="sharedSpec" />
+                    <Kart id="1452" name="sharedSpec" />
+                    <Kart id="1453" name="missingSpec" />
+                </Names>
+                <Specs>
+                    <Spec name="shurikenV1">
+                        <BodyParam
+                            ForwardAccelForce="147"
+                            NormalBoosterTime="-100"
+                            DriftLeanFactor="-0.005"
+                            draftTick="12.9"
+                            UseTransformBooster="TrUe"
+                            PartsEngineLock="1"
+                            instAccelGaugeCooldownTime="3.25"
+                            instAccelGaugeLength="2.5"
+                            instAccelGaugeMinUsable="0.3"
+                            TransAccelFactor="NaN"
+                            DragFactor="Infinity"
+                            FutureP5136Field="preserved-by-newer-servers" />
+                    </Spec>
+                    <Spec name="sharedSpec"><BodyParam /></Spec>
+                    <Spec name="unusedSpec"><BodyParam /></Spec>
+                </Specs>
+                <Inventory total="1" categories="1">
+                    <Item category="3" id="1450" name="shurikenV1" />
+                </Inventory>
+            </KartCatalog>"#,
+        )
+        .unwrap();
+
+        assert_eq!(catalog.kart_name(1450), Some("SHURIKENV1"));
+        let spec = catalog.kart_spec(1450).unwrap();
+        assert_eq!(spec.forward_accel_force.to_bits(), 147.0_f32.to_bits());
+        assert_eq!(spec.normal_booster_time.to_bits(), 2_900.0_f32.to_bits());
+        assert_eq!(spec.drift_lean_factor.to_bits(), 0.065_f32.to_bits());
+        assert_eq!(spec.draft_tick, 12);
+        assert_eq!(spec.use_transform_booster, 1);
+        // BooleanAttributes uses bool.TryParse: a numeric "1" falls back.
+        assert_eq!(spec.parts_engine_lock, 0);
+        assert_eq!(spec.inst_accel_gauge_cooldown_time, 3_250);
+        assert_eq!(
+            spec.inst_accel_gauge_length.to_bits(),
+            2_500.0_f32.to_bits()
+        );
+        assert_eq!(
+            spec.inst_accel_gauge_min_usable.to_bits(),
+            750.0_f32.to_bits()
+        );
+        // Non-decimal/non-finite spellings take the C# config default.
+        assert_eq!(spec.trans_accel_factor.to_bits(), 1.5_f32.to_bits());
+        assert_eq!(spec.drag_factor.to_bits(), 0.0_f32.to_bits());
+        // Missing fields use KartSpecConfig.DefaultValue, not the property
+        // initializer values in P5136KartSpecSnapshot::csharp_default().
+        assert_eq!(
+            spec.drift_boost_mul_accel_factor.to_bits(),
+            1.31_f32.to_bits()
+        );
+        assert_eq!(spec.item_booster_time.to_bits(), 3_000.0_f32.to_bits());
+        assert_eq!(spec.bike_rear_wheel, 1);
+        assert_eq!(spec.parts_wheel_lock, 0);
+
+        assert!(std::ptr::eq(
+            catalog.kart_spec(1451).unwrap(),
+            catalog.kart_spec(1452).unwrap()
+        ));
+        assert!(catalog.kart_spec(1453).is_none());
+        assert!(catalog.kart_spec_by_name("UNUSEDSPEC").is_some());
+        assert_eq!(
+            catalog.kart_spec_stats(),
+            super::CatalogKartSpecStats {
+                names: 4,
+                specs: 3,
+                resolved_names: 3,
+                unresolved_names: 1,
+                unreferenced_specs: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_spec_names_sections_and_body_params() {
+        let duplicate_id = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="one" /><Kart id="1" name="two" /></Names>
+                <Specs><Spec name="one"><BodyParam /></Spec></Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            duplicate_id,
+            Err(CatalogInventoryError::DuplicateKartId { id: 1 })
+        ));
+
+        let duplicate_spec = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="one" /></Names>
+                <Specs>
+                    <Spec name="One"><BodyParam /></Spec>
+                    <Spec name="oNE"><BodyParam /></Spec>
+                </Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            duplicate_spec,
+            Err(CatalogInventoryError::DuplicateKartSpecName { .. })
+        ));
+
+        let duplicate_sections = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names /><Names />
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            duplicate_sections,
+            Err(CatalogInventoryError::MultipleNames)
+        ));
+
+        let duplicate_body = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="one" /></Names>
+                <Specs><Spec name="one"><BodyParam /><BodyParam /></Spec></Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            duplicate_body,
+            Err(CatalogInventoryError::MultipleBodyParams { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_partial_or_malformed_metadata_but_allows_unresolved_entries() {
+        let names_only = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="one" /></Names>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            names_only,
+            Err(CatalogInventoryError::PartialKartMetadata { names: 1, specs: 0 })
+        ));
+
+        let specs_only = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Specs><Spec name="one"><BodyParam /></Spec></Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            specs_only,
+            Err(CatalogInventoryError::PartialKartMetadata { names: 0, specs: 1 })
+        ));
+
+        let missing_body = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="one" /></Names>
+                <Specs><Spec name="one"><ModelParam /></Spec></Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            missing_body,
+            Err(CatalogInventoryError::MissingBodyParam { .. })
+        ));
+
+        let unresolved = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names>
+                    <Kart id="1" name="one" />
+                    <Kart id="2" name="intentionallyMissing" />
+                </Names>
+                <Specs>
+                    <Spec name="one"><BodyParam /></Spec>
+                    <Spec name="unreferenced"><BodyParam /></Spec>
+                </Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        )
+        .unwrap();
+        assert!(unresolved.kart_spec(1).is_some());
+        assert!(unresolved.kart_spec(2).is_none());
+        assert_eq!(unresolved.kart_spec_stats().unresolved_names, 1);
+        assert_eq!(unresolved.kart_spec_stats().unreferenced_specs, 1);
+    }
+
+    #[test]
+    fn enforces_name_text_attribute_and_field_bounds() {
+        let long_name = "n".repeat(MAX_KART_NAME_BYTES + 1);
+        let error = parse_structural(&format!(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="{long_name}" /></Names>
+                <Specs><Spec name="one"><BodyParam /></Spec></Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#
+        ));
+        assert!(matches!(
+            error,
+            Err(CatalogInventoryError::KartNameTooLong { .. })
+        ));
+
+        let long_attribute = "v".repeat(MAX_XML_ATTRIBUTE_VALUE_BYTES + 1);
+        let error = parse_structural(&format!(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Unknown value="{long_attribute}" />
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#
+        ));
+        assert!(matches!(
+            error,
+            Err(CatalogInventoryError::AttributeValueTooLong { .. })
+        ));
+
+        let long_text = "x".repeat(MAX_XML_TEXT_BYTES + 1);
+        let error = parse_structural(&format!(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Unknown>{long_text}</Unknown>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#
+        ));
+        assert!(matches!(
+            error,
+            Err(CatalogInventoryError::TextTooLong { .. })
+        ));
+
+        let mut attributes = String::new();
+        for index in 0..=MAX_XML_ATTRIBUTES_PER_ELEMENT {
+            write!(attributes, r#" f{index}="0""#).unwrap();
+        }
+        let error = parse_structural(&format!(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Unknown{attributes} />
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#
+        ));
+        assert!(matches!(
+            error,
+            Err(CatalogInventoryError::TooManyAttributes { .. })
+        ));
     }
 
     #[test]
