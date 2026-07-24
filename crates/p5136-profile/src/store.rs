@@ -592,7 +592,7 @@ impl ProfileStore {
     }
 
     #[cfg(test)]
-    fn fail_next_directory_sync(&self, kind: io::ErrorKind) {
+    pub(crate) fn fail_next_directory_sync(&self, kind: io::ErrorKind) {
         *self.next_directory_sync_fault.lock().unwrap() = Some(kind);
     }
 

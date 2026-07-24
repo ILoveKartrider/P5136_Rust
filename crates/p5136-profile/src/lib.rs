@@ -25,9 +25,11 @@ pub use myroom_items::{
     MyRoomOwnerInventory,
 };
 pub use progression::{
-    AppliedTimeReward, DEFAULT_RP, MAX_TIME_REWARD_LUCCI_ROLL, MAX_TIME_REWARD_RP_ROLL,
-    RewardRollError, TIME_REWARD_BASELINE_RANK, TimeReward, apply_time_reward, finish_reward,
-    time_reward_from_rolls,
+    AppliedTimeReward, DEFAULT_RP, GlobalRaceEpoch, MAX_TIME_REWARD_LUCCI_ROLL,
+    MAX_TIME_REWARD_RP_ROLL, PersistedRaceRewardReceipt, RaceRewardKey, RaceRewardKeyError,
+    RaceRewardOrderError, RaceRewardPersistenceError, RaceRunId, RewardRollError,
+    TIME_REWARD_BASELINE_RANK, TimeReward, apply_race_reward_once, apply_time_reward,
+    finish_reward, time_reward_from_rolls,
 };
 pub use store::{
     LoadedProfile, ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction,

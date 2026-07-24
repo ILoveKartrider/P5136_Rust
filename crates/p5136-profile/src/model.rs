@@ -14,6 +14,12 @@ pub struct Profile {
     pub granted_karts: Vec<GrantedKart>,
     pub my_room: MyRoom,
     pub game_option: GameOptions,
+    #[serde(
+        default,
+        rename = "P5136RustRaceRewardReceipt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub race_reward_receipt: Option<crate::progression::PersistedRaceRewardReceipt>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -404,6 +410,7 @@ mod tests {
         assert_eq!(profile.rider_item.dye, 1);
         assert_eq!(profile.game_option.video_quality, 14);
         assert_eq!(profile.game_option.speed_type, 7);
+        assert_eq!(profile.race_reward_receipt, None);
     }
 
     #[test]
@@ -427,11 +434,13 @@ mod tests {
         assert_eq!(profile.rider.club_mark_logo, 77);
         assert_eq!(profile.rider_item.character, 42);
         assert_eq!(profile.rider_item.slot_background, 8);
+        assert_eq!(profile.race_reward_receipt, None);
 
         let encoded = serde_json::to_value(profile).unwrap();
         assert_eq!(encoded["Rider"]["futureRiderField"]["value"], true);
         assert_eq!(encoded["futureTopLevel"], json!([1, 2, 3]));
         assert_eq!(encoded["Rider"]["RP"], 456);
         assert_eq!(encoded["RiderItem"]["Set_Character"], 42);
+        assert!(encoded.get("P5136RustRaceRewardReceipt").is_none());
     }
 }
