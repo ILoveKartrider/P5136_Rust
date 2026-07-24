@@ -23,11 +23,19 @@ use p5136_core::{
     frame::{self, FrameError},
     handshake,
     inventory::{InventoryError, serialize_get_rider_sequence},
+    kart_physics::{
+        KartPhysicsBuildError, P5136KartPhysicsSnapshot, build_p5136_kart_physics_block,
+    },
+    lobby_protocol::{
+        LobbyProtocolError, LobbyRequest, classify_lobby_request, parse_change_master_request,
+        parse_change_team_request, parse_set_slot_state_request, parse_start_room_request,
+    },
     login::{
         LegacyTime, LoginError, PrLoginFields, parse_pq_login, serialize_pr_cn_authen_login,
         serialize_pr_login,
     },
     packet::PacketError,
+    race_start_protocol::P5136KartPhysicsBlock,
     room_protocol::{
         RoomPlayer, RoomProtocolError, RoomProtocolRequest, classify_room_protocol_request,
         parse_ch_create_room_request, parse_ch_get_room_list_request, parse_ch_join_room_request,
@@ -37,6 +45,7 @@ use p5136_core::{
         self, PrGetRiderFields, StartupError, StartupRequest, classify_startup_request,
         is_startup_noop, parse_pq_update_game_option,
     },
+    track::P5136_FALLBACK_TRACK_ID,
 };
 use p5136_profile::{
     CatalogInventory, EquipmentExceptions, EquipmentStateError, InventoryBuildError, Profile,
@@ -56,7 +65,10 @@ use tokio::{
 use crate::{
     ChannelBinding, IdentityBinding, MigrationToken, ServerConfig, SessionId, UserNo, WorldError,
     WorldHandle,
-    world::{OutboundBatch, RoomCommandPayload, RoomParticipant},
+    world::{
+        LobbyCommandPayload, LobbyError, OutboundBatch, RoomCommandPayload, RoomParticipant,
+        StartRoomPlan,
+    },
 };
 
 const MAX_OUTBOUND_BATCH_BURST: usize = 8;
@@ -130,6 +142,12 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     RoomProtocol(#[from] RoomProtocolError),
+
+    #[error(transparent)]
+    LobbyProtocol(#[from] LobbyProtocolError),
+
+    #[error(transparent)]
+    KartPhysicsBuild(#[from] KartPhysicsBuildError),
 
     #[error(transparent)]
     EquipmentProtocol(#[from] EquipmentProtocolError),
@@ -866,6 +884,10 @@ async fn dispatch_packet(
         .await;
     }
 
+    if let Some(request) = classify_lobby_request(hash) {
+        return handle_lobby_request(services.world, services.session_id, request, packet).await;
+    }
+
     if let Some(request) = classify_equipment_request(hash) {
         return dispatch_equipment_request(services, request, packet, context).await;
     }
@@ -990,7 +1012,7 @@ async fn handle_room_request(
             let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Create {
                 request,
-                participant: room_participant_from_profile(&identity, profile),
+                participant: room_participant_from_profile(&identity, profile)?,
             }
         }
         RoomProtocolRequest::JoinRoom => {
@@ -999,7 +1021,7 @@ async fn handle_room_request(
             let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Join {
                 request,
-                participant: room_participant_from_profile(&identity, profile),
+                participant: room_participant_from_profile(&identity, profile)?,
             }
         }
         RoomProtocolRequest::LeaveRoom => {
@@ -1012,6 +1034,57 @@ async fn handle_room_request(
         }
     };
     world.room_protocol(session_id, payload).await?;
+    Ok(Vec::new())
+}
+
+async fn handle_lobby_request(
+    world: &WorldHandle,
+    session_id: SessionId,
+    request: LobbyRequest,
+    packet: &[u8],
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let payload = match request {
+        LobbyRequest::SetSlotState => {
+            LobbyCommandPayload::SetSlotState(parse_set_slot_state_request(packet)?.state)
+        }
+        LobbyRequest::ChangeTeam => {
+            LobbyCommandPayload::ChangeTeam(parse_change_team_request(packet)?.team)
+        }
+        LobbyRequest::ChangeMaster => {
+            LobbyCommandPayload::ChangeMaster(parse_change_master_request(packet)?.target_nickname)
+        }
+        LobbyRequest::StartRoom => {
+            let _ = parse_start_room_request(packet)?;
+            LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                vec![P5136_FALLBACK_TRACK_ID],
+                Vec::new(),
+            ))
+        }
+    };
+    match world.lobby_command(session_id, payload).await {
+        Ok(_) => {}
+        Err(WorldError::Lobby(
+            error @ (LobbyError::NotInRoom
+            | LobbyError::NotLobby { .. }
+            | LobbyError::HumanRacerRequired
+            | LobbyError::ObserverStateServerOwned
+            | LobbyError::PreparingStateServerOwned
+            | LobbyError::NotRoomMaster
+            | LobbyError::InvalidMasterTarget { .. }
+            | LobbyError::TeamModeRequired
+            | LobbyError::TeamFull { .. }
+            | LobbyError::NoRacers
+            | LobbyError::RacerNotReady { .. }
+            | LobbyError::MissingTrackCandidates),
+        )) => {
+            tracing::debug!(
+                %error,
+                session_id = session_id.get(),
+                "rejected a lobby command without terminating the session"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(Vec::new())
 }
 
@@ -1124,7 +1197,45 @@ async fn equip_plant_part(
     Ok(vec![serialize_equip_tuning_success(request)])
 }
 
-fn room_participant_from_profile(identity: &IdentityBinding, profile: &Profile) -> RoomParticipant {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoomPhysicsMetadata {
+    kart_id: u16,
+    physics_fallback: bool,
+    block: P5136KartPhysicsBlock,
+}
+
+fn room_physics_metadata(profile: &Profile) -> Result<RoomPhysicsMetadata, KartPhysicsBuildError> {
+    let items = &profile.rider_item;
+    let physics_fallback = items.kart != 0
+        || items.flying_pet != 0
+        || [
+            items.kart_plant1,
+            items.kart_plant2,
+            items.kart_plant3,
+            items.kart_plant4,
+        ]
+        .into_iter()
+        .any(|item_id| item_id != 0);
+    Ok(RoomPhysicsMetadata {
+        kart_id: items.kart,
+        physics_fallback,
+        block: build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())?,
+    })
+}
+
+fn room_participant_from_profile(
+    identity: &IdentityBinding,
+    profile: &Profile,
+) -> Result<RoomParticipant, LoginSessionError> {
+    let physics = room_physics_metadata(profile)?;
+    if physics.physics_fallback {
+        tracing::warn!(
+            nickname = %identity.nickname,
+            kart_id = physics.kart_id,
+            physics_fallback = true,
+            "using the exact S7 baseline because equipped kart physics are not ported"
+        );
+    }
     let observer = matches!(profile.rider.pmap, 590 | 718);
     let p2p_address = match identity.source_ip {
         IpAddr::V4(address) => address,
@@ -1135,7 +1246,7 @@ fn room_participant_from_profile(identity: &IdentityBinding, profile: &Profile) 
     } else {
         profile.rider.club_name.clone()
     };
-    RoomParticipant {
+    Ok(RoomParticipant {
         player: RoomPlayer {
             player_type: if observer { 4 } else { 2 },
             user_no: identity.user_no.get(),
@@ -1154,7 +1265,8 @@ fn room_participant_from_profile(identity: &IdentityBinding, profile: &Profile) 
             club_mark_logo: profile.rider.club_mark_logo,
         },
         observer,
-    }
+        kart_physics: physics.block,
+    })
 }
 
 async fn handle_startup_request(
@@ -1379,8 +1491,13 @@ mod tests {
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
         },
         frame::{DEFAULT_MAX_PAYLOAD, encode_encrypted},
+        kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
+        lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         packet::PacketWriter,
-        room_protocol::{RoomProtocolError, RoomProtocolRequest},
+        room_protocol::{
+            ChCreateRoomRequest, ChJoinRoomRequest, ROOM_CONNECTION_CONTEXT_LENGTH,
+            ROOM_DATA_LENGTH, RoomProtocolError, RoomProtocolRequest,
+        },
         startup::GameOptions,
     };
     use p5136_profile::{
@@ -1393,13 +1510,16 @@ mod tests {
 
     use super::{
         BlockingUpdateHook, LoginSessionError, MAX_OUTBOUND_BATCH_BURST, ProfileCoordinator,
-        SessionContext, SessionReadEvent, handle_equipment_request, handle_room_request,
-        read_encrypted_frame, read_session_frame, select_session_read_event, update_game_options,
-        validate_rider_item_selection, write_session_bytes,
+        SessionContext, SessionReadEvent, SessionServices, dispatch_packet,
+        handle_equipment_request, handle_lobby_request, handle_room_request, read_encrypted_frame,
+        read_session_frame, room_participant_from_profile, room_physics_metadata,
+        select_session_read_event, update_game_options, validate_rider_item_selection,
+        write_session_bytes,
     };
     use crate::{
-        ChannelBinding, IdentityError, MigrationToken, SessionId, WorldError, WorldHandle,
-        world::OutboundBatch,
+        ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
+        WorldError, WorldHandle,
+        world::{OutboundBatch, RoomCommandPayload},
     };
 
     fn test_catalog() -> Arc<CatalogInventory> {
@@ -1526,6 +1646,93 @@ mod tests {
         packet.write_u8(selection.unknown4);
         packet.write_u16(selection.kart_coating);
         packet.write_u16(selection.kart_tail_lamp);
+        packet.into_inner()
+    }
+
+    struct TestLobbySession {
+        source_session: SessionId,
+        session: SessionId,
+        identity: IdentityBinding,
+        outbound: mpsc::Receiver<OutboundBatch>,
+    }
+
+    async fn register_lobby_session(
+        world: &WorldHandle,
+        nickname: &str,
+        source_port: u16,
+    ) -> TestLobbySession {
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source_session = world
+            .register_session(SocketAddr::new(address, source_port))
+            .await
+            .unwrap();
+        let claimed = world
+            .claim_identity(source_session, nickname)
+            .await
+            .unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(source_port).unwrap();
+        world
+            .begin_migration(source_session, channel, token, Instant::now())
+            .await
+            .unwrap();
+        let (session, _cancellation, outbound) = world
+            .register_login_session(SocketAddr::new(address, source_port + 1))
+            .await
+            .unwrap();
+        let identity = world
+            .complete_migration(
+                session,
+                claimed.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap()
+            .binding;
+        TestLobbySession {
+            source_session,
+            session,
+            identity,
+            outbound,
+        }
+    }
+
+    fn create_room_request(name: &str) -> ChCreateRoomRequest {
+        ChCreateRoomRequest {
+            room_name: name.to_owned(),
+            password: String::new(),
+            game_type: 1,
+            reserved_after_game_type: 0,
+            ai_count: 0,
+            room_data_header: 0,
+            room_data: [0; ROOM_DATA_LENGTH],
+            connection_context: [0; ROOM_CONNECTION_CONTEXT_LENGTH],
+            reserved_before_ai_switch: 0,
+            ai_switch: 0,
+            reserved_after_ai_switch_1: 0,
+            reserved_after_ai_switch_2: 0,
+            reserved_tail: 0,
+            reserved_last: 0,
+        }
+    }
+
+    fn join_room_request(room_id: u16) -> ChJoinRoomRequest {
+        ChJoinRoomRequest {
+            room_id,
+            password: String::new(),
+            reserved: 0,
+            connection_context: [0; ROOM_CONNECTION_CONTEXT_LENGTH],
+        }
+    }
+
+    fn set_slot_state_packet(state: PlayerSlotState) -> Vec<u8> {
+        let mut packet = PacketWriter::named("GrRequestSetSlotStatePacket");
+        packet.write_i32(state as i32);
         packet.into_inner()
     }
 
@@ -1725,6 +1932,241 @@ mod tests {
 
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_dispatch_classifies_all_lobby_requests() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4);
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_705))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "LobbyClassifier")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = SessionContext::default();
+
+        let mut invalid_state = PacketWriter::named("GrRequestSetSlotStatePacket");
+        invalid_state.write_i32(99);
+        let mut invalid_team = PacketWriter::named("GrChangeTeamPacket");
+        invalid_team.write_u8(99);
+        let mut invalid_master = PacketWriter::named("PqRoomMasterChangePacket");
+        invalid_master.write_utf16(&"x".repeat(33)).unwrap();
+        let mut trailing_start = PacketWriter::named("GrRequestStartPacket");
+        trailing_start.write_i32(0);
+        trailing_start.write_u8(0xff);
+
+        for packet in [
+            invalid_state.into_inner(),
+            invalid_team.into_inner(),
+            invalid_master.into_inner(),
+            trailing_start.into_inner(),
+        ] {
+            assert!(matches!(
+                dispatch_packet(&services, &packet, &mut context).await,
+                Err(LoginSessionError::LobbyProtocol(_))
+            ));
+        }
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trailing_lobby_packet_cannot_mutate_actor_state() {
+        let (world, world_task) = WorldHandle::spawn(16);
+        let mut rider = register_lobby_session(&world, "TrailingLobby", 49_710).await;
+        let profile = Profile::default();
+        world
+            .room_protocol(
+                rider.session,
+                RoomCommandPayload::Create {
+                    request: create_room_request("Trailing"),
+                    participant: room_participant_from_profile(&rider.identity, &profile).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let _create_reply = time::timeout(Duration::from_secs(1), rider.outbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut packet = set_slot_state_packet(PlayerSlotState::Ready);
+        packet.push(0xff);
+        assert!(matches!(
+            handle_lobby_request(&world, rider.session, LobbyRequest::SetSlotState, &packet).await,
+            Err(LoginSessionError::LobbyProtocol(
+                LobbyProtocolError::TrailingBytes { count: 1, .. }
+            ))
+        ));
+        assert!(matches!(
+            rider.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expected_lobby_rejection_does_not_terminate_the_session() {
+        let (world, world_task) = WorldHandle::spawn(8);
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_720))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "LobbyWithoutRoom")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle_lobby_request(
+                &world,
+                session,
+                LobbyRequest::SetSlotState,
+                &set_slot_state_packet(PlayerSlotState::Ready),
+            )
+            .await
+            .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        assert_eq!(world.authorize_identity(session).await.unwrap(), identity);
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_start_keeps_session_alive_and_uses_actor_reply() {
+        let (world, world_task) = WorldHandle::spawn(32);
+        let mut owner = register_lobby_session(&world, "StartOwner", 49_740).await;
+        let mut guest = register_lobby_session(&world, "StartGuest", 49_750).await;
+        let profile = Profile::default();
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_room_request("NotReady"),
+                    participant: room_participant_from_profile(&owner.identity, &profile).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = owner.outbound.recv().await.unwrap();
+        world
+            .room_protocol(
+                guest.session,
+                RoomCommandPayload::Join {
+                    request: join_room_request(1),
+                    participant: room_participant_from_profile(&guest.identity, &profile).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = guest.outbound.recv().await.unwrap();
+
+        let mut start = PacketWriter::named("GrRequestStartPacket");
+        start.write_i32(0);
+        assert_eq!(
+            handle_lobby_request(
+                &world,
+                owner.session,
+                LobbyRequest::StartRoom,
+                start.as_slice(),
+            )
+            .await
+            .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        let packets = owner.outbound.recv().await.unwrap().into_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            u32::from_le_bytes(packets[0][..4].try_into().unwrap()),
+            p5136_core::adler32::packet_hash("GrReplyStartPacket")
+        );
+        assert_eq!(i32::from_le_bytes(packets[0][4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            world.authorize_identity(owner.session).await.unwrap(),
+            owner.identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_generation_is_rejected_before_lobby_mutation() {
+        let (world, world_task) = WorldHandle::spawn(8);
+        let rider = register_lobby_session(&world, "StaleLobby", 49_730).await;
+        let packet = set_slot_state_packet(PlayerSlotState::Ready);
+
+        assert!(matches!(
+            handle_lobby_request(
+                &world,
+                rider.source_session,
+                LobbyRequest::SetSlotState,
+                &packet,
+            )
+            .await,
+            Err(LoginSessionError::World(WorldError::Identity(
+                IdentityError::StaleSession(id)
+            ))) if id == rider.source_session
+        ));
+        assert_eq!(
+            world.authorize_identity(rider.session).await.unwrap(),
+            rider.identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[test]
+    fn room_physics_reports_exact_baseline_fallback_metadata() {
+        let baseline =
+            build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
+                .unwrap();
+        let mut profile = Profile::default();
+
+        let unequipped = room_physics_metadata(&profile).unwrap();
+        assert_eq!(unequipped.kart_id, 0);
+        assert!(!unequipped.physics_fallback);
+        assert_eq!(unequipped.block, baseline);
+
+        profile.rider_item.kart = 5136;
+        let kart = room_physics_metadata(&profile).unwrap();
+        assert_eq!(kart.kart_id, 5136);
+        assert!(kart.physics_fallback);
+        assert_eq!(kart.block, baseline);
+
+        profile.rider_item.kart = 0;
+        profile.rider_item.flying_pet = 83;
+        let flying_pet = room_physics_metadata(&profile).unwrap();
+        assert_eq!(flying_pet.kart_id, 0);
+        assert!(flying_pet.physics_fallback);
+        assert_eq!(flying_pet.block, baseline);
+
+        profile.rider_item.flying_pet = 0;
+        profile.rider_item.kart_plant3 = 45;
+        let plant = room_physics_metadata(&profile).unwrap();
+        assert!(plant.physics_fallback);
+        assert_eq!(plant.block, baseline);
     }
 
     #[tokio::test]
