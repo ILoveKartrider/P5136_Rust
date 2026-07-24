@@ -52,7 +52,7 @@ not completion evidence.
 - [x] atomic eight-slot concurrent room admission
 - [x] static channel catalog and migration membership binding
 - [x] room create/list/join/leave wire codecs
-- [ ] room create/list/join/leave runtime integration
+- [x] room create/list/join/leave runtime integration
 - [ ] ready/team/master/observer/AI state
 - [ ] generation-bound game UDP endpoint registration
 - [ ] generation-bound P2P endpoint registration

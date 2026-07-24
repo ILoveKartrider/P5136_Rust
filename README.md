@@ -14,15 +14,18 @@ server. The implemented foundation provides:
 - the Korean P5136 first-message payload;
 - authentication, login, identity fencing, and channel migration over real TCP;
 - request-driven startup replies plus catalog-backed rider inventory/equipment;
-- an actor-owned room-state foundation with stale-session cancellation;
+- actor-owned channel rooms with create/list/join/leave, bounded fan-out, and
+  stale-generation cancellation;
 - bounded login concurrency and opt-in remote profile creation;
 - PIN/BML patching with immutable backups, a process lock, and atomic writes;
 - executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
 - versioned JSON profile persistence compatible with legacy `Launcher.json`;
 - a no-argument desktop connector GUI and an equivalent headless CLI.
 
-Room wire codecs and modern P5136 UDP codecs are present. Room runtime state,
-UDP/P2P relay, messenger, and race/gameplay flows still need integration.
+Room admission and first-state runtime flows are integrated. Modern P5136 UDP
+codecs, generation-bound endpoint state, and a bounded messenger hub are
+present; UDP/P2P socket relay, messenger stream I/O, and race/gameplay flows
+still need integration.
 
 ## Build
 
