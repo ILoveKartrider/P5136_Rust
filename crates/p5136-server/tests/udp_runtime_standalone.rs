@@ -10,29 +10,13 @@ use p5136_core::{
         UdpLogicalBody, encode_routed_udp_packet,
     },
 };
-use p5136_server::{DisconnectOutcome, IdentityRegistry, SessionId, WorldHandle};
-use tokio::{net::UdpSocket, time::timeout};
-
-pub use p5136_server::{IdentityBinding, ReleasedIdentity};
-
-pub mod udp_state {
-    pub use p5136_server::{
-        CurrentUdpEndpoint, UdpEndpointBindStatus, UdpEndpointState, UdpEndpointStateError,
-        UdpTransport,
-    };
-}
-
-// `udp_runtime.rs` is intentionally not wired into the central library module
-// yet. This path module keeps its production API compiled and exercised while
-// the parent integration tranche owns `lib.rs` and `runtime.rs`.
-#[path = "../src/udp_runtime.rs"]
-pub mod udp_runtime;
-
-use udp_runtime::{
-    ServerClock, UdpDispatchAction, UdpDispatchRequest, UdpIngress, UdpIngressBody, UdpRuntime,
-    UdpRuntimeConfig, UdpServiceError,
+use p5136_server::{
+    DisconnectOutcome, IdentityBinding, IdentityRegistry, ServerClock, SessionId,
+    UdpDispatchAction, UdpDispatchRequest, UdpEndpointBindStatus, UdpEndpointStateError, UdpIngress,
+    UdpIngressBody, UdpRuntime, UdpRuntimeConfig, UdpServiceError, UdpTransport, WorldHandle,
+    decode_udp_ingress,
 };
-use udp_state::{UdpEndpointBindStatus, UdpEndpointStateError, UdpTransport};
+use tokio::{net::UdpSocket, time::timeout};
 
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -574,7 +558,7 @@ async fn oversized_datagram_is_dropped_without_stopping_the_reader() {
         .expect("reader did not answer after oversized datagram")
         .unwrap();
     assert_eq!(source, runtime.endpoints().game);
-    let reply = udp_runtime::decode_udp_ingress(
+    let reply = decode_udp_ingress(
         UdpTransport::Game,
         source,
         &wire[..length],
@@ -724,7 +708,7 @@ async fn receive_ingress(socket: &UdpSocket, transport: UdpTransport) -> UdpIngr
         .await
         .expect("UDP response timed out")
         .unwrap();
-    udp_runtime::decode_udp_ingress(
+    decode_udp_ingress(
         transport,
         source,
         &wire[..length],

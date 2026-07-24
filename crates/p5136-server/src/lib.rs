@@ -6,6 +6,7 @@ mod messenger_hub;
 mod messenger_runtime;
 mod runtime;
 mod session;
+mod udp_runtime;
 mod udp_state;
 mod world;
 
@@ -29,6 +30,14 @@ pub use messenger_runtime::{
 };
 pub use runtime::{BoundServer, ServerError, ServerHandle};
 pub use session::{LoginSessionError, read_encrypted_frame};
+pub use udp_runtime::{
+    DEFAULT_MAX_ACTIVE_UDP_IDENTITIES, DEFAULT_MAX_RELAY_TARGETS, DEFAULT_UDP_ADMISSION_CAPACITY,
+    DEFAULT_UDP_COMMAND_CAPACITY, ServerClock, UdpDispatchAction, UdpDispatchOutcome,
+    UdpDispatchRequest, UdpIngress, UdpIngressBody, UdpIngressDecodeError, UdpRuntime,
+    UdpRuntimeConfig, UdpRuntimeEndpoints, UdpRuntimeEvent, UdpRuntimeFailure,
+    UdpRuntimeStartError, UdpRuntimeStats, UdpRuntimeTask, UdpService, UdpServiceError,
+    decode_udp_ingress,
+};
 pub use udp_state::{
     CurrentUdpEndpoint, UdpEndpointBindStatus, UdpEndpointBinding, UdpEndpointState,
     UdpEndpointStateError, UdpIngressBinding, UdpTransport,
