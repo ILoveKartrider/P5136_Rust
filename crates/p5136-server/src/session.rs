@@ -260,6 +260,10 @@ impl ProfileCoordinator {
         }
     }
 
+    fn catalog(&self) -> Option<&CatalogInventory> {
+        self.catalog.as_deref()
+    }
+
     #[cfg(test)]
     fn with_blocking_update_hook(mut self, hook: Arc<BlockingUpdateHook>) -> Self {
         self.blocking_update_hook = Some(hook);
@@ -839,33 +843,8 @@ async fn dispatch_packet(
     }
 
     if hash == adler32::packet_hash("PqChannelSwitch") {
-        let request = parse_pq_channel_switch(packet)?;
-        let selected_channel =
-            resolve_channel_id(request.requested_game_type, request.preferred_channel_id).ok_or(
-                LoginSessionError::UnsupportedChannel {
-                    game_type: request.requested_game_type,
-                    preferred_channel: request.preferred_channel_id,
-                },
-            )?;
-        let token = random_migration_token();
-        let permit = services
-            .world
-            .begin_migration(
-                services.session_id,
-                ChannelBinding {
-                    channel_id: selected_channel,
-                    game_type: request.requested_game_type,
-                },
-                token,
-                Instant::now(),
-            )
-            .await?;
-        return Ok(vec![serialize_pr_channel_switch(
-            selected_channel,
-            permit.token.get(),
-            services.config.advertised_address,
-            services.config.ports.login_tcp(),
-        )]);
+        return handle_channel_switch(services.config, services.world, services.session_id, packet)
+            .await;
     }
 
     if hash == adler32::packet_hash("PqChannelMovein") {
@@ -883,6 +862,7 @@ async fn dispatch_packet(
     if let Some(request) = classify_room_protocol_request(hash) {
         return handle_room_request(
             services.world,
+            services.profiles,
             services.session_id,
             request,
             packet,
@@ -931,6 +911,39 @@ async fn dispatch_packet(
         .authorize_identity(services.session_id)
         .await?;
     Ok(Vec::new())
+}
+
+async fn handle_channel_switch(
+    config: &ServerConfig,
+    world: &WorldHandle,
+    session_id: SessionId,
+    packet: &[u8],
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let request = parse_pq_channel_switch(packet)?;
+    let selected_channel =
+        resolve_channel_id(request.requested_game_type, request.preferred_channel_id).ok_or(
+            LoginSessionError::UnsupportedChannel {
+                game_type: request.requested_game_type,
+                preferred_channel: request.preferred_channel_id,
+            },
+        )?;
+    let permit = world
+        .begin_migration(
+            session_id,
+            ChannelBinding {
+                channel_id: selected_channel,
+                game_type: request.requested_game_type,
+            },
+            random_migration_token(),
+            Instant::now(),
+        )
+        .await?;
+    Ok(vec![serialize_pr_channel_switch(
+        selected_channel,
+        permit.token.get(),
+        config.advertised_address,
+        config.ports.login_tcp(),
+    )])
 }
 
 async fn handle_login(
@@ -1008,6 +1021,7 @@ async fn handle_channel_move_in(
 
 async fn handle_room_request(
     world: &WorldHandle,
+    profiles: &ProfileCoordinator,
     session_id: SessionId,
     request: RoomProtocolRequest,
     packet: &[u8],
@@ -1023,7 +1037,7 @@ async fn handle_room_request(
             let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Create {
                 request,
-                participant: room_participant_from_profile(&identity, profile)?,
+                participant: room_participant_from_profile(&identity, profile, profiles.catalog())?,
             }
         }
         RoomProtocolRequest::JoinRoom => {
@@ -1032,7 +1046,7 @@ async fn handle_room_request(
             let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Join {
                 request,
-                participant: room_participant_from_profile(&identity, profile)?,
+                participant: room_participant_from_profile(&identity, profile, profiles.catalog())?,
             }
         }
         RoomProtocolRequest::LeaveRoom => {
@@ -1238,42 +1252,110 @@ async fn equip_plant_part(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum RoomKartBaseResolution {
+    KartZeroBaseline,
+    CatalogBaseSpec,
+    MissingCatalogFallback,
+    MissingCatalogSpecFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoomPhysicsFallbackReason {
+    CatalogUnavailable,
+    CatalogSpecUnavailable,
+    FlyingPetNotApplied { item_id: u16 },
+    KartPlantNotApplied { slot: u8, item_id: u16 },
+    SpeedPatchNotApplied { value: u8 },
+    TuneLevelV2SidecarsUninspected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RoomPhysicsMetadata {
     kart_id: u16,
-    physics_fallback: bool,
+    base_resolution: RoomKartBaseResolution,
+    fallback_reasons: Vec<RoomPhysicsFallbackReason>,
     block: P5136KartPhysicsBlock,
 }
 
-fn room_physics_metadata(profile: &Profile) -> Result<RoomPhysicsMetadata, KartPhysicsBuildError> {
+impl RoomPhysicsMetadata {
+    fn physics_fallback(&self) -> bool {
+        !self.fallback_reasons.is_empty()
+    }
+}
+
+fn room_physics_metadata(
+    profile: &Profile,
+    catalog: Option<&CatalogInventory>,
+) -> Result<RoomPhysicsMetadata, KartPhysicsBuildError> {
     let items = &profile.rider_item;
-    let physics_fallback = items.kart != 0
-        || items.flying_pet != 0
-        || [
-            items.kart_plant1,
-            items.kart_plant2,
-            items.kart_plant3,
-            items.kart_plant4,
-        ]
-        .into_iter()
-        .any(|item_id| item_id != 0);
+    let mut snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+    let mut fallback_reasons = Vec::new();
+    let base_resolution = if items.kart == 0 {
+        RoomKartBaseResolution::KartZeroBaseline
+    } else if let Some(catalog) = catalog {
+        if let Some(spec) = catalog.kart_spec(items.kart) {
+            snapshot.kart = *spec;
+            RoomKartBaseResolution::CatalogBaseSpec
+        } else {
+            fallback_reasons.push(RoomPhysicsFallbackReason::CatalogSpecUnavailable);
+            RoomKartBaseResolution::MissingCatalogSpecFallback
+        }
+    } else {
+        fallback_reasons.push(RoomPhysicsFallbackReason::CatalogUnavailable);
+        RoomKartBaseResolution::MissingCatalogFallback
+    };
+
+    if items.flying_pet != 0 {
+        fallback_reasons.push(RoomPhysicsFallbackReason::FlyingPetNotApplied {
+            item_id: items.flying_pet,
+        });
+    }
+    for (slot, item_id) in [
+        items.kart_plant1,
+        items.kart_plant2,
+        items.kart_plant3,
+        items.kart_plant4,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(_, item_id)| *item_id != 0)
+    {
+        fallback_reasons.push(RoomPhysicsFallbackReason::KartPlantNotApplied {
+            slot: u8::try_from(slot + 1).expect("the four kart-plant slots fit in u8"),
+            item_id,
+        });
+    }
+    if profile.server_setting.speed_patch_use != 0 {
+        fallback_reasons.push(RoomPhysicsFallbackReason::SpeedPatchNotApplied {
+            value: profile.server_setting.speed_patch_use,
+        });
+    }
+    if items.kart != 0 {
+        fallback_reasons.push(RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected);
+    }
+
     Ok(RoomPhysicsMetadata {
         kart_id: items.kart,
-        physics_fallback,
-        block: build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())?,
+        base_resolution,
+        fallback_reasons,
+        block: build_p5136_kart_physics_block(&snapshot)?,
     })
 }
 
 fn room_participant_from_profile(
     identity: &IdentityBinding,
     profile: &Profile,
+    catalog: Option<&CatalogInventory>,
 ) -> Result<RoomParticipant, LoginSessionError> {
-    let physics = room_physics_metadata(profile)?;
-    if physics.physics_fallback {
+    let physics = room_physics_metadata(profile, catalog)?;
+    if physics.physics_fallback() {
         tracing::warn!(
             nickname = %identity.nickname,
             kart_id = physics.kart_id,
+            base_resolution = ?physics.base_resolution,
             physics_fallback = true,
-            "using the exact S7 baseline because equipped kart physics are not ported"
+            fallback_reasons = ?physics.fallback_reasons,
+            "using bounded room-entry kart physics with omitted optional contributions"
         );
     }
     let observer = matches!(profile.rider.pmap, 590 | 718);
@@ -1553,11 +1635,11 @@ mod tests {
 
     use super::{
         BlockingUpdateHook, LoginSessionError, MAX_OUTBOUND_BATCH_BURST, ProfileCoordinator,
-        SessionContext, SessionReadEvent, SessionServices, dispatch_packet,
-        handle_equipment_request, handle_lobby_request, handle_race_request, handle_room_request,
-        read_encrypted_frame, read_session_frame, room_participant_from_profile,
-        room_physics_metadata, select_session_read_event, update_game_options,
-        validate_rider_item_selection, write_session_bytes,
+        RoomKartBaseResolution, RoomPhysicsFallbackReason, SessionContext, SessionReadEvent,
+        SessionServices, dispatch_packet, handle_equipment_request, handle_lobby_request,
+        handle_race_request, handle_room_request, read_encrypted_frame, read_session_frame,
+        room_participant_from_profile, room_physics_metadata, select_session_read_event,
+        update_game_options, validate_rider_item_selection, write_session_bytes,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
@@ -1605,7 +1687,15 @@ mod tests {
         assert_eq!(item_count, 6_800);
         let xml = format!(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
-                <Names />
+                <Names>
+                    <Kart id="1450" name="sessionKnownKart" />
+                    <Kart id="1453" name="sessionMissingKartSpec" />
+                </Names>
+                <Specs>
+                    <Spec name="sessionKnownKart">
+                        <BodyParam ForwardAccelForce="147" DragFactor="-0.05" />
+                    </Spec>
+                </Specs>
                 <Inventory total="{item_count}" categories="60">{items}</Inventory>
             </KartCatalog>"#
         );
@@ -1812,7 +1902,8 @@ mod tests {
                 rider.session,
                 RoomCommandPayload::Create {
                     request: create_room_request(room_name),
-                    participant: room_participant_from_profile(&rider.identity, &profile).unwrap(),
+                    participant: room_participant_from_profile(&rider.identity, &profile, None)
+                        .unwrap(),
                 },
             )
             .await
@@ -1992,6 +2083,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_room_packets_are_rejected_before_world_authorization() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
         let (world, world_task) = WorldHandle::spawn(4);
         let context = SessionContext::default();
         let mut trailing = PacketWriter::named("ChGetRoomListRequestPacket");
@@ -2002,6 +2095,7 @@ mod tests {
         assert!(matches!(
             handle_room_request(
                 &world,
+                &profiles,
                 SessionId::new(999),
                 RoomProtocolRequest::RoomList,
                 trailing.as_slice(),
@@ -2020,6 +2114,7 @@ mod tests {
         assert!(matches!(
             handle_room_request(
                 &world,
+                &profiles,
                 SessionId::new(999),
                 RoomProtocolRequest::RoomList,
                 invalid_page.as_slice(),
@@ -2097,7 +2192,8 @@ mod tests {
                 rider.session,
                 RoomCommandPayload::Create {
                     request: create_room_request("Trailing"),
-                    participant: room_participant_from_profile(&rider.identity, &profile).unwrap(),
+                    participant: room_participant_from_profile(&rider.identity, &profile, None)
+                        .unwrap(),
                 },
             )
             .await
@@ -2164,7 +2260,8 @@ mod tests {
                 owner.session,
                 RoomCommandPayload::Create {
                     request: create_room_request("NotReady"),
-                    participant: room_participant_from_profile(&owner.identity, &profile).unwrap(),
+                    participant: room_participant_from_profile(&owner.identity, &profile, None)
+                        .unwrap(),
                 },
             )
             .await
@@ -2175,7 +2272,8 @@ mod tests {
                 guest.session,
                 RoomCommandPayload::Join {
                     request: join_room_request(1),
-                    participant: room_participant_from_profile(&guest.identity, &profile).unwrap(),
+                    participant: room_participant_from_profile(&guest.identity, &profile, None)
+                        .unwrap(),
                 },
             )
             .await
@@ -2239,35 +2337,180 @@ mod tests {
     }
 
     #[test]
-    fn room_physics_reports_exact_baseline_fallback_metadata() {
+    fn room_physics_resolves_the_exact_catalog_base_block() {
+        let catalog = test_catalog();
         let baseline =
             build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
                 .unwrap();
         let mut profile = Profile::default();
 
-        let unequipped = room_physics_metadata(&profile).unwrap();
+        let unequipped = room_physics_metadata(&profile, None).unwrap();
         assert_eq!(unequipped.kart_id, 0);
-        assert!(!unequipped.physics_fallback);
+        assert_eq!(
+            unequipped.base_resolution,
+            RoomKartBaseResolution::KartZeroBaseline
+        );
+        assert!(unequipped.fallback_reasons.is_empty());
+        assert!(!unequipped.physics_fallback());
         assert_eq!(unequipped.block, baseline);
 
-        profile.rider_item.kart = 5136;
-        let kart = room_physics_metadata(&profile).unwrap();
-        assert_eq!(kart.kart_id, 5136);
-        assert!(kart.physics_fallback);
-        assert_eq!(kart.block, baseline);
+        profile.rider_item.kart = 1_450;
+        let resolved = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected_snapshot.kart = *catalog.kart_spec(1_450).unwrap();
+        let expected = build_p5136_kart_physics_block(&expected_snapshot).unwrap();
+
+        assert_eq!(resolved.kart_id, 1_450);
+        assert_eq!(
+            resolved.base_resolution,
+            RoomKartBaseResolution::CatalogBaseSpec
+        );
+        assert_eq!(
+            resolved.fallback_reasons,
+            vec![RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected]
+        );
+        assert!(resolved.physics_fallback());
+        assert_eq!(resolved.block.as_bytes().len(), 235);
+        assert_ne!(resolved.block, baseline);
+        assert_eq!(resolved.block, expected);
+    }
+
+    #[test]
+    fn missing_catalog_or_kart_spec_uses_typed_baseline_fallback() {
+        let catalog = test_catalog();
+        let baseline =
+            build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
+                .unwrap();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+
+        let missing_catalog = room_physics_metadata(&profile, None).unwrap();
+        assert_eq!(
+            missing_catalog.base_resolution,
+            RoomKartBaseResolution::MissingCatalogFallback
+        );
+        assert_eq!(
+            missing_catalog.fallback_reasons,
+            vec![
+                RoomPhysicsFallbackReason::CatalogUnavailable,
+                RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected,
+            ]
+        );
+        assert_eq!(missing_catalog.block, baseline);
+
+        profile.rider_item.kart = 1_453;
+        let missing_spec = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        assert_eq!(
+            missing_spec.base_resolution,
+            RoomKartBaseResolution::MissingCatalogSpecFallback
+        );
+        assert_eq!(
+            missing_spec.fallback_reasons,
+            vec![
+                RoomPhysicsFallbackReason::CatalogSpecUnavailable,
+                RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected,
+            ]
+        );
+        assert_eq!(missing_spec.block, baseline);
+    }
+
+    #[test]
+    fn optional_physics_inputs_are_typed_without_overstating_the_base_spec() {
+        let catalog = test_catalog();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+        profile.rider_item.flying_pet = 83;
+        profile.rider_item.kart_plant2 = 44;
+        profile.rider_item.kart_plant4 = 46;
+        profile.server_setting.speed_patch_use = 1;
+
+        let resolved = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        assert_eq!(
+            resolved.base_resolution,
+            RoomKartBaseResolution::CatalogBaseSpec
+        );
+        assert_eq!(
+            resolved.fallback_reasons,
+            vec![
+                RoomPhysicsFallbackReason::FlyingPetNotApplied { item_id: 83 },
+                RoomPhysicsFallbackReason::KartPlantNotApplied {
+                    slot: 2,
+                    item_id: 44,
+                },
+                RoomPhysicsFallbackReason::KartPlantNotApplied {
+                    slot: 4,
+                    item_id: 46,
+                },
+                RoomPhysicsFallbackReason::SpeedPatchNotApplied { value: 1 },
+                RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected,
+            ]
+        );
+
+        let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected_snapshot.kart = *catalog.kart_spec(1_450).unwrap();
+        assert_eq!(
+            resolved.block,
+            build_p5136_kart_physics_block(&expected_snapshot).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn equipment_publish_does_not_refresh_admission_physics_snapshot() {
+        let catalog = test_catalog();
+        let (world, world_task) = WorldHandle::spawn(16);
+        let mut rider = register_lobby_session(&world, "PhysicsSnapshot", 49_735).await;
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+        let participant =
+            room_participant_from_profile(&rider.identity, &profile, Some(catalog.as_ref()))
+                .unwrap();
+        let admission_physics = participant.kart_physics.clone();
+        world
+            .room_protocol(
+                rider.session,
+                RoomCommandPayload::Create {
+                    request: create_room_request("PhysicsSnapshot"),
+                    participant,
+                },
+            )
+            .await
+            .unwrap();
+        let _create_reply = rider.outbound.recv().await.unwrap();
 
         profile.rider_item.kart = 0;
-        profile.rider_item.flying_pet = 83;
-        let flying_pet = room_physics_metadata(&profile).unwrap();
-        assert_eq!(flying_pet.kart_id, 0);
-        assert!(flying_pet.physics_fallback);
-        assert_eq!(flying_pet.block, baseline);
+        world
+            .publish_room_equipment(rider.session, rider_item_snapshot(&profile.rider_item))
+            .await
+            .unwrap();
 
-        profile.rider_item.flying_pet = 0;
-        profile.rider_item.kart_plant3 = 45;
-        let plant = room_physics_metadata(&profile).unwrap();
-        assert!(plant.physics_fallback);
-        assert_eq!(plant.block, baseline);
+        let mut start = PacketWriter::named("GrRequestStartPacket");
+        start.write_i32(0);
+        handle_lobby_request(
+            &world,
+            rider.session,
+            LobbyRequest::StartRoom,
+            start.as_slice(),
+        )
+        .await
+        .unwrap();
+        let start_packets = rider.outbound.recv().await.unwrap().into_packets();
+        let command = &start_packets[1];
+        let baseline =
+            build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
+                .unwrap();
+        assert!(
+            command
+                .windows(admission_physics.as_bytes().len())
+                .any(|window| window == admission_physics.as_bytes())
+        );
+        assert!(
+            !command
+                .windows(baseline.as_bytes().len())
+                .any(|window| window == baseline.as_bytes())
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -2457,7 +2700,8 @@ mod tests {
                 rider.session,
                 RoomCommandPayload::Create {
                     request: create_room_request("RaceRejection"),
-                    participant: room_participant_from_profile(&rider.identity, &profile).unwrap(),
+                    participant: room_participant_from_profile(&rider.identity, &profile, None)
+                        .unwrap(),
                 },
             )
             .await
