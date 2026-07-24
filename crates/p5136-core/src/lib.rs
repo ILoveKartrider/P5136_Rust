@@ -10,6 +10,7 @@ pub mod equipment_protocol;
 pub mod frame;
 pub mod handshake;
 pub mod inventory;
+pub mod lobby_protocol;
 pub mod login;
 pub mod messenger;
 pub mod nickname;
