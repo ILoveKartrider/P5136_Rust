@@ -3,26 +3,32 @@
 use std::{
     borrow::Cow,
     cell::Cell,
+    collections::BTreeMap,
     fmt,
-    fs::File,
-    io::{Read, Take},
+    fs::{self, File, OpenOptions},
+    io::{Read, Take, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-use p5136_core::inventory::{PartsExcRecord, PlantExcRecord};
+use p5136_core::{
+    equipment_protocol::PlantPartEquipRequest,
+    inventory::{PartsExcRecord, PlantExcRecord},
+};
 use quick_xml::{
     Reader, XmlVersion,
     events::{BytesStart, Event},
     name::QName,
 };
 use serde::{
-    Deserialize,
+    Deserialize, Serialize,
     de::{DeserializeSeed, Deserializer, Error as _, SeqAccess, Visitor},
 };
 use thiserror::Error;
 
 pub const MAX_EQUIPMENT_STATE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_EQUIPMENT_RECORDS: usize = 65_535;
+static EQUIPMENT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EquipmentExceptions {
@@ -47,6 +53,50 @@ impl EquipmentExceptions {
             plant: load_plant_records(&plant_path)?,
             parts: load_parts_records(&parts_path)?,
         })
+    }
+
+    /// Applies one validated P5136 plant-part selection and atomically
+    /// publishes the C#-compatible `PlantData.json` sidecar.
+    pub fn equip_plant_part(
+        rider_directory: impl AsRef<Path>,
+        request: PlantPartEquipRequest,
+    ) -> Result<PlantExcRecord, EquipmentStateError> {
+        validate_plant_request(request)?;
+        let rider_directory = rider_directory.as_ref();
+        fs::create_dir_all(rider_directory).map_err(|source| EquipmentStateError::Io {
+            operation: "create rider equipment directory",
+            path: rider_directory.to_owned(),
+            source,
+        })?;
+        let path = rider_directory.join("PlantData.json");
+        let mut states = load_plant_states(&path)?;
+        let serial = normalize_kart_serial(request.kart_id, request.kart_serial);
+
+        let state = if let Some(state) = states
+            .iter_mut()
+            .find(|state| state.id == request.kart_id && state.serial == serial)
+        {
+            state
+        } else {
+            if states.len() >= MAX_EQUIPMENT_RECORDS {
+                return Err(EquipmentStateError::TooManyRecords {
+                    kind: "plant",
+                    maximum: MAX_EQUIPMENT_RECORDS,
+                });
+            }
+            states.push(PlantState {
+                id: request.kart_id,
+                serial,
+                ..PlantState::default()
+            });
+            states
+                .last_mut()
+                .expect("a state was appended immediately before lookup")
+        };
+        state.set_part(request.item_category, request.item_id);
+        let result = state.as_exception();
+        write_plant_states(&path, &states)?;
+        Ok(result)
     }
 }
 
@@ -92,9 +142,18 @@ pub enum EquipmentStateError {
 
     #[error("{kind} equipment state has more than {maximum} records")]
     TooManyRecords { kind: &'static str, maximum: usize },
+
+    #[error("plant part category {0} is outside 43..=46")]
+    InvalidPlantPartCategory(i16),
+
+    #[error("plant part item ID {0} cannot be negative")]
+    InvalidPlantPartItem(i16),
+
+    #[error("plant target kart ID {0} must be positive")]
+    InvalidPlantKart(i16),
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct PlantState {
     #[serde(rename = "ID")]
@@ -117,6 +176,47 @@ struct PlantState {
     kit_category: i16,
     #[serde(rename = "KitID")]
     kit_id: i16,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl PlantState {
+    fn set_part(&mut self, category: i16, item_id: i16) {
+        match category {
+            43 => {
+                self.engine_category = category;
+                self.engine_id = item_id;
+            }
+            44 => {
+                self.handle_category = category;
+                self.handle_id = item_id;
+            }
+            45 => {
+                self.wheel_category = category;
+                self.wheel_id = item_id;
+            }
+            46 => {
+                self.kit_category = category;
+                self.kit_id = item_id;
+            }
+            _ => unreachable!("plant request validation precedes mutation"),
+        }
+    }
+
+    fn as_exception(&self) -> PlantExcRecord {
+        PlantExcRecord {
+            id: self.id,
+            serial: normalize_kart_serial(self.id, self.serial),
+            engine_category: self.engine_category,
+            engine_id: self.engine_id,
+            handle_category: self.handle_category,
+            handle_id: self.handle_id,
+            wheel_category: self.wheel_category,
+            wheel_id: self.wheel_id,
+            kit_category: self.kit_category,
+            kit_id: self.kit_id,
+        }
+    }
 }
 
 struct PlantStatesSeed<'a> {
@@ -185,6 +285,13 @@ impl<'de> DeserializeSeed<'de> for RejectAdditionalPlantRecord<'_> {
 }
 
 fn load_plant_records(path: &Path) -> Result<Vec<PlantExcRecord>, EquipmentStateError> {
+    Ok(load_plant_states(path)?
+        .iter()
+        .map(PlantState::as_exception)
+        .collect())
+}
+
+fn load_plant_states(path: &Path) -> Result<Vec<PlantState>, EquipmentStateError> {
     let Some(bytes) = read_optional_bounded(path)? else {
         return Ok(Vec::new());
     };
@@ -218,21 +325,115 @@ fn load_plant_records(path: &Path) -> Result<Vec<PlantExcRecord>, EquipmentState
             path: path.to_owned(),
             source,
         })?;
-    Ok(states
-        .into_iter()
-        .map(|state| PlantExcRecord {
-            id: state.id,
-            serial: normalize_kart_serial(state.id, state.serial),
-            engine_category: state.engine_category,
-            engine_id: state.engine_id,
-            handle_category: state.handle_category,
-            handle_id: state.handle_id,
-            wheel_category: state.wheel_category,
-            wheel_id: state.wheel_id,
-            kit_category: state.kit_category,
-            kit_id: state.kit_id,
+    Ok(states)
+}
+
+fn validate_plant_request(request: PlantPartEquipRequest) -> Result<(), EquipmentStateError> {
+    if !(43..=46).contains(&request.item_category) {
+        return Err(EquipmentStateError::InvalidPlantPartCategory(
+            request.item_category,
+        ));
+    }
+    if request.item_id < 0 {
+        return Err(EquipmentStateError::InvalidPlantPartItem(request.item_id));
+    }
+    if request.kart_id <= 0 {
+        return Err(EquipmentStateError::InvalidPlantKart(request.kart_id));
+    }
+    Ok(())
+}
+
+fn write_plant_states(path: &Path, states: &[PlantState]) -> Result<(), EquipmentStateError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(states).map_err(|source| EquipmentStateError::Json {
+            path: path.to_owned(),
+            source,
+        })?;
+    bytes.push(b'\n');
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if length > MAX_EQUIPMENT_STATE_BYTES {
+        return Err(EquipmentStateError::TooLarge {
+            path: path.to_owned(),
+            actual: length,
+            maximum: MAX_EQUIPMENT_STATE_BYTES,
+        });
+    }
+
+    let directory = path
+        .parent()
+        .expect("PlantData.json always has a rider-directory parent");
+    let temporary_path = create_equipment_temporary(directory, &bytes)?;
+    let publish_result =
+        fs::rename(&temporary_path, path).map_err(|source| EquipmentStateError::Io {
+            operation: "publish plant equipment state",
+            path: path.to_owned(),
+            source,
+        });
+    if publish_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    publish_result?;
+    sync_equipment_directory(directory)
+}
+
+fn create_equipment_temporary(
+    directory: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, EquipmentStateError> {
+    loop {
+        let sequence = EQUIPMENT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            ".PlantData.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(EquipmentStateError::Io {
+                    operation: "create temporary plant equipment state",
+                    path,
+                    source,
+                });
+            }
+        };
+        let write_result = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all());
+        if let Err(source) = write_result {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(EquipmentStateError::Io {
+                operation: "write temporary plant equipment state",
+                path,
+                source,
+            });
+        }
+        return Ok(path);
+    }
+}
+
+#[cfg(unix)]
+fn sync_equipment_directory(directory: &Path) -> Result<(), EquipmentStateError> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| EquipmentStateError::Io {
+            operation: "sync plant equipment directory",
+            path: directory.to_owned(),
+            source,
         })
-        .collect())
+}
+
+#[cfg(not(unix))]
+fn sync_equipment_directory(directory: &Path) -> Result<(), EquipmentStateError> {
+    fs::metadata(directory).map_err(|source| EquipmentStateError::Io {
+        operation: "verify plant equipment directory",
+        path: directory.to_owned(),
+        source,
+    })?;
+    Ok(())
 }
 
 fn load_parts_records(path: &Path) -> Result<Vec<PartsExcRecord>, EquipmentStateError> {
@@ -436,6 +637,8 @@ const fn normalize_kart_serial(id: i16, serial: i16) -> i16 {
 mod tests {
     use std::fs;
 
+    use p5136_core::equipment_protocol::PlantPartEquipRequest;
+    use serde_json::Value;
     use tempfile::tempdir;
 
     use super::{EquipmentExceptions, EquipmentStateError, MAX_EQUIPMENT_RECORDS};
@@ -546,5 +749,102 @@ mod tests {
                 maximum: MAX_EQUIPMENT_RECORDS,
             })
         ));
+    }
+
+    #[test]
+    fn equips_and_atomically_replaces_a_csharp_plant_sidecar() {
+        let root = tempdir().unwrap();
+        let rider = root.path().join("Rider");
+        fs::create_dir(&rider).unwrap();
+        fs::write(
+            rider.join("PlantData.json"),
+            concat!(
+                "[{\"ID\":1401,\"SN\":1,\"Engine\":43,\"EngineID\":5,",
+                "\"Handle\":0,\"HandleID\":0,\"Wheel\":45,\"WheelID\":14,",
+                "\"Kit\":0,\"KitID\":0,\"FutureField\":{\"keep\":true}}]"
+            ),
+        )
+        .unwrap();
+
+        let equipped = EquipmentExceptions::equip_plant_part(
+            &rider,
+            PlantPartEquipRequest {
+                item_category: 44,
+                item_id: 2,
+                kart_category: 3,
+                kart_id: 1_401,
+                kart_serial: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(equipped.engine_id, 5);
+        assert_eq!(equipped.handle_category, 44);
+        assert_eq!(equipped.handle_id, 2);
+        assert_eq!(equipped.wheel_id, 14);
+
+        let encoded: Value =
+            serde_json::from_slice(&fs::read(rider.join("PlantData.json")).unwrap()).unwrap();
+        assert_eq!(encoded[0]["FutureField"]["keep"], true);
+        assert_eq!(encoded[0]["Handle"], 44);
+        assert_eq!(encoded[0]["HandleID"], 2);
+        assert!(fs::read_dir(&rider).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn first_equip_creates_one_normalized_record_and_later_updates_it() {
+        let root = tempdir().unwrap();
+        let rider = root.path().join("Rider");
+        let first = EquipmentExceptions::equip_plant_part(
+            &rider,
+            PlantPartEquipRequest {
+                item_category: 43,
+                item_id: 5,
+                kart_category: 3,
+                kart_id: 1_401,
+                kart_serial: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.serial, 1);
+
+        let second = EquipmentExceptions::equip_plant_part(
+            &rider,
+            PlantPartEquipRequest {
+                item_category: 46,
+                item_id: 6,
+                kart_category: 3,
+                kart_id: 1_401,
+                kart_serial: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.engine_id, 5);
+        assert_eq!(second.kit_id, 6);
+
+        let loaded = EquipmentExceptions::load(root.path(), &rider).unwrap();
+        assert_eq!(loaded.plant, vec![second]);
+    }
+
+    #[test]
+    fn direct_plant_mutation_revalidates_typed_requests() {
+        let root = tempdir().unwrap();
+        let request = PlantPartEquipRequest {
+            item_category: 42,
+            item_id: -1,
+            kart_category: 3,
+            kart_id: 0,
+            kart_serial: 0,
+        };
+        assert!(matches!(
+            EquipmentExceptions::equip_plant_part(root.path(), request),
+            Err(EquipmentStateError::InvalidPlantPartCategory(42))
+        ));
+        assert!(!root.path().join("PlantData.json").exists());
     }
 }
