@@ -38,6 +38,7 @@ use p5136_core::{
     },
     track::is_random_track_selector,
 };
+use p5136_profile::GlobalRaceEpoch;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -315,7 +316,7 @@ pub enum LobbyError {
     #[error("non-master racer {user_no} is not ready")]
     RacerNotReady { user_no: u32 },
 
-    #[error("room race epoch is exhausted")]
+    #[error("process-global race epoch is exhausted")]
     RaceEpochExhausted,
 
     #[error("random track selection requires at least one non-zero concrete candidate")]
@@ -962,6 +963,9 @@ struct World {
     identity_capacity: Option<usize>,
     next_session_id: u64,
     next_room_id: u32,
+    /// The next process-global epoch is consumed only after a race start and
+    /// its complete outbound fan-out have committed.
+    next_race_epoch: Option<GlobalRaceEpoch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1539,6 +1543,7 @@ impl Default for World {
             identity_capacity: None,
             next_session_id: 1,
             next_room_id: 1,
+            next_race_epoch: GlobalRaceEpoch::new(1),
         }
     }
 }
@@ -3017,10 +3022,9 @@ impl World {
             }
         }
 
-        let race_epoch = room
-            .race_epoch
-            .checked_add(1)
-            .ok_or(LobbyError::RaceEpochExhausted)?;
+        let allocated_race_epoch = self.next_race_epoch.ok_or(LobbyError::RaceEpochExhausted)?;
+        let race_epoch = allocated_race_epoch.get();
+        let following_race_epoch = race_epoch.checked_add(1).and_then(GlobalRaceEpoch::new);
         let concrete_track =
             room.select_concrete_track(race_epoch, &plan.random_track_candidates)?;
         let frozen = self.freeze_race_roster(room, race_epoch, concrete_track)?;
@@ -3065,6 +3069,7 @@ impl World {
         next.race_progress = RaceProgress::default();
         next.loading_handshake = LoadingHandshake::Dormant;
         self.protocol_rooms.insert(room_id, next);
+        self.next_race_epoch = following_race_epoch;
         Self::publish_reserved(reserved);
         self.debug_assert_invariants();
         Ok(LobbyCommandOutcome::Started {
@@ -4261,10 +4266,10 @@ mod tests {
     };
 
     use super::{
-        LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome, LobbyCommandPayload,
-        LobbyError, OutboundBatch, ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload,
-        RaceError, RoomCommandPayload, RoomError, RoomId, RoomParticipant, RoomPhase, SessionId,
-        StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
+        GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
+        LobbyCommandPayload, LobbyError, OutboundBatch, ROOM_CAPACITY, RaceCommandOutcome,
+        RaceCommandPayload, RaceError, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
+        RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
@@ -6422,6 +6427,7 @@ mod tests {
             .try_send(OutboundBatch::single(vec![0xAA]))
             .unwrap();
         let before = world.protocol_rooms[&room_id].clone();
+        let epoch_before = world.next_race_epoch;
         assert!(matches!(
             world.lobby_command(
                 owner.session,
@@ -6434,6 +6440,7 @@ mod tests {
                 if session == guest.session
         ));
         assert_eq!(world.protocol_rooms[&room_id], before);
+        assert_eq!(world.next_race_epoch, epoch_before);
         assert!(matches!(
             owner.outbound.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -6446,6 +6453,109 @@ mod tests {
             guest.outbound.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new()
+                    ))
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started { race_epoch: 1, .. }
+        ));
+        assert_eq!(world.next_race_epoch.map(GlobalRaceEpoch::get), Some(2));
+    }
+
+    #[test]
+    fn race_epochs_are_process_global_across_room_id_reuse() {
+        let mut world = World::default();
+        let first = register_channel_session(&mut world, "EpochFirst", 67, 45_101, 64);
+        let second = register_channel_session(&mut world, "EpochSecond", 67, 45_111, 64);
+
+        let reused_room_id = create_protocol_room(&mut world, &first, 1);
+        assert!(matches!(
+            world
+                .lobby_command(
+                    first.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new()
+                    ))
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started {
+                room_id,
+                race_epoch: 1,
+                ..
+            } if room_id == reused_room_id
+        ));
+        world
+            .room_protocol(first.session, RoomCommandPayload::Leave)
+            .unwrap();
+        assert!(!world.protocol_rooms.contains_key(&reused_room_id));
+
+        let second_room_id = create_protocol_room(&mut world, &second, 1);
+        assert_eq!(second_room_id, reused_room_id);
+        assert!(matches!(
+            world
+                .lobby_command(
+                    second.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new()
+                    ))
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started {
+                room_id,
+                race_epoch: 2,
+                ..
+            } if room_id == reused_room_id
+        ));
+        assert_eq!(world.next_race_epoch.map(GlobalRaceEpoch::get), Some(3));
+    }
+
+    #[test]
+    fn maximum_global_race_epoch_is_allocated_once_then_exhausted() {
+        let mut world = World {
+            next_race_epoch: GlobalRaceEpoch::new(u64::MAX),
+            ..World::default()
+        };
+        let first = register_channel_session(&mut world, "EpochMax", 67, 45_201, 64);
+        let second = register_channel_session(&mut world, "EpochExhausted", 67, 45_211, 64);
+        let first_room = create_protocol_room(&mut world, &first, 1);
+        let second_room = create_protocol_room(&mut world, &second, 1);
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    first.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new()
+                    ))
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started {
+                room_id,
+                race_epoch: u64::MAX,
+                ..
+            } if room_id == first_room
+        ));
+        assert_eq!(world.next_race_epoch, None);
+
+        let before = world.protocol_rooms[&second_room].clone();
+        assert!(matches!(
+            world.lobby_command(
+                second.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new()))
+            ),
+            Err(WorldError::Lobby(LobbyError::RaceEpochExhausted))
+        ));
+        assert_eq!(world.protocol_rooms[&second_room], before);
     }
 
     #[tokio::test]
