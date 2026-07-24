@@ -1,20 +1,24 @@
 //! Pure modern-P5136 UDP endpoint binding state.
 //!
-//! The future world actor can call [`UdpEndpointState::bind_ingress`] while it
-//! owns both this value and the [`IdentityRegistry`]. The method performs the
-//! account lookup, source-IP authorization, and generation-bound endpoint
-//! update synchronously, leaving no authorization/update `await` boundary.
-//! Socket I/O and relay audience selection deliberately live elsewhere.
+//! A world actor which owns the identity registry can call
+//! [`UdpEndpointState::bind_ingress`]. The standalone socket service instead
+//! accepts a caller-resolved identity through
+//! [`UdpEndpointState::bind_authorized_ingress`]. Both paths perform source-IP
+//! authorization and generation-bound endpoint mutation synchronously, leaving
+//! no authorization/update `await` boundary.
 
 use std::{
     collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
 };
 
 use thiserror::Error;
 
 use crate::{IdentityBinding, IdentityGeneration, IdentityRegistry, ReleasedIdentity, UserNo};
+
+pub const DEFAULT_MAXIMUM_ACTIVE_UDP_IDENTITIES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UdpTransport {
@@ -70,6 +74,9 @@ pub enum UdpEndpointStateError {
     #[error("UDP account ID {account_id} has no active current-generation owner")]
     InactiveAccount { account_id: u32 },
 
+    #[error("UDP active identity capacity {maximum} is exhausted")]
+    ActiveIdentityCapacity { maximum: usize },
+
     #[error("UDP source endpoint {endpoint} has invalid port zero")]
     InvalidSourceEndpoint { endpoint: SocketAddr },
 
@@ -104,16 +111,42 @@ pub enum UdpEndpointStateError {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UdpEndpointState {
+    active: HashMap<UserNo, ActiveIdentity>,
+    maximum_active_identities: NonZeroUsize,
     game: GenerationEndpointTable,
     p2p: GenerationEndpointTable,
+}
+
+impl Default for UdpEndpointState {
+    fn default() -> Self {
+        Self::with_max_active_identities(
+            NonZeroUsize::new(DEFAULT_MAXIMUM_ACTIVE_UDP_IDENTITIES)
+                .expect("the default UDP identity capacity is non-zero"),
+        )
+    }
 }
 
 impl UdpEndpointState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_max_active_identities(maximum_active_identities: NonZeroUsize) -> Self {
+        Self {
+            active: HashMap::new(),
+            maximum_active_identities,
+            game: GenerationEndpointTable::default(),
+            p2p: GenerationEndpointTable::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn active_identity_count(&self) -> usize {
+        self.active.len()
     }
 
     /// Authorizes and binds one decrypted, validated UDP ingress header.
@@ -134,13 +167,51 @@ impl UdpEndpointState {
         let identity = identities
             .active_identity_by_user_no(user_no)
             .ok_or(UdpEndpointStateError::InactiveAccount { account_id })?;
+        self.advance_identity(&identity)?;
+        self.bind_authorized_ingress(transport, &identity, source, route_hash)
+    }
+
+    /// Binds ingress after the service caller has resolved the active identity.
+    ///
+    /// Keeping this operation synchronous lets an actor resolve an identity,
+    /// pass its exact generation, and mutate endpoint state without performing
+    /// socket I/O inside the authorization boundary.
+    pub fn bind_authorized_ingress(
+        &mut self,
+        transport: UdpTransport,
+        identity: &IdentityBinding,
+        source: SocketAddr,
+        route_hash: u32,
+    ) -> Result<UdpIngressBinding, UdpEndpointStateError> {
+        let account_id = identity.user_no.get();
+        let user_no = identity.user_no;
         if source.port() == 0 {
             return Err(UdpEndpointStateError::InvalidSourceEndpoint { endpoint: source });
         }
-        if source.ip() != identity.source_ip {
+        let active = self
+            .active
+            .get(&user_no)
+            .copied()
+            .ok_or(UdpEndpointStateError::InactiveAccount { account_id })?;
+        if active.generation != identity.generation {
+            return Err(UdpEndpointStateError::StaleGeneration {
+                transport,
+                account_id,
+                attempted_generation: identity.generation.get(),
+                current_generation: active.generation.get(),
+            });
+        }
+        if identity.source_ip != active.source_ip {
             return Err(UdpEndpointStateError::SourceIpMismatch {
                 account_id,
-                expected: identity.source_ip,
+                expected: active.source_ip,
+                received: identity.source_ip,
+            });
+        }
+        if source.ip() != active.source_ip {
+            return Err(UdpEndpointStateError::SourceIpMismatch {
+                account_id,
+                expected: active.source_ip,
                 received: source.ip(),
             });
         }
@@ -156,7 +227,7 @@ impl UdpEndpointState {
             .bind(user_no, candidate)
             .map_err(|error| map_table_error(transport, user_no, source, error))?;
         Ok(UdpIngressBinding {
-            identity,
+            identity: identity.clone(),
             endpoint,
             status,
         })
@@ -172,23 +243,91 @@ impl UdpEndpointState {
         user_no: UserNo,
     ) -> Option<CurrentUdpEndpoint> {
         let identity = identities.active_identity_by_user_no(user_no)?;
-        let endpoint = self.table(transport).get(user_no)?;
+        self.current_authorized_target(transport, &identity)
+    }
+
+    /// Resolves a target only for the exact identity generation supplied by an
+    /// authorization owner such as the world actor.
+    #[must_use]
+    pub fn current_authorized_target(
+        &self,
+        transport: UdpTransport,
+        identity: &IdentityBinding,
+    ) -> Option<CurrentUdpEndpoint> {
+        let active = self.active.get(&identity.user_no)?;
+        if active.generation != identity.generation || active.source_ip != identity.source_ip {
+            return None;
+        }
+        let endpoint = self
+            .table(transport)
+            .get_authorized(identity.user_no, identity.generation)?;
         if endpoint.generation != identity.generation
             || endpoint.endpoint.ip() != identity.source_ip
         {
             return None;
         }
-        Some(CurrentUdpEndpoint { identity, endpoint })
+        Some(CurrentUdpEndpoint {
+            identity: identity.clone(),
+            endpoint,
+        })
     }
 
-    /// Removes both transport routes after the world actor releases an
-    /// identity. User numbers are stable and never reused by the registry.
+    /// Activates or advances the exact generation mirror without inventing an
+    /// endpoint.
+    ///
+    /// A stale advance is ignored. Adding a distinct active account is bounded
+    /// by the configured capacity; advancing an existing account is always
+    /// allowed.
+    pub fn advance_identity(
+        &mut self,
+        identity: &IdentityBinding,
+    ) -> Result<(), UdpEndpointStateError> {
+        if let Some(current) = self.active.get(&identity.user_no).copied() {
+            if current.generation.get() > identity.generation.get() {
+                return Ok(());
+            }
+            if current.generation == identity.generation {
+                if current.source_ip != identity.source_ip {
+                    return Err(UdpEndpointStateError::SourceIpMismatch {
+                        account_id: identity.user_no.get(),
+                        expected: current.source_ip,
+                        received: identity.source_ip,
+                    });
+                }
+                return Ok(());
+            }
+        }
+
+        if !self.active.contains_key(&identity.user_no)
+            && self.active.len() >= self.maximum_active_identities.get()
+        {
+            return Err(UdpEndpointStateError::ActiveIdentityCapacity {
+                maximum: self.maximum_active_identities.get(),
+            });
+        }
+        self.active
+            .insert(identity.user_no, ActiveIdentity::from(identity));
+        Ok(())
+    }
+
+    /// Removes both transport routes only when the released generation is
+    /// current. A delayed release for an older owner cannot erase a replacement
+    /// owner's endpoint.
     pub fn remove_released_identity(&mut self, identity: &ReleasedIdentity) {
-        self.game.remove(identity.user_no);
-        self.p2p.remove(identity.user_no);
+        if !self
+            .active
+            .get(&identity.user_no)
+            .is_some_and(|active| active.generation == identity.generation)
+        {
+            return;
+        }
+        self.active.remove(&identity.user_no);
+        self.game.release(identity.user_no, identity.generation);
+        self.p2p.release(identity.user_no, identity.generation);
     }
 
     pub fn clear(&mut self) {
+        self.active.clear();
         self.game.clear();
         self.p2p.clear();
     }
@@ -208,6 +347,21 @@ impl UdpEndpointState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveIdentity {
+    generation: IdentityGeneration,
+    source_ip: IpAddr,
+}
+
+impl From<&IdentityBinding> for ActiveIdentity {
+    fn from(identity: &IdentityBinding) -> Self {
+        Self {
+            generation: identity.generation,
+            source_ip: identity.source_ip,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct GenerationEndpointTable {
     bindings: HashMap<UserNo, UdpEndpointBinding>,
@@ -223,7 +377,7 @@ impl GenerationEndpointTable {
             None => UdpEndpointBindStatus::Bound,
             Some(current) if current.generation.get() > candidate.generation.get() => {
                 return Err(TableBindError::StaleGeneration {
-                    current,
+                    current: current.generation,
                     attempted: candidate.generation,
                 });
             }
@@ -242,12 +396,25 @@ impl GenerationEndpointTable {
         Ok((status, candidate))
     }
 
-    fn get(&self, user_no: UserNo) -> Option<UdpEndpointBinding> {
-        self.bindings.get(&user_no).copied()
+    fn get_authorized(
+        &self,
+        user_no: UserNo,
+        generation: IdentityGeneration,
+    ) -> Option<UdpEndpointBinding> {
+        self.bindings
+            .get(&user_no)
+            .copied()
+            .filter(|binding| binding.generation == generation)
     }
 
-    fn remove(&mut self, user_no: UserNo) {
-        self.bindings.remove(&user_no);
+    fn release(&mut self, user_no: UserNo, generation: IdentityGeneration) {
+        if self
+            .bindings
+            .get(&user_no)
+            .is_some_and(|binding| binding.generation == generation)
+        {
+            self.bindings.remove(&user_no);
+        }
     }
 
     fn clear(&mut self) {
@@ -261,7 +428,7 @@ enum TableBindError {
         current: UdpEndpointBinding,
     },
     StaleGeneration {
-        current: UdpEndpointBinding,
+        current: IdentityGeneration,
         attempted: IdentityGeneration,
     },
 }
@@ -285,7 +452,7 @@ fn map_table_error(
                 transport,
                 account_id: user_no.get(),
                 attempted_generation: attempted.get(),
-                current_generation: current.generation.get(),
+                current_generation: current.get(),
             }
         }
     }
@@ -295,6 +462,7 @@ fn map_table_error(
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        num::NonZeroUsize,
         time::Instant,
     };
 
@@ -430,6 +598,22 @@ mod tests {
                 .is_none(),
             "a previous-generation route must not be returned as a target"
         );
+        endpoints.advance_identity(&destination).unwrap();
+        assert!(
+            endpoints
+                .current_authorized_target(UdpTransport::Game, &source)
+                .is_none(),
+            "the explicit generation fence must reject a stale caller"
+        );
+        assert_eq!(
+            endpoints.bind_authorized_ingress(UdpTransport::Game, &source, GAME_ENDPOINT, 2,),
+            Err(UdpEndpointStateError::StaleGeneration {
+                transport: UdpTransport::Game,
+                account_id: source.user_no.get(),
+                attempted_generation: source.generation.get(),
+                current_generation: destination.generation.get(),
+            })
+        );
 
         let advanced = endpoints
             .bind_ingress(
@@ -453,7 +637,7 @@ mod tests {
         assert_eq!(
             endpoints.game.bind(source.user_no, stale),
             Err(TableBindError::StaleGeneration {
-                current: advanced.endpoint,
+                current: advanced.endpoint.generation,
                 attempted: old_generation,
             })
         );
@@ -597,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn released_identity_cleanup_removes_both_transport_routes() {
+    fn release_and_advance_are_exact_generation_fences() {
         let now = Instant::now();
         let (mut identities, identity) = active_identity();
         let mut endpoints = UdpEndpointState::new();
@@ -625,13 +809,174 @@ mod tests {
             panic!("current owner did not release");
         };
         endpoints.remove_released_identity(&released);
+        assert_eq!(endpoints.active_identity_count(), 0);
         assert!(endpoints.game.bindings.is_empty());
         assert!(endpoints.p2p.bindings.is_empty());
+        assert_eq!(
+            endpoints.bind_authorized_ingress(UdpTransport::Game, &identity, GAME_ENDPOINT, 3,),
+            Err(UdpEndpointStateError::InactiveAccount {
+                account_id: identity.user_no.get(),
+            })
+        );
         assert!(
             endpoints
                 .current_target(&identities, UdpTransport::Game, identity.user_no)
                 .is_none()
         );
+
+        let replacement = identities
+            .claim(SessionId::new(2), SOURCE_IP, "rIDER")
+            .unwrap();
+        endpoints.advance_identity(&replacement).unwrap();
+        let advanced = endpoints
+            .bind_authorized_ingress(UdpTransport::Game, &replacement, GAME_ALTERNATE, 4)
+            .unwrap();
+        assert_eq!(advanced.status, UdpEndpointBindStatus::Bound);
+
+        endpoints.remove_released_identity(&released);
+        assert_eq!(
+            endpoints
+                .current_target(&identities, UdpTransport::Game, replacement.user_no)
+                .unwrap()
+                .endpoint,
+            advanced.endpoint,
+            "a delayed old-generation release cannot remove a replacement"
+        );
+
+        let DisconnectOutcome::Released(replacement_release) =
+            identities.disconnect(SessionId::new(2), now)
+        else {
+            panic!("replacement owner did not release");
+        };
+        endpoints.remove_released_identity(&replacement_release);
+        assert_eq!(
+            endpoints.bind_authorized_ingress(UdpTransport::Game, &replacement, GAME_ALTERNATE, 5,),
+            Err(UdpEndpointStateError::InactiveAccount {
+                account_id: replacement.user_no.get(),
+            })
+        );
+        assert_eq!(endpoints.active_identity_count(), 0);
+        assert!(endpoints.game.bindings.is_empty());
+        assert!(endpoints.p2p.bindings.is_empty());
+    }
+
+    #[test]
+    fn active_identity_capacity_is_finite_and_replacement_does_not_consume_another_slot() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities
+            .claim(SessionId::new(1), SOURCE_IP, "Rider")
+            .unwrap();
+        let mut endpoints =
+            UdpEndpointState::with_max_active_identities(NonZeroUsize::new(1).unwrap());
+        endpoints.advance_identity(&source).unwrap();
+
+        let permit = identities
+            .begin_migration(SessionId::new(1), CHANNEL, token(300), now)
+            .unwrap();
+        let replacement = identities
+            .complete_migration(
+                SessionId::new(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap()
+            .binding;
+        endpoints.advance_identity(&replacement).unwrap();
+        assert_eq!(endpoints.active_identity_count(), 1);
+
+        let rival = identities
+            .claim(SessionId::new(3), SOURCE_IP, "Rival")
+            .unwrap();
+        assert_eq!(
+            endpoints.advance_identity(&rival),
+            Err(UdpEndpointStateError::ActiveIdentityCapacity { maximum: 1 })
+        );
+        assert_eq!(endpoints.active_identity_count(), 1);
+        assert_eq!(
+            endpoints.bind_authorized_ingress(UdpTransport::Game, &rival, GAME_ENDPOINT, 0,),
+            Err(UdpEndpointStateError::InactiveAccount {
+                account_id: rival.user_no.get(),
+            })
+        );
+    }
+
+    #[test]
+    fn retained_identity_and_endpoint_are_rejected_after_exact_release() {
+        let now = Instant::now();
+        let (mut identities, identity) = active_identity();
+        let mut endpoints = UdpEndpointState::new();
+        let retained = endpoints
+            .bind_ingress(
+                &identities,
+                UdpTransport::Game,
+                identity.user_no.get(),
+                GAME_ENDPOINT,
+                7,
+            )
+            .unwrap();
+        let DisconnectOutcome::Released(released) = identities.disconnect(SessionId::new(1), now)
+        else {
+            panic!("current owner did not release");
+        };
+        endpoints.remove_released_identity(&released);
+
+        assert!(
+            endpoints
+                .current_authorized_target(UdpTransport::Game, &retained.identity)
+                .is_none()
+        );
+        assert_eq!(
+            endpoints.bind_authorized_ingress(
+                UdpTransport::Game,
+                &retained.identity,
+                retained.endpoint.endpoint,
+                retained.endpoint.route_hash,
+            ),
+            Err(UdpEndpointStateError::InactiveAccount {
+                account_id: identity.user_no.get(),
+            })
+        );
+        assert_eq!(endpoints.active_identity_count(), 0);
+        assert!(endpoints.game.bindings.is_empty());
+        assert!(endpoints.p2p.bindings.is_empty());
+    }
+
+    #[test]
+    fn sequential_identity_churn_leaves_no_mirror_routes_or_tombstones() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let mut endpoints =
+            UdpEndpointState::with_max_active_identities(NonZeroUsize::new(1).unwrap());
+
+        for session in 1..=512 {
+            let identity = identities
+                .claim(SessionId::new(session), SOURCE_IP, "Rider")
+                .unwrap();
+            let route_hash = u32::try_from(session).unwrap();
+            endpoints.advance_identity(&identity).unwrap();
+            endpoints
+                .bind_authorized_ingress(UdpTransport::Game, &identity, GAME_ENDPOINT, route_hash)
+                .unwrap();
+            endpoints
+                .bind_authorized_ingress(UdpTransport::P2p, &identity, P2P_ENDPOINT, route_hash)
+                .unwrap();
+
+            let DisconnectOutcome::Released(released) =
+                identities.disconnect(SessionId::new(session), now)
+            else {
+                panic!("current owner did not release");
+            };
+            endpoints.remove_released_identity(&released);
+
+            assert_eq!(endpoints.active_identity_count(), 0);
+            assert!(endpoints.active.is_empty());
+            assert!(endpoints.game.bindings.is_empty());
+            assert!(endpoints.p2p.bindings.is_empty());
+        }
     }
 
     fn active_identity() -> (IdentityRegistry, crate::IdentityBinding) {
