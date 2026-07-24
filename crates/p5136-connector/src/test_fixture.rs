@@ -1,0 +1,17 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+pub(crate) const CSHARP_SYNTHETIC_PIN_SHA256: &str =
+    "074BDA3086339ECF158BC22D0A3212DA0FB31BB6B45EC66FB8673F318EB5C879";
+
+const CSHARP_SYNTHETIC_PIN_BASE64: &str = "\
+YAEAAFMDQ2N+BjOWaTO4AgAAireP5YgnTXtkGHRANXeWZtNbasqnx9RDcQaQSyVwns3ikjSXBzGO\
+vlBqmuhwUVSr60K5YpxvXxEtK587ppM/zgyF5k9dHim5d9oFeCvhRxoGWmHahEDCbN4rFeAKQeV\
+AwyXLG3T3RNvopCYYTklbOc+o+vuNqd6zxJGNGoyXUXEqiKhgWrtTiASpcgkXOvECWlQimgWDrI\
+EyjsT8XGQiFY2ohIgKDOUmtouLn7vEe66a2MpL16BOX3GIDUfh2ahuPPPIITfifpvEVpzbX8DlJZ\
+QGbPEK7/x/UMB0g3ADPNNtAkAQI6d3sG+AmzGc5NfTc5G8p8eJULMezZvpvf8+Z4CwPiSlJeqh7\
+snkqdHKk8sCYund/RzK6qp+A5tn4Mt9oAJcS8tCsGfUg/9NzriiCbWmtL07noBpoaQNONFw3A6mh\
+zMGVUMT26uFSHFLYH9ylRg=";
+
+pub(crate) fn csharp_synthetic_pin() -> Vec<u8> {
+    STANDARD.decode(CSHARP_SYNTHETIC_PIN_BASE64).unwrap()
+}

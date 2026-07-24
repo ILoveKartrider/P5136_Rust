@@ -33,7 +33,13 @@ mod tests {
     fn matches_p5136_packet_name_goldens() {
         assert_eq!(packet_hash("PcFirstMessage"), 0x282b_0580);
         assert_eq!(packet_hash("PqCnAuthenLogin"), 0x2d22_05d0);
+        assert_eq!(packet_hash("PrCnAuthenLogin"), 0x2d30_05d1);
         assert_eq!(packet_hash("PqLogin"), 0x0a83_02ba);
         assert_eq!(packet_hash("PrLogin"), 0x0a89_02bb);
+        assert_eq!(packet_hash("AccountDataProfile"), 0x422b_0718);
+        assert_eq!(packet_hash("PqChannelSwitch"), 0x2e09_05ec);
+        assert_eq!(packet_hash("PrChannelSwitch"), 0x2e17_05ed);
+        assert_eq!(packet_hash("PqChannelMovein"), 0x2dd6_05e8);
+        assert_eq!(packet_hash("PrChannelMoveIn"), 0x2da4_05c9);
     }
 }

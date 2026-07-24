@@ -6,19 +6,21 @@ reference and is not vendored into this repository.
 
 ## Status
 
-This repository is an early compatibility foundation, not yet a complete game
-server. The first milestone provides:
+This repository is an active compatibility port, not yet a complete game
+server. The implemented foundation provides:
 
 - exact P5136 packet-name hashing and primitive serialization;
-- the P5136 TCP checksum/encryption and bounded frame decoder;
+- P5136 TCP and UDP checksum/encryption with bounded frame decoders;
 - the Korean P5136 first-message payload;
-- a Tokio login listener with explicit startup and shutdown;
-- an actor-owned room roster, avoiding shared mutable room collections;
-- native, Wine, and CrossOver launch-command construction;
+- authentication, login, identity fencing, and channel migration over real TCP;
+- an actor-owned room roster with stale-session cancellation;
+- PIN/BML patching with immutable backups, a process lock, and atomic writes;
+- executable/PIN build detection and native, Wine, and CrossOver launch specs;
+- versioned JSON profile persistence compatible with legacy `Launcher.json`;
 - one `p5136` command-line entry point.
 
-The login listener can send the initial client handshake. Login, channel, room,
-gameplay, persistence, PIN/XML patching, and a desktop GUI remain to be ported.
+Post-login startup codecs are present, but the full inventory stream, room and
+race protocols, live connector launch, and desktop GUI still need integration.
 
 ## Build
 

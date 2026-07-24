@@ -13,7 +13,7 @@ not completion evidence.
 - [x] exact production `PcFirstMessage` payload and plaintext frame
 - [x] transactional four-socket bind and controlled shutdown
 - [x] fragmented and coalesced TCP frame coverage
-- [ ] encoded primitive substitution table
+- [x] encoded primitive substitution table
 - [ ] game UDP framing and relay crypto
 - [ ] messenger framing
 
@@ -24,25 +24,25 @@ not completion evidence.
 - [x] Windows-compatible nickname validation on every host
 - [x] messenger-port reachability probe
 - [x] native, Wine, and CrossOver launch specifications
-- [ ] PIN/BML/encoded-block read/write
-- [ ] build detection by executable SHA-256 and PIN header
-- [ ] endpoint replacement and NGS toggle
-- [ ] immutable pristine backup and absent-marker transaction
-- [ ] process-wide patch lock and atomic same-directory replacement
+- [x] PIN/BML/encoded-block read/write
+- [x] build detection by executable SHA-256 and PIN header
+- [x] endpoint replacement and NGS toggle
+- [x] immutable pristine backup and absent-marker transaction
+- [x] process-wide patch lock and atomic same-directory replacement
 - [ ] Windows `runas` launch
 - [ ] live Wine/CrossOver launch
 - [ ] no-argument desktop GUI
 
 ## Login and identity
 
-- [ ] `PqCnAuthenLogin` / `PrCnAuthenLogin`
-- [ ] BML-backed `PqLogin` parser
-- [ ] duplicate nickname rejection and stable user number
+- [x] `PqCnAuthenLogin` / `PrCnAuthenLogin`
+- [x] BML-backed `PqLogin` parser
+- [x] duplicate nickname rejection and stable user number
 - [ ] `PrLogin` and startup response sequence
-- [ ] session generation and stale-owner rejection
-- [ ] channel-switch permit creation
-- [ ] `PqChannelMovein` ownership transfer
-- [ ] source-disconnect deferral and permit expiration
+- [x] session generation and stale-owner rejection
+- [x] channel-switch permit creation
+- [x] `PqChannelMovein` ownership transfer
+- [x] source-disconnect deferral and permit expiration
 
 ## World and transport state
 
