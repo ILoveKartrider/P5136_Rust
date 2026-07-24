@@ -57,6 +57,7 @@ pub struct LoadedProfile {
     pub revision: Option<u64>,
     pub source_path: PathBuf,
     pub created: bool,
+    pub recovered_revisions: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,14 @@ pub struct ProfileStore {
     root: PathBuf,
     maximum_bytes: u64,
     profile_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    cache: Mutex<HashMap<String, CachedProfile>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProfile {
+    profile: Profile,
+    revision: Option<u64>,
+    source_path: PathBuf,
 }
 
 impl ProfileStore {
@@ -85,6 +94,7 @@ impl ProfileStore {
             root: root.into(),
             maximum_bytes,
             profile_locks: Mutex::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -100,6 +110,24 @@ impl ProfileStore {
         let profile_lock = self.profile_lock(&nickname)?;
         let _guard = lock(&profile_lock)?;
         self.load_or_create_locked(&nickname)
+    }
+
+    /// Drops one cached snapshot. The next load re-reads immutable revisions
+    /// from disk, which is useful after an administrator restores files.
+    pub fn invalidate(&self, nickname: &str) -> Result<(), ProfileStoreError> {
+        let nickname = normalize_nickname(nickname)?;
+        let profile_lock = self.profile_lock(&nickname)?;
+        let _guard = lock(&profile_lock)?;
+        self.cache
+            .lock()
+            .map_err(|_| ProfileStoreError::LockPoisoned)?
+            .remove(&canonical_nickname_key(&nickname));
+        Ok(())
+    }
+
+    pub fn reload(&self, nickname: &str) -> Result<LoadedProfile, ProfileStoreError> {
+        self.invalidate(nickname)?;
+        self.load_or_create(nickname)
     }
 
     /// Writes a new immutable revision. An existing revision is never
@@ -146,14 +174,28 @@ impl ProfileStore {
     }
 
     fn load_or_create_locked(&self, nickname: &str) -> Result<LoadedProfile, ProfileStoreError> {
-        let (profile, revision, source_path) = self.load_or_default_locked(nickname)?;
+        if let Some(cached) = self.cached_profile(nickname)? {
+            return Ok(LoadedProfile {
+                nickname: nickname.to_owned(),
+                profile: cached.profile,
+                revision: cached.revision,
+                source_path: cached.source_path,
+                created: false,
+                recovered_revisions: Vec::new(),
+            });
+        }
+
+        let (profile, revision, source_path, recovered_revisions) =
+            self.load_or_default_locked(nickname)?;
         if source_path.exists() {
+            self.cache_profile(nickname, &profile, revision, source_path.clone())?;
             return Ok(LoadedProfile {
                 nickname: nickname.to_owned(),
                 profile,
                 revision,
                 source_path,
                 created: false,
+                recovered_revisions,
             });
         }
 
@@ -164,24 +206,58 @@ impl ProfileStore {
             revision: Some(saved.revision),
             source_path: saved.path,
             created: true,
+            recovered_revisions,
         })
     }
 
     fn load_or_default_locked(
         &self,
         nickname: &str,
-    ) -> Result<(Profile, Option<u64>, PathBuf), ProfileStoreError> {
+    ) -> Result<(Profile, Option<u64>, PathBuf, Vec<PathBuf>), ProfileStoreError> {
+        if let Some(cached) = self.cached_profile(nickname)? {
+            return Ok((
+                cached.profile,
+                cached.revision,
+                cached.source_path,
+                Vec::new(),
+            ));
+        }
+
         let directory = self.profile_directory(nickname)?;
         create_dir_all(&directory)?;
-        if let Some((revision, path)) = newest_revision(&directory)? {
-            return Ok((self.read_profile(&path)?, Some(revision), path));
+        let mut recovered_revisions = Vec::new();
+        let mut first_corruption = None;
+        for (revision, path) in revisions_descending(&directory)? {
+            match self.read_profile(&path) {
+                Ok(profile) => {
+                    return Ok((profile, Some(revision), path, recovered_revisions));
+                }
+                Err(
+                    error @ (ProfileStoreError::Json { .. }
+                    | ProfileStoreError::ProfileTooLarge { .. }),
+                ) => {
+                    recovered_revisions.push(path);
+                    if first_corruption.is_none() {
+                        first_corruption = Some(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let legacy = directory.join(LEGACY_FILENAME);
         if legacy.is_file() {
-            return Ok((self.read_profile(&legacy)?, None, legacy));
+            return Ok((
+                self.read_profile(&legacy)?,
+                None,
+                legacy,
+                recovered_revisions,
+            ));
         }
-        Ok((Profile::default(), None, legacy))
+        if let Some(error) = first_corruption {
+            return Err(error);
+        }
+        Ok((Profile::default(), None, legacy, recovered_revisions))
     }
 
     fn save_locked(
@@ -245,6 +321,7 @@ impl ProfileStore {
             match fs::rename(&temporary_path, &final_path) {
                 Ok(()) => {
                     sync_directory(&directory)?;
+                    self.cache_profile(nickname, profile, Some(revision), final_path.clone())?;
                     return Ok(SavedProfile {
                         nickname: nickname.to_owned(),
                         revision,
@@ -345,6 +422,36 @@ impl ProfileStore {
         }
         Ok(self.root.join(nickname))
     }
+
+    fn cached_profile(&self, nickname: &str) -> Result<Option<CachedProfile>, ProfileStoreError> {
+        Ok(self
+            .cache
+            .lock()
+            .map_err(|_| ProfileStoreError::LockPoisoned)?
+            .get(&canonical_nickname_key(nickname))
+            .cloned())
+    }
+
+    fn cache_profile(
+        &self,
+        nickname: &str,
+        profile: &Profile,
+        revision: Option<u64>,
+        source_path: PathBuf,
+    ) -> Result<(), ProfileStoreError> {
+        self.cache
+            .lock()
+            .map_err(|_| ProfileStoreError::LockPoisoned)?
+            .insert(
+                canonical_nickname_key(nickname),
+                CachedProfile {
+                    profile: profile.clone(),
+                    revision,
+                    source_path,
+                },
+            );
+        Ok(())
+    }
 }
 
 fn lock(value: &Mutex<()>) -> Result<MutexGuard<'_, ()>, ProfileStoreError> {
@@ -360,12 +467,16 @@ fn create_dir_all(path: &Path) -> Result<(), ProfileStoreError> {
 }
 
 fn newest_revision(directory: &Path) -> Result<Option<(u64, PathBuf)>, ProfileStoreError> {
+    Ok(revisions_descending(directory)?.into_iter().next())
+}
+
+fn revisions_descending(directory: &Path) -> Result<Vec<(u64, PathBuf)>, ProfileStoreError> {
     let entries = fs::read_dir(directory).map_err(|source| ProfileStoreError::Io {
         operation: "list profile revisions",
         path: directory.to_owned(),
         source,
     })?;
-    let mut newest: Option<(u64, PathBuf)> = None;
+    let mut revisions = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| ProfileStoreError::Io {
             operation: "read profile directory entry",
@@ -378,14 +489,10 @@ fn newest_revision(directory: &Path) -> Result<Option<(u64, PathBuf)>, ProfileSt
         let Some(revision) = parse_revision(&name) else {
             continue;
         };
-        if newest
-            .as_ref()
-            .is_none_or(|(current, _)| revision > *current)
-        {
-            newest = Some((revision, entry.path()));
-        }
+        revisions.push((revision, entry.path()));
     }
-    Ok(newest)
+    revisions.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    Ok(revisions)
 }
 
 fn parse_revision(filename: &str) -> Option<u64> {
@@ -501,6 +608,51 @@ mod tests {
         let loaded = store.load_or_create("Rider").unwrap();
         assert_eq!(loaded.profile.rider.lucci, 1_000_016);
         assert_eq!(loaded.revision, Some(17));
+    }
+
+    #[test]
+    fn cache_is_stable_until_an_explicit_reload() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("Rider");
+        fs::create_dir_all(&directory).unwrap();
+        let legacy = directory.join("Launcher.json");
+        fs::write(&legacy, br#"{"Rider":{"Lucci":42}}"#).unwrap();
+
+        let store = ProfileStore::new(root.path());
+        assert_eq!(
+            store.load_or_create("Rider").unwrap().profile.rider.lucci,
+            42
+        );
+        fs::write(&legacy, br#"{"Rider":{"Lucci":99}}"#).unwrap();
+        assert_eq!(
+            store.load_or_create("rIDER").unwrap().profile.rider.lucci,
+            42
+        );
+        assert_eq!(store.reload("Rider").unwrap().profile.rider.lucci, 99);
+    }
+
+    #[test]
+    fn corrupt_latest_revision_falls_back_without_overwriting_it() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let first = store.load_or_create("Rider").unwrap();
+        let (second, _) = store
+            .update("Rider", |profile| profile.rider.lucci = 77)
+            .unwrap();
+        fs::write(&second.path, b"{truncated").unwrap();
+        drop(store);
+
+        let recovered = ProfileStore::new(root.path())
+            .load_or_create("Rider")
+            .unwrap();
+        assert_eq!(recovered.revision, Some(1));
+        assert_eq!(recovered.profile, first.profile);
+        assert_eq!(recovered.recovered_revisions, vec![second.path.clone()]);
+
+        let store = ProfileStore::new(root.path());
+        let saved = store.save("Rider", &recovered.profile).unwrap();
+        assert_eq!(saved.revision, 3);
+        assert_eq!(fs::read(second.path).unwrap(), b"{truncated");
     }
 
     #[test]

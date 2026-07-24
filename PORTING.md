@@ -58,7 +58,7 @@ not completion evidence.
 
 ## Profile and gameplay
 
-- [ ] profile load/cache/versioned atomic writer
+- [x] profile load/cache/versioned atomic writer
 - [ ] rider/account initialization packets
 - [ ] inventory and equipment
 - [ ] kart grant/tuning/upgrades
