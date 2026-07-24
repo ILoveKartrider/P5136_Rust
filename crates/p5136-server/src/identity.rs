@@ -94,6 +94,8 @@ pub struct MigrationPermit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationCompletion {
     pub binding: IdentityBinding,
+    /// Exact pre-transfer stamp used to advance generation-bound sidecars.
+    pub previous_identity: ReleasedIdentity,
     /// `Some` when the old owner was still connected at transfer time. The
     /// caller should close it; its old generation is already stale either way.
     pub previous_owner: Option<SessionId>,
@@ -105,6 +107,7 @@ pub struct ReleasedIdentity {
     pub nickname: String,
     pub user_no: UserNo,
     pub generation: IdentityGeneration,
+    pub source_ip: IpAddr,
     pub channel: Option<ChannelBinding>,
 }
 
@@ -410,6 +413,7 @@ impl IdentityRegistry {
         }
 
         let previous_owner = active.owner;
+        let previous_identity = released_identity(active);
         let known = active.known.clone();
         let generation = self.allocate_generation()?;
         let channel = permit.channel;
@@ -436,6 +440,7 @@ impl IdentityRegistry {
 
         Ok(MigrationCompletion {
             binding,
+            previous_identity,
             previous_owner,
         })
     }
@@ -553,6 +558,7 @@ fn released_identity(active: &ActiveIdentity) -> ReleasedIdentity {
         nickname: active.known.nickname.clone(),
         user_no: active.known.user_no,
         generation: active.generation,
+        source_ip: active.owner_ip,
         channel: active.channel,
     }
 }
@@ -940,6 +946,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(complete.previous_owner, Some(session(1)));
+        assert_eq!(complete.previous_identity.nickname, source.nickname);
+        assert_eq!(complete.previous_identity.user_no, source.user_no);
+        assert_eq!(complete.previous_identity.generation, source.generation);
+        assert_eq!(complete.previous_identity.source_ip, source.source_ip);
         assert_eq!(
             identities.authorize(session(1)),
             Err(IdentityError::StaleSession(session(1)))
