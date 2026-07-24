@@ -170,13 +170,15 @@ impl BoundServer {
         let messenger_config = messenger_runtime_config(&config);
         let udp_config = udp_runtime_config(&config);
         let udp_mailbox_capacity = udp_config.admission_capacity;
-        let udp = UdpRuntime::spawn_with_clock(game_udp, p2p_udp, udp_config, ServerClock::new())?;
+        let clock = ServerClock::new();
+        let udp = UdpRuntime::spawn_with_clock(game_udp, p2p_udp, udp_config, clock.clone())?;
         let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config)?;
         let (world, world_task) = WorldHandle::spawn_with_services(
             1_024,
             udp_mailbox_capacity,
             messenger.clone(),
             udp.service(),
+            clock,
         );
         let supervisor_world = world.clone();
         let task = tokio::spawn(async move {

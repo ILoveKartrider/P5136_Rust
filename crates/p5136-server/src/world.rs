@@ -15,7 +15,10 @@ use p5136_core::{
         serialize_start_room_reply,
     },
     nickname::canonical_nickname_key,
-    race_protocol::{AiGoalInRequest, GameControlRequest, TeamBoosterGaugeRequest},
+    race_protocol::{
+        AiGoalInRequest, GameControlRequest, ServerGameControl, TeamBoosterGaugeRequest,
+        serialize_ai_master_notice, serialize_game_control,
+    },
     race_start_protocol::{
         AiRaceSpec, GrCommandStart, MAX_GR_COMMAND_START_PAYLOAD_LENGTH, P5136KartPhysicsBlock,
         RaceStartProtocolError, serialize_gr_command_start_bounded,
@@ -44,11 +47,18 @@ use crate::identity::{
 };
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
-use crate::udp_runtime::{UdpDispatchRequest, UdpIngress, UdpService, UdpServiceError};
+use crate::udp_runtime::{
+    ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
+    UdpIngressBody, UdpService, UdpServiceError,
+};
 use crate::udp_state::UdpEndpointStateError;
 
 pub const ROOM_CAPACITY: usize = 8;
 pub(crate) const SESSION_OUTBOUND_CAPACITY: usize = 64;
+const LOADING_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const RACE_START_DELAY: Duration = Duration::from_secs(1);
+const LOADING_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+const RACE_START_TICK_LEAD: u32 = 3_000;
 
 /// One ordered write unit for a login session. A batch consumes one bounded
 /// queue slot even when a protocol response contains many logical packets.
@@ -499,7 +509,8 @@ impl WorldHandle {
             udp_sender: None,
         };
         let task = tokio::spawn(async move {
-            let result = run_world(receiver, None, WorldSidecars::default()).await;
+            let result =
+                run_world(receiver, None, WorldSidecars::default(), ServerClock::new()).await;
             debug_assert!(result.is_ok());
         });
         (handle, task)
@@ -520,7 +531,7 @@ impl WorldHandle {
             udp: None,
         };
         let task = tokio::spawn(async move {
-            match run_world(receiver, None, sidecars).await {
+            match run_world(receiver, None, sidecars, ServerClock::new()).await {
                 Ok(()) => Ok(()),
                 Err(WorldSidecarError::Messenger(error)) => Err(error),
                 Err(WorldSidecarError::Udp(_)) => {
@@ -536,6 +547,7 @@ impl WorldHandle {
         udp_mailbox_capacity: usize,
         messenger: MessengerServiceHandle,
         udp: UdpService,
+        clock: ServerClock,
     ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
         let (udp_sender, udp_receiver) = mpsc::channel(udp_mailbox_capacity);
@@ -547,7 +559,7 @@ impl WorldHandle {
             messenger: Some(messenger),
             udp: Some(udp),
         };
-        let task = tokio::spawn(run_world(receiver, Some(udp_receiver), sidecars));
+        let task = tokio::spawn(run_world(receiver, Some(udp_receiver), sidecars, clock));
         (handle, task)
     }
 
@@ -939,6 +951,13 @@ impl From<&IdentityBinding> for FrozenParticipantStamp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadingReadinessCandidate {
+    room_id: RoomId,
+    race_epoch: u64,
+    participant: FrozenParticipantStamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoadingHandshake {
     Dormant,
@@ -946,6 +965,9 @@ enum LoadingHandshake {
         expected: HashSet<FrozenParticipantStamp>,
         ready: HashSet<FrozenParticipantStamp>,
         deadline: Instant,
+    },
+    StartScheduled {
+        at: Instant,
     },
 }
 
@@ -1293,6 +1315,10 @@ const fn source_ipv4(address: IpAddr) -> Ipv4Addr {
     }
 }
 
+const fn race_start_tick(server_tick: u32) -> u32 {
+    server_tick.wrapping_add(RACE_START_TICK_LEAD)
+}
+
 impl Default for World {
     fn default() -> Self {
         Self {
@@ -1381,6 +1407,243 @@ impl World {
                     .filter(|active| active == &participant.identity)
             })
             .collect()
+    }
+
+    fn loading_readiness_candidate(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Option<LoadingReadinessCandidate> {
+        if self
+            .identities
+            .active_identity_by_user_no(identity.user_no)
+            .as_ref()
+            != Some(identity)
+        {
+            return None;
+        }
+        let room_id = *self.protocol_room_by_user.get(&identity.user_no)?;
+        let room = self.protocol_rooms.get(&room_id)?;
+        if room.phase != RoomPhase::Loading {
+            return None;
+        }
+        let frozen = room.frozen_race.as_ref()?;
+        if frozen.epoch != room.race_epoch
+            || !frozen
+                .participants
+                .iter()
+                .any(|participant| participant.identity == *identity)
+        {
+            return None;
+        }
+        let participant = FrozenParticipantStamp::from(identity);
+        let LoadingHandshake::Awaiting { expected, .. } = &room.loading_handshake else {
+            return None;
+        };
+        expected
+            .contains(&participant)
+            .then_some(LoadingReadinessCandidate {
+                room_id,
+                race_epoch: frozen.epoch,
+                participant,
+            })
+    }
+
+    fn mark_loading_ready(&mut self, candidate: LoadingReadinessCandidate) -> bool {
+        let Some(active) = self
+            .identities
+            .active_identity_by_user_no(candidate.participant.user_no)
+        else {
+            return false;
+        };
+        if FrozenParticipantStamp::from(&active) != candidate.participant {
+            return false;
+        }
+        let Some(room) = self.protocol_rooms.get_mut(&candidate.room_id) else {
+            return false;
+        };
+        if room.phase != RoomPhase::Loading || room.race_epoch != candidate.race_epoch {
+            return false;
+        }
+        let Some(frozen) = room.frozen_race.as_ref() else {
+            return false;
+        };
+        if frozen.epoch != candidate.race_epoch
+            || !frozen
+                .participants
+                .iter()
+                .any(|participant| participant.identity == active)
+        {
+            return false;
+        }
+        let LoadingHandshake::Awaiting {
+            expected, ready, ..
+        } = &mut room.loading_handshake
+        else {
+            return false;
+        };
+        expected.contains(&candidate.participant) && ready.insert(candidate.participant)
+    }
+
+    fn apply_udp_dispatch_readiness(
+        &mut self,
+        candidate: Option<LoadingReadinessCandidate>,
+        outcome: UdpDispatchOutcome,
+    ) -> bool {
+        if outcome.action != UdpDispatchAction::TimeSyncReply || outcome.sent_datagrams != 1 {
+            return false;
+        }
+        candidate.is_some_and(|candidate| self.mark_loading_ready(candidate))
+    }
+
+    fn advance_loading(&mut self, now: Instant, clock: &ServerClock) {
+        let loading_rooms = self
+            .protocol_rooms
+            .iter()
+            .filter_map(|(room_id, room)| (room.phase == RoomPhase::Loading).then_some(*room_id))
+            .collect::<Vec<_>>();
+        for room_id in loading_rooms {
+            self.advance_loading_room(room_id, now, clock);
+        }
+        self.debug_assert_invariants();
+    }
+
+    fn advance_loading_room(&mut self, room_id: RoomId, now: Instant, clock: &ServerClock) {
+        let (active_stamps, active_human_count) = self.active_frozen_participant_stamps(room_id);
+
+        if active_human_count == 0 {
+            self.abort_loading_room(room_id);
+            return;
+        }
+
+        self.reconcile_loading_handshake(room_id, &active_stamps, now);
+        self.try_start_scheduled_room(room_id, now, clock);
+    }
+
+    fn active_frozen_participant_stamps(
+        &self,
+        room_id: RoomId,
+    ) -> (HashSet<FrozenParticipantStamp>, usize) {
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("the loading room list contains existing rooms");
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .expect("a Loading room has a frozen roster");
+        let mut active_stamps = HashSet::with_capacity(frozen.participants.len());
+        let mut active_human_count = 0;
+        for participant in &frozen.participants {
+            if self
+                .identities
+                .active_identity_by_user_no(participant.identity.user_no)
+                .as_ref()
+                == Some(&participant.identity)
+            {
+                active_stamps.insert(FrozenParticipantStamp::from(&participant.identity));
+                active_human_count += usize::from(!participant.observer);
+            }
+        }
+        (active_stamps, active_human_count)
+    }
+
+    fn abort_loading_room(&mut self, room_id: RoomId) {
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("the loading room list contains existing rooms");
+        room.phase = RoomPhase::Lobby;
+        room.frozen_race = None;
+        room.loading_handshake = LoadingHandshake::Dormant;
+        for member in room.members_by_id.iter_mut().flatten() {
+            member.player.player_type = PlayerSlotState::NotReady as i32;
+        }
+    }
+
+    fn reconcile_loading_handshake(
+        &mut self,
+        room_id: RoomId,
+        active_stamps: &HashSet<FrozenParticipantStamp>,
+        now: Instant,
+    ) {
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("the loading room list contains existing rooms");
+        let LoadingHandshake::Awaiting {
+            expected,
+            ready,
+            deadline,
+        } = &mut room.loading_handshake
+        else {
+            return;
+        };
+        expected.retain(|participant| active_stamps.contains(participant));
+        ready.retain(|participant| expected.contains(participant));
+        if (ready.len() == expected.len() || now >= *deadline)
+            && let Some(at) = now.checked_add(RACE_START_DELAY)
+        {
+            room.loading_handshake = LoadingHandshake::StartScheduled { at };
+        }
+    }
+
+    fn try_start_scheduled_room(&mut self, room_id: RoomId, now: Instant, clock: &ServerClock) {
+        if !self.protocol_rooms.get(&room_id).is_some_and(|room| {
+            matches!(
+                room.loading_handshake,
+                LoadingHandshake::StartScheduled { at } if now >= at
+            )
+        }) {
+            return;
+        }
+        let start_tick = race_start_tick(clock.tick());
+        let batch = OutboundBatch::ordered(vec![
+            serialize_ai_master_notice(),
+            serialize_game_control(ServerGameControl::RaceStart, start_tick),
+        ]);
+        let deliveries = {
+            let room = self
+                .protocol_rooms
+                .get(&room_id)
+                .expect("the loading room list contains existing rooms");
+            let frozen = room
+                .frozen_race
+                .as_ref()
+                .expect("a Loading room has a frozen roster");
+            frozen
+                .participants
+                .iter()
+                .filter_map(|participant| {
+                    self.identities
+                        .active_identity_by_user_no(participant.identity.user_no)
+                        .filter(|active| active == &participant.identity)
+                        .map(|identity| (identity.owner, batch.clone()))
+                })
+                .collect()
+        };
+        let reserved = match self.reserve_outbound(deliveries) {
+            Ok(reserved) => reserved,
+            Err(LobbyError::OutboundUnavailable { session }) => {
+                tracing::trace!(
+                    room_id = room_id.0,
+                    session = session.get(),
+                    "race start fan-out is blocked; retaining the scheduled transition"
+                );
+                return;
+            }
+            Err(error) => {
+                debug_assert!(false, "race start reservation returned {error}");
+                return;
+            }
+        };
+
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("the loading room list contains existing rooms");
+        room.phase = RoomPhase::Running;
+        room.loading_handshake = LoadingHandshake::Dormant;
+        Self::publish_reserved(reserved);
     }
 
     fn claim_identity(
@@ -1580,14 +1843,17 @@ impl World {
             .into());
         }
 
-        if matches!(room.loading_handshake, LoadingHandshake::Awaiting { .. }) {
+        if matches!(
+            room.loading_handshake,
+            LoadingHandshake::Awaiting { .. } | LoadingHandshake::StartScheduled { .. }
+        ) {
             return Ok(RaceCommandOutcome::IgnoredDuplicate {
                 room_id,
                 race_epoch: room.race_epoch,
             });
         }
         let deadline = now
-            .checked_add(Duration::from_secs(30))
+            .checked_add(LOADING_READY_TIMEOUT)
             .ok_or(RaceError::RaceDeadlineOverflow)?;
         let expected = frozen
             .participants
@@ -2564,27 +2830,30 @@ impl World {
 
 #[cfg(debug_assertions)]
 fn debug_assert_loading_handshake_invariants(room: &ProtocolRoomState) {
-    let LoadingHandshake::Awaiting {
-        expected,
-        ready,
-        deadline: _,
-    } = &room.loading_handshake
-    else {
-        return;
-    };
-
-    debug_assert_eq!(room.phase, RoomPhase::Loading);
-    debug_assert!(ready.is_subset(expected));
-    let frozen = room
-        .frozen_race
-        .as_ref()
-        .expect("an awaiting room has a frozen roster");
-    let frozen_stamps = frozen
-        .participants
-        .iter()
-        .map(|participant| FrozenParticipantStamp::from(&participant.identity))
-        .collect::<HashSet<_>>();
-    debug_assert_eq!(expected, &frozen_stamps);
+    match &room.loading_handshake {
+        LoadingHandshake::Dormant => {}
+        LoadingHandshake::StartScheduled { .. } => {
+            debug_assert_eq!(room.phase, RoomPhase::Loading);
+        }
+        LoadingHandshake::Awaiting {
+            expected,
+            ready,
+            deadline: _,
+        } => {
+            debug_assert_eq!(room.phase, RoomPhase::Loading);
+            debug_assert!(ready.is_subset(expected));
+            let frozen = room
+                .frozen_race
+                .as_ref()
+                .expect("an awaiting room has a frozen roster");
+            let frozen_stamps = frozen
+                .participants
+                .iter()
+                .map(|participant| FrozenParticipantStamp::from(&participant.identity))
+                .collect::<HashSet<_>>();
+            debug_assert!(expected.is_subset(&frozen_stamps));
+        }
+    }
 }
 
 fn messenger_identity_from_binding(
@@ -2682,7 +2951,7 @@ async fn receive_udp_ingress(
 }
 
 async fn dispatch_udp_ingress(
-    world: &World,
+    world: &mut World,
     udp: &UdpService,
     ingress: UdpIngress,
 ) -> Result<(), WorldSidecarError> {
@@ -2703,6 +2972,9 @@ async fn dispatch_udp_ingress(
     };
     let account_id = ingress.account_id;
     let source = ingress.source;
+    let readiness_candidate = matches!(&ingress.body, UdpIngressBody::PqUdpTimeSync(_))
+        .then(|| world.loading_readiness_candidate(&identity))
+        .flatten();
     let request = UdpDispatchRequest {
         ingress,
         identity,
@@ -2713,7 +2985,10 @@ async fn dispatch_udp_ingress(
     };
 
     match udp.dispatch(request).await {
-        Ok(_) => Ok(()),
+        Ok(outcome) => {
+            world.apply_udp_dispatch_readiness(readiness_candidate, outcome);
+            Ok(())
+        }
         Err(
             error @ UdpServiceError::EndpointState(
                 UdpEndpointStateError::InvalidSourceEndpoint { .. }
@@ -2737,6 +3012,7 @@ async fn run_world(
     mut receiver: mpsc::Receiver<WorldCommand>,
     mut udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
     sidecars: WorldSidecars,
+    clock: ServerClock,
 ) -> Result<(), WorldSidecarError> {
     let mut world = World {
         identity_capacity: sidecars.identity_capacity(),
@@ -2744,6 +3020,8 @@ async fn run_world(
     };
     let mut migration_expiry = tokio::time::interval(Duration::from_secs(1));
     migration_expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut loading_heartbeat = tokio::time::interval(LOADING_HEARTBEAT_INTERVAL);
+    loading_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -2753,13 +3031,22 @@ async fn run_world(
                 let Some(command) = command else {
                     break;
                 };
-                if dispatch_command(&mut world, command, &sidecars).await? {
+                world.advance_loading(Instant::now(), &clock);
+                let should_stop = dispatch_command(&mut world, command, &sidecars).await?;
+                world.advance_loading(Instant::now(), &clock);
+                if should_stop {
                     break;
                 }
             }
             _ = migration_expiry.tick() => {
-                world.expire_migrations(Instant::now());
+                let now = Instant::now();
+                world.advance_loading(now, &clock);
+                world.expire_migrations(now);
                 flush_identity_lifecycle(&mut world, &sidecars).await?;
+                world.advance_loading(Instant::now(), &clock);
+            }
+            _ = loading_heartbeat.tick() => {
+                world.advance_loading(Instant::now(), &clock);
             }
             ingress = receive_udp_ingress(&mut udp_receiver) => {
                 let Some(ingress) = ingress else {
@@ -2770,7 +3057,10 @@ async fn run_world(
                     debug_assert!(false, "UDP ingress mailbox requires a UDP sidecar");
                     continue;
                 };
-                dispatch_udp_ingress(&world, udp, ingress).await?;
+                world.advance_loading(Instant::now(), &clock);
+                let result = dispatch_udp_ingress(&mut world, udp, ingress).await;
+                world.advance_loading(Instant::now(), &clock);
+                result?;
             }
         }
     }
@@ -2950,7 +3240,10 @@ mod tests {
             CHANGE_TEAM_REPLY_NAME, PlayerSlotState, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
         },
-        race_protocol::{AiGoalInRequest, GameControlRequest},
+        race_protocol::{
+            AiGoalInRequest, GAME_AI_MASTER_NOTICE_NAME, GAME_CONTROL_PACKET_NAME,
+            GameControlRequest,
+        },
         race_start_protocol::{
             GR_COMMAND_START_PACKET_NAME, P5136KartPhysicsBlock, RaceStartProtocolError,
         },
@@ -2966,14 +3259,15 @@ mod tests {
     };
 
     use super::{
-        LoadingHandshake, LobbyCommandOutcome, LobbyCommandPayload, LobbyError, OutboundBatch,
-        ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload, RaceError, RoomCommandPayload,
-        RoomError, RoomId, RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World,
-        WorldCommand, WorldError, WorldHandle,
+        LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome, LobbyCommandPayload,
+        LobbyError, OutboundBatch, ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload,
+        RaceError, RoomCommandPayload, RoomError, RoomId, RoomParticipant, RoomPhase, SessionId,
+        StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
-        MessengerServiceError, MessengerServiceHandle, MigrationToken, UdpDispatchRequest,
+        MessengerServiceError, MessengerServiceHandle, MigrationToken, ServerClock,
+        UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpEndpointBindStatus,
         UdpEndpointStateError, UdpIngress, UdpIngressBody, UdpRuntime, UdpRuntimeConfig,
         UdpServiceError, UdpTransport,
     };
@@ -3207,6 +3501,34 @@ mod tests {
             value0: 0,
             trailing: Vec::new(),
         })
+    }
+
+    fn udp_dispatch_outcome(
+        action: UdpDispatchAction,
+        sent_datagrams: usize,
+    ) -> UdpDispatchOutcome {
+        UdpDispatchOutcome {
+            binding_status: UdpEndpointBindStatus::Bound,
+            action,
+            sent_datagrams,
+            failed_sends: usize::from(sent_datagrams == 0),
+            unavailable_targets: 0,
+        }
+    }
+
+    fn take_race_start_tick(receiver: &mut mpsc::Receiver<OutboundBatch>) -> u32 {
+        let packets = receiver.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            logical_packet_hash(&packets[0]),
+            adler32::packet_hash(GAME_AI_MASTER_NOTICE_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&packets[1]),
+            adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+        );
+        assert_eq!(i32::from_le_bytes(packets[1][4..8].try_into().unwrap()), 1);
+        u32::from_le_bytes(packets[1][9..13].try_into().unwrap())
     }
 
     #[test]
@@ -3467,7 +3789,9 @@ mod tests {
                 assert!(ready.is_empty());
                 assert_eq!(*deadline, armed_at + Duration::from_secs(30));
             }
-            LoadingHandshake::Dormant => panic!("state=0 did not arm loading"),
+            LoadingHandshake::Dormant | LoadingHandshake::StartScheduled { .. } => {
+                panic!("state=0 did not arm loading")
+            }
         }
 
         assert_eq!(
@@ -3514,6 +3838,12 @@ mod tests {
             )
             .unwrap();
 
+        world
+            .race_command(owner.session, game_control_request(0), Instant::now())
+            .unwrap();
+        let stale_candidate = world
+            .loading_readiness_candidate(&guest.identity)
+            .expect("the frozen guest is initially eligible");
         let replacement = migrate_channel_session(&mut world, &guest, 41_401, 64);
         assert!(matches!(
             world.race_command(replacement.session, game_control_request(0), Instant::now()),
@@ -3524,10 +3854,245 @@ mod tests {
             Err(WorldError::Identity(IdentityError::StaleSession(session)))
                 if session == guest.session
         ));
+        assert!(
+            world
+                .loading_readiness_candidate(&replacement.identity)
+                .is_none()
+        );
+        assert!(!world.apply_udp_dispatch_readiness(
+            Some(stale_candidate),
+            udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 1)
+        ));
+        world.advance_loading(Instant::now(), &ServerClock::new());
+        let LoadingHandshake::Awaiting {
+            expected, ready, ..
+        } = &world.protocol_rooms[&room_id].loading_handshake
+        else {
+            panic!("the remaining exact frozen owner should keep waiting");
+        };
+        assert_eq!(expected.len(), 1);
+        assert!(expected.contains(&super::FrozenParticipantStamp::from(&owner.identity)));
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn loading_udp_gate_observer_start_wrap_and_queue_retry_are_atomic() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "ReadyOwner", 67, 41_501, 64);
+        let mut guest = register_channel_session(&mut world, "ReadyGuest", 67, 41_511, 1);
+        let mut observer = register_channel_session(&mut world, "ReadyObserver", 67, 41_521, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        join_protocol_room(&mut world, &observer, room_id, true);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        drain_batches(&mut observer.outbound);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        drain_batches(&mut observer.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        drain_batches(&mut observer.outbound);
+
+        let armed_at = Instant::now();
+        world
+            .race_command(owner.session, game_control_request(0), armed_at)
+            .unwrap();
+        let owner_candidate = world.loading_readiness_candidate(&owner.identity).unwrap();
+        for action in [
+            UdpDispatchAction::EchoReply,
+            UdpDispatchAction::GameSlotRelay,
+            UdpDispatchAction::RoomSlotRelay,
+            UdpDispatchAction::ClientReplyDropped,
+        ] {
+            assert!(!world.apply_udp_dispatch_readiness(
+                Some(owner_candidate),
+                udp_dispatch_outcome(action, 1)
+            ));
+        }
+        assert!(!world.apply_udp_dispatch_readiness(
+            Some(owner_candidate),
+            udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 0)
+        ));
+        assert!(!world.apply_udp_dispatch_readiness(
+            Some(owner_candidate),
+            udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 2)
+        ));
+        assert!(!world.apply_udp_dispatch_readiness(
+            None,
+            udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 1)
+        ));
+        assert!(world.apply_udp_dispatch_readiness(
+            Some(owner_candidate),
+            udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 1)
+        ));
+        assert!(!world.apply_udp_dispatch_readiness(
+            Some(owner_candidate),
+            udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 1)
+        ));
+
+        for identity in [&guest.identity, &observer.identity] {
+            let candidate = world.loading_readiness_candidate(identity).unwrap();
+            assert!(world.apply_udp_dispatch_readiness(
+                Some(candidate),
+                udp_dispatch_outcome(UdpDispatchAction::TimeSyncReply, 1)
+            ));
+        }
+
+        assert_eq!(super::race_start_tick(u32::MAX - 1_000), 1_999);
+        let clock = ServerClock::new();
+        let shared_clock = clock.clone();
+        world.advance_loading(armed_at, &clock);
         assert_eq!(
             world.protocol_rooms[&room_id].loading_handshake,
-            LoadingHandshake::Dormant
+            LoadingHandshake::StartScheduled {
+                at: armed_at + Duration::from_secs(1)
+            }
         );
+        assert!(LOADING_HEARTBEAT_INTERVAL <= Duration::from_millis(100));
+
+        let guest_sender = world.sessions[&guest.session].outbound.clone().unwrap();
+        guest_sender
+            .try_send(OutboundBatch::single(vec![0xAA]))
+            .unwrap();
+        world.advance_loading(armed_at + Duration::from_secs(1), &clock);
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Loading);
+        assert!(matches!(
+            world.protocol_rooms[&room_id].loading_handshake,
+            LoadingHandshake::StartScheduled { .. }
+        ));
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(observer.outbound.try_recv().is_err());
+        assert_eq!(
+            guest.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xAA]]
+        );
+
+        world.advance_loading(
+            armed_at + Duration::from_secs(1) + Duration::from_millis(1),
+            &clock,
+        );
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Running);
+        assert!(world.protocol_rooms[&room_id].frozen_race.is_some());
+        let owner_tick = take_race_start_tick(&mut owner.outbound);
+        assert_eq!(take_race_start_tick(&mut guest.outbound), owner_tick);
+        assert_eq!(take_race_start_tick(&mut observer.outbound), owner_tick);
+        assert!(owner_tick < 10_000);
+        let current_shared_tick = shared_clock.tick().wrapping_add(3_000);
+        assert!(
+            current_shared_tick.wrapping_sub(owner_tick) < 1_000,
+            "UDP and TCP race control must use the same clock epoch"
+        );
+    }
+
+    #[test]
+    fn loading_timeout_schedules_then_starts_one_second_later() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "TimeoutOwner", 67, 41_601, 64);
+        let mut guest = register_channel_session(&mut world, "TimeoutGuest", 67, 41_611, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+
+        let armed_at = Instant::now();
+        world
+            .race_command(owner.session, game_control_request(0), armed_at)
+            .unwrap();
+        let deadline = armed_at + Duration::from_secs(30);
+        let clock = ServerClock::new();
+        world.advance_loading(deadline, &clock);
+        assert_eq!(
+            world.protocol_rooms[&room_id].loading_handshake,
+            LoadingHandshake::StartScheduled {
+                at: deadline + Duration::from_secs(1)
+            }
+        );
+        world.advance_loading(deadline + Duration::from_millis(999), &clock);
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Loading);
+        world.advance_loading(deadline + Duration::from_secs(1), &clock);
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Running);
+        assert_eq!(
+            take_race_start_tick(&mut owner.outbound),
+            take_race_start_tick(&mut guest.outbound)
+        );
+    }
+
+    #[test]
+    fn loading_disconnect_prunes_expected_and_zero_humans_abort_to_lobby() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "DropOwner", 67, 41_701, 64);
+        let guest = register_channel_session(&mut world, "DropGuest", 67, 41_711, 64);
+        let observer = register_channel_session(&mut world, "DropObserver", 67, 41_721, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        join_protocol_room(&mut world, &observer, room_id, true);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        let frozen = world.protocol_rooms[&room_id].frozen_race.clone();
+        let now = Instant::now();
+        world
+            .race_command(owner.session, game_control_request(0), now)
+            .unwrap();
+
+        world.close_session(guest.session, now);
+        world.advance_loading(now, &ServerClock::new());
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.frozen_race, frozen);
+        let LoadingHandshake::Awaiting {
+            expected, ready, ..
+        } = &room.loading_handshake
+        else {
+            panic!("remaining human and observer must continue loading");
+        };
+        assert_eq!(expected.len(), 2);
+        assert!(expected.contains(&super::FrozenParticipantStamp::from(&owner.identity)));
+        assert!(expected.contains(&super::FrozenParticipantStamp::from(&observer.identity)));
+        assert!(ready.is_empty());
+
+        world.close_session(owner.session, now);
+        world.advance_loading(now, &ServerClock::new());
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.phase, RoomPhase::Lobby);
+        assert!(room.frozen_race.is_none());
+        assert_eq!(room.loading_handshake, LoadingHandshake::Dormant);
+        assert_eq!(room.observers.iter().flatten().count(), 1);
+        assert_eq!(room.members_by_id.iter().flatten().count(), 0);
     }
 
     #[test]
@@ -4437,8 +5002,13 @@ mod tests {
         };
         let udp_runtime = UdpRuntime::spawn(game_socket, p2p_socket, udp_config).unwrap();
         let udp = udp_runtime.service();
-        let (world, world_task) =
-            WorldHandle::spawn_with_services(64, 64, messenger.clone(), udp.clone());
+        let (world, world_task) = WorldHandle::spawn_with_services(
+            64,
+            64,
+            messenger.clone(),
+            udp.clone(),
+            ServerClock::new(),
+        );
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
         let source = world
