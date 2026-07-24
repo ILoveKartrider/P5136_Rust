@@ -212,11 +212,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         "P5136 foundation server is running"
     );
     if catalog_configured {
-        tracing::warn!("room, UDP, messenger, and race handling remain in progress");
+        tracing::warn!("race settlement, MyRoom, and progression handling remain in progress");
     } else {
         tracing::warn!(
             "no inventory catalog is configured, so PqGetRider is unavailable; \
-             room, UDP, messenger, and race handling remain in progress"
+             race settlement, MyRoom, and progression handling remain in progress"
         );
     }
 
