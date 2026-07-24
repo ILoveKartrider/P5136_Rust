@@ -343,6 +343,9 @@ mod tests {
         adler32,
         bml::BmlNode,
         channel::serialize_pr_channel_move_in,
+        equipment_protocol::{
+            PlantPartEquipRequest, serialize_equip_tuning_failure, serialize_equip_tuning_success,
+        },
         frame, handshake,
         login::{LegacyTime, serialize_pr_cn_authen_login},
         packet::{PacketReader, PacketWriter},
@@ -356,7 +359,7 @@ mod tests {
             serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_login_vip_info,
         },
     };
-    use p5136_profile::{Profile, ProfileStore, rider_item_snapshot};
+    use p5136_profile::{EquipmentExceptions, Profile, ProfileStore, rider_item_snapshot};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
@@ -766,7 +769,9 @@ mod tests {
     #[tokio::test]
     async fn two_real_tcp_clients_create_list_join_first_and_leave_a_room() {
         let profile_root = tempfile::tempdir().unwrap();
-        let (server, maximum) = start_test_server(profile_root.path(), None).await;
+        let catalog_path = profile_root.path().join("KartCatalog.xml");
+        fs::write(&catalog_path, complete_catalog_xml()).unwrap();
+        let (server, maximum) = start_test_server(profile_root.path(), Some(&catalog_path)).await;
         let endpoint = server.endpoints().login_tcp;
 
         let owner_source = authenticate_and_login(endpoint, maximum, "Owner").await;
@@ -855,6 +860,9 @@ mod tests {
         assert_eq!(owner_own_slots, joiner_slots);
         assert_eq!(joiner_peer_slots, joiner_slots);
 
+        exercise_equipment_over_real_tcp(&mut owner, &mut joiner, profile_root.path(), maximum)
+            .await;
+
         let leave = build_leave_room_request();
         send_packet(&mut joiner.stream, &leave, &mut joiner.send_iv, maximum).await;
         assert_eq!(
@@ -872,6 +880,84 @@ mod tests {
         drop(owner);
         wait_for_session_count(&server.world(), 0).await;
         server.shutdown().await.unwrap();
+    }
+
+    async fn exercise_equipment_over_real_tcp(
+        owner: &mut LoginClient,
+        joiner: &mut LoginClient,
+        profile_root: &Path,
+        maximum: usize,
+    ) {
+        let rider_update = build_rider_item_update();
+        let expected_snapshot: [u8; 65] = rider_update[4..].try_into().unwrap();
+        send_packet(
+            &mut owner.stream,
+            &rider_update,
+            &mut owner.send_iv,
+            maximum,
+        )
+        .await;
+        let peer_equipment = read_login_packet(joiner, maximum).await;
+        assert_eq!(
+            u32::from_le_bytes(peer_equipment[..4].try_into().unwrap()),
+            adler32::packet_hash("GrSlotItemOnPacket")
+        );
+        assert_eq!(
+            i32::from_le_bytes(peer_equipment[4..8].try_into().unwrap()),
+            0
+        );
+        assert_eq!(&peer_equipment[8..], expected_snapshot);
+        assert_no_login_data(&mut owner.stream).await;
+        let persisted = ProfileStore::new(profile_root)
+            .load_or_create("Owner")
+            .unwrap();
+        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(
+            rider_item_snapshot(&persisted.profile.rider_item),
+            expected_snapshot
+        );
+
+        let plant_request = PlantPartEquipRequest {
+            item_category: 43,
+            item_id: 1,
+            kart_category: 3,
+            kart_id: 1,
+            kart_serial: 1,
+        };
+        let plant_packet = build_plant_part_request(plant_request, false);
+        send_packet(
+            &mut owner.stream,
+            &plant_packet,
+            &mut owner.send_iv,
+            maximum,
+        )
+        .await;
+        assert_eq!(
+            read_login_packet(owner, maximum).await,
+            serialize_equip_tuning_success(plant_request)
+        );
+        let rider_directory = persisted.source_path.parent().unwrap();
+        let equipment = EquipmentExceptions::load(profile_root, rider_directory).unwrap();
+        assert_eq!(equipment.plant.len(), 1);
+        assert_eq!(equipment.plant[0].engine_category, 43);
+        assert_eq!(equipment.plant[0].engine_id, 1);
+
+        let malformed_plant = build_plant_part_request(plant_request, true);
+        send_packet(
+            &mut owner.stream,
+            &malformed_plant,
+            &mut owner.send_iv,
+            maximum,
+        )
+        .await;
+        assert_eq!(
+            read_login_packet(owner, maximum).await,
+            serialize_equip_tuning_failure()
+        );
+        assert_eq!(
+            request_named(owner, "PqLoginVipInfo", maximum).await,
+            serialize_pr_login_vip_info(5)
+        );
     }
 
     async fn start_test_server(
@@ -976,6 +1062,35 @@ mod tests {
     fn build_leave_room_request() -> Vec<u8> {
         let mut packet = PacketWriter::named("ChLeaveRoomRequestPacket");
         packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    fn build_rider_item_update() -> Vec<u8> {
+        let mut packet = PacketWriter::named("LoRqSetRiderItemOnPacket");
+        let mut items = [0_u16; 30];
+        items[0] = 1;
+        items[1] = 1;
+        items[2] = 1;
+        items[29] = 1;
+        for item in items {
+            packet.write_u16(item);
+        }
+        packet.write_u8(0);
+        packet.write_u16(0);
+        packet.write_u16(0);
+        packet.into_inner()
+    }
+
+    fn build_plant_part_request(request: PlantPartEquipRequest, trailing: bool) -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqEquipTuningExPacket");
+        packet.write_i16(request.item_category);
+        packet.write_i16(request.item_id);
+        packet.write_i16(request.kart_category);
+        packet.write_i16(request.kart_id);
+        packet.write_i16(request.kart_serial);
+        if trailing {
+            packet.write_u8(0xff);
+        }
         packet.into_inner()
     }
 

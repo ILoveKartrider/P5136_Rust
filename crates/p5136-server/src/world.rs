@@ -7,13 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use p5136_core::room_protocol::{
-    ChCreateRoomRequest, ChGetRoomListRequest, ChJoinRoomRequest, CreateRoomOutcome,
-    JoinRoomStatus, ROOM_DATA_LENGTH, ROOM_OBSERVER_COUNT, ROOM_SLOT_COUNT, RoomListEntry,
-    RoomMember as WireRoomMember, RoomObserver, RoomObserverSlot, RoomPlayer, RoomProtocolError,
-    RoomSessionData, RoomSlotData, serialize_ch_create_room_reply,
-    serialize_ch_get_room_list_reply, serialize_ch_join_room_reply, serialize_ch_leave_room_reply,
-    serialize_gr_slot_data, serialize_initial_room_state,
+use p5136_core::{
+    equipment_protocol::{EquipmentProtocolError, serialize_room_slot_items},
+    room_protocol::{
+        ChCreateRoomRequest, ChGetRoomListRequest, ChJoinRoomRequest, CreateRoomOutcome,
+        JoinRoomStatus, ROOM_DATA_LENGTH, ROOM_OBSERVER_COUNT, ROOM_SLOT_COUNT, RoomListEntry,
+        RoomMember as WireRoomMember, RoomObserver, RoomObserverSlot, RoomPlayer,
+        RoomProtocolError, RoomSessionData, RoomSlotData, serialize_ch_create_room_reply,
+        serialize_ch_get_room_list_reply, serialize_ch_join_room_reply,
+        serialize_ch_leave_room_reply, serialize_gr_slot_data, serialize_initial_room_state,
+    },
 };
 use thiserror::Error;
 use tokio::{
@@ -153,6 +156,9 @@ pub enum WorldError {
     #[error(transparent)]
     RoomProtocol(#[from] RoomProtocolError),
 
+    #[error(transparent)]
+    EquipmentProtocol(#[from] EquipmentProtocolError),
+
     #[error("session {0:?} is not registered")]
     UnknownSession(SessionId),
 }
@@ -195,6 +201,11 @@ enum WorldCommand {
     RoomProtocol {
         session: SessionId,
         payload: Box<RoomCommandPayload>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    PublishRoomEquipment {
+        session: SessionId,
+        snapshot: Box<[u8; 65]>,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     CreateRoom {
@@ -384,6 +395,23 @@ impl WorldHandle {
             .send(WorldCommand::RoomProtocol {
                 session,
                 payload: Box::new(payload),
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn publish_room_equipment(
+        &self,
+        session: SessionId,
+        snapshot: [u8; 65],
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::PublishRoomEquipment {
+                session,
+                snapshot: Box::new(snapshot),
                 reply,
             })
             .await
@@ -653,6 +681,39 @@ impl ProtocolRoomState {
             .collect()
     }
 
+    fn equipment_player_id(&self, user_no: UserNo) -> Option<i32> {
+        if let Some(member_id) = self.members_by_id.iter().position(|member| {
+            member
+                .as_ref()
+                .is_some_and(|member| member.user_no == user_no)
+        }) {
+            return i32::try_from(member_id).ok();
+        }
+        self.observers
+            .iter()
+            .position(|member| {
+                member
+                    .as_ref()
+                    .is_some_and(|member| member.user_no == user_no)
+            })
+            .and_then(|observer_id| i32::try_from(ROOM_SLOT_COUNT + observer_id).ok())
+    }
+
+    fn set_equipment_snapshot(&mut self, user_no: UserNo, snapshot: [u8; 65]) -> bool {
+        if let Some(member) = self
+            .members_by_id
+            .iter_mut()
+            .chain(&mut self.observers)
+            .flatten()
+            .find(|member| member.user_no == user_no)
+        {
+            member.player.rider_item_snapshot = snapshot;
+            true
+        } else {
+            false
+        }
+    }
+
     fn list_entry(&self) -> RoomListEntry {
         let room_id =
             u16::try_from(self.id.0).expect("protocol room IDs are always bounded to u16");
@@ -806,9 +867,20 @@ impl World {
             token,
             now,
         )?;
+        let changed_room_channel = self
+            .protocol_room_by_user
+            .get(&completion.binding.user_no)
+            .and_then(|room_id| self.protocol_rooms.get(room_id))
+            .is_some_and(|room| completion.binding.channel != Some(room.settings.channel));
+        let deliveries = if changed_room_channel {
+            self.remove_protocol_user(completion.binding.user_no)
+        } else {
+            Vec::new()
+        };
         if let Some(previous_owner) = completion.previous_owner {
             self.cancel_session(previous_owner);
         }
+        self.deliver(deliveries, now);
         Ok(completion)
     }
 
@@ -838,6 +910,37 @@ impl World {
         }
     }
 
+    fn publish_room_equipment(
+        &mut self,
+        session: SessionId,
+        snapshot: [u8; 65],
+    ) -> Result<(), WorldError> {
+        let identity = self.identities.authorize(session)?;
+        let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
+            return Ok(());
+        };
+        let room = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .expect("protocol membership always references an existing room");
+        let Some(player_id) = room.equipment_player_id(identity.user_no) else {
+            debug_assert!(false, "protocol membership map and room state diverged");
+            return Ok(());
+        };
+        let packet = serialize_room_slot_items(player_id, &snapshot)?;
+        let recipients = room
+            .user_nos()
+            .into_iter()
+            .filter(|user_no| *user_no != identity.user_no)
+            .collect();
+        let updated = room.set_equipment_snapshot(identity.user_no, snapshot);
+        debug_assert!(updated, "protocol membership map and room state diverged");
+        let deliveries = self.deliveries_for_users(recipients, &OutboundBatch::single(packet));
+        self.deliver(deliveries, Instant::now());
+        self.debug_assert_invariants();
+        Ok(())
+    }
+
     fn protocol_room_list(
         &mut self,
         session: SessionId,
@@ -854,7 +957,7 @@ impl World {
             let mut rooms = self
                 .protocol_rooms
                 .values()
-                .filter(|room| room.settings.channel.game_type == channel.game_type)
+                .filter(|room| room.settings.channel == channel)
                 .filter(|room| room.settings.game_type == request.room_list_type)
                 .collect::<Vec<_>>();
             rooms.sort_unstable_by_key(|room| room.id.0);
@@ -981,7 +1084,7 @@ impl World {
             Some(room)
                 if room.settings.started
                     || identity.channel.is_none_or(|channel| {
-                        room.settings.channel.game_type != channel.game_type
+                        room.settings.channel != channel
                             || expected_room_game_type(channel.game_type)
                                 != Some(room.settings.game_type)
                     }) =>
@@ -1215,6 +1318,18 @@ impl World {
         id
     }
 
+    fn room_snapshot(&self, room: RoomId) -> Result<RoomSnapshot, RoomError> {
+        self.rooms
+            .get(&room)
+            .cloned()
+            .or_else(|| {
+                self.protocol_rooms
+                    .get(&room)
+                    .map(ProtocolRoomState::snapshot)
+            })
+            .ok_or(RoomError::NotFound(room.0))
+    }
+
     fn join_room(&mut self, room: RoomId, identity: String) -> Result<SlotId, RoomError> {
         if self.room_by_identity.contains_key(&identity) {
             return Err(RoomError::AlreadyJoined(identity));
@@ -1407,6 +1522,14 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
             let result = world.room_protocol(session, *payload);
             let _ = reply.send(result);
         }
+        WorldCommand::PublishRoomEquipment {
+            session,
+            snapshot,
+            reply,
+        } => {
+            let result = world.publish_room_equipment(session, *snapshot);
+            let _ = reply.send(result);
+        }
         WorldCommand::CreateRoom { reply } => {
             let _ = reply.send(world.create_room());
         }
@@ -1428,18 +1551,7 @@ fn dispatch_command(world: &mut World, command: WorldCommand) -> bool {
             let _ = reply.send(world.leave_room(&identity));
         }
         WorldCommand::RoomSnapshot { room, reply } => {
-            let result = world
-                .rooms
-                .get(&room)
-                .cloned()
-                .or_else(|| {
-                    world
-                        .protocol_rooms
-                        .get(&room)
-                        .map(ProtocolRoomState::snapshot)
-                })
-                .ok_or(RoomError::NotFound(room.0));
-            let _ = reply.send(result);
+            let _ = reply.send(world.room_snapshot(room));
         }
         WorldCommand::SessionCount { reply } => {
             let _ = reply.send(world.sessions.len());
@@ -1530,7 +1642,22 @@ mod tests {
         destination_port: u16,
         outbound_capacity: usize,
     ) -> TestChannelSession {
-        let channel = source.identity.channel.unwrap();
+        migrate_channel_session_to(
+            world,
+            source,
+            source.identity.channel.unwrap(),
+            destination_port,
+            outbound_capacity,
+        )
+    }
+
+    fn migrate_channel_session_to(
+        world: &mut World,
+        source: &TestChannelSession,
+        channel: ChannelBinding,
+        destination_port: u16,
+        outbound_capacity: usize,
+    ) -> TestChannelSession {
         let token = MigrationToken::new(destination_port.max(1)).unwrap();
         world
             .identities
@@ -1869,6 +1996,56 @@ mod tests {
     }
 
     #[test]
+    fn same_game_type_rooms_remain_isolated_by_channel_id() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "ChannelOwner", 67, 46_100, 16);
+        let other_source = register_channel_session(&mut world, "OtherChannel", 67, 46_200, 16);
+        let mut other = migrate_channel_session_to(
+            &mut world,
+            &other_source,
+            ChannelBinding {
+                channel_id: 12,
+                game_type: 67,
+            },
+            46_300,
+            16,
+        );
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Channel 67", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut owner.outbound);
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+
+        world
+            .room_protocol(
+                other.session,
+                RoomCommandPayload::List(ChGetRoomListRequest {
+                    page: 0,
+                    room_list_type: 1,
+                    room_list_mode: 0,
+                }),
+            )
+            .unwrap();
+        assert_eq!(room_list_count(&take_single_packet(&mut other.outbound)), 0);
+        world
+            .room_protocol(
+                other.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        assert_eq!(take_single_packet(&mut other.outbound)[4], 1);
+    }
+
+    #[test]
     fn stale_generation_cannot_leave_or_replace_its_protocol_room() {
         let mut world = World::default();
         let mut source = register_channel_session(&mut world, "Migrating", 67, 47_000, 16);
@@ -1907,6 +2084,132 @@ mod tests {
             .unwrap();
         assert_eq!(take_single_packet(&mut destination.outbound)[4], 1);
         assert!(!world.protocol_rooms.contains_key(&room_id));
+    }
+
+    #[test]
+    fn committed_equipment_snapshot_is_fenced_and_fanned_out_to_room_peers() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "Equipped", 67, 47_110, 16);
+        let mut peer = register_channel_session(&mut world, "Witness", 67, 47_120, 16);
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Equipment", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut owner.outbound);
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        world
+            .room_protocol(
+                peer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut peer.outbound);
+
+        let committed = [0x5a; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH];
+        world
+            .publish_room_equipment(owner.session, committed)
+            .unwrap();
+        let packet = take_single_packet(&mut peer.outbound);
+        assert_eq!(
+            u32::from_le_bytes(packet[..4].try_into().unwrap()),
+            adler32::packet_hash("GrSlotItemOnPacket")
+        );
+        assert_eq!(i32::from_le_bytes(packet[4..8].try_into().unwrap()), 0);
+        assert_eq!(&packet[8..], committed);
+        assert!(owner.outbound.try_recv().is_err());
+        assert_eq!(
+            world.protocol_rooms[&room_id].members_by_id[0]
+                .as_ref()
+                .unwrap()
+                .player
+                .rider_item_snapshot,
+            committed
+        );
+
+        let mut destination = migrate_channel_session(&mut world, &owner, 47_130, 16);
+        assert!(matches!(
+            world.publish_room_equipment(owner.session, [0x33; 65]),
+            Err(WorldError::Identity(IdentityError::StaleSession(session)))
+                if session == owner.session
+        ));
+        assert!(peer.outbound.try_recv().is_err());
+        assert_eq!(
+            world.protocol_rooms[&room_id].members_by_id[0]
+                .as_ref()
+                .unwrap()
+                .player
+                .rider_item_snapshot,
+            committed
+        );
+
+        world
+            .publish_room_equipment(destination.session, [0x44; 65])
+            .unwrap();
+        let _ = take_single_packet(&mut peer.outbound);
+        assert!(destination.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn cross_channel_migration_removes_room_membership_and_fans_out_slots() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "Switching", 67, 47_200, 16);
+        let mut peer = register_channel_session(&mut world, "Remaining", 67, 47_300, 16);
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Channel", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut owner.outbound);
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        world
+            .room_protocol(
+                peer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut peer.outbound);
+
+        let mut destination = migrate_channel_session_to(
+            &mut world,
+            &owner,
+            ChannelBinding {
+                channel_id: 12,
+                game_type: 67,
+            },
+            47_400,
+            16,
+        );
+        let peer_update = take_single_packet(&mut peer.outbound);
+        assert_eq!(
+            u32::from_le_bytes(peer_update[..4].try_into().unwrap()),
+            adler32::packet_hash("GrSlotDataPacket")
+        );
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&owner.identity.user_no)
+        );
+        assert_eq!(world.protocol_rooms[&room_id].room_master, 1);
+
+        world
+            .room_protocol(destination.session, RoomCommandPayload::FirstState)
+            .unwrap();
+        assert!(destination.outbound.try_recv().is_err());
     }
 
     #[test]
