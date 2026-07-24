@@ -1,15 +1,18 @@
-//! Bounded P5136 `MyRoom` request and small-response codecs.
+//! Bounded P5136 `MyRoom` request and response codecs.
 //!
 //! `MyRoom` membership and fan-out belong to the server actor. This module only
 //! accepts complete, structurally valid client packets and produces the
-//! compact replies whose field order is independent of inventory/profile I/O.
+//! replies whose field order is independent of inventory/profile I/O.
+
+use std::net::Ipv4Addr;
 
 use thiserror::Error;
 
 use crate::{
     adler32,
     packet::{PacketError, PacketReader, PacketWriter},
-    room_protocol::MAX_RIDER_NICKNAME_UTF16_UNITS,
+    room_protocol::{MAX_CLUB_NAME_UTF16_UNITS, MAX_RIDER_NICKNAME_UTF16_UNITS},
+    startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
 };
 
 pub const REENTER_MYROOM_REQUEST_NAME: &str = "ChReRqEnterMyRoomPacket";
@@ -30,11 +33,18 @@ pub const REQUEST_EMBLEMS_NAME: &str = "RmRequestEmblemsPacket";
 pub const OWNER_EMBLEMS_NAME: &str = "RmOwnerEmblemPacket";
 pub const UPDATE_MAIN_EMBLEM_REQUEST_NAME: &str = "RmRqUpdateMainEmblemPacket";
 pub const UPDATE_MAIN_EMBLEM_REPLY_NAME: &str = "RmRpUpdateMainEmblemPacket";
+pub const SLOT_DATA_NAME: &str = "RmSlotDataPacket";
 
 pub const MAX_MYROOM_PASSWORD_UTF16_UNITS: usize = 64;
 pub const MAX_MYROOM_TALK_UTF16_UNITS: usize = 256;
 pub const MAX_MYROOM_EMBLEMS: usize = 65_535;
 pub const MYROOM_SLOT_COUNT: usize = 8;
+pub const MYROOM_EMPTY_SLOT_ZERO_LENGTH: usize = 122;
+pub const MYROOM_EMPTY_SLOT_WIRE_LENGTH: usize = MYROOM_EMPTY_SLOT_ZERO_LENGTH + 1;
+pub const MYROOM_PLAYER_RESERVED_LENGTH: usize = 29;
+
+const _: () = assert!(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH == 65);
+const _: () = assert!(MYROOM_EMPTY_SLOT_WIRE_LENGTH == 123);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MyRoomRequest {
@@ -110,6 +120,27 @@ pub struct UpdateMainEmblemRequest {
     pub emblem_2: i16,
 }
 
+/// The variable-length player form of one P5136 `RmSlotDataPacket` entry.
+///
+/// The secondary endpoint, 29 reserved bytes, and final zero byte are fixed by
+/// the wire format and are therefore not caller-controlled fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyRoomPlayerSlot {
+    pub user_no: u32,
+    pub p2p_address: Ipv4Addr,
+    pub p2p_port: u16,
+    pub nickname: String,
+    pub rider_item_snapshot: [u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+    pub rp: u32,
+    pub club_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MyRoomSlot {
+    Empty,
+    Player(MyRoomPlayerSlot),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EnterMyRoomStatus {
@@ -149,6 +180,9 @@ pub enum MyRoomProtocolError {
 
     #[error("MyRoom emblem list has {actual} entries; maximum is {maximum}")]
     TooManyEmblems { actual: usize, maximum: usize },
+
+    #[error("MyRoom slot data has {actual} slots; expected exactly {expected}")]
+    InvalidSlotCount { actual: usize, expected: usize },
 }
 
 #[must_use]
@@ -359,12 +393,76 @@ pub fn serialize_owner_emblems(emblems: &[i16]) -> Result<Vec<u8>, MyRoomProtoco
     Ok(packet.into_inner())
 }
 
+/// Serializes the exact Korean P5136 eight-slot `MyRoom` snapshot.
+///
+/// Empty entries are 122 zero bytes followed by `0xFF`. Player entries mirror
+/// `MyRoom.WritePlayerSlot`: user number, primary IPv4 endpoint, a zero
+/// secondary endpoint, nickname, the 65-byte rider snapshot, RP, 29 zero bytes,
+/// club name, and one trailing zero byte.
+pub fn serialize_slot_data(slots: &[MyRoomSlot]) -> Result<Vec<u8>, MyRoomProtocolError> {
+    if slots.len() != MYROOM_SLOT_COUNT {
+        return Err(MyRoomProtocolError::InvalidSlotCount {
+            actual: slots.len(),
+            expected: MYROOM_SLOT_COUNT,
+        });
+    }
+    for slot in slots {
+        if let MyRoomSlot::Player(player) = slot {
+            validate_string(
+                "MyRoom rider nickname",
+                &player.nickname,
+                MAX_RIDER_NICKNAME_UTF16_UNITS,
+            )?;
+            validate_string(
+                "MyRoom club name",
+                &player.club_name,
+                MAX_CLUB_NAME_UTF16_UNITS,
+            )?;
+        }
+    }
+
+    let mut packet = PacketWriter::named(SLOT_DATA_NAME);
+    for slot in slots {
+        match slot {
+            MyRoomSlot::Empty => write_empty_slot(&mut packet),
+            MyRoomSlot::Player(player) => write_player_slot(&mut packet, player)?,
+        }
+    }
+    Ok(packet.into_inner())
+}
+
 #[must_use]
 pub fn serialize_update_main_emblem_reply(success: bool) -> Vec<u8> {
     let mut packet = PacketWriter::named(UPDATE_MAIN_EMBLEM_REPLY_NAME);
     packet.write_u8(u8::from(success));
     packet.write_u8(0);
     packet.into_inner()
+}
+
+fn write_empty_slot(packet: &mut PacketWriter) {
+    packet.write_bytes(&[0; MYROOM_EMPTY_SLOT_ZERO_LENGTH]);
+    packet.write_u8(0xff);
+}
+
+fn write_player_slot(
+    packet: &mut PacketWriter,
+    player: &MyRoomPlayerSlot,
+) -> Result<(), MyRoomProtocolError> {
+    packet.write_u32(player.user_no);
+    write_endpoint(packet, player.p2p_address, player.p2p_port);
+    write_endpoint(packet, Ipv4Addr::UNSPECIFIED, 0);
+    packet.write_utf16(&player.nickname)?;
+    packet.write_bytes(&player.rider_item_snapshot);
+    packet.write_u32(player.rp);
+    packet.write_bytes(&[0; MYROOM_PLAYER_RESERVED_LENGTH]);
+    packet.write_utf16(&player.club_name)?;
+    packet.write_u8(0);
+    Ok(())
+}
+
+fn write_endpoint(packet: &mut PacketWriter, address: Ipv4Addr, port: u16) {
+    packet.write_bytes(&address.octets());
+    packet.write_u16(port);
 }
 
 fn parse_empty_request(packet: &[u8], name: &'static str) -> Result<(), MyRoomProtocolError> {
@@ -495,24 +593,31 @@ fn ensure_exhausted(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use sha2::{Digest, Sha256};
+
     use super::{
         CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, ENTER_MYROOM_REQUEST_NAME,
         ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus, FIRST_MYROOM_REQUEST_NAME,
         MAX_MYROOM_EMBLEMS, MAX_MYROOM_PASSWORD_UTF16_UNITS, MAX_MYROOM_TALK_UTF16_UNITS,
-        MyRoomInfo, MyRoomProtocolError, MyRoomRequest, NOTIFY_MYROOM_INFO_NAME,
+        MYROOM_EMPTY_SLOT_WIRE_LENGTH, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot,
+        MyRoomProtocolError, MyRoomRequest, MyRoomSlot, NOTIFY_MYROOM_INFO_NAME,
         REENTER_MYROOM_REQUEST_NAME, REQUEST_EMBLEMS_NAME, REQUEST_MYROOM_ITEMS_NAME,
-        RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, UPDATE_MAIN_EMBLEM_REQUEST_NAME,
-        classify_myroom_request, parse_character_position, parse_check_password,
-        parse_enter_random_request, parse_enter_request, parse_first_request,
+        RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME,
+        UPDATE_MAIN_EMBLEM_REQUEST_NAME, classify_myroom_request, parse_character_position,
+        parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
         parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
         parse_secede_request, parse_update_info, parse_update_main_emblem,
         serialize_character_position, serialize_check_password_reply, serialize_enter_error,
         serialize_enter_reply, serialize_myroom_info, serialize_owner_emblems,
-        serialize_rider_echo, serialize_secede_reply, serialize_update_main_emblem_reply,
+        serialize_rider_echo, serialize_secede_reply, serialize_slot_data,
+        serialize_update_main_emblem_reply,
     };
     use crate::{
         adler32,
         packet::{PacketReader, PacketWriter},
+        room_protocol::{MAX_CLUB_NAME_UTF16_UNITS, MAX_RIDER_NICKNAME_UTF16_UNITS},
     };
 
     fn sample_info() -> MyRoomInfo {
@@ -757,6 +862,123 @@ mod tests {
         assert!(matches!(
             serialize_owner_emblems(&excessive),
             Err(MyRoomProtocolError::TooManyEmblems { .. })
+        ));
+    }
+
+    #[test]
+    fn slot_data_matches_the_exact_p5136_player_and_empty_slot_layout() {
+        let mut slots = vec![MyRoomSlot::Empty; MYROOM_SLOT_COUNT];
+        slots[0] = MyRoomSlot::Player(MyRoomPlayerSlot {
+            user_no: 0x1122_3344,
+            p2p_address: Ipv4Addr::new(1, 2, 3, 4),
+            p2p_port: 0x5678,
+            nickname: "AB".to_owned(),
+            rider_item_snapshot: std::array::from_fn(|index| {
+                u8::try_from(index).expect("the 65-byte snapshot index fits in u8")
+            }),
+            rp: 0xa1b2_c3d4,
+            club_name: "C".to_owned(),
+        });
+
+        let packet = serialize_slot_data(&slots).unwrap();
+        assert_eq!(adler32::packet_hash(SLOT_DATA_NAME), 870_385_203);
+        assert_eq!(&packet[0..4], &0x33e1_0633_u32.to_le_bytes());
+        assert_eq!(packet.len(), 994);
+
+        // First player slot starts immediately after the RTTI hash.
+        assert_eq!(&packet[4..8], &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(&packet[8..12], &[1, 2, 3, 4]);
+        assert_eq!(&packet[12..14], &0x5678_u16.to_le_bytes());
+        assert_eq!(&packet[14..20], &[0; 6]);
+        assert_eq!(&packet[20..24], &2_i32.to_le_bytes());
+        assert_eq!(&packet[24..28], &[b'A', 0, b'B', 0]);
+        assert_eq!(&packet[28..93], &(0_u8..65).collect::<Vec<_>>());
+        assert_eq!(&packet[93..97], &0xa1b2_c3d4_u32.to_le_bytes());
+        assert_eq!(&packet[97..126], &[0; 29]);
+        assert_eq!(&packet[126..130], &1_i32.to_le_bytes());
+        assert_eq!(&packet[130..132], &[b'C', 0]);
+        assert_eq!(packet[132], 0);
+
+        // Every remaining entry is exactly [0; 122] followed by 0xFF.
+        for index in 0..7 {
+            let start = 133 + index * MYROOM_EMPTY_SLOT_WIRE_LENGTH;
+            assert_eq!(
+                &packet[start..start + MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1],
+                &[0; MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1]
+            );
+            assert_eq!(packet[start + MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1], 0xff);
+        }
+
+        assert_eq!(
+            format!("{:X}", Sha256::digest(&packet)),
+            "F836C575D35E7ED5889E01E28A9FC861047E23587F25CB1AA79CCE629021C1C9"
+        );
+    }
+
+    #[test]
+    fn all_empty_slot_data_has_eight_exact_123_byte_sentinels() {
+        let slots = vec![MyRoomSlot::Empty; MYROOM_SLOT_COUNT];
+        let packet = serialize_slot_data(&slots).unwrap();
+        assert_eq!(
+            packet.len(),
+            4 + MYROOM_SLOT_COUNT * MYROOM_EMPTY_SLOT_WIRE_LENGTH
+        );
+        for index in 0..MYROOM_SLOT_COUNT {
+            let start = 4 + index * MYROOM_EMPTY_SLOT_WIRE_LENGTH;
+            assert_eq!(
+                &packet[start..start + MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1],
+                &[0; MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1]
+            );
+            assert_eq!(packet[start + MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1], 0xff);
+        }
+    }
+
+    #[test]
+    fn slot_data_rejects_wrong_counts_and_oversized_utf16_fields() {
+        for count in [MYROOM_SLOT_COUNT - 1, MYROOM_SLOT_COUNT + 1] {
+            let slots = vec![MyRoomSlot::Empty; count];
+            assert!(matches!(
+                serialize_slot_data(&slots),
+                Err(MyRoomProtocolError::InvalidSlotCount {
+                    actual,
+                    expected: MYROOM_SLOT_COUNT
+                }) if actual == count
+            ));
+        }
+
+        let base = MyRoomPlayerSlot {
+            user_no: 1,
+            p2p_address: Ipv4Addr::LOCALHOST,
+            p2p_port: 5136,
+            nickname: String::new(),
+            rider_item_snapshot: [0; 65],
+            rp: 20_000_000,
+            club_name: String::new(),
+        };
+        let mut slots = vec![MyRoomSlot::Empty; MYROOM_SLOT_COUNT];
+
+        let mut oversized_nickname = base.clone();
+        oversized_nickname.nickname = "x".repeat(MAX_RIDER_NICKNAME_UTF16_UNITS + 1);
+        slots[0] = MyRoomSlot::Player(oversized_nickname);
+        assert!(matches!(
+            serialize_slot_data(&slots),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom rider nickname",
+                actual,
+                maximum: MAX_RIDER_NICKNAME_UTF16_UNITS
+            }) if actual == MAX_RIDER_NICKNAME_UTF16_UNITS + 1
+        ));
+
+        let mut oversized_club = base;
+        oversized_club.club_name = "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1);
+        slots[0] = MyRoomSlot::Player(oversized_club);
+        assert!(matches!(
+            serialize_slot_data(&slots),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom club name",
+                actual,
+                maximum: MAX_CLUB_NAME_UTF16_UNITS
+            }) if actual == MAX_CLUB_NAME_UTF16_UNITS + 1
         ));
     }
 
