@@ -12,6 +12,7 @@ use std::{
     path::Path,
 };
 
+use p5136_core::dotnet_decimal::DotNetDecimal;
 pub use p5136_core::kart_physics::P5136KartSpecSnapshot;
 use quick_xml::{
     Reader, XmlVersion,
@@ -975,7 +976,7 @@ fn parse_body_param<R: BufRead>(
         drift_boost_mul_accel_factor,
         "driftBoostMulAccelFactor",
         DECIMAL_ZERO,
-        Decimal96::new(131, 2, false),
+        decimal_literal(131, 2, false),
         DECIMAL_ONE
     );
     int_field!(
@@ -989,21 +990,21 @@ fn parse_body_param<R: BufRead>(
         charge_boost_by_speed,
         "chargeBoostBySpeed",
         DECIMAL_ZERO,
-        Decimal96::new(2, 0, false),
+        decimal_literal(2, 0, false),
         DECIMAL_ONE
     );
     byte_field!(
         speed_slot_capacity,
         "SpeedSlotCapacity",
         DECIMAL_ZERO,
-        Decimal96::new(2, 0, false),
+        decimal_literal(2, 0, false),
         DECIMAL_ONE
     );
     byte_field!(
         item_slot_capacity,
         "ItemSlotCapacity",
         DECIMAL_ZERO,
-        Decimal96::new(2, 0, false),
+        decimal_literal(2, 0, false),
         DECIMAL_ONE
     );
     byte_field!(
@@ -1125,15 +1126,15 @@ fn parse_body_param<R: BufRead>(
     float_field!(
         drift_lean_factor,
         "DriftLeanFactor",
-        Decimal96::new(7, 2, false),
-        Decimal96::new(7, 2, false),
+        decimal_literal(7, 2, false),
+        decimal_literal(7, 2, false),
         DECIMAL_ONE
     );
     float_field!(
         steer_lean_factor,
         "SteerLeanFactor",
-        Decimal96::new(1, 2, false),
-        Decimal96::new(1, 2, false),
+        decimal_literal(1, 2, false),
+        decimal_literal(1, 2, false),
         DECIMAL_ONE
     );
     float_field!(
@@ -1146,64 +1147,64 @@ fn parse_body_param<R: BufRead>(
     float_field!(
         normal_booster_time,
         "NormalBoosterTime",
-        Decimal96::new(3_000, 0, false),
-        Decimal96::new(3_000, 0, false),
+        decimal_literal(3_000, 0, false),
+        decimal_literal(3_000, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         item_booster_time,
         "ItemBoosterTime",
-        Decimal96::new(3_000, 0, false),
-        Decimal96::new(3_000, 0, false),
+        decimal_literal(3_000, 0, false),
+        decimal_literal(3_000, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         team_booster_time,
         "TeamBoosterTime",
-        Decimal96::new(4_500, 0, false),
-        Decimal96::new(4_500, 0, false),
+        decimal_literal(4_500, 0, false),
+        decimal_literal(4_500, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         animal_booster_time,
         "AnimalBoosterTime",
-        Decimal96::new(4_000, 0, false),
-        Decimal96::new(4_000, 0, false),
+        decimal_literal(4_000, 0, false),
+        decimal_literal(4_000, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         super_booster_time,
         "SuperBoosterTime",
-        Decimal96::new(3_500, 0, false),
-        Decimal96::new(3_500, 0, false),
+        decimal_literal(3_500, 0, false),
+        decimal_literal(3_500, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         trans_accel_factor,
         "TransAccelFactor",
         DECIMAL_ZERO,
-        Decimal96::new(15, 1, false),
+        decimal_literal(15, 1, false),
         DECIMAL_ONE
     );
     float_field!(
         boost_accel_factor,
         "BoostAccelFactor",
         DECIMAL_ZERO,
-        Decimal96::new(15, 1, false),
+        decimal_literal(15, 1, false),
         DECIMAL_ONE
     );
     float_field!(
         start_booster_time_item,
         "StartBoosterTimeItem",
         DECIMAL_ZERO,
-        Decimal96::new(1_000, 0, false),
+        decimal_literal(1_000, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         start_booster_time_speed,
         "StartBoosterTimeSpeed",
         DECIMAL_ZERO,
-        Decimal96::new(1_000, 0, false),
+        decimal_literal(1_000, 0, false),
         DECIMAL_ONE
     );
     float_field!(
@@ -1232,7 +1233,7 @@ fn parse_body_param<R: BufRead>(
         boost_accel_factor_only_item,
         "BoostAccelFactorOnlyItem",
         DECIMAL_ZERO,
-        Decimal96::new(15, 1, false),
+        decimal_literal(15, 1, false),
         DECIMAL_ONE
     );
     float_field!(
@@ -1247,28 +1248,28 @@ fn parse_body_param<R: BufRead>(
         dual_booster_tick_min,
         "dualBoosterTickMin",
         DECIMAL_ZERO,
-        Decimal96::new(40, 0, false),
+        decimal_literal(40, 0, false),
         DECIMAL_ONE
     );
     int_field!(
         dual_booster_tick_max,
         "dualBoosterTickMax",
         DECIMAL_ZERO,
-        Decimal96::new(60, 0, false),
+        decimal_literal(60, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         dual_mul_accel_factor,
         "dualMulAccelFactor",
         DECIMAL_ZERO,
-        Decimal96::new(11, 1, false),
+        decimal_literal(11, 1, false),
         DECIMAL_ONE
     );
     float_field!(
         dual_trans_low_speed,
         "dualTransLowSpeed",
         DECIMAL_ZERO,
-        Decimal96::new(100, 0, false),
+        decimal_literal(100, 0, false),
         DECIMAL_ONE
     );
     bool_field!(parts_engine_lock, "PartsEngineLock", false);
@@ -1281,28 +1282,28 @@ fn parse_body_param<R: BufRead>(
         charge_inst_accel_gauge_by_boost,
         "chargeInstAccelGaugeByBoost",
         DECIMAL_ZERO,
-        Decimal96::new(2, 2, false),
+        decimal_literal(2, 2, false),
         DECIMAL_ONE
     );
     float_field!(
         charge_inst_accel_gauge_by_grip,
         "chargeInstAccelGaugeByGrip",
         DECIMAL_ZERO,
-        Decimal96::new(2, 2, false),
+        decimal_literal(2, 2, false),
         DECIMAL_ONE
     );
     float_field!(
         charge_inst_accel_gauge_by_wall,
         "chargeInstAccelGaugeByWall",
         DECIMAL_ZERO,
-        Decimal96::new(2, 1, false),
+        decimal_literal(2, 1, false),
         DECIMAL_ONE
     );
     float_field!(
         inst_accel_factor,
         "instAccelFactor",
         DECIMAL_ZERO,
-        Decimal96::new(125, 2, false),
+        decimal_literal(125, 2, false),
         DECIMAL_ONE
     );
     int_field!(
@@ -1322,7 +1323,7 @@ fn parse_body_param<R: BufRead>(
 
     let raw_length = attributes
         .get("instAccelGaugeLength")
-        .and_then(|value| parse_decimal(value))
+        .and_then(|value| DotNetDecimal::parse_invariant(value))
         .unwrap_or(DECIMAL_ZERO);
     let minimum_usable_scale = DECIMAL_THOUSAND.checked_mul(raw_length).ok_or_else(|| {
         CatalogInventoryError::InvalidBodyParamValue {
@@ -1344,14 +1345,14 @@ fn parse_body_param<R: BufRead>(
         inst_accel_gauge_min_vel_bound,
         "instAccelGaugeMinVelBound",
         DECIMAL_ZERO,
-        Decimal96::new(200, 0, false),
+        decimal_literal(200, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         inst_accel_gauge_min_vel_loss,
         "instAccelGaugeMinVelLoss",
         DECIMAL_ZERO,
-        Decimal96::new(50, 0, false),
+        decimal_literal(50, 0, false),
         DECIMAL_ONE
     );
     bool_field!(
@@ -1370,21 +1371,21 @@ fn parse_body_param<R: BufRead>(
         wall_coll_gauge_max_vel_loss,
         "wallCollGaugeMaxVelLoss",
         DECIMAL_ZERO,
-        Decimal96::new(200, 0, false),
+        decimal_literal(200, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         wall_coll_gauge_min_vel_bound,
         "wallCollGaugeMinVelBound",
         DECIMAL_ZERO,
-        Decimal96::new(200, 0, false),
+        decimal_literal(200, 0, false),
         DECIMAL_ONE
     );
     float_field!(
         wall_coll_gauge_min_vel_loss,
         "wallCollGaugeMinVelLoss",
         DECIMAL_ZERO,
-        Decimal96::new(50, 0, false),
+        decimal_literal(50, 0, false),
         DECIMAL_ONE
     );
 
@@ -1487,12 +1488,15 @@ fn resolve_bool_field(
 fn resolve_decimal_field(
     attributes: &HashMap<&'static str, String>,
     field: &'static str,
-    fallback: Decimal96,
-    default: Decimal96,
-    scale: Decimal96,
+    fallback: DotNetDecimal,
+    default: DotNetDecimal,
+    scale: DotNetDecimal,
     spec_name: &str,
-) -> Result<Decimal96, CatalogInventoryError> {
-    let Some(value) = attributes.get(field).and_then(|value| parse_decimal(value)) else {
+) -> Result<DotNetDecimal, CatalogInventoryError> {
+    let Some(value) = attributes
+        .get(field)
+        .and_then(|value| DotNetDecimal::parse_invariant(value))
+    else {
         return Ok(default);
     };
     value
@@ -1504,494 +1508,14 @@ fn resolve_decimal_field(
         })
 }
 
-const DECIMAL_MAX_MANTISSA: u128 = (1_u128 << 96) - 1;
-const DECIMAL_ZERO: Decimal96 = Decimal96::new(0, 0, false);
-const DECIMAL_ONE: Decimal96 = Decimal96::new(1, 0, false);
-const DECIMAL_THOUSAND: Decimal96 = Decimal96::new(1_000, 0, false);
+const DECIMAL_ZERO: DotNetDecimal = DotNetDecimal::ZERO;
+const DECIMAL_ONE: DotNetDecimal = DotNetDecimal::ONE;
+const DECIMAL_THOUSAND: DotNetDecimal = decimal_literal(1_000, 0, false);
 
-/// The subset of `System.Decimal` needed by `KartSpec.GetScaledValue`.
-///
-/// Keeping the value as a 96-bit mantissa plus scale preserves the C# order:
-/// parse decimal, multiply the scale, add the fallback, then cast once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Decimal96 {
-    mantissa: u128,
-    scale: u32,
-    negative: bool,
-}
-
-impl Decimal96 {
-    const fn new(mantissa: u128, scale: u32, negative: bool) -> Self {
-        Self {
-            mantissa,
-            scale,
-            negative,
-        }
-    }
-
-    fn checked_mul(self, other: Self) -> Option<Self> {
-        let product = U256::multiply_u128(self.mantissa, other.mantissa);
-        Self::from_wide(
-            product,
-            self.scale + other.scale,
-            self.negative ^ other.negative,
-        )
-    }
-
-    fn checked_add(self, other: Self) -> Option<Self> {
-        let scale = self.scale.max(other.scale);
-        let left = U256::from_u128(self.mantissa).checked_mul_power_of_ten(scale - self.scale)?;
-        let right =
-            U256::from_u128(other.mantissa).checked_mul_power_of_ten(scale - other.scale)?;
-        let (magnitude, negative) = if self.negative == other.negative {
-            (left.checked_add(right)?, self.negative)
-        } else {
-            match left.magnitude_cmp(right) {
-                std::cmp::Ordering::Less => (right.checked_sub(left)?, other.negative),
-                std::cmp::Ordering::Equal => return Some(DECIMAL_ZERO),
-                std::cmp::Ordering::Greater => (left.checked_sub(right)?, self.negative),
-            }
-        };
-        Self::from_wide(magnitude, scale, negative)
-    }
-
-    fn from_wide(value: U256, scale: u32, negative: bool) -> Option<Self> {
-        let minimum_removed = scale.saturating_sub(28);
-        for removed in minimum_removed..=scale {
-            let rounded = value.round_div_power_of_ten(removed)?;
-            if rounded.fits_decimal_mantissa() {
-                let mantissa = rounded.to_u128();
-                return if mantissa == 0 {
-                    Some(DECIMAL_ZERO)
-                } else {
-                    Some(Self::new(mantissa, scale - removed, negative))
-                };
-            }
-        }
-        None
-    }
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
-    fn to_f32(self) -> f32 {
-        if self.mantissa == 0 {
-            return 0.0;
-        }
-
-        let numerator = U256::from_u128(self.mantissa);
-        let denominator = U256::from_u128(10_u128.pow(self.scale));
-        let mut exponent = numerator.bit_length() as i32 - denominator.bit_length() as i32;
-        let below_power = if exponent >= 0 {
-            numerator.magnitude_cmp(
-                denominator
-                    .checked_shift_left(exponent as u32)
-                    .expect("decimal exponent comparison fits U256"),
-            ) == std::cmp::Ordering::Less
-        } else {
-            numerator
-                .checked_shift_left((-exponent) as u32)
-                .expect("decimal exponent comparison fits U256")
-                .magnitude_cmp(denominator)
-                == std::cmp::Ordering::Less
-        };
-        if below_power {
-            exponent -= 1;
-        }
-
-        let significand_shift = 23 - exponent;
-        let (scaled_numerator, scaled_denominator) = if significand_shift >= 0 {
-            (
-                numerator
-                    .checked_shift_left(significand_shift as u32)
-                    .expect("decimal-to-f32 numerator fits U256"),
-                denominator,
-            )
-        } else {
-            (
-                numerator,
-                denominator
-                    .checked_shift_left((-significand_shift) as u32)
-                    .expect("decimal-to-f32 denominator fits U256"),
-            )
-        };
-        let (mut significand, remainder) =
-            scaled_numerator.div_rem_u32_quotient(scaled_denominator);
-        let doubled_remainder = remainder
-            .checked_mul_u64(2)
-            .expect("decimal-to-f32 remainder fits U256");
-        if doubled_remainder.magnitude_cmp(scaled_denominator) == std::cmp::Ordering::Greater
-            || (doubled_remainder == scaled_denominator && !significand.is_multiple_of(2))
-        {
-            significand += 1;
-        }
-        if significand == 1 << 24 {
-            significand >>= 1;
-            exponent += 1;
-        }
-
-        debug_assert!((1 << 23..1 << 24).contains(&significand));
-        let biased_exponent = (exponent + 127) as u32;
-        debug_assert!((1..0xff).contains(&biased_exponent));
-        let sign = u32::from(self.negative) << 31;
-        f32::from_bits(sign | (biased_exponent << 23) | (significand - (1 << 23)))
-    }
-
-    fn to_i32(self) -> Option<i32> {
-        let magnitude = self.mantissa / 10_u128.pow(self.scale);
-        if self.negative {
-            if magnitude == 1_u128 << 31 {
-                Some(i32::MIN)
-            } else {
-                i32::try_from(magnitude).ok().map(|value| -value)
-            }
-        } else {
-            i32::try_from(magnitude).ok()
-        }
-    }
-
-    fn to_u8(self) -> Option<u8> {
-        if self.negative {
-            return None;
-        }
-        u8::try_from(self.mantissa / 10_u128.pow(self.scale)).ok()
-    }
-}
-
-/// Parses the practical `NumberStyles.Any` grammar used by
-/// `decimal.TryParse(..., InvariantCulture)`.
-///
-/// Exported catalogs use plain invariant decimals, while accepting signs,
-/// grouping, exponents, parentheses, and the invariant currency symbol keeps
-/// fallback behavior aligned with the reference parser.
-fn parse_decimal(input: &str) -> Option<Decimal96> {
-    let mut value = input.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    let mut negative = false;
-    let mut sign_seen = false;
-    if value.starts_with('(') && value.ends_with(')') {
-        negative = true;
-        sign_seen = true;
-        value = value[1..value.len() - 1].trim();
-    } else if value.contains(['(', ')']) {
-        return None;
-    }
-
-    value = trim_invariant_currency(value);
-    if let Some(rest) = value.strip_prefix(['+', '-']) {
-        if sign_seen {
-            return None;
-        }
-        negative = value.starts_with('-');
-        sign_seen = true;
-        value = trim_invariant_currency(rest.trim_start());
-    }
-    if let Some(rest) = value.strip_suffix(['+', '-']) {
-        if sign_seen {
-            return None;
-        }
-        negative = value.ends_with('-');
-        value = trim_invariant_currency(rest.trim_end());
-    }
-    if value.is_empty() {
-        return None;
-    }
-
-    let mut exponent = 0_i64;
-    if let Some(index) = value.find(['e', 'E']) {
-        if value[index + 1..].contains(['e', 'E']) {
-            return None;
-        }
-        exponent = value[index + 1..].trim().parse::<i64>().ok()?;
-        value = value[..index].trim_end();
-    }
-
-    let mut digits = String::with_capacity(value.len());
-    let mut fractional_digits = 0_i64;
-    let mut decimal_seen = false;
-    let mut digit_seen = false;
-    for character in value.chars() {
-        match character {
-            '0'..='9' => {
-                digit_seen = true;
-                digits.push(character);
-                if decimal_seen {
-                    fractional_digits = fractional_digits.checked_add(1)?;
-                }
-            }
-            '.' if !decimal_seen => decimal_seen = true,
-            ',' => {}
-            _ => return None,
-        }
-    }
-    if !digit_seen {
-        return None;
-    }
-
-    let significant = digits.trim_start_matches('0');
-    if significant.is_empty() {
-        return Some(DECIMAL_ZERO);
-    }
-    let scale = fractional_digits.checked_sub(exponent)?;
-    decimal_from_digits(significant, scale, negative)
-}
-
-fn trim_invariant_currency(mut value: &str) -> &str {
-    loop {
-        let trimmed = value.trim();
-        if let Some(rest) = trimmed.strip_prefix('¤') {
-            value = rest;
-        } else if let Some(rest) = trimmed.strip_suffix('¤') {
-            value = rest;
-        } else {
-            return trimmed;
-        }
-    }
-}
-
-fn decimal_from_digits(digits: &str, scale: i64, negative: bool) -> Option<Decimal96> {
-    if scale < 0 {
-        let appended = usize::try_from(scale.checked_neg()?).ok()?;
-        if digits.len().checked_add(appended)? > 29 {
-            return None;
-        }
-        let mut expanded = String::with_capacity(digits.len() + appended);
-        expanded.push_str(digits);
-        expanded.extend(std::iter::repeat_n('0', appended));
-        let mantissa = expanded.parse::<u128>().ok()?;
-        return (mantissa <= DECIMAL_MAX_MANTISSA).then_some(Decimal96::new(mantissa, 0, negative));
-    }
-
-    let scale = usize::try_from(scale).ok()?;
-    if scale > digits.len().saturating_add(28) {
-        return Some(DECIMAL_ZERO);
-    }
-    let minimum_removed = scale
-        .saturating_sub(28)
-        .max(digits.len().saturating_sub(29));
-    if minimum_removed > scale {
-        return None;
-    }
-    for removed in minimum_removed..=scale {
-        let mantissa = rounded_decimal_digits(digits, removed)?;
-        if mantissa <= DECIMAL_MAX_MANTISSA {
-            return if mantissa == 0 {
-                Some(DECIMAL_ZERO)
-            } else {
-                Some(Decimal96::new(
-                    mantissa,
-                    u32::try_from(scale - removed).ok()?,
-                    negative,
-                ))
-            };
-        }
-    }
-    None
-}
-
-fn rounded_decimal_digits(digits: &str, removed: usize) -> Option<u128> {
-    if removed == 0 {
-        return digits.parse::<u128>().ok();
-    }
-    if removed > digits.len() {
-        return Some(0);
-    }
-
-    let retained_length = digits.len() - removed;
-    let retained = &digits[..retained_length];
-    let discarded = digits.as_bytes().get(retained_length..)?;
-    let mut value = if retained.is_empty() {
-        0
-    } else {
-        retained.parse::<u128>().ok()?
-    };
-    let round_digit = discarded[0] - b'0';
-    let sticky = discarded[1..].iter().any(|digit| *digit != b'0');
-    if round_digit > 5 || (round_digit == 5 && (sticky || value % 2 != 0)) {
-        value = value.checked_add(1)?;
-    }
-    Some(value)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct U256([u64; 4]);
-
-#[allow(clippy::cast_possible_truncation)]
-impl U256 {
-    const fn from_u128(value: u128) -> Self {
-        Self([value as u64, (value >> 64) as u64, 0, 0])
-    }
-
-    fn multiply_u128(left: u128, right: u128) -> Self {
-        let left = [left as u64, (left >> 64) as u64];
-        let right = [right as u64, (right >> 64) as u64];
-        let mut product = [0_u64; 4];
-
-        for (left_index, left_limb) in left.into_iter().enumerate() {
-            let mut carry = 0_u128;
-            for (right_index, right_limb) in right.into_iter().enumerate() {
-                let index = left_index + right_index;
-                let value = u128::from(product[index])
-                    + u128::from(left_limb) * u128::from(right_limb)
-                    + carry;
-                product[index] = value as u64;
-                carry = value >> 64;
-            }
-
-            let mut index = left_index + 2;
-            while carry != 0 {
-                let value = u128::from(product[index]) + carry;
-                product[index] = value as u64;
-                carry = value >> 64;
-                index += 1;
-            }
-        }
-        Self(product)
-    }
-
-    fn checked_add(self, other: Self) -> Option<Self> {
-        let mut result = [0_u64; 4];
-        let mut carry = false;
-        for (index, output) in result.iter_mut().enumerate() {
-            let (partial, first_carry) = self.0[index].overflowing_add(other.0[index]);
-            let (sum, second_carry) = partial.overflowing_add(u64::from(carry));
-            *output = sum;
-            carry = first_carry || second_carry;
-        }
-        (!carry).then_some(Self(result))
-    }
-
-    fn checked_sub(self, other: Self) -> Option<Self> {
-        if self.magnitude_cmp(other) == std::cmp::Ordering::Less {
-            return None;
-        }
-
-        let mut result = [0_u64; 4];
-        let mut borrow = false;
-        for (index, output) in result.iter_mut().enumerate() {
-            let (partial, first_borrow) = self.0[index].overflowing_sub(other.0[index]);
-            let (difference, second_borrow) = partial.overflowing_sub(u64::from(borrow));
-            *output = difference;
-            borrow = first_borrow || second_borrow;
-        }
-        debug_assert!(!borrow);
-        Some(Self(result))
-    }
-
-    fn checked_mul_u64(self, multiplier: u64) -> Option<Self> {
-        let mut result = [0_u64; 4];
-        let mut carry = 0_u128;
-        for (limb, output) in self.0.into_iter().zip(result.iter_mut()) {
-            let value = u128::from(limb) * u128::from(multiplier) + carry;
-            *output = value as u64;
-            carry = value >> 64;
-        }
-        (carry == 0).then_some(Self(result))
-    }
-
-    fn checked_mul_power_of_ten(mut self, power: u32) -> Option<Self> {
-        for _ in 0..power {
-            self = self.checked_mul_u64(10)?;
-        }
-        Some(self)
-    }
-
-    fn checked_shift_left(mut self, shift: u32) -> Option<Self> {
-        for _ in 0..shift {
-            self = self.checked_mul_u64(2)?;
-        }
-        Some(self)
-    }
-
-    fn div_rem_u64(self, divisor: u64) -> (Self, u64) {
-        let mut quotient = [0_u64; 4];
-        let mut remainder = 0_u128;
-        for index in (0..4).rev() {
-            let value = (remainder << 64) | u128::from(self.0[index]);
-            quotient[index] = (value / u128::from(divisor)) as u64;
-            remainder = value % u128::from(divisor);
-        }
-        (Self(quotient), remainder as u64)
-    }
-
-    fn round_div_power_of_ten(self, power: u32) -> Option<Self> {
-        if power == 0 {
-            return Some(self);
-        }
-
-        let mut quotient = self;
-        let mut sticky = false;
-        let mut round_digit = 0_u64;
-        for digit in 0..power {
-            let (next, remainder) = quotient.div_rem_u64(10);
-            quotient = next;
-            if digit + 1 == power {
-                round_digit = remainder;
-            } else {
-                sticky |= remainder != 0;
-            }
-        }
-
-        if round_digit > 5 || (round_digit == 5 && (sticky || quotient.0[0] & 1 != 0)) {
-            quotient = quotient.checked_add(Self::from_u128(1))?;
-        }
-        Some(quotient)
-    }
-
-    fn div_rem_u32_quotient(self, divisor: Self) -> (u32, Self) {
-        let mut lower = 0_u32;
-        let mut upper = 1_u32 << 25;
-        while lower + 1 < upper {
-            let middle = lower + (upper - lower) / 2;
-            let product = divisor
-                .checked_mul_u64(u64::from(middle))
-                .expect("bounded decimal-to-f32 quotient fits U256");
-            if product.magnitude_cmp(self) == std::cmp::Ordering::Greater {
-                upper = middle;
-            } else {
-                lower = middle;
-            }
-        }
-        let product = divisor
-            .checked_mul_u64(u64::from(lower))
-            .expect("bounded decimal-to-f32 quotient fits U256");
-        (
-            lower,
-            self.checked_sub(product)
-                .expect("the quotient product does not exceed the dividend"),
-        )
-    }
-
-    fn magnitude_cmp(self, other: Self) -> std::cmp::Ordering {
-        for index in (0..4).rev() {
-            match self.0[index].cmp(&other.0[index]) {
-                std::cmp::Ordering::Equal => {}
-                ordering => return ordering,
-            }
-        }
-        std::cmp::Ordering::Equal
-    }
-
-    fn bit_length(self) -> u32 {
-        for index in (0..4).rev() {
-            if self.0[index] != 0 {
-                return index as u32 * 64 + (64 - self.0[index].leading_zeros());
-            }
-        }
-        0
-    }
-
-    fn fits_decimal_mantissa(self) -> bool {
-        self.0[2] == 0 && self.0[3] == 0 && u32::try_from(self.0[1]).is_ok()
-    }
-
-    fn to_u128(self) -> u128 {
-        u128::from(self.0[0]) | (u128::from(self.0[1]) << 64)
+const fn decimal_literal(mantissa: u128, scale: u32, negative: bool) -> DotNetDecimal {
+    match DotNetDecimal::from_parts(mantissa, scale, negative) {
+        Some(value) => value,
+        None => panic!("P5136 decimal literal fits System.Decimal"),
     }
 }
 
@@ -2315,6 +1839,23 @@ mod tests {
         assert!(unresolved.kart_spec(2).is_none());
         assert_eq!(unresolved.kart_spec_stats().unresolved_names, 1);
         assert_eq!(unresolved.kart_spec_stats().unreferenced_specs, 1);
+
+        let target_overflow = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names><Kart id="1" name="one" /></Names>
+                <Specs>
+                    <Spec name="one"><BodyParam SpeedSlotCapacity="256" /></Spec>
+                </Specs>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            target_overflow,
+            Err(CatalogInventoryError::InvalidBodyParamValue {
+                field: "SpeedSlotCapacity",
+                ..
+            })
+        ));
     }
 
     #[test]

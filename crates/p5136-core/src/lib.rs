@@ -5,6 +5,7 @@ pub mod bml;
 pub mod channel;
 pub mod crypto;
 pub mod datagram;
+pub mod dotnet_decimal;
 pub mod encoded;
 pub mod equipment_protocol;
 pub mod frame;
