@@ -1,0 +1,16 @@
+[package]
+name = "p5136-core"
+description = "Wire protocol primitives for the KartRider P5136 client"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

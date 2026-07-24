@@ -1,0 +1,15 @@
+[package]
+name = "p5136-connector"
+description = "Cross-platform connector core for KartRider P5136"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+p5136-core = { path = "../p5136-core" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
