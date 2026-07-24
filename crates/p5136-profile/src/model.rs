@@ -443,4 +443,35 @@ mod tests {
         assert_eq!(encoded["RiderItem"]["Set_Character"], 42);
         assert!(encoded.get("P5136RustRaceRewardReceipt").is_none());
     }
+
+    #[test]
+    fn first_generation_race_receipt_schema_remains_readable() {
+        let source = json!({
+            "P5136RustRaceRewardReceipt": {
+                "Key": {
+                    "RunId": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    "RoomId": 7,
+                    "RaceEpoch": 11,
+                    "UserNo": 42
+                },
+                "Applied": {
+                    "CurrentRp": 20_000_000,
+                    "EarnedRp": 37,
+                    "EarnedLucci": 25,
+                    "CurrentLucci": 1_000_025
+                }
+            }
+        });
+        let profile: Profile = serde_json::from_value(source).unwrap();
+        let receipt = profile.race_reward_receipt.as_ref().unwrap();
+        assert_eq!(receipt.key.run_generation(), None);
+        assert!(receipt.key.legacy_run_id().is_some());
+        assert_eq!(receipt.key.canonical_nickname(), None);
+        assert_eq!(receipt.applied.current_lucci, 1_000_025);
+
+        let encoded = serde_json::to_value(profile).unwrap();
+        let key = &encoded["P5136RustRaceRewardReceipt"]["Key"];
+        assert!(key.get("RunId").is_some());
+        assert!(key.get("RunGeneration").is_none());
+    }
 }

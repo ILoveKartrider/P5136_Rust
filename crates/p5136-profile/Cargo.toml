@@ -7,8 +7,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+fs2.workspace = true
 p5136-core = { path = "../p5136-core" }
 quick-xml.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

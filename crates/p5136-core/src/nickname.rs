@@ -1,6 +1,8 @@
 //! Cross-platform nickname validation and case-insensitive identity keys.
 
 use thiserror::Error;
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 pub const MAXIMUM_NICKNAME_LENGTH: usize = 32;
 
@@ -28,7 +30,7 @@ pub enum NicknameError {
 }
 
 pub fn normalize_nickname(value: &str) -> Result<String, NicknameError> {
-    let nickname = value.trim();
+    let nickname = value.trim().nfc().collect::<String>();
     if nickname.is_empty() {
         return Err(NicknameError::Empty);
     }
@@ -61,17 +63,18 @@ pub fn normalize_nickname(value: &str) -> Result<String, NicknameError> {
         return Err(NicknameError::ReservedWindowsName(base_name.to_owned()));
     }
 
-    Ok(nickname.to_owned())
+    Ok(nickname)
 }
 
 #[must_use]
 pub fn canonical_nickname_key(nickname: &str) -> String {
-    nickname.chars().flat_map(char::to_lowercase).collect()
+    nickname.nfc().case_fold().nfc().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{NicknameError, canonical_nickname_key, normalize_nickname};
+    use unicode_normalization::UnicodeNormalization;
 
     #[test]
     fn applies_windows_path_rules_on_every_host() {
@@ -97,5 +100,38 @@ mod tests {
             canonical_nickname_key("rider")
         );
         assert_eq!(canonical_nickname_key("라이더"), "라이더");
+    }
+
+    #[test]
+    fn normalizes_unicode_before_validation_and_after_case_mapping() {
+        let composed = "\u{00e9}";
+        let decomposed = "e\u{0301}";
+        assert_eq!(normalize_nickname(composed).unwrap(), composed);
+        assert_eq!(normalize_nickname(decomposed).unwrap(), composed);
+        assert_eq!(
+            canonical_nickname_key(composed),
+            canonical_nickname_key(decomposed)
+        );
+
+        // U+0130 lowercases to `i` plus a combining dot. The canonical key
+        // remains normalized even when case mapping expands one scalar.
+        let expanded = canonical_nickname_key("\u{0130}");
+        assert_eq!(expanded, expanded.nfc().collect::<String>());
+    }
+
+    #[test]
+    fn canonical_key_uses_full_unicode_case_folding() {
+        assert_eq!(
+            canonical_nickname_key("\u{03c3}"),
+            canonical_nickname_key("\u{03c2}")
+        );
+        assert_eq!(
+            canonical_nickname_key("Stra\u{00df}e"),
+            canonical_nickname_key("STRASSE")
+        );
+        assert_eq!(
+            canonical_nickname_key("\u{017f}"),
+            canonical_nickname_key("S")
+        );
     }
 }
