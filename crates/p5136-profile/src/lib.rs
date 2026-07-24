@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod equipment;
 pub mod inventory;
 pub mod model;
+pub mod progression;
 pub mod store;
 
 pub use catalog::{
@@ -17,5 +18,10 @@ pub use inventory::{
 };
 pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,
+};
+pub use progression::{
+    AppliedTimeReward, DEFAULT_RP, MAX_TIME_REWARD_LUCCI_ROLL, MAX_TIME_REWARD_RP_ROLL,
+    RewardRollError, TIME_REWARD_BASELINE_RANK, TimeReward, apply_time_reward, finish_reward,
+    time_reward_from_rolls,
 };
 pub use store::{LoadedProfile, ProfileStore, ProfileStoreError, SavedProfile};
