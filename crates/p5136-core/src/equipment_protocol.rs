@@ -11,6 +11,7 @@ use crate::{
 pub const SET_RIDER_ITEMS_REQUEST_NAME: &str = "LoRqSetRiderItemOnPacket";
 pub const EQUIP_PLANT_PART_REQUEST_NAME: &str = "PqEquipTuningExPacket";
 pub const EQUIP_TUNING_REPLY_NAME: &str = "PrEquipTuningPacket";
+pub const ROOM_SLOT_ITEMS_PACKET_NAME: &str = "GrSlotItemOnPacket";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EquipmentRequest {
@@ -87,6 +88,9 @@ pub enum EquipmentProtocolError {
 
     #[error("plant target kart ID {0} must be positive")]
     InvalidPlantKart(i16),
+
+    #[error("room equipment player ID {0} is outside 0..=15")]
+    InvalidRoomPlayerId(i32),
 }
 
 #[must_use]
@@ -194,6 +198,19 @@ pub fn serialize_equip_tuning_success(request: PlantPartEquipRequest) -> Vec<u8>
     packet.into_inner()
 }
 
+pub fn serialize_room_slot_items(
+    player_id: i32,
+    rider_item_snapshot: &[u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+) -> Result<Vec<u8>, EquipmentProtocolError> {
+    if !(0..=15).contains(&player_id) {
+        return Err(EquipmentProtocolError::InvalidRoomPlayerId(player_id));
+    }
+    let mut packet = PacketWriter::named(ROOM_SLOT_ITEMS_PACKET_NAME);
+    packet.write_i32(player_id);
+    packet.write_bytes(rider_item_snapshot);
+    Ok(packet.into_inner())
+}
+
 fn expect_hash(
     reader: &mut PacketReader<'_>,
     name: &'static str,
@@ -249,7 +266,7 @@ mod tests {
         EQUIP_PLANT_PART_REQUEST_NAME, EquipmentProtocolError, EquipmentRequest,
         PlantPartEquipRequest, SET_RIDER_ITEMS_REQUEST_NAME, classify_equipment_request,
         parse_equip_plant_part, parse_set_rider_items, serialize_equip_tuning_failure,
-        serialize_equip_tuning_success,
+        serialize_equip_tuning_success, serialize_room_slot_items,
     };
     use crate::{adler32, packet::PacketWriter};
 
@@ -351,6 +368,22 @@ mod tests {
         assert!(matches!(
             parse_equip_plant_part(&invalid),
             Err(EquipmentProtocolError::InvalidPlantPartCategory(42))
+        ));
+    }
+
+    #[test]
+    fn room_equipment_broadcast_matches_the_csharp_layout() {
+        let mut snapshot = [0_u8; 65];
+        for (value, expected) in snapshot.iter_mut().zip(0_u8..65) {
+            *value = expected;
+        }
+        let packet = serialize_room_slot_items(2, &snapshot).unwrap();
+        assert_eq!(&packet[..8], &decode_hex("FF06834102000000"));
+        assert_eq!(&packet[8..], &snapshot);
+        assert_eq!(packet.len(), 73);
+        assert!(matches!(
+            serialize_room_slot_items(16, &snapshot),
+            Err(EquipmentProtocolError::InvalidRoomPlayerId(16))
         ));
     }
 
