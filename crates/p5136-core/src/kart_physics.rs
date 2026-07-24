@@ -210,6 +210,44 @@ pub struct P5136SpeedSpecSnapshot {
     pub boost_accel_factor: f32,
 }
 
+impl P5136SpeedSpecSnapshot {
+    /// The `SpeedType.Default()` values used by the Korean P5136 server.
+    ///
+    /// Room speed type 7 falls through to this preset. Keeping this explicit
+    /// avoids confusing it with [`Default::default`], whose all-zero value is
+    /// useful while assembling a snapshot from external catalog data.
+    #[must_use]
+    pub const fn csharp_default() -> Self {
+        Self {
+            mass: 100.0,
+            air_friction: 3.0,
+            drag_factor: 0.75,
+            forward_accel_force: 2_150.0,
+            backward_accel_force: 1_725.0,
+            grip_brake_force: 2_070.0,
+            slip_brake_force: 1_415.0,
+            max_steer_angle: 10.0,
+            steer_constraint: 22.25,
+            add_spec_steer_constraint: 1.95,
+            front_grip_factor: 5.0,
+            rear_grip_factor: 5.0,
+            drift_trigger_factor: 0.2,
+            drift_trigger_time: 0.2,
+            drift_slip_factor: 0.2,
+            drift_escape_force: 2_600.0,
+            add_spec_drift_escape_force: 400.0,
+            corner_draw_factor: 0.18,
+            steer_lean_factor: 0.0,
+            drift_max_gauge: 4_300.0,
+            normal_booster_time: 0.0,
+            team_booster_time: 0.0,
+            trans_accel_factor: -0.0045,
+            add_spec_trans_accel_factor: 0.2005,
+            boost_accel_factor: -0.006,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct P5136KartSpecSnapshot {
     pub draft_mul_accel_factor: f32,
@@ -523,6 +561,23 @@ pub struct P5136KartPhysicsSnapshot {
     pub exc: P5136ExcSpecSnapshot,
     pub speed_patch: P5136SpeedPatchSnapshot,
     pub v2: P5136V2SpecSnapshot,
+}
+
+impl P5136KartPhysicsSnapshot {
+    /// A byte-exact input snapshot for the reference server's safe fallback:
+    /// S7/`SpeedType.Default()`, kart ID 0, and no optional equipment sidecars.
+    ///
+    /// This is protocol-valid and exact for the unequipped fallback. It must
+    /// not be presented as the exact physics of an arbitrary equipped kart.
+    #[must_use]
+    pub fn csharp_s7_baseline() -> Self {
+        Self {
+            speed_type: 7,
+            speed: P5136SpeedSpecSnapshot::csharp_default(),
+            kart: P5136KartSpecSnapshot::csharp_default(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1701,6 +1756,50 @@ mod tests {
             P5136_ENCODED_F32_COUNT * 4 + P5136_ENCODED_I32_COUNT * 4 + P5136_ENCODED_U8_COUNT,
             235
         );
+    }
+
+    #[test]
+    fn s7_baseline_uses_the_reference_default_speed_and_kart_inputs() {
+        let baseline = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        assert_eq!(baseline.speed_type, 7);
+        assert_eq!(
+            baseline.speed,
+            P5136SpeedSpecSnapshot {
+                mass: 100.0,
+                air_friction: 3.0,
+                drag_factor: 0.75,
+                forward_accel_force: 2_150.0,
+                backward_accel_force: 1_725.0,
+                grip_brake_force: 2_070.0,
+                slip_brake_force: 1_415.0,
+                max_steer_angle: 10.0,
+                steer_constraint: 22.25,
+                add_spec_steer_constraint: 1.95,
+                front_grip_factor: 5.0,
+                rear_grip_factor: 5.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 2_600.0,
+                add_spec_drift_escape_force: 400.0,
+                corner_draw_factor: 0.18,
+                steer_lean_factor: 0.0,
+                drift_max_gauge: 4_300.0,
+                normal_booster_time: 0.0,
+                team_booster_time: 0.0,
+                trans_accel_factor: -0.0045,
+                add_spec_trans_accel_factor: 0.2005,
+                boost_accel_factor: -0.006,
+            }
+        );
+        assert_eq!(baseline.kart, P5136KartSpecSnapshot::csharp_default());
+        assert_eq!(baseline.flying_pet, P5136FlyingPetSpecSnapshot::default());
+        assert_eq!(baseline.exc, P5136ExcSpecSnapshot::default());
+        assert_eq!(baseline.speed_patch, P5136SpeedPatchSnapshot::default());
+        assert_eq!(baseline.v2, P5136V2SpecSnapshot::default());
+
+        let block = build_p5136_kart_physics_block(&baseline).unwrap();
+        assert_eq!(block.as_bytes().len(), P5136_KART_PHYSICS_BLOCK_LENGTH);
     }
 
     #[test]
