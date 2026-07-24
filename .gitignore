@@ -1,6 +1,44 @@
 /target/
 *.pdb
 *.log
+
+# IDE and host metadata
+.vs/
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
+
+# Local work, unrelated simulations, and historical reverse-engineering notes
+/_scratch/
+/scratch/
+/analysis/
+/_analysis/
+/past-analysis/
+/research/
+/[Pp]hysics[Ss]im/
+/KartRider-P5136/
+
+# Runtime profiles and proprietary client material must remain external
+/Profile/
+/profile/
+/client/
+/game/
+*.exe
+*.dll
+*.pin
+*.rho
+*.pak
+KartCatalog.xml
+PartsData.xml
+PlantData.json
+Launcher.json
+Launcher.v*.json
+
+# Connector transactions and local compatibility runtimes
+*.pristine.bak
+*.pristine.absent
+.p5136-connector.lock
+/.wine/
+/wine-prefix/
+/bottles/
