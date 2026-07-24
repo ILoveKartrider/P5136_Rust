@@ -48,6 +48,17 @@ pub enum ProfileStoreError {
 
     #[error("profile revision counter is exhausted for {0}")]
     RevisionExhausted(String),
+
+    #[error(
+        "profile revision {revision} for {nickname} was published at {path}, but directory durability could not be confirmed"
+    )]
+    CommittedButDurabilityUncertain {
+        nickname: String,
+        revision: u64,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,12 +78,64 @@ pub struct SavedProfile {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProfileMutation<T> {
+    Changed { value: T, profile: Box<Profile> },
+    Unchanged(T),
+}
+
+impl<T> ProfileMutation<T> {
+    #[must_use]
+    pub fn changed(value: T, profile: Profile) -> Self {
+        Self::Changed {
+            value,
+            profile: Box::new(profile),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ProfileTransaction<T> {
+    Unchanged {
+        value: T,
+        profile: Profile,
+    },
+    Committed {
+        value: T,
+        profile: Profile,
+        saved: SavedProfile,
+    },
+    CommittedButDurabilityUncertain {
+        value: T,
+        profile: Profile,
+        saved: SavedProfile,
+        error: ProfileStoreError,
+    },
+}
+
+#[derive(Debug)]
+enum SaveOutcome {
+    Durable(SavedProfile),
+    DurabilityUncertain {
+        saved: SavedProfile,
+        error: ProfileStoreError,
+    },
+}
+
+#[derive(Debug)]
+enum PreparedPublishOutcome {
+    Published(SaveOutcome),
+    DestinationExists,
+}
+
 #[derive(Debug)]
 pub struct ProfileStore {
     root: PathBuf,
     maximum_bytes: u64,
     profile_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     cache: Mutex<HashMap<String, CachedProfile>>,
+    #[cfg(test)]
+    next_directory_sync_fault: Mutex<Option<io::ErrorKind>>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +158,8 @@ impl ProfileStore {
             maximum_bytes,
             profile_locks: Mutex::new(HashMap::new()),
             cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            next_directory_sync_fault: Mutex::new(None),
         }
     }
 
@@ -188,7 +253,10 @@ impl ProfileStore {
         let nickname = normalize_nickname(nickname)?;
         let profile_lock = self.profile_lock(&nickname)?;
         let _guard = lock(&profile_lock)?;
-        self.save_locked(&nickname, profile)
+        match self.save_locked(&nickname, profile)? {
+            SaveOutcome::Durable(saved) => Ok(saved),
+            SaveOutcome::DurabilityUncertain { error, .. } => Err(error),
+        }
     }
 
     /// Serializes read-modify-write operations for one case-insensitive
@@ -201,13 +269,65 @@ impl ProfileStore {
     where
         F: FnOnce(&mut Profile),
     {
+        match self.transaction(nickname, |profile| {
+            let mut profile = profile.clone();
+            update(&mut profile);
+            ProfileMutation::changed((), profile)
+        })? {
+            ProfileTransaction::Committed { profile, saved, .. } => Ok((saved, profile)),
+            ProfileTransaction::CommittedButDurabilityUncertain { error, .. } => Err(error),
+            ProfileTransaction::Unchanged { .. } => {
+                unreachable!("an unconditional profile update always requests a commit")
+            }
+        }
+    }
+
+    /// Runs one conditional read-modify-write transaction under the
+    /// case-insensitive per-profile lock.
+    ///
+    /// The closure sees an immutable snapshot. A changed transaction must
+    /// return its replacement snapshot explicitly, so an unchanged outcome
+    /// cannot accidentally expose a mutation that was never persisted.
+    ///
+    /// `ProfileMutation::Unchanged` returns the loaded snapshot without
+    /// publishing a new immutable revision. Once a revision has been
+    /// published, a directory-sync failure is returned as a committed outcome
+    /// so callers must not blindly reapply the mutation.
+    pub fn transaction<T, F>(
+        &self,
+        nickname: &str,
+        transaction: F,
+    ) -> Result<ProfileTransaction<T>, ProfileStoreError>
+    where
+        F: FnOnce(&Profile) -> ProfileMutation<T>,
+    {
         let nickname = normalize_nickname(nickname)?;
         let profile_lock = self.profile_lock(&nickname)?;
         let _guard = lock(&profile_lock)?;
-        let mut profile = self.load_or_default_locked(&nickname)?.0;
-        update(&mut profile);
-        let saved = self.save_locked(&nickname, &profile)?;
-        Ok((saved, profile))
+        let profile = self.load_or_default_locked(&nickname)?.0;
+        match transaction(&profile) {
+            ProfileMutation::Unchanged(value) => {
+                Ok(ProfileTransaction::Unchanged { value, profile })
+            }
+            ProfileMutation::Changed { value, profile } => {
+                let profile = *profile;
+                match self.save_locked(&nickname, &profile)? {
+                    SaveOutcome::Durable(saved) => Ok(ProfileTransaction::Committed {
+                        value,
+                        profile,
+                        saved,
+                    }),
+                    SaveOutcome::DurabilityUncertain { saved, error } => {
+                        Ok(ProfileTransaction::CommittedButDurabilityUncertain {
+                            value,
+                            profile,
+                            saved,
+                            error,
+                        })
+                    }
+                }
+            }
+        }
     }
 
     fn profile_lock(&self, nickname: &str) -> Result<Arc<Mutex<()>>, ProfileStoreError> {
@@ -247,7 +367,10 @@ impl ProfileStore {
             });
         }
 
-        let saved = self.save_locked(nickname, &profile)?;
+        let saved = match self.save_locked(nickname, &profile)? {
+            SaveOutcome::Durable(saved) => saved,
+            SaveOutcome::DurabilityUncertain { error, .. } => return Err(error),
+        };
         Ok(LoadedProfile {
             nickname: nickname.to_owned(),
             profile,
@@ -312,7 +435,7 @@ impl ProfileStore {
         &self,
         nickname: &str,
         profile: &Profile,
-    ) -> Result<SavedProfile, ProfileStoreError> {
+    ) -> Result<SaveOutcome, ProfileStoreError> {
         let directory = self.profile_directory(nickname)?;
         create_dir_all(&directory)?;
         let mut revision =
@@ -366,33 +489,111 @@ impl ProfileStore {
                 }
             }
 
-            match publish_new_file(&temporary_path, &final_path) {
-                Ok(true) => {
-                    let _ = fs::remove_file(&temporary_path);
-                    sync_directory(&directory)?;
-                    self.cache_profile(nickname, profile, Some(revision), final_path.clone())?;
-                    return Ok(SavedProfile {
-                        nickname: nickname.to_owned(),
-                        revision,
-                        path: final_path,
-                    });
-                }
-                Ok(false) => {
-                    let _ = fs::remove_file(&temporary_path);
+            match self.publish_prepared_revision(
+                nickname,
+                profile,
+                revision,
+                &directory,
+                &temporary_path,
+                &final_path,
+            )? {
+                PreparedPublishOutcome::Published(outcome) => return Ok(outcome),
+                PreparedPublishOutcome::DestinationExists => {
                     revision = revision
                         .checked_add(1)
                         .ok_or_else(|| ProfileStoreError::RevisionExhausted(nickname.to_owned()))?;
                 }
-                Err(source) => {
-                    let _ = fs::remove_file(&temporary_path);
-                    return Err(ProfileStoreError::Io {
-                        operation: "publish profile revision",
-                        path: final_path,
-                        source,
-                    });
-                }
             }
         }
+    }
+
+    fn publish_prepared_revision(
+        &self,
+        nickname: &str,
+        profile: &Profile,
+        revision: u64,
+        directory: &Path,
+        temporary_path: &Path,
+        final_path: &Path,
+    ) -> Result<PreparedPublishOutcome, ProfileStoreError> {
+        // Acquire the cache guard before the atomic publish. This makes it
+        // impossible to create the final immutable revision and then fail to
+        // acquire the cache needed to expose it. File creation, writes, and
+        // fsync happen before this point; unrelated profiles are serialized
+        // only for this one hard-link syscall and cache insert.
+        let Ok(mut cache) = self.cache.lock() else {
+            let _ = fs::remove_file(temporary_path);
+            return Err(ProfileStoreError::LockPoisoned);
+        };
+        match publish_new_file(temporary_path, final_path) {
+            Ok(true) => {
+                let saved = SavedProfile {
+                    nickname: nickname.to_owned(),
+                    revision,
+                    path: final_path.to_owned(),
+                };
+                cache.insert(
+                    canonical_nickname_key(nickname),
+                    CachedProfile {
+                        profile: profile.clone(),
+                        revision: Some(revision),
+                        source_path: final_path.to_owned(),
+                    },
+                );
+                drop(cache);
+                let _ = fs::remove_file(temporary_path);
+                Ok(PreparedPublishOutcome::Published(
+                    match self.sync_published_directory(directory) {
+                        Ok(()) => SaveOutcome::Durable(saved),
+                        Err(source) => SaveOutcome::DurabilityUncertain {
+                            error: ProfileStoreError::CommittedButDurabilityUncertain {
+                                nickname: nickname.to_owned(),
+                                revision,
+                                path: final_path.to_owned(),
+                                source,
+                            },
+                            saved,
+                        },
+                    },
+                ))
+            }
+            Ok(false) => {
+                drop(cache);
+                let _ = fs::remove_file(temporary_path);
+                Ok(PreparedPublishOutcome::DestinationExists)
+            }
+            Err(source) => {
+                drop(cache);
+                let _ = fs::remove_file(temporary_path);
+                Err(ProfileStoreError::Io {
+                    operation: "publish profile revision",
+                    path: final_path.to_owned(),
+                    source,
+                })
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn sync_published_directory(&self, directory: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(kind) = self
+            .next_directory_sync_fault
+            .lock()
+            .map_err(|_| io::Error::other("directory sync fault lock was poisoned"))?
+            .take()
+        {
+            return Err(io::Error::new(
+                kind,
+                "injected post-publication directory sync failure",
+            ));
+        }
+        sync_directory(directory)
+    }
+
+    #[cfg(test)]
+    fn fail_next_directory_sync(&self, kind: io::ErrorKind) {
+        *self.next_directory_sync_fault.lock().unwrap() = Some(kind);
     }
 
     fn read_profile(&self, path: &Path) -> Result<Profile, ProfileStoreError> {
@@ -577,24 +778,13 @@ fn publish_new_file(temporary: &Path, destination: &Path) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<(), ProfileStoreError> {
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| ProfileStoreError::Io {
-            operation: "sync profile directory",
-            path: directory.to_owned(),
-            source,
-        })
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory).and_then(|file| file.sync_all())
 }
 
 #[cfg(not(unix))]
-fn sync_directory(directory: &Path) -> Result<(), ProfileStoreError> {
-    fs::metadata(directory).map_err(|source| ProfileStoreError::Io {
-        operation: "verify published profile directory",
-        path: directory.to_owned(),
-        source,
-    })?;
-    Ok(())
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    fs::metadata(directory).map(|_| ())
 }
 
 #[cfg(test)]
@@ -604,7 +794,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{ProfileStore, ProfileStoreError, publish_new_file};
+    use super::{
+        ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction, publish_new_file,
+        revisions_descending, version_filename,
+    };
 
     #[test]
     fn creates_and_loads_an_immutable_first_revision() {
@@ -680,6 +873,175 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_transaction_does_not_publish_a_revision() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let initial = store.load_or_create("Rider").unwrap();
+
+        let outcome = store
+            .transaction("rIDER", |profile| {
+                ProfileMutation::Unchanged(profile.rider.lucci)
+            })
+            .unwrap();
+        match outcome {
+            ProfileTransaction::Unchanged { value, profile } => {
+                assert_eq!(value, initial.profile.rider.lucci);
+                assert_eq!(profile, initial.profile);
+            }
+            other => panic!("expected an unchanged transaction, got {other:?}"),
+        }
+
+        let loaded = store.load_or_create("Rider").unwrap();
+        assert_eq!(loaded.revision, Some(1));
+        assert_eq!(
+            revisions_descending(root.path().join("Rider").as_path())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn changed_transaction_returns_its_value_and_committed_profile() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        store.load_or_create("Rider").unwrap();
+
+        let outcome = store
+            .transaction("Rider", |profile| {
+                let mut profile = profile.clone();
+                profile.rider.lucci += 7;
+                ProfileMutation::changed("reward-applied", profile)
+            })
+            .unwrap();
+        match outcome {
+            ProfileTransaction::Committed {
+                value,
+                profile,
+                saved,
+            } => {
+                assert_eq!(value, "reward-applied");
+                assert_eq!(profile.rider.lucci, 1_000_007);
+                assert_eq!(saved.revision, 2);
+                assert_eq!(
+                    saved.path,
+                    root.path().join("Rider").join(version_filename(2))
+                );
+            }
+            other => panic!("expected a durable commit, got {other:?}"),
+        }
+        assert_eq!(
+            store.load_or_create("Rider").unwrap().profile.rider.lucci,
+            1_000_007
+        );
+    }
+
+    #[test]
+    fn duplicate_conditional_mutation_reuses_state_without_a_new_revision() {
+        const MARKER: &str = "ConditionalRewardApplied";
+
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        store.load_or_create("Rider").unwrap();
+
+        let apply = || {
+            store.transaction("Rider", |profile| {
+                if profile.extra.contains_key(MARKER) {
+                    ProfileMutation::Unchanged(profile.rider.lucci)
+                } else {
+                    let mut profile = profile.clone();
+                    profile.rider.lucci += 25;
+                    profile.extra.insert(MARKER.to_owned(), json!(true));
+                    ProfileMutation::changed(profile.rider.lucci, profile)
+                }
+            })
+        };
+        assert!(matches!(
+            apply().unwrap(),
+            ProfileTransaction::Committed {
+                value: 1_000_025,
+                ..
+            }
+        ));
+        assert!(matches!(
+            apply().unwrap(),
+            ProfileTransaction::Unchanged {
+                value: 1_000_025,
+                ..
+            }
+        ));
+
+        let loaded = store.load_or_create("Rider").unwrap();
+        assert_eq!(loaded.revision, Some(2));
+        assert_eq!(loaded.profile.rider.lucci, 1_000_025);
+    }
+
+    #[test]
+    fn post_publish_sync_failure_keeps_committed_cache_visible_and_retry_is_a_noop() {
+        const MARKER: &str = "SyncFaultRewardApplied";
+
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        store.load_or_create("Rider").unwrap();
+        store.fail_next_directory_sync(std::io::ErrorKind::Other);
+
+        let mutate_once = || {
+            store.transaction("Rider", |profile| {
+                if profile.extra.contains_key(MARKER) {
+                    ProfileMutation::Unchanged(profile.rider.lucci)
+                } else {
+                    let mut profile = profile.clone();
+                    profile.rider.lucci += 40;
+                    profile.extra.insert(MARKER.to_owned(), json!(true));
+                    ProfileMutation::changed(profile.rider.lucci, profile)
+                }
+            })
+        };
+        let outcome = mutate_once().unwrap();
+        match outcome {
+            ProfileTransaction::CommittedButDurabilityUncertain {
+                value,
+                profile,
+                saved,
+                error:
+                    ProfileStoreError::CommittedButDurabilityUncertain {
+                        nickname,
+                        revision,
+                        path,
+                        source,
+                    },
+            } => {
+                assert_eq!(value, 1_000_040);
+                assert_eq!(profile.rider.lucci, 1_000_040);
+                assert_eq!(saved.revision, 2);
+                assert_eq!(nickname, "Rider");
+                assert_eq!(revision, 2);
+                assert_eq!(path, saved.path);
+                assert_eq!(source.kind(), std::io::ErrorKind::Other);
+            }
+            other => panic!("expected a committed durability warning, got {other:?}"),
+        }
+
+        let cached = store.load_or_create("rIDER").unwrap();
+        assert_eq!(cached.revision, Some(2));
+        assert_eq!(cached.profile.rider.lucci, 1_000_040);
+        assert!(matches!(
+            mutate_once().unwrap(),
+            ProfileTransaction::Unchanged {
+                value: 1_000_040,
+                ..
+            }
+        ));
+        assert_eq!(store.load_or_create("Rider").unwrap().revision, Some(2));
+
+        let from_disk = ProfileStore::new(root.path())
+            .load_or_create("Rider")
+            .unwrap();
+        assert_eq!(from_disk.revision, Some(2));
+        assert_eq!(from_disk.profile.rider.lucci, 1_000_040);
+    }
+
+    #[test]
     fn concurrent_updates_for_one_name_do_not_lose_mutations() {
         let root = tempdir().unwrap();
         let store = Arc::new(ProfileStore::new(root.path()));
@@ -700,6 +1062,34 @@ mod tests {
         let loaded = store.load_or_create("Rider").unwrap();
         assert_eq!(loaded.profile.rider.lucci, 1_000_016);
         assert_eq!(loaded.revision, Some(17));
+    }
+
+    #[test]
+    fn concurrent_conditional_transactions_share_the_per_name_lock() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(ProfileStore::new(root.path()));
+        store.load_or_create("Rider").unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            workers.push(thread::spawn(move || {
+                let outcome = store
+                    .transaction("rIDER", |profile| {
+                        let mut profile = profile.clone();
+                        profile.rider.lucci += 1;
+                        ProfileMutation::changed(profile.rider.lucci, profile)
+                    })
+                    .unwrap();
+                assert!(matches!(outcome, ProfileTransaction::Committed { .. }));
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let loaded = store.load_or_create("Rider").unwrap();
+        assert_eq!(loaded.profile.rider.lucci, 1_000_008);
+        assert_eq!(loaded.revision, Some(9));
     }
 
     #[test]

@@ -29,4 +29,7 @@ pub use progression::{
     RewardRollError, TIME_REWARD_BASELINE_RANK, TimeReward, apply_time_reward, finish_reward,
     time_reward_from_rolls,
 };
-pub use store::{LoadedProfile, ProfileStore, ProfileStoreError, SavedProfile};
+pub use store::{
+    LoadedProfile, ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction,
+    SavedProfile,
+};
