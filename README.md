@@ -16,16 +16,22 @@ server. The implemented foundation provides:
 - request-driven startup replies plus catalog-backed rider inventory/equipment;
 - actor-owned channel rooms with create/list/join/leave, bounded fan-out, and
   stale-generation cancellation;
+- bounded messenger TCP sessions with generation-fenced identity publication;
+- supervised game/P2P UDP sockets with exact Echo/TimeSync replies and
+  generation-fenced room relay;
+- exact ready-stage, race-control, race-start, settlement, and 235-byte kart
+  physics codecs ready for actor integration;
 - bounded login concurrency and opt-in remote profile creation;
 - PIN/BML patching with immutable backups, a process lock, and atomic writes;
 - executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
 - versioned JSON profile persistence compatible with legacy `Launcher.json`;
 - a no-argument desktop connector GUI and an equivalent headless CLI.
 
-Room admission and first-state runtime flows are integrated. Modern P5136 UDP
-codecs, generation-bound endpoint state, and a bounded messenger hub are
-present; UDP/P2P socket relay, messenger stream I/O, and race/gameplay flows
-still need integration.
+Room admission, first-state, messenger, and UDP/P2P runtime flows are
+integrated. UDP authorization and room audience selection run inside the world
+actor so channel migration cannot race a stale relay decision. The next
+runtime milestone is the ready/start/race/settlement state machine, followed by
+MyRoom and the remaining progression/economy surface.
 
 ## Build
 

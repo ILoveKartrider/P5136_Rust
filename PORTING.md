@@ -16,8 +16,9 @@ not completion evidence.
 - [x] encoded primitive substitution table
 - [x] game UDP envelope, routed header, control, and opaque-relay codecs
 - [x] messenger logical packet codecs
-- [ ] generation-bound UDP runtime and relay routing
-- [ ] messenger length-prefixed stream runtime
+- [x] generation-bound UDP runtime and relay routing
+- [x] supervised game/P2P UDP workers and bounded world admission
+- [x] messenger length-prefixed stream runtime
 
 ## Connector
 
@@ -54,10 +55,10 @@ not completion evidence.
 - [x] room create/list/join/leave wire codecs
 - [x] room create/list/join/leave runtime integration
 - [ ] ready/team/master/observer/AI state
-- [ ] generation-bound game UDP endpoint registration
-- [ ] generation-bound P2P endpoint registration
-- [ ] UDP/P2P room relay
-- [ ] messenger identity validation, chat rooms, and single-writer queues
+- [x] generation-bound game UDP endpoint registration
+- [x] generation-bound P2P endpoint registration
+- [x] UDP/P2P room relay
+- [x] messenger identity validation, chat rooms, and single-writer queues
 
 ## Profile and gameplay
 
@@ -67,6 +68,8 @@ not completion evidence.
 - [ ] kart grant/tuning/upgrades
 - [ ] quests, rewards, attendance, and progression
 - [ ] MyRoom state
+- [x] exact P5136 kart-physics block builder
+- [x] ready/start, race-control, and settlement wire codecs
 - [ ] race start/grid/ready sequence
 - [ ] race movement relay and finish/ranking
 - [ ] track/mode/random-track controls
