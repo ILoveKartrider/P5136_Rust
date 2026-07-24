@@ -15,6 +15,7 @@ pub mod kart_physics;
 pub mod lobby_protocol;
 pub mod login;
 pub mod messenger;
+pub mod myroom_protocol;
 pub mod nickname;
 pub mod packet;
 pub mod ports;
