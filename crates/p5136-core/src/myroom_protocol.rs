@@ -34,10 +34,13 @@ pub const OWNER_EMBLEMS_NAME: &str = "RmOwnerEmblemPacket";
 pub const UPDATE_MAIN_EMBLEM_REQUEST_NAME: &str = "RmRqUpdateMainEmblemPacket";
 pub const UPDATE_MAIN_EMBLEM_REPLY_NAME: &str = "RmRpUpdateMainEmblemPacket";
 pub const SLOT_DATA_NAME: &str = "RmSlotDataPacket";
+pub const OWNER_ITEM_ENCHANT_NAME: &str = "RmOwnerItemEnchantPacket";
+pub const OWNER_ITEM_NAME: &str = "RmOwnerItemPacket";
 
 pub const MAX_MYROOM_PASSWORD_UTF16_UNITS: usize = 64;
 pub const MAX_MYROOM_TALK_UTF16_UNITS: usize = 256;
 pub const MAX_MYROOM_EMBLEMS: usize = 65_535;
+pub const MYROOM_ITEM_CHUNK_SIZE: usize = 26;
 pub const MYROOM_SLOT_COUNT: usize = 8;
 pub const MYROOM_EMPTY_SLOT_ZERO_LENGTH: usize = 122;
 pub const MYROOM_EMPTY_SLOT_WIRE_LENGTH: usize = MYROOM_EMPTY_SLOT_ZERO_LENGTH + 1;
@@ -141,6 +144,49 @@ pub enum MyRoomSlot {
     Player(MyRoomPlayerSlot),
 }
 
+/// One 24-byte entry in `RmOwnerItemEnchantPacket`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MyRoomTune {
+    pub item_id: i16,
+    pub serial_number: i16,
+    pub tune_1: i16,
+    pub tune_2: i16,
+    pub tune_3: i16,
+    pub slot_1: i16,
+    pub count_1: i16,
+    pub slot_2: i16,
+    pub count_2: i16,
+}
+
+/// One 18-byte kart entry in the Korean P5136 `RmOwnerItemPacket`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MyRoomKart {
+    pub kart_id: u16,
+    pub serial_number: u16,
+}
+
+/// One 40-byte legacy parts entry in the Korean P5136
+/// `RmOwnerItemPacket`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MyRoomParts {
+    pub item_id: i16,
+    pub serial_number: i16,
+    pub engine: i16,
+    pub engine_grade: u8,
+    pub engine_value: i16,
+    pub handle: i16,
+    pub handle_grade: u8,
+    pub handle_value: i16,
+    pub wheel: i16,
+    pub wheel_grade: u8,
+    pub wheel_value: i16,
+    pub booster: i16,
+    pub booster_grade: u8,
+    pub booster_value: i16,
+    pub coating: i16,
+    pub tail_lamp: i16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EnterMyRoomStatus {
@@ -183,6 +229,9 @@ pub enum MyRoomProtocolError {
 
     #[error("MyRoom slot data has {actual} slots; expected exactly {expected}")]
     InvalidSlotCount { actual: usize, expected: usize },
+
+    #[error("MyRoom {field} collection has {actual} entries and cannot fit its wire counters")]
+    ItemCollectionTooLarge { field: &'static str, actual: usize },
 }
 
 #[must_use]
@@ -431,6 +480,133 @@ pub fn serialize_slot_data(slots: &[MyRoomSlot]) -> Result<Vec<u8>, MyRoomProtoc
     Ok(packet.into_inner())
 }
 
+/// Serializes every non-empty 26-entry enchant chunk.
+///
+/// The original owner-present path emits no packet at all for an empty tune
+/// list. The owner-missing response is a distinct, explicit zero-count packet
+/// produced by [`serialize_missing_owner_items`].
+pub fn serialize_owner_item_enchants(
+    tunes: &[MyRoomTune],
+) -> Result<Vec<Vec<u8>>, MyRoomProtocolError> {
+    checked_collection_len("tune", tunes.len())?;
+    let mut packets = Vec::with_capacity(tunes.len().div_ceil(MYROOM_ITEM_CHUNK_SIZE));
+    for chunk in tunes.chunks(MYROOM_ITEM_CHUNK_SIZE) {
+        let mut packet = PacketWriter::named(OWNER_ITEM_ENCHANT_NAME);
+        packet.write_i32(wire_len(chunk.len()));
+        for tune in chunk {
+            packet.write_i16(3);
+            packet.write_i16(tune.item_id);
+            packet.write_i16(tune.serial_number);
+            packet.write_i16(0);
+            packet.write_i16(0);
+            packet.write_i16(tune.tune_1);
+            packet.write_i16(tune.tune_2);
+            packet.write_i16(tune.tune_3);
+            packet.write_i16(tune.slot_1);
+            packet.write_i16(tune.count_1);
+            packet.write_i16(tune.slot_2);
+            packet.write_i16(tune.count_2);
+        }
+        packets.push(packet.into_inner());
+    }
+    Ok(packets)
+}
+
+/// Serializes the Korean P5136 owner kart/parts stream.
+///
+/// Packet ordinals are global across both item types while the first two
+/// counters are local to their type. P5136 deliberately excludes the later
+/// `Parts12` form. It also preserves the original server's early-return quirk:
+/// when no kart exists, one 28-byte empty body is emitted and every parts
+/// entry is omitted.
+pub fn serialize_owner_items(
+    karts: &[MyRoomKart],
+    parts: &[MyRoomParts],
+    prevent_item: bool,
+) -> Result<Vec<Vec<u8>>, MyRoomProtocolError> {
+    checked_collection_len("kart", karts.len())?;
+    checked_collection_len("parts", parts.len())?;
+
+    if karts.is_empty() {
+        let mut packet = PacketWriter::named(OWNER_ITEM_NAME);
+        packet.write_i32(1);
+        packet.write_i32(1);
+        packet.write_i32(0);
+        packet.write_bytes(&[0; 8]);
+        packet.write_i32(1);
+        packet.write_i32(1);
+        return Ok(vec![packet.into_inner()]);
+    }
+
+    let kart_chunk_count = karts.len().div_ceil(MYROOM_ITEM_CHUNK_SIZE);
+    let parts_chunk_count = parts.len().div_ceil(MYROOM_ITEM_CHUNK_SIZE);
+    let all_count = kart_chunk_count
+        .checked_add(parts_chunk_count)
+        .and_then(|count| i32::try_from(count).ok())
+        .ok_or(MyRoomProtocolError::ItemCollectionTooLarge {
+            field: "owner item packet",
+            actual: karts.len().saturating_add(parts.len()),
+        })?;
+    let mut packets = Vec::with_capacity(
+        usize::try_from(all_count).expect("a non-negative bounded packet count fits in usize"),
+    );
+    let kart_chunks = wire_chunk_count("kart", karts.len())?;
+    let parts_chunks = wire_chunk_count("parts", parts.len())?;
+    let mut ordinal = 1_i32;
+
+    for (index, chunk) in karts.chunks(MYROOM_ITEM_CHUNK_SIZE).enumerate() {
+        let mut packet = PacketWriter::named(OWNER_ITEM_NAME);
+        packet.write_i32(kart_chunks);
+        packet.write_i32(wire_index(index));
+        packet.write_i32(wire_len(chunk.len()));
+        for kart in chunk {
+            packet.write_u16(3);
+            packet.write_u16(kart.kart_id);
+            packet.write_u16(kart.serial_number);
+            packet.write_u16(1);
+            packet.write_u8(u8::from(prevent_item));
+            packet.write_u8(0);
+            packet.write_i16(-1);
+            packet.write_i16(0);
+            packet.write_u8(0);
+            packet.write_u8(0);
+            packet.write_i16(0);
+        }
+        packet.write_bytes(&[0; 8]);
+        packet.write_i32(all_count);
+        packet.write_i32(ordinal);
+        ordinal += 1;
+        packets.push(packet.into_inner());
+    }
+
+    for (index, chunk) in parts.chunks(MYROOM_ITEM_CHUNK_SIZE).enumerate() {
+        let mut packet = PacketWriter::named(OWNER_ITEM_NAME);
+        packet.write_i32(parts_chunks);
+        packet.write_i32(wire_index(index));
+        packet.write_i32(0);
+        packet.write_i32(0);
+        packet.write_i32(wire_len(chunk.len()));
+        for part in chunk {
+            write_owner_part(&mut packet, part);
+        }
+        packet.write_i32(all_count);
+        packet.write_i32(ordinal);
+        ordinal += 1;
+        packets.push(packet.into_inner());
+    }
+    debug_assert_eq!(ordinal - 1, all_count);
+    Ok(packets)
+}
+
+/// Produces the sole response used when the requested `MyRoom` owner no longer
+/// exists. No `RmOwnerItemPacket` follows this packet.
+#[must_use]
+pub fn serialize_missing_owner_items() -> Vec<u8> {
+    let mut packet = PacketWriter::named(OWNER_ITEM_ENCHANT_NAME);
+    packet.write_i32(0);
+    packet.into_inner()
+}
+
 #[must_use]
 pub fn serialize_update_main_emblem_reply(success: bool) -> Vec<u8> {
     let mut packet = PacketWriter::named(UPDATE_MAIN_EMBLEM_REPLY_NAME);
@@ -463,6 +639,49 @@ fn write_player_slot(
 fn write_endpoint(packet: &mut PacketWriter, address: Ipv4Addr, port: u16) {
     packet.write_bytes(&address.octets());
     packet.write_u16(port);
+}
+
+fn write_owner_part(packet: &mut PacketWriter, part: &MyRoomParts) {
+    packet.write_i16(part.item_id);
+    packet.write_i16(part.serial_number);
+    packet.write_i16(0);
+    packet.write_i16(-1);
+    packet.write_i16(0);
+    packet.write_i16(part.engine);
+    packet.write_u8(part.engine_grade);
+    packet.write_i16(part.engine_value);
+    packet.write_i16(part.handle);
+    packet.write_u8(part.handle_grade);
+    packet.write_i16(part.handle_value);
+    packet.write_i16(part.wheel);
+    packet.write_u8(part.wheel_grade);
+    packet.write_i16(part.wheel_value);
+    packet.write_i16(part.booster);
+    packet.write_u8(part.booster_grade);
+    packet.write_i16(part.booster_value);
+    packet.write_i16(part.coating);
+    packet.write_u8(0);
+    packet.write_i16(0);
+    packet.write_i16(part.tail_lamp);
+    packet.write_u8(0);
+    packet.write_i16(0);
+}
+
+fn checked_collection_len(field: &'static str, len: usize) -> Result<(), MyRoomProtocolError> {
+    wire_chunk_count(field, len).map(|_| ())
+}
+
+fn wire_chunk_count(field: &'static str, len: usize) -> Result<i32, MyRoomProtocolError> {
+    i32::try_from(len.div_ceil(MYROOM_ITEM_CHUNK_SIZE))
+        .map_err(|_| MyRoomProtocolError::ItemCollectionTooLarge { field, actual: len })
+}
+
+fn wire_len(len: usize) -> i32 {
+    i32::try_from(len).expect("a 26-entry MyRoom item chunk fits in i32")
+}
+
+fn wire_index(zero_based_index: usize) -> i32 {
+    i32::try_from(zero_based_index + 1).expect("the validated MyRoom item chunk index fits in i32")
 }
 
 fn parse_empty_request(packet: &[u8], name: &'static str) -> Result<(), MyRoomProtocolError> {
@@ -601,8 +820,9 @@ mod tests {
         CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, ENTER_MYROOM_REQUEST_NAME,
         ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus, FIRST_MYROOM_REQUEST_NAME,
         MAX_MYROOM_EMBLEMS, MAX_MYROOM_PASSWORD_UTF16_UNITS, MAX_MYROOM_TALK_UTF16_UNITS,
-        MYROOM_EMPTY_SLOT_WIRE_LENGTH, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot,
-        MyRoomProtocolError, MyRoomRequest, MyRoomSlot, NOTIFY_MYROOM_INFO_NAME,
+        MYROOM_EMPTY_SLOT_WIRE_LENGTH, MYROOM_ITEM_CHUNK_SIZE, MYROOM_SLOT_COUNT, MyRoomInfo,
+        MyRoomKart, MyRoomParts, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest, MyRoomSlot,
+        MyRoomTune, NOTIFY_MYROOM_INFO_NAME, OWNER_ITEM_ENCHANT_NAME, OWNER_ITEM_NAME,
         REENTER_MYROOM_REQUEST_NAME, REQUEST_EMBLEMS_NAME, REQUEST_MYROOM_ITEMS_NAME,
         RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME,
         UPDATE_MAIN_EMBLEM_REQUEST_NAME, classify_myroom_request, parse_character_position,
@@ -610,7 +830,8 @@ mod tests {
         parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
         parse_secede_request, parse_update_info, parse_update_main_emblem,
         serialize_character_position, serialize_check_password_reply, serialize_enter_error,
-        serialize_enter_reply, serialize_myroom_info, serialize_owner_emblems,
+        serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
+        serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
         serialize_rider_echo, serialize_secede_reply, serialize_slot_data,
         serialize_update_main_emblem_reply,
     };
@@ -863,6 +1084,154 @@ mod tests {
             serialize_owner_emblems(&excessive),
             Err(MyRoomProtocolError::TooManyEmblems { .. })
         ));
+    }
+
+    #[test]
+    fn owner_enchants_use_exact_24_byte_entries_and_nonempty_26_item_chunks() {
+        let tunes: Vec<_> = (0..=MYROOM_ITEM_CHUNK_SIZE)
+            .map(|index| MyRoomTune {
+                item_id: i16::try_from(100 + index).unwrap(),
+                serial_number: i16::try_from(200 + index).unwrap(),
+                tune_1: 1,
+                tune_2: 2,
+                tune_3: 3,
+                slot_1: 4,
+                count_1: 5,
+                slot_2: 6,
+                count_2: 7,
+            })
+            .collect();
+        let packets = serialize_owner_item_enchants(&tunes).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(adler32::packet_hash(OWNER_ITEM_ENCHANT_NAME), 1_961_625_970);
+        assert_eq!(packets[0].len(), 4 + 4 + MYROOM_ITEM_CHUNK_SIZE * 24);
+        assert_eq!(packets[1].len(), 4 + 4 + 24);
+
+        let mut first = PacketReader::new(&packets[0]);
+        assert_eq!(first.read_u32().unwrap(), 1_961_625_970);
+        assert_eq!(first.read_i32().unwrap(), 26);
+        assert_eq!(first.read_i16().unwrap(), 3);
+        assert_eq!(first.read_i16().unwrap(), 100);
+        assert_eq!(first.read_i16().unwrap(), 200);
+        assert_eq!(first.read_i16().unwrap(), 0);
+        assert_eq!(first.read_i16().unwrap(), 0);
+        assert_eq!(first.read_i16().unwrap(), 1);
+        assert_eq!(first.read_i16().unwrap(), 2);
+        assert_eq!(first.read_i16().unwrap(), 3);
+        assert_eq!(first.read_i16().unwrap(), 4);
+        assert_eq!(first.read_i16().unwrap(), 5);
+        assert_eq!(first.read_i16().unwrap(), 6);
+        assert_eq!(first.read_i16().unwrap(), 7);
+
+        let mut last = PacketReader::new(&packets[1]);
+        assert_eq!(last.read_u32().unwrap(), 1_961_625_970);
+        assert_eq!(last.read_i32().unwrap(), 1);
+        assert_eq!(last.read_i16().unwrap(), 3);
+        assert_eq!(last.read_i16().unwrap(), 126);
+        assert_eq!(last.read_i16().unwrap(), 226);
+
+        assert!(serialize_owner_item_enchants(&[]).unwrap().is_empty());
+        let missing = serialize_missing_owner_items();
+        assert_eq!(missing.len(), 8);
+        assert_eq!(&missing[0..4], &1_961_625_970_u32.to_le_bytes());
+        assert_eq!(&missing[4..8], &0_i32.to_le_bytes());
+    }
+
+    #[test]
+    fn empty_owner_karts_preserve_the_p5136_early_return_and_omit_parts() {
+        let parts = [MyRoomParts {
+            item_id: 5136,
+            ..MyRoomParts::default()
+        }];
+        let packets = serialize_owner_items(&[], &parts, false).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(adler32::packet_hash(OWNER_ITEM_NAME), 998_114_993);
+        assert_eq!(packets[0].len(), 4 + 28);
+
+        let mut reader = PacketReader::new(&packets[0]);
+        assert_eq!(reader.read_u32().unwrap(), 998_114_993);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_bytes(8).unwrap(), &[0; 8]);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert!(reader.remaining().is_empty());
+    }
+
+    #[test]
+    fn owner_karts_and_parts_share_global_ordinals_but_keep_local_chunk_counts() {
+        let karts: Vec<_> = (0..=MYROOM_ITEM_CHUNK_SIZE)
+            .map(|index| MyRoomKart {
+                kart_id: u16::try_from(1000 + index).unwrap(),
+                serial_number: u16::try_from(index + 1).unwrap(),
+            })
+            .collect();
+        let parts: Vec<_> = (0..=MYROOM_ITEM_CHUNK_SIZE)
+            .map(|index| MyRoomParts {
+                item_id: i16::try_from(2000 + index).unwrap(),
+                serial_number: i16::try_from(index + 1).unwrap(),
+                engine: 11,
+                engine_grade: 12,
+                engine_value: 13,
+                handle: 21,
+                handle_grade: 22,
+                handle_value: 23,
+                wheel: 31,
+                wheel_grade: 32,
+                wheel_value: 33,
+                booster: 41,
+                booster_grade: 42,
+                booster_value: 43,
+                coating: 51,
+                tail_lamp: 61,
+            })
+            .collect();
+        let packets = serialize_owner_items(&karts, &parts, true).unwrap();
+        assert_eq!(packets.len(), 4);
+        assert_eq!(
+            packets.iter().map(Vec::len).collect::<Vec<_>>(),
+            [500, 50, 1_072, 72]
+        );
+
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(&packet[0..4], &998_114_993_u32.to_le_bytes());
+            assert_eq!(
+                &packet[packet.len() - 8..packet.len() - 4],
+                &4_i32.to_le_bytes()
+            );
+            assert_eq!(
+                &packet[packet.len() - 4..],
+                &i32::try_from(index + 1).unwrap().to_le_bytes()
+            );
+        }
+
+        let mut second_kart = PacketReader::new(&packets[1]);
+        assert_eq!(second_kart.read_u32().unwrap(), 998_114_993);
+        assert_eq!(second_kart.read_i32().unwrap(), 2);
+        assert_eq!(second_kart.read_i32().unwrap(), 2);
+        assert_eq!(second_kart.read_i32().unwrap(), 1);
+        assert_eq!(second_kart.read_u16().unwrap(), 3);
+        assert_eq!(second_kart.read_u16().unwrap(), 1026);
+        assert_eq!(second_kart.read_u16().unwrap(), 27);
+        assert_eq!(second_kart.read_u16().unwrap(), 1);
+        assert_eq!(second_kart.read_u8().unwrap(), 1);
+
+        let mut last_part = PacketReader::new(&packets[3]);
+        assert_eq!(last_part.read_u32().unwrap(), 998_114_993);
+        assert_eq!(last_part.read_i32().unwrap(), 2);
+        assert_eq!(last_part.read_i32().unwrap(), 2);
+        assert_eq!(last_part.read_i32().unwrap(), 0);
+        assert_eq!(last_part.read_i32().unwrap(), 0);
+        assert_eq!(last_part.read_i32().unwrap(), 1);
+        assert_eq!(last_part.read_i16().unwrap(), 2026);
+        assert_eq!(last_part.read_i16().unwrap(), 27);
+        assert_eq!(last_part.read_i16().unwrap(), 0);
+        assert_eq!(last_part.read_i16().unwrap(), -1);
+        assert_eq!(last_part.read_i16().unwrap(), 0);
+        assert_eq!(last_part.read_i16().unwrap(), 11);
+        assert_eq!(last_part.read_u8().unwrap(), 12);
+        assert_eq!(last_part.read_i16().unwrap(), 13);
     }
 
     #[test]
