@@ -53,7 +53,7 @@ use p5136_core::{
 };
 use p5136_profile::{
     CatalogInventory, EquipmentExceptions, EquipmentStateError, InventoryBuildError, Profile,
-    ProfileStore, ProfileStoreError, apply_rider_item_selection,
+    ProfileMutation, ProfileStoreError, ProfileTransaction, apply_rider_item_selection,
     build_inventory_snapshot_with_equipment, is_grant_item, rider_item_snapshot,
 };
 use rand::Rng;
@@ -61,14 +61,14 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, OwnedMutexGuard, mpsc, oneshot},
-    task::JoinError,
+    sync::{mpsc, oneshot},
     time,
 };
 
 use crate::{
-    ChannelBinding, IdentityBinding, MigrationToken, ServerConfig, SessionId, UserNo, WorldError,
-    WorldHandle,
+    ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ServerConfig, SessionId,
+    UserNo, WorldError, WorldHandle,
+    profile_io::{ProfileIoError, ProfileIoHandle, ProfileJobAdmission, ProfileLanePermit},
     world::{
         LobbyCommandPayload, LobbyError, OutboundBatch, RaceCommandPayload, RoomCommandPayload,
         RoomParticipant, StartRoomPlan,
@@ -159,8 +159,8 @@ pub enum LoginSessionError {
     #[error(transparent)]
     EquipmentProtocol(#[from] EquipmentProtocolError),
 
-    #[error("profile worker task failed")]
-    ProfileWorker(#[from] JoinError),
+    #[error(transparent)]
+    ProfileIo(#[from] ProfileIoError),
 
     #[error(transparent)]
     World(#[from] WorldError),
@@ -214,19 +214,39 @@ pub enum LoginSessionError {
 
     #[error("profile {nickname:?} does not exist and remote profile creation is disabled")]
     ProfileCreationDenied { nickname: String },
+
+    #[error(
+        "profile admission for {admitted:?} cannot authorize operation on profile {requested:?}"
+    )]
+    ProfileSubjectMismatch { admitted: String, requested: String },
+
+    #[error("an unconditional profile mutation unexpectedly produced no revision")]
+    ProfileMutationUnchanged,
+
+    #[error(
+        "identity changed while profile I/O was in flight: expected session {expected_owner:?}, user {expected_user_no:?}, generation {expected_generation:?}; received session {actual_owner:?}, user {actual_user_no:?}, generation {actual_generation:?}"
+    )]
+    ProfileIdentityFenceChanged {
+        expected_owner: SessionId,
+        expected_user_no: UserNo,
+        expected_generation: IdentityGeneration,
+        actual_owner: SessionId,
+        actual_user_no: UserNo,
+        actual_generation: IdentityGeneration,
+    },
 }
 
 /// Shared persistence and ownership-transfer coordination.
 ///
-/// Disk mutations and migration completion take the same asynchronous gate.
-/// This prevents an old generation from publishing a profile revision while a
-/// destination session takes ownership. The actual filesystem work always
-/// runs on Tokio's blocking pool.
+/// Disk operations and migration completion take the same canonical,
+/// nickname-keyed lane. This prevents an old generation from publishing a
+/// profile revision while a destination session takes ownership, without
+/// serializing unrelated riders. Filesystem work runs on the tracked blocking
+/// profile runtime.
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileCoordinator {
-    store: Arc<ProfileStore>,
+    io: ProfileIoHandle,
     catalog: Option<Arc<CatalogInventory>>,
-    ownership_gate: Arc<Mutex<()>>,
     #[cfg(test)]
     blocking_update_hook: Option<Arc<BlockingUpdateHook>>,
 }
@@ -250,14 +270,25 @@ impl BlockingUpdateHook {
 
 impl ProfileCoordinator {
     #[must_use]
-    pub(crate) fn new(root: PathBuf, catalog: Option<Arc<CatalogInventory>>) -> Self {
+    pub(crate) fn new(io: ProfileIoHandle, catalog: Option<Arc<CatalogInventory>>) -> Self {
         Self {
-            store: Arc::new(ProfileStore::new(root)),
+            io,
             catalog,
-            ownership_gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             blocking_update_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn new_test(
+        root: PathBuf,
+        catalog: Option<Arc<CatalogInventory>>,
+    ) -> (Self, crate::profile_io::ProfileIoRuntime) {
+        let limits = crate::profile_io::ProfileIoLimits::for_tests(128, 128);
+        let bootstrap = crate::profile_io::ProfileIoBootstrap::acquire(root, limits)
+            .expect("test profile runtime should acquire its isolated race-run lease");
+        let (io, runtime) = bootstrap.spawn();
+        (Self::new(io, catalog), runtime)
     }
 
     fn catalog(&self) -> Option<&CatalogInventory> {
@@ -270,168 +301,250 @@ impl ProfileCoordinator {
         self
     }
 
-    async fn ownership_guard(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.ownership_gate).lock_owned().await
+    async fn admit(
+        &self,
+        nickname: &str,
+        operation: &'static str,
+    ) -> Result<ProfileJobAdmission, LoginSessionError> {
+        Ok(self.io.admit(nickname, operation).await?)
+    }
+
+    fn ensure_admitted_subject(
+        admission: &ProfileJobAdmission,
+        nickname: &str,
+    ) -> Result<(), LoginSessionError> {
+        if admission
+            .subject()
+            .matches_nickname(nickname)
+            .map_err(ProfileIoError::from)?
+        {
+            return Ok(());
+        }
+        Err(LoginSessionError::ProfileSubjectMismatch {
+            admitted: admission.subject().nickname().to_owned(),
+            requested: nickname.to_owned(),
+        })
     }
 
     async fn load(
         &self,
         nickname: String,
         allow_creation: bool,
-        ownership_guard: OwnedMutexGuard<()>,
-    ) -> Result<ProfileSnapshot, LoginSessionError> {
-        let store = Arc::clone(&self.store);
-        let loaded = tokio::task::spawn_blocking(move || -> Result<_, LoginSessionError> {
-            let _ownership_guard = ownership_guard;
-            if !allow_creation && !store.profile_exists(&nickname)? {
-                return Err(LoginSessionError::ProfileCreationDenied { nickname });
-            }
-            Ok(store.load_or_create(&nickname)?)
-        })
-        .await??;
-        Ok(ProfileSnapshot {
-            profile: loaded.profile,
-            source_path: loaded.source_path,
-        })
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run("load profile", move |store, _, subject| {
+                if !allow_creation && !store.profile_exists(subject.nickname())? {
+                    return Err(LoginSessionError::ProfileCreationDenied { nickname });
+                }
+                Ok::<_, LoginSessionError>(store.load_or_create(subject.nickname())?)
+            })
+            .await?;
+        let (loaded, lane) = completed.into_parts();
+        let loaded = loaded?;
+        Ok((
+            ProfileSnapshot {
+                profile: loaded.profile,
+                revision: loaded.revision,
+                source_path: loaded.source_path,
+            },
+            lane,
+        ))
     }
 
     async fn update_game_options(
         &self,
         nickname: String,
         options: startup::GameOptions,
-        ownership_guard: OwnedMutexGuard<()>,
-    ) -> Result<ProfileSnapshot, LoginSessionError> {
-        let store = Arc::clone(&self.store);
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
-        let (saved, profile) = tokio::task::spawn_blocking(move || {
-            let _ownership_guard = ownership_guard;
-            #[cfg(test)]
-            if let Some(hook) = blocking_update_hook {
-                hook.entered.wait();
-                hook.release.wait();
-            }
-            store.update(&nickname, |profile| {
-                apply_game_options(&mut profile.game_option, &options);
+        let completed = admission
+            .run("update game options", move |store, _, subject| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_update_hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
+                store.update(subject.nickname(), |profile| {
+                    apply_game_options(&mut profile.game_option, &options);
+                })
             })
-        })
-        .await??;
-        Ok(ProfileSnapshot {
-            profile,
-            source_path: saved.path,
-        })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
+        Ok((
+            ProfileSnapshot {
+                profile,
+                revision: Some(saved.revision),
+                source_path: saved.path,
+            },
+            lane,
+        ))
     }
 
     async fn update_rider_items(
         &self,
         nickname: String,
-        current: &Profile,
         selection: RiderItemSelection,
-        ownership_guard: OwnedMutexGuard<()>,
-    ) -> Result<(ProfileSnapshot, OwnedMutexGuard<()>), LoginSessionError> {
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
         let catalog = self
             .catalog
-            .as_deref()
+            .clone()
             .ok_or(LoginSessionError::CatalogUnavailable)?;
-        validate_rider_item_selection(catalog, current, selection)?;
-        let store = Arc::clone(&self.store);
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
-        let (saved, profile, ownership_guard) = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some(hook) = blocking_update_hook {
-                hook.entered.wait();
-                hook.release.wait();
-            }
-            let (saved, profile) = store.update(&nickname, |profile| {
-                apply_rider_item_selection(&mut profile.rider_item, selection);
-            })?;
-            Ok::<_, ProfileStoreError>((saved, profile, ownership_guard))
-        })
-        .await??;
+        let completed = admission
+            .run("update rider equipment", move |store, _, subject| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_update_hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
+                let transaction = store.transaction(subject.nickname(), |profile| {
+                    if let Err(error) = validate_rider_item_selection(&catalog, profile, selection)
+                    {
+                        return ProfileMutation::Unchanged(Err(error));
+                    }
+                    let mut next = profile.clone();
+                    apply_rider_item_selection(&mut next.rider_item, selection);
+                    ProfileMutation::changed(Ok(()), next)
+                })?;
+                match transaction {
+                    ProfileTransaction::Committed {
+                        value,
+                        profile,
+                        saved,
+                    } => {
+                        value?;
+                        Ok::<_, LoginSessionError>((saved, profile))
+                    }
+                    ProfileTransaction::CommittedButDurabilityUncertain { error, .. } => {
+                        Err(error.into())
+                    }
+                    ProfileTransaction::Unchanged { value, .. } => match value {
+                        Err(error) => Err(error),
+                        Ok(()) => Err(LoginSessionError::ProfileMutationUnchanged),
+                    },
+                }
+            })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
         Ok((
             ProfileSnapshot {
                 profile,
+                revision: Some(saved.revision),
                 source_path: saved.path,
             },
-            ownership_guard,
+            lane,
         ))
-    }
-
-    fn plant_part_is_owned(&self, profile: &Profile, request: PlantPartEquipRequest) -> bool {
-        let Some(catalog) = self.catalog.as_deref() else {
-            return false;
-        };
-        if request.kart_category != 3 {
-            return false;
-        }
-        let Ok(kart_id) = u16::try_from(request.kart_id) else {
-            return false;
-        };
-        let Ok(kart_serial) = u16::try_from(request.kart_serial) else {
-            return false;
-        };
-        if !kart_is_owned(catalog, profile, kart_id, kart_serial) {
-            return false;
-        }
-        request.item_id == 0
-            || u16::try_from(request.item_category)
-                .ok()
-                .zip(u16::try_from(request.item_id).ok())
-                .is_some_and(|(category, item_id)| catalog_grants(catalog, category, item_id))
     }
 
     async fn equip_plant_part(
         &self,
-        rider_directory: PathBuf,
         request: PlantPartEquipRequest,
-        ownership_guard: OwnedMutexGuard<()>,
-    ) -> Result<OwnedMutexGuard<()>, LoginSessionError> {
+        admission: ProfileJobAdmission,
+    ) -> Result<(bool, ProfileLanePermit), LoginSessionError> {
+        let catalog = self.catalog.clone();
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
-        tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some(hook) = blocking_update_hook {
-                hook.entered.wait();
-                hook.release.wait();
-            }
-            EquipmentExceptions::equip_plant_part(rider_directory, request)?;
-            Ok::<_, EquipmentStateError>(ownership_guard)
-        })
-        .await?
-        .map_err(LoginSessionError::from)
+        let completed = admission
+            .run("equip plant part", move |store, _, subject| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_update_hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
+                let loaded = store.load_or_create(subject.nickname())?;
+                if !plant_part_is_owned(catalog.as_deref(), &loaded.profile, request) {
+                    return Ok::<_, LoginSessionError>(false);
+                }
+                let rider_directory = loaded
+                    .source_path
+                    .parent()
+                    .map(std::path::Path::to_owned)
+                    .ok_or(LoginSessionError::ProfileDirectoryUnavailable)?;
+                EquipmentExceptions::equip_plant_part(rider_directory, request)?;
+                Ok(true)
+            })
+            .await?;
+        let (result, lane) = completed.into_parts();
+        Ok((result?, lane))
     }
 
     async fn get_rider_sequence(
         &self,
         nickname: String,
-        profile: ProfileSnapshot,
-        ownership_guard: OwnedMutexGuard<()>,
-    ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+        admission: ProfileJobAdmission,
+    ) -> Result<(Vec<Vec<u8>>, ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
         let catalog = self
             .catalog
             .clone()
             .ok_or(LoginSessionError::CatalogUnavailable)?;
-        let profile_root = self.store.root().to_owned();
-        let rider_directory = profile
-            .source_path
-            .parent()
-            .map(std::path::Path::to_owned)
-            .ok_or(LoginSessionError::ProfileDirectoryUnavailable)?;
-
-        tokio::task::spawn_blocking(move || {
-            let _ownership_guard = ownership_guard;
-            let equipment = EquipmentExceptions::load(profile_root, rider_directory)?;
-            let inventory =
-                build_inventory_snapshot_with_equipment(&catalog, &profile.profile, equipment)?;
-            let rider = profile_rider_fields(nickname, &profile.profile);
-            Ok(serialize_get_rider_sequence(&inventory, &rider)?
-                .into_iter()
-                .map(|packet| packet.logical_packet)
-                .collect())
-        })
-        .await?
+        let completed = admission
+            .run("load fresh rider inventory", move |store, _, subject| {
+                let loaded = store.load_or_create(subject.nickname())?;
+                let rider_directory = loaded
+                    .source_path
+                    .parent()
+                    .map(std::path::Path::to_owned)
+                    .ok_or(LoginSessionError::ProfileDirectoryUnavailable)?;
+                let equipment = EquipmentExceptions::load(store.root(), rider_directory)?;
+                let inventory =
+                    build_inventory_snapshot_with_equipment(&catalog, &loaded.profile, equipment)?;
+                let rider = profile_rider_fields(nickname, &loaded.profile);
+                let responses = serialize_get_rider_sequence(&inventory, &rider)?
+                    .into_iter()
+                    .map(|packet| packet.logical_packet)
+                    .collect();
+                Ok::<_, LoginSessionError>((
+                    responses,
+                    ProfileSnapshot {
+                        profile: loaded.profile,
+                        revision: loaded.revision,
+                        source_path: loaded.source_path,
+                    },
+                ))
+            })
+            .await?;
+        let (result, lane) = completed.into_parts();
+        let (responses, profile) = result?;
+        Ok((responses, profile, lane))
     }
+}
+
+fn plant_part_is_owned(
+    catalog: Option<&CatalogInventory>,
+    profile: &Profile,
+    request: PlantPartEquipRequest,
+) -> bool {
+    let Some(catalog) = catalog else {
+        return false;
+    };
+    if request.kart_category != 3 {
+        return false;
+    }
+    let Ok(kart_id) = u16::try_from(request.kart_id) else {
+        return false;
+    };
+    let Ok(kart_serial) = u16::try_from(request.kart_serial) else {
+        return false;
+    };
+    if !kart_is_owned(catalog, profile, kart_id, kart_serial) {
+        return false;
+    }
+    request.item_id == 0
+        || u16::try_from(request.item_category)
+            .ok()
+            .zip(u16::try_from(request.item_id).ok())
+            .is_some_and(|(category, item_id)| catalog_grants(catalog, category, item_id))
 }
 
 fn catalog_grants(catalog: &CatalogInventory, category: u16, item_id: u16) -> bool {
@@ -515,6 +628,7 @@ fn validate_rider_item_selection(
 #[derive(Debug, Clone)]
 struct ProfileSnapshot {
     profile: Profile,
+    revision: Option<u64>,
     source_path: PathBuf,
 }
 
@@ -529,7 +643,20 @@ impl SessionContext {
     }
 
     fn bind_profile(&mut self, identity: IdentityBinding, profile: ProfileSnapshot) {
+        tracing::trace!(
+            nickname = %identity.nickname,
+            revision = ?profile.revision,
+            source_path = %profile.source_path.display(),
+            "binding profile snapshot to session generation"
+        );
         self.profile = Some(BoundProfile { identity, profile });
+    }
+
+    fn bound_identity(&self) -> Result<&IdentityBinding, LoginSessionError> {
+        self.profile
+            .as_ref()
+            .map(|bound| &bound.identity)
+            .ok_or(LoginSessionError::ProfileNotBound)
     }
 
     fn profile_for(&self, identity: &IdentityBinding) -> Result<&Profile, LoginSessionError> {
@@ -547,6 +674,23 @@ impl SessionContext {
             .filter(|bound| bound.identity.generation == identity.generation)
             .ok_or(LoginSessionError::ProfileNotBound)
     }
+}
+
+fn ensure_identity_fence(
+    expected: &IdentityBinding,
+    actual: &IdentityBinding,
+) -> Result<(), LoginSessionError> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(LoginSessionError::ProfileIdentityFenceChanged {
+        expected_owner: expected.owner,
+        expected_user_no: expected.user_no,
+        expected_generation: expected.generation,
+        actual_owner: actual.owner,
+        actual_user_no: actual.user_no,
+        actual_generation: actual.generation,
+    })
 }
 
 #[derive(Debug)]
@@ -955,20 +1099,21 @@ async fn handle_login(
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let login = parse_pq_login(packet)?;
-    let ownership_guard = profiles.ownership_guard().await;
+    let admission = profiles.admit(&login.nickname, "login profile").await?;
     let claimed = world.claim_identity(session_id, login.nickname).await?;
-    let profile = profiles
+    let (profile, lane) = profiles
         .load(
             claimed.nickname.clone(),
             config.allow_remote_profile_creation || claimed.source_ip.is_loopback(),
-            ownership_guard,
+            admission,
         )
         .await?;
     let identity = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&claimed, &identity)?;
     context.bind_profile(identity.clone(), profile);
     let profile = context.profile_for(&identity)?;
 
-    Ok(vec![serialize_pr_login(&PrLoginFields {
+    let response = serialize_pr_login(&PrLoginFields {
         time: current_legacy_time(),
         user_no: identity.user_no.get(),
         nickname: identity.nickname,
@@ -977,7 +1122,9 @@ async fn handle_login(
         game_udp_port: config.ports.game_udp(),
         p2p_udp_port: config.ports.p2p_udp(),
         screen: profile.game_option.screen,
-    })?])
+    })?;
+    drop(lane);
+    Ok(vec![response])
 }
 
 async fn handle_channel_move_in(
@@ -993,9 +1140,8 @@ async fn handle_channel_move_in(
     let token = MigrationToken::new(request.migration_token)
         .ok_or(LoginSessionError::InvalidMigrationToken)?;
 
-    let ownership_guard = profiles.ownership_guard().await;
-    let completion = world
-        .complete_migration(
+    let preflight = world
+        .preflight_migration(
             session_id,
             user_no,
             request.channel_id,
@@ -1003,15 +1149,23 @@ async fn handle_channel_move_in(
             Instant::now(),
         )
         .await?;
-    let profile = profiles
+    let admission = profiles
+        .admit(preflight.nickname(), "load migrated profile")
+        .await?;
+    let (profile, lane) = profiles
         .load(
-            completion.binding.nickname.clone(),
-            config.allow_remote_profile_creation || completion.binding.source_ip.is_loopback(),
-            ownership_guard,
+            preflight.nickname().to_owned(),
+            config.allow_remote_profile_creation || preflight.destination_ip().is_loopback(),
+            admission,
         )
         .await?;
+    let completion = world
+        .complete_preflighted_migration(preflight, Instant::now())
+        .await?;
     let identity = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&completion.binding, &identity)?;
     context.bind_profile(identity, profile);
+    drop(lane);
 
     Ok(vec![serialize_pr_channel_move_in(
         config.ports.game_udp(),
@@ -1101,7 +1255,8 @@ async fn handle_lobby_request(
             | LobbyError::NoRacers
             | LobbyError::AiParticipantsUnsupported
             | LobbyError::RacerNotReady { .. }
-            | LobbyError::MissingTrackCandidates),
+            | LobbyError::MissingTrackCandidates
+            | LobbyError::WorldQuiescing),
         )) => {
             tracing::debug!(
                 %error,
@@ -1196,24 +1351,22 @@ async fn update_rider_equipment(
     selection: RiderItemSelection,
     context: &mut SessionContext,
 ) -> Result<(), LoginSessionError> {
-    let ownership_guard = profiles.ownership_guard().await;
+    let nickname = context.bound_identity()?.nickname.clone();
+    let admission = profiles.admit(&nickname, "update rider equipment").await?;
     let before = world.authorize_identity(session_id).await?;
-    let current = context.profile_for(&before)?.clone();
-    let (profile, ownership_guard) = profiles
-        .update_rider_items(
-            before.nickname.clone(),
-            &current,
-            selection,
-            ownership_guard,
-        )
+    let _ = context.profile_for(&before)?;
+    let (profile, lane) = profiles
+        .update_rider_items(before.nickname.clone(), selection, admission)
         .await?;
     let after_write = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after_write)?;
     let _ = context.profile_for(&after_write)?;
     let snapshot = rider_item_snapshot(&profile.profile.rider_item);
     world.publish_room_equipment(session_id, snapshot).await?;
     let after_publish = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after_publish)?;
     context.bind_profile(after_publish, profile);
-    drop(ownership_guard);
+    drop(lane);
     Ok(())
 }
 
@@ -1224,32 +1377,26 @@ async fn equip_plant_part(
     request: PlantPartEquipRequest,
     context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
-    let ownership_guard = profiles.ownership_guard().await;
+    let nickname = context.bound_identity()?.nickname.clone();
+    let admission = profiles.admit(&nickname, "equip plant part").await?;
     let before = world.authorize_identity(session_id).await?;
-    let bound = context.bound_profile_for(&before)?;
-    if !profiles.plant_part_is_owned(&bound.profile.profile, request) {
-        return Ok(vec![serialize_equip_tuning_failure()]);
-    }
-    let rider_directory = bound
-        .profile
-        .source_path
-        .parent()
-        .map(std::path::Path::to_owned)
-        .ok_or(LoginSessionError::ProfileDirectoryUnavailable)?;
-    let ownership_guard = match profiles
-        .equip_plant_part(rider_directory, request, ownership_guard)
-        .await
-    {
-        Ok(ownership_guard) => ownership_guard,
+    let _ = context.bound_profile_for(&before)?;
+    let (equipped, lane) = match profiles.equip_plant_part(request, admission).await {
+        Ok(result) => result,
         Err(error) => {
             tracing::warn!(%error, "failed to persist P5136 plant-part selection");
             return Ok(vec![serialize_equip_tuning_failure()]);
         }
     };
     let after_write = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after_write)?;
     let _ = context.profile_for(&after_write)?;
-    drop(ownership_guard);
-    Ok(vec![serialize_equip_tuning_success(request)])
+    drop(lane);
+    Ok(vec![if equipped {
+        serialize_equip_tuning_success(request)
+    } else {
+        serialize_equip_tuning_failure()
+    }])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1417,16 +1564,22 @@ async fn handle_get_rider(
     world: &WorldHandle,
     profiles: &ProfileCoordinator,
     session_id: SessionId,
-    context: &SessionContext,
+    context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
-    let ownership_guard = profiles.ownership_guard().await;
+    let nickname = context.bound_identity()?.nickname.clone();
+    let admission = profiles
+        .admit(&nickname, "load fresh rider inventory")
+        .await?;
     let before = world.authorize_identity(session_id).await?;
-    let profile = context.bound_profile_for(&before)?.profile.clone();
-    let responses = profiles
-        .get_rider_sequence(before.nickname.clone(), profile, ownership_guard)
+    let _ = context.bound_profile_for(&before)?;
+    let (responses, profile, lane) = profiles
+        .get_rider_sequence(before.nickname.clone(), admission)
         .await?;
     let after = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after)?;
     let _ = context.profile_for(&after)?;
+    context.bind_profile(after, profile);
+    drop(lane);
     Ok(responses)
 }
 
@@ -1438,14 +1591,18 @@ async fn update_game_options(
     context: &mut SessionContext,
 ) -> Result<(), LoginSessionError> {
     let request = parse_pq_update_game_option(packet)?;
-    let ownership_guard = profiles.ownership_guard().await;
+    let nickname = context.bound_identity()?.nickname.clone();
+    let admission = profiles.admit(&nickname, "update game options").await?;
     let before = world.authorize_identity(session_id).await?;
     let _ = context.profile_for(&before)?;
-    let profile = profiles
-        .update_game_options(before.nickname.clone(), request.options, ownership_guard)
+    let (profile, lane) = profiles
+        .update_game_options(before.nickname.clone(), request.options, admission)
         .await?;
     let after = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after)?;
+    let _ = context.profile_for(&after)?;
     context.bind_profile(after, profile);
+    drop(lane);
     Ok(())
 }
 
@@ -1637,10 +1794,11 @@ mod tests {
     use super::{
         BlockingUpdateHook, LoginSessionError, MAX_OUTBOUND_BATCH_BURST, ProfileCoordinator,
         RoomKartBaseResolution, RoomPhysicsFallbackReason, SessionContext, SessionReadEvent,
-        SessionServices, dispatch_packet, handle_equipment_request, handle_lobby_request,
-        handle_race_request, handle_room_request, read_encrypted_frame, read_session_frame,
-        room_participant_from_profile, room_physics_metadata, select_session_read_event,
-        update_game_options, validate_rider_item_selection, write_session_bytes,
+        SessionServices, dispatch_packet, handle_channel_move_in, handle_equipment_request,
+        handle_get_rider, handle_lobby_request, handle_race_request, handle_room_request,
+        read_encrypted_frame, read_session_frame, room_participant_from_profile,
+        room_physics_metadata, select_session_read_event, update_game_options,
+        validate_rider_item_selection, write_session_bytes,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
@@ -2085,7 +2243,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_room_packets_are_rejected_before_world_authorization() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let (world, world_task) = WorldHandle::spawn(4);
         let context = SessionContext::default();
         let mut trailing = PacketWriter::named("ChGetRoomListRequestPacket");
@@ -2134,7 +2293,8 @@ mod tests {
     #[tokio::test]
     async fn authenticated_dispatch_classifies_all_lobby_requests() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let config = ServerConfig::default();
         let (world, world_task) = WorldHandle::spawn(4);
         let session_id = world
@@ -2510,6 +2670,7 @@ mod tests {
                 .any(|window| window == baseline.as_bytes())
         );
 
+        world.session_closed(rider.session).await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
     }
@@ -2517,7 +2678,8 @@ mod tests {
     #[tokio::test]
     async fn authenticated_dispatch_classifies_all_race_requests() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let config = ServerConfig::default();
         let (world, world_task) = WorldHandle::spawn(4);
         let session_id = world
@@ -2628,6 +2790,7 @@ mod tests {
             }
         ));
 
+        world.session_closed(rider.session).await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
     }
@@ -2660,6 +2823,7 @@ mod tests {
             RaceCommandOutcome::IgnoredDuplicate { .. }
         ));
 
+        world.session_closed(rider.session).await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
     }
@@ -2737,7 +2901,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_plant_request_requires_current_identity_and_returns_exact_failure() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let (world, world_task) = WorldHandle::spawn(8);
         let source = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_700))
@@ -2751,13 +2916,17 @@ mod tests {
             .claim_identity(source, "MalformedOwner")
             .await
             .unwrap();
-        let guard = profiles.ownership_guard().await;
-        let profile = profiles
-            .load(identity.nickname.clone(), true, guard)
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (profile, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
             .await
             .unwrap();
         let mut context = SessionContext::default();
         context.bind_profile(identity.clone(), profile);
+        drop(lane);
         let mut truncated = PacketWriter::named("PqEquipTuningExPacket");
         truncated.write_i16(43);
 
@@ -2828,22 +2997,26 @@ mod tests {
     #[tokio::test]
     async fn owned_plant_request_persists_sidecar_before_exact_success() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles =
-            ProfileCoordinator::new(profile_root.path().to_owned(), Some(test_catalog()));
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
         let (world, world_task) = WorldHandle::spawn(8);
         let session = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_800))
             .await
             .unwrap();
         let identity = world.claim_identity(session, "PlantOwner").await.unwrap();
-        let guard = profiles.ownership_guard().await;
-        let profile = profiles
-            .load(identity.nickname.clone(), true, guard)
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (profile, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
             .await
             .unwrap();
         let rider_directory = profile.source_path.parent().unwrap().to_owned();
         let mut context = SessionContext::default();
         context.bind_profile(identity, profile);
+        drop(lane);
         let request = PlantPartEquipRequest {
             item_category: 43,
             item_id: 1_000,
@@ -2883,21 +3056,25 @@ mod tests {
     #[tokio::test]
     async fn valid_rider_request_updates_revision_and_bound_context_snapshot() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles =
-            ProfileCoordinator::new(profile_root.path().to_owned(), Some(test_catalog()));
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
         let (world, world_task) = WorldHandle::spawn(8);
         let session = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_900))
             .await
             .unwrap();
         let identity = world.claim_identity(session, "RiderOwner").await.unwrap();
-        let guard = profiles.ownership_guard().await;
-        let profile = profiles
-            .load(identity.nickname.clone(), true, guard)
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (profile, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
             .await
             .unwrap();
         let mut context = SessionContext::default();
         context.bind_profile(identity, profile);
+        drop(lane);
         let selection = rider_selection();
         let packet = rider_selection_packet(selection);
 
@@ -2933,13 +3110,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_rider_reloads_disk_and_replaces_the_bound_context_snapshot() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
+        let (world, world_task) = WorldHandle::spawn(8);
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_950))
+            .await
+            .unwrap();
+        let identity = world.claim_identity(session, "FreshRider").await.unwrap();
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (profile, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        let mut context = SessionContext::default();
+        context.bind_profile(identity.clone(), profile);
+        drop(lane);
+
+        let stale_premium = context.profile_for(&identity).unwrap().rider.premium;
+        assert_ne!(stale_premium, 42);
+        ProfileStore::new(profile_root.path())
+            .update("FreshRider", |profile| profile.rider.premium = 42)
+            .unwrap();
+        assert_eq!(
+            context.profile_for(&identity).unwrap().rider.premium,
+            stale_premium,
+            "the test must begin with a stale in-memory snapshot"
+        );
+
+        let responses = handle_get_rider(&world, &profiles, session, &mut context)
+            .await
+            .unwrap();
+        assert!(!responses.is_empty());
+        let current = world.authorize_identity(session).await.unwrap();
+        assert_eq!(context.profile_for(&current).unwrap().rider.premium, 42);
+
+        world.session_closed(session).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn creation_policy_rejects_unknown_profiles_without_allocating_disk_state() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
 
-        let guard = profiles.ownership_guard().await;
+        let admission = profiles
+            .admit("RemoteRider", "test denied profile load")
+            .await
+            .unwrap();
         let error = profiles
-            .load("RemoteRider".to_owned(), false, guard)
+            .load("RemoteRider".to_owned(), false, admission)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2950,12 +3177,16 @@ mod tests {
         assert!(!profile_root.path().join("RemoteRider").exists());
 
         fs::create_dir(profile_root.path().join("RemoteRider")).unwrap();
-        let guard = profiles.ownership_guard().await;
-        let loaded = profiles
-            .load("remoterider".to_owned(), false, guard)
+        let admission = profiles
+            .admit("remoterider", "test existing profile load")
+            .await
+            .unwrap();
+        let (loaded, lane) = profiles
+            .load("remoterider".to_owned(), false, admission)
             .await
             .unwrap();
         assert!(loaded.source_path.is_file());
+        drop(lane);
     }
 
     #[test]
@@ -2997,19 +3228,26 @@ mod tests {
     #[tokio::test]
     async fn rejected_rider_selection_does_not_publish_a_profile_revision() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles =
-            ProfileCoordinator::new(profile_root.path().to_owned(), Some(test_catalog()));
-        let guard = profiles.ownership_guard().await;
-        let snapshot = profiles
-            .load("Rider".to_owned(), true, guard)
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
+        let admission = profiles
+            .admit("Rider", "test initial profile load")
             .await
             .unwrap();
+        let (_, lane) = profiles
+            .load("Rider".to_owned(), true, admission)
+            .await
+            .unwrap();
+        drop(lane);
         let mut invalid = rider_selection();
         invalid.character = 999;
-        let guard = profiles.ownership_guard().await;
+        let admission = profiles
+            .admit("Rider", "test rejected rider update")
+            .await
+            .unwrap();
         assert!(matches!(
             profiles
-                .update_rider_items("Rider".to_owned(), &snapshot.profile, invalid, guard)
+                .update_rider_items("Rider".to_owned(), invalid, admission)
                 .await,
             Err(LoginSessionError::RiderItemNotGranted {
                 category: 1,
@@ -3025,11 +3263,182 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migration_preflight_survives_source_disconnect_while_profile_lane_waits() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let (world, world_task) = WorldHandle::spawn(32);
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(address, 49_900))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(address, 49_901))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(source, "MigratingRider")
+            .await
+            .unwrap();
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (_, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        drop(lane);
+
+        let token = MigrationToken::new(0x5135).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 12,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let held_admission = profiles
+            .admit(&identity.nickname, "hold migration profile lane")
+            .await
+            .unwrap();
+        let preflight = world
+            .preflight_migration(destination, identity.user_no, 12, token, Instant::now())
+            .await
+            .unwrap();
+
+        let migration_profiles = profiles.clone();
+        let migration_world = world.clone();
+        let mut migration = tokio::spawn(async move {
+            let admission = migration_profiles
+                .admit(preflight.nickname(), "load migrated profile")
+                .await
+                .unwrap();
+            let (_, lane) = migration_profiles
+                .load(preflight.nickname().to_owned(), false, admission)
+                .await
+                .unwrap();
+            let completion = migration_world
+                .complete_preflighted_migration(preflight, Instant::now())
+                .await
+                .unwrap();
+            drop(lane);
+            completion
+        });
+
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut migration)
+                .await
+                .is_err(),
+            "migration unexpectedly bypassed the held profile lane"
+        );
+        world.session_closed(source).await.unwrap();
+        drop(held_admission);
+
+        let completion = migration.await.unwrap();
+        assert_eq!(completion.previous_owner, None);
+        assert_eq!(completion.binding.owner, destination);
+        assert_eq!(
+            completion.binding.channel.map(|channel| channel.game_type),
+            Some(67)
+        );
+
+        world.session_closed(destination).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_profile_failure_preserves_source_owner_permit_and_destination_fence() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let (world, world_task) = WorldHandle::spawn(16);
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let (source, mut source_cancelled, _source_outbound) = world
+            .register_login_session(SocketAddr::new(remote, 49_910))
+            .await
+            .unwrap();
+        let (destination, _destination_cancelled, _destination_outbound) = world
+            .register_login_session(SocketAddr::new(remote, 49_911))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(source, "MissingMigrationProfile")
+            .await
+            .unwrap();
+        let token = MigrationToken::new(0x5134).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 12,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let mut packet = PacketWriter::named("PqChannelMovein");
+        packet.write_u32(identity.user_no.get());
+        packet.write_u16(12);
+        packet.write_u16(token.get());
+
+        let error = handle_channel_move_in(
+            &ServerConfig::default(),
+            &world,
+            &profiles,
+            destination,
+            &packet.into_inner(),
+            &mut SessionContext::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LoginSessionError::ProfileCreationDenied { ref nickname }
+                if nickname == "MissingMigrationProfile"
+        ));
+        assert_eq!(world.authorize_identity(source).await.unwrap(), identity);
+        assert!(matches!(
+            world.authorize_identity(destination).await,
+            Err(WorldError::Identity(
+                IdentityError::UnauthenticatedSession(session)
+            )) if session == destination
+        ));
+        assert!(
+            time::timeout(Duration::from_millis(20), &mut source_cancelled)
+                .await
+                .is_err(),
+            "profile failure must not cancel the still-authoritative source session"
+        );
+        let retry = world
+            .preflight_migration(destination, identity.user_no, 12, token, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(retry.source_generation(), identity.generation);
+
+        world.session_closed(destination).await.unwrap();
+        world.session_closed(source).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+        profile_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_update_keeps_ownership_gate_until_disk_save_finishes() {
         let profile_root = tempfile::tempdir().unwrap();
         let hook = BlockingUpdateHook::new();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None)
-            .with_blocking_update_hook(Arc::clone(&hook));
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let profiles = profiles.with_blocking_update_hook(Arc::clone(&hook));
         let (world, world_task) = WorldHandle::spawn(32);
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
@@ -3041,11 +3450,15 @@ mod tests {
             .await
             .unwrap();
         let identity = world.claim_identity(source, "Rider").await.unwrap();
-        let ownership_guard = profiles.ownership_guard().await;
-        profiles
-            .load(identity.nickname.clone(), true, ownership_guard)
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
             .await
             .unwrap();
+        let (_, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        drop(lane);
 
         let token = MigrationToken::new(0x5136).unwrap();
         world
@@ -3062,16 +3475,19 @@ mod tests {
             .unwrap();
 
         let update_profiles = profiles.clone();
+        let update_nickname = identity.nickname.clone();
         let update = tokio::spawn(async move {
-            let ownership_guard = update_profiles.ownership_guard().await;
+            let admission = update_profiles
+                .admit(&update_nickname, "test blocked game-option update")
+                .await?;
             update_profiles
                 .update_game_options(
-                    identity.nickname,
+                    update_nickname,
                     GameOptions {
                         video_quality: 77,
                         ..GameOptions::default()
                     },
-                    ownership_guard,
+                    admission,
                 )
                 .await
         });
@@ -3086,14 +3502,18 @@ mod tests {
         let migration_profiles = profiles.clone();
         let migration_world = world.clone();
         let user_no = identity.user_no;
+        let migration_nickname = identity.nickname.clone();
         let (attempting, attempted) = oneshot::channel();
         let mut migration = tokio::spawn(async move {
             let _ = attempting.send(());
-            let ownership_guard = migration_profiles.ownership_guard().await;
+            let admission = migration_profiles
+                .admit(&migration_nickname, "test migration handoff")
+                .await
+                .unwrap();
             let completion = migration_world
                 .complete_migration(destination, user_no, 12, token, Instant::now())
                 .await;
-            drop(ownership_guard);
+            drop(admission);
             completion
         });
         attempted.await.unwrap();
@@ -3126,9 +3546,9 @@ mod tests {
     async fn cancelled_rider_update_keeps_gate_until_save_precedes_migration() {
         let profile_root = tempfile::tempdir().unwrap();
         let hook = BlockingUpdateHook::new();
-        let profiles =
-            ProfileCoordinator::new(profile_root.path().to_owned(), Some(test_catalog()))
-                .with_blocking_update_hook(Arc::clone(&hook));
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
+        let profiles = profiles.with_blocking_update_hook(Arc::clone(&hook));
         let (world, world_task) = WorldHandle::spawn(32);
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
@@ -3143,11 +3563,15 @@ mod tests {
             .claim_identity(source, "EquipmentRider")
             .await
             .unwrap();
-        let guard = profiles.ownership_guard().await;
-        let snapshot = profiles
-            .load(identity.nickname.clone(), true, guard)
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
             .await
             .unwrap();
+        let (_, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        drop(lane);
         let token = MigrationToken::new(0x5137).unwrap();
         world
             .begin_migration(
@@ -3164,11 +3588,12 @@ mod tests {
 
         let update_profiles = profiles.clone();
         let nickname = identity.nickname.clone();
-        let current = snapshot.profile;
         let update = tokio::spawn(async move {
-            let guard = update_profiles.ownership_guard().await;
+            let admission = update_profiles
+                .admit(&nickname, "test blocked rider update")
+                .await?;
             update_profiles
-                .update_rider_items(nickname, &current, rider_selection(), guard)
+                .update_rider_items(nickname, rider_selection(), admission)
                 .await
         });
         let entered_hook = Arc::clone(&hook);
@@ -3181,12 +3606,16 @@ mod tests {
         let migration_profiles = profiles.clone();
         let migration_world = world.clone();
         let user_no = identity.user_no;
+        let migration_nickname = identity.nickname.clone();
         let mut migration = tokio::spawn(async move {
-            let guard = migration_profiles.ownership_guard().await;
+            let admission = migration_profiles
+                .admit(&migration_nickname, "test migration handoff")
+                .await
+                .unwrap();
             let completion = migration_world
                 .complete_migration(destination, user_no, 12, token, Instant::now())
                 .await;
-            drop(guard);
+            drop(admission);
             completion
         });
         assert!(
@@ -3217,23 +3646,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_plant_write_keeps_ownership_gate_until_atomic_publish_finishes() {
         let profile_root = tempfile::tempdir().unwrap();
-        let rider_directory = profile_root.path().join("PlantRider");
         let hook = BlockingUpdateHook::new();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None)
-            .with_blocking_update_hook(Arc::clone(&hook));
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
+        let profiles = profiles.with_blocking_update_hook(Arc::clone(&hook));
         let write_profiles = profiles.clone();
         let request = PlantPartEquipRequest {
             item_category: 43,
-            item_id: 1,
+            item_id: 1_000,
             kart_category: 3,
             kart_id: 1,
             kart_serial: 1,
         };
         let write = tokio::spawn(async move {
-            let guard = write_profiles.ownership_guard().await;
-            write_profiles
-                .equip_plant_part(rider_directory, request, guard)
-                .await
+            let admission = write_profiles
+                .admit("PlantRider", "test blocked plant write")
+                .await?;
+            write_profiles.equip_plant_part(request, admission).await
         });
         let entered_hook = Arc::clone(&hook);
         tokio::task::spawn_blocking(move || entered_hook.entered.wait())
@@ -3243,7 +3672,11 @@ mod tests {
         assert!(write.await.unwrap_err().is_cancelled());
 
         let gate_profiles = profiles.clone();
-        let mut next_owner = tokio::spawn(async move { gate_profiles.ownership_guard().await });
+        let mut next_owner = tokio::spawn(async move {
+            gate_profiles
+                .admit("plantrider", "test next plant owner")
+                .await
+        });
         assert!(
             time::timeout(Duration::from_millis(50), &mut next_owner)
                 .await
@@ -3254,7 +3687,7 @@ mod tests {
         tokio::task::spawn_blocking(move || release_hook.release.wait())
             .await
             .unwrap();
-        drop(next_owner.await.unwrap());
+        drop(next_owner.await.unwrap().unwrap());
 
         let equipment =
             EquipmentExceptions::load(profile_root.path(), profile_root.path().join("PlantRider"))
@@ -3262,13 +3695,14 @@ mod tests {
         assert_eq!(equipment.plant.len(), 1);
         assert_eq!(equipment.plant[0].id, 1);
         assert_eq!(equipment.plant[0].engine_category, 43);
-        assert_eq!(equipment.plant[0].engine_id, 1);
+        assert_eq!(equipment.plant[0].engine_id, 1_000);
     }
 
     #[tokio::test]
     async fn stale_generation_cannot_publish_a_profile_update() {
         let profile_root = tempfile::tempdir().unwrap();
-        let profiles = ProfileCoordinator::new(profile_root.path().to_owned(), None);
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let (world, world_task) = WorldHandle::spawn(32);
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
@@ -3280,13 +3714,17 @@ mod tests {
             .await
             .unwrap();
         let identity = world.claim_identity(source, "Rider").await.unwrap();
-        let ownership_guard = profiles.ownership_guard().await;
-        let profile = profiles
-            .load(identity.nickname.clone(), true, ownership_guard)
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (profile, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
             .await
             .unwrap();
         let mut context = SessionContext::default();
         context.bind_profile(identity.clone(), profile);
+        drop(lane);
 
         let token = MigrationToken::new(0x5136).unwrap();
         world

@@ -11,7 +11,10 @@ use p5136_connector::{
     execute_connector, launcher_profile_xml, probe_messenger, server_config_xml,
 };
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
-use p5136_server::{BoundServer, DEFAULT_MAX_LOGIN_SESSIONS, ServerConfig};
+use p5136_server::{
+    BoundServer, DEFAULT_MAX_LOGIN_SESSIONS, RewardPersistenceRuntimeError, ServerConfig,
+    ServerError, ServerHandle,
+};
 use tracing_subscriber::EnvFilter;
 
 mod gui;
@@ -220,10 +223,74 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         );
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed to install Ctrl-C handler")?;
-    server.shutdown().await.context("server shutdown failed")
+    wait_for_server_exit(&server).await
+}
+
+async fn wait_for_server_exit(server: &ServerHandle) -> Result<()> {
+    tokio::select! {
+        result = server.wait() => result.context("P5136 server runtime stopped"),
+        signal = shutdown_signal() => {
+            signal.context("failed to install the process shutdown-signal handler")?;
+            shutdown_server_after_signal(server).await
+        }
+    }
+}
+
+async fn shutdown_server_after_signal(server: &ServerHandle) -> Result<()> {
+    match server.shutdown().await {
+        Ok(()) => Ok(()),
+        Err(
+            error @ ServerError::RewardPersistence(RewardPersistenceRuntimeError::DeadLetter {
+                ..
+            }),
+        ) => {
+            let status = server
+                .reward_status()
+                .await
+                .context("failed to inspect retained reward recovery state")?;
+            tracing::error!(
+                %error,
+                outstanding_lanes = status.outstanding_lanes().len(),
+                dead_letters = status.dead_letters().len(),
+                "graceful shutdown is paused on retained reward recovery state"
+            );
+            tracing::warn!(
+                "send the shutdown signal again to explicitly discard in-memory reward recovery and force shutdown"
+            );
+            tokio::select! {
+                result = server.wait() => {
+                    result.context(
+                        "P5136 server runtime stopped while awaiting force-shutdown confirmation",
+                    )
+                }
+                signal = shutdown_signal() => {
+                    signal.context("failed to wait for force-shutdown confirmation")?;
+                    server
+                        .force_shutdown()
+                        .await
+                        .context("forced server shutdown failed")
+                }
+            }
+        }
+        Err(error) => Err(error).context("server shutdown failed"),
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 async fn run_probe(args: ProbeArgs) -> Result<()> {

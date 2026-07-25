@@ -4,6 +4,7 @@ use std::{
     array,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroU64,
     time::{Duration, Instant},
 };
 
@@ -38,7 +39,11 @@ use p5136_core::{
     },
     track::is_random_track_selector,
 };
-use p5136_profile::GlobalRaceEpoch;
+use p5136_profile::{
+    AppliedTimeReward, GlobalRaceEpoch, MAX_TIME_REWARD_LUCCI_ROLL, MAX_TIME_REWARD_RP_ROLL,
+    TimeReward, time_reward_from_rolls,
+};
+use rand::Rng;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -48,11 +53,12 @@ use tokio::{
 
 use crate::identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
-    IdentityRegistry, MigrationCompletion, MigrationPermit, MigrationToken, ReleasedIdentity,
-    UserNo,
+    IdentityRegistry, MigrationCompletion, MigrationPermit, MigrationPreflight, MigrationToken,
+    ReleasedIdentity, UserNo,
 };
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
+use crate::profile_io::DurableRewardReceipt;
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
     UdpIngressBody, UdpService, UdpServiceError,
@@ -69,6 +75,28 @@ const SETTLEMENT_DELAY: Duration = Duration::from_secs(10);
 const SETTLEMENT_TICK_LEAD: u32 = 10_000;
 const FINAL_STAGE_TICK_LEAD: u32 = 6_000;
 const TEAM_POINTS_BY_RANK: [i32; ROOM_SLOT_COUNT] = [10, 8, 6, 5, 4, 3, 2, 1];
+const MAX_REWARD_PERSISTENCE_FAILURES: u8 = 8;
+const REWARD_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const REWARD_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const REWARD_ATTEMPT_LEASE: Duration = Duration::from_secs(30);
+const MAX_DUE_REWARD_TASK_BATCH: usize = 64;
+
+trait RewardRollSource {
+    fn draw_rp(&mut self) -> u8;
+    fn draw_lucci(&mut self) -> u16;
+}
+
+struct RandomRewardRollSource;
+
+impl RewardRollSource for RandomRewardRollSource {
+    fn draw_rp(&mut self) -> u8 {
+        rand::rng().random_range(0..=MAX_TIME_REWARD_RP_ROLL)
+    }
+
+    fn draw_lucci(&mut self) -> u16 {
+        rand::rng().random_range(0..=MAX_TIME_REWARD_LUCCI_ROLL)
+    }
+}
 
 /// One ordered write unit for a login session. A batch consumes one bounded
 /// queue slot even when a protocol response contains many logical packets.
@@ -112,6 +140,321 @@ impl SessionId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RoomId(pub u32);
+
+/// The exact actor-owned race incarnation used to fence reward work.
+///
+/// Room IDs are deliberately reusable. A room ID by itself therefore cannot
+/// authorize a persistence completion or release a user's outstanding reward
+/// lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RaceFence {
+    room_id: RoomId,
+    race_epoch: GlobalRaceEpoch,
+}
+
+impl RaceFence {
+    const fn new(room_id: RoomId, race_epoch: GlobalRaceEpoch) -> Self {
+        Self {
+            room_id,
+            race_epoch,
+        }
+    }
+
+    #[must_use]
+    pub const fn room_id(self) -> RoomId {
+        self.room_id
+    }
+
+    #[must_use]
+    pub const fn race_epoch(self) -> GlobalRaceEpoch {
+        self.race_epoch
+    }
+}
+
+/// Unique identifier for one scheduled persistence attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RewardAttemptId(NonZeroU64);
+
+impl RewardAttemptId {
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "read-only persistence boundary accessor")
+    )]
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// One immutable persistence proposal taken from the World actor.
+///
+/// Retrying a failed task creates a new [`RewardAttemptId`] but preserves
+/// every other field, especially `proposed_reward`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewardSettlementTask {
+    fence: RaceFence,
+    attempt_id: RewardAttemptId,
+    user_no: UserNo,
+    nickname: String,
+    canonical_nickname: String,
+    proposed_reward: TimeReward,
+}
+
+impl RewardSettlementTask {
+    #[must_use]
+    pub(crate) const fn fence(&self) -> RaceFence {
+        self.fence
+    }
+
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "read-only persistence boundary accessor")
+    )]
+    pub(crate) const fn attempt_id(&self) -> RewardAttemptId {
+        self.attempt_id
+    }
+
+    #[must_use]
+    pub(crate) const fn user_no(&self) -> UserNo {
+        self.user_no
+    }
+
+    #[must_use]
+    pub(crate) fn nickname(&self) -> &str {
+        &self.nickname
+    }
+
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "read-only persistence boundary accessor")
+    )]
+    pub(crate) fn canonical_nickname(&self) -> &str {
+        &self.canonical_nickname
+    }
+
+    #[must_use]
+    pub(crate) const fn proposed_reward(&self) -> TimeReward {
+        self.proposed_reward
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        room_id: RoomId,
+        race_epoch: GlobalRaceEpoch,
+        attempt_id: NonZeroU64,
+        user_no: UserNo,
+        nickname: &str,
+        proposed_reward: TimeReward,
+    ) -> Self {
+        Self {
+            fence: RaceFence::new(room_id, race_epoch),
+            attempt_id: RewardAttemptId(attempt_id),
+            user_no,
+            nickname: nickname.to_owned(),
+            canonical_nickname: canonical_nickname_key(nickname),
+            proposed_reward,
+        }
+    }
+}
+
+#[derive(Debug)]
+// This actor boundary is consumed by the profile worker in the next
+// integration tranche; tests exercise every variant in the meantime.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RewardPersistenceCompletion {
+    Durable(DurableRewardReceipt),
+    RetryableFailure(RewardSettlementTask),
+    FatalFailure(RewardSettlementTask),
+}
+
+impl RewardPersistenceCompletion {
+    fn task(&self) -> &RewardSettlementTask {
+        match self {
+            Self::Durable(receipt) => receipt.task(),
+            Self::RetryableFailure(task) | Self::FatalFailure(task) => task,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewardCompletionDisposition {
+    Applied,
+    RetryScheduled { failure_count: u8 },
+    TerminalFailure,
+    IgnoredStale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewardTerminalReason {
+    InvalidRanking,
+    RewardSampling,
+    RewardPersistence,
+    RewardReceiptMismatch,
+    RewardParticipantMissing,
+    RewardRetryDeadlineOverflow,
+    RewardAttemptIdExhausted,
+    RewardAttemptLeaseDeadlineOverflow,
+    ResultSerialization,
+    OutboundReservation,
+}
+
+impl RewardTerminalReason {
+    const fn permits_persistence_retry(self) -> bool {
+        matches!(self, Self::RewardPersistence)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewardLanePhase {
+    Loading,
+    Running,
+    AwaitingDeadline,
+    Queued,
+    InFlight,
+    DurableAwaitingFinalization,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutstandingRewardLane {
+    fence: RaceFence,
+    user_no: UserNo,
+    nickname: String,
+    phase: RewardLanePhase,
+}
+
+impl OutstandingRewardLane {
+    #[must_use]
+    pub const fn fence(&self) -> RaceFence {
+        self.fence
+    }
+
+    #[must_use]
+    pub const fn user_no(&self) -> UserNo {
+        self.user_no
+    }
+
+    #[must_use]
+    pub fn nickname(&self) -> &str {
+        &self.nickname
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> RewardLanePhase {
+        self.phase
+    }
+}
+
+/// Actor-minted capability naming the exact retained terminal reward state.
+///
+/// All fields stay private so a caller can request reconciliation only for a
+/// dead letter it previously observed. The actor revalidates the full stamp
+/// before resetting persistence work. There is exactly one capability per
+/// failed settlement; its optional user fields identify the originating
+/// failure only. Reconciliation preserves durable entries and resets every
+/// non-durable entry in that race together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewardDeadLetter {
+    fence: RaceFence,
+    failed_attempt_id: Option<RewardAttemptId>,
+    failed_user_no: Option<UserNo>,
+    failed_nickname: Option<String>,
+    failed_canonical_nickname: Option<String>,
+    failed_proposed_reward: Option<TimeReward>,
+    reason: RewardTerminalReason,
+    retained_ranking: Option<SettlementRanking>,
+    retained_rewards: Vec<RewardPersistenceEntry>,
+    retained_packets: Option<Vec<Vec<u8>>>,
+}
+
+impl RewardDeadLetter {
+    #[must_use]
+    pub const fn fence(&self) -> RaceFence {
+        self.fence
+    }
+
+    #[must_use]
+    pub(crate) const fn failed_attempt_id(&self) -> Option<RewardAttemptId> {
+        self.failed_attempt_id
+    }
+
+    #[must_use]
+    pub const fn failed_user_no(&self) -> Option<UserNo> {
+        self.failed_user_no
+    }
+
+    #[must_use]
+    pub fn failed_nickname(&self) -> Option<&str> {
+        self.failed_nickname.as_deref()
+    }
+
+    #[must_use]
+    pub fn failed_canonical_nickname(&self) -> Option<&str> {
+        self.failed_canonical_nickname.as_deref()
+    }
+
+    #[must_use]
+    pub const fn failed_proposed_reward(&self) -> Option<TimeReward> {
+        self.failed_proposed_reward
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> RewardTerminalReason {
+        self.reason
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewardDrainStatus {
+    quiescing: bool,
+    outstanding_lanes: Vec<OutstandingRewardLane>,
+    dead_letters: Vec<RewardDeadLetter>,
+}
+
+impl RewardDrainStatus {
+    #[must_use]
+    pub const fn is_quiescing(&self) -> bool {
+        self.quiescing
+    }
+
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        self.outstanding_lanes.is_empty() && self.dead_letters.is_empty()
+    }
+
+    #[must_use]
+    pub fn outstanding_lanes(&self) -> &[OutstandingRewardLane] {
+        &self.outstanding_lanes
+    }
+
+    #[must_use]
+    pub fn dead_letters(&self) -> &[RewardDeadLetter] {
+        &self.dead_letters
+    }
+
+    #[must_use]
+    pub fn queued_count(&self) -> usize {
+        self.outstanding_lanes
+            .iter()
+            .filter(|lane| lane.phase == RewardLanePhase::Queued)
+            .count()
+    }
+
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.outstanding_lanes
+            .iter()
+            .filter(|lane| lane.phase == RewardLanePhase::InFlight)
+            .count()
+    }
+
+    #[must_use]
+    pub fn terminal_count(&self) -> usize {
+        self.dead_letters.len()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlotId(pub u8);
@@ -280,6 +623,9 @@ pub enum RoomError {
 
 #[derive(Debug, Error)]
 pub enum LobbyError {
+    #[error("world is quiescing and will not start another race")]
+    WorldQuiescing,
+
     #[error("identity is not in a protocol room")]
     NotInRoom,
 
@@ -324,6 +670,15 @@ pub enum LobbyError {
 
     #[error("room participant {user_no} has no active exact-generation identity")]
     InactiveRosterMember { user_no: u32 },
+
+    #[error(
+        "human racer {user_no} still has an outstanding reward for room {room_id}, epoch {race_epoch}"
+    )]
+    RewardLaneOccupied {
+        user_no: u32,
+        room_id: u32,
+        race_epoch: u64,
+    },
 
     #[error("session {session:?} has no available outbound queue slot")]
     OutboundUnavailable { session: SessionId },
@@ -388,6 +743,18 @@ pub enum RaceError {
     #[error("frozen settlement roster contains {racers} racers; expected 1 through 8")]
     InvalidSettlementRoster { racers: usize },
 
+    #[error("reward sampling failed for player {player_id}: {reason}")]
+    RewardSampling {
+        player_id: i32,
+        reason: p5136_profile::RewardRollError,
+    },
+
+    #[error("settlement result serialization was attempted before every reward was durable")]
+    RewardsNotDurable,
+
+    #[error("settlement invariant failed: {detail}")]
+    SettlementInvariant { detail: &'static str },
+
     #[error(transparent)]
     Protocol(#[from] RaceProtocolError),
 
@@ -444,6 +811,62 @@ pub enum WorldError {
 
     #[error("active identity limit {maximum} reached")]
     IdentityLimitReached { maximum: usize },
+
+    #[error(
+        "reward attempt ID space exhausted for room {room_id}, epoch {race_epoch}, user {user_no}"
+    )]
+    RewardAttemptIdExhausted {
+        room_id: u32,
+        race_epoch: u64,
+        user_no: u32,
+    },
+
+    #[error(
+        "reward attempt lease failures exhausted for room {room_id}, epoch {race_epoch}, user {user_no}"
+    )]
+    RewardAttemptLeaseFailuresExhausted {
+        room_id: u32,
+        race_epoch: u64,
+        user_no: u32,
+    },
+
+    #[error(
+        "reward attempt lease deadline overflowed for room {room_id}, epoch {race_epoch}, user {user_no}"
+    )]
+    RewardAttemptLeaseDeadlineOverflow {
+        room_id: u32,
+        race_epoch: u64,
+        user_no: u32,
+    },
+
+    #[error(
+        "reward retry deadline overflowed for room {room_id}, epoch {race_epoch}, user {user_no}"
+    )]
+    RewardRetryDeadlineOverflow {
+        room_id: u32,
+        race_epoch: u64,
+        user_no: u32,
+    },
+
+    #[error("reward scheduler invariant failed for room {room_id}, user {user_no}")]
+    RewardSchedulerInvariant { room_id: u32, user_no: u32 },
+
+    #[error("terminal reward settlement invariant failed for room {room_id}, epoch {race_epoch}")]
+    RewardDeadLetterInvariant { room_id: u32, race_epoch: u64 },
+
+    #[error(
+        "world shutdown refused while {outstanding_lanes} reward lanes remain ({dead_letters} terminal)"
+    )]
+    RewardShutdownBlocked {
+        outstanding_lanes: usize,
+        dead_letters: usize,
+    },
+
+    #[error("reward dead-letter capability is stale")]
+    StaleRewardDeadLetter,
+
+    #[error("reward dead-letter reason {reason:?} is not eligible for persistence retry")]
+    RewardDeadLetterNotRetryable { reason: RewardTerminalReason },
 }
 
 /// A terminal failure while publishing actor-owned state to a process sidecar.
@@ -496,6 +919,21 @@ enum WorldCommand {
         now: Instant,
         reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
+    PreflightMigration {
+        destination: SessionId,
+        user_no: UserNo,
+        channel_id: u16,
+        token: MigrationToken,
+        now: Instant,
+        reply: oneshot::Sender<Result<MigrationPreflight, WorldError>>,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    CompletePreflightedMigration {
+        preflight: MigrationPreflight,
+        now: Instant,
+        reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
+    },
     RoomProtocol {
         session: SessionId,
         payload: Box<RoomCommandPayload>,
@@ -540,7 +978,32 @@ enum WorldCommand {
     SessionCount {
         reply: oneshot::Sender<usize>,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
+    TakeDueRewardTasks {
+        now: Instant,
+        maximum: usize,
+        reply: oneshot::Sender<Result<Vec<RewardSettlementTask>, WorldError>>,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    CompleteRewardTask {
+        completion: RewardPersistenceCompletion,
+        now: Instant,
+        reply: oneshot::Sender<Result<RewardCompletionDisposition, WorldError>>,
+    },
+    Quiesce {
+        reply: oneshot::Sender<()>,
+    },
+    RewardDrainStatus {
+        reply: oneshot::Sender<Result<RewardDrainStatus, WorldError>>,
+    },
+    RetryRewardDeadLetter {
+        dead_letter: RewardDeadLetter,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
     Shutdown {
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    ForceShutdown {
         reply: oneshot::Sender<()>,
     },
 }
@@ -785,6 +1248,48 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn preflight_migration(
+        &self,
+        destination: SessionId,
+        user_no: UserNo,
+        channel_id: u16,
+        token: MigrationToken,
+        now: Instant,
+    ) -> Result<MigrationPreflight, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::PreflightMigration {
+                destination,
+                user_no,
+                channel_id,
+                token,
+                now,
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn complete_preflighted_migration(
+        &self,
+        preflight: MigrationPreflight,
+        now: Instant,
+    ) -> Result<MigrationCompletion, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::CompletePreflightedMigration {
+                preflight,
+                now,
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub(crate) async fn room_protocol(
         &self,
         session: SessionId,
@@ -940,10 +1445,89 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn take_due_reward_tasks(
+        &self,
+        now: Instant,
+        maximum: usize,
+    ) -> Result<Vec<RewardSettlementTask>, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::TakeDueRewardTasks {
+                now,
+                maximum,
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn complete_reward_task(
+        &self,
+        completion: RewardPersistenceCompletion,
+        now: Instant,
+    ) -> Result<RewardCompletionDisposition, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::CompleteRewardTask {
+                completion,
+                now,
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub async fn quiesce(&self) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::Quiesce { reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)
+    }
+
+    pub async fn reward_drain_status(&self) -> Result<RewardDrainStatus, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::RewardDrainStatus { reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub async fn retry_reward_dead_letter(
+        &self,
+        dead_letter: RewardDeadLetter,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::RetryRewardDeadLetter { dead_letter, reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub async fn shutdown(&self) -> Result<(), WorldError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WorldCommand::Shutdown { reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    /// Unconditionally terminates the actor during process-fatal teardown.
+    ///
+    /// Normal shutdown must use [`Self::shutdown`], whose reward-lane barrier
+    /// prevents silent loss of issued or dead-lettered work.
+    pub(crate) async fn force_shutdown(&self) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::ForceShutdown { reply })
             .await
             .map_err(|_| WorldError::Stopped)?;
         response.await.map_err(|_| WorldError::Stopped)
@@ -966,6 +1550,11 @@ struct World {
     /// The next process-global epoch is consumed only after a race start and
     /// its complete outbound fan-out have committed.
     next_race_epoch: Option<GlobalRaceEpoch>,
+    /// At most one unsettled race may own a human user. Lanes survive session
+    /// and room membership changes and are released only by their exact fence.
+    reward_lanes: HashMap<UserNo, RaceFence>,
+    next_reward_attempt_id: Option<NonZeroU64>,
+    quiescing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -995,6 +1584,7 @@ struct ProtocolRoomMember {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FrozenRaceParticipant {
     identity: IdentityBinding,
+    nickname: String,
     player_id: i32,
     observer: bool,
     team: u8,
@@ -1009,23 +1599,17 @@ struct FrozenHumanResultSnapshot {
     economy: FrozenResultEconomy,
 }
 
-/// Result economics are deliberately frozen without persistence for this
-/// tranche. A later profile transaction replaces these explicit zero fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FrozenResultEconomy {
-    current_rp: u32,
-    earned_rp_without_persistence: u32,
-    earned_lucci_without_persistence: u32,
-    current_lucci_without_persistence: u32,
+enum FrozenResultEconomy {
+    Pending,
+    Applied(AppliedTimeReward),
 }
 
 impl FrozenResultEconomy {
-    const fn pending_persistence(current_rp: u32) -> Self {
-        Self {
-            current_rp,
-            earned_rp_without_persistence: 0,
-            earned_lucci_without_persistence: 0,
-            current_lucci_without_persistence: 0,
+    const fn applied(self) -> Option<AppliedTimeReward> {
+        match self {
+            Self::Pending => None,
+            Self::Applied(reward) => Some(reward),
         }
     }
 }
@@ -1039,7 +1623,7 @@ struct FrozenAiRaceParticipant {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FrozenRaceRoster {
-    epoch: u64,
+    fence: RaceFence,
     concrete_track: u32,
     participants: Vec<FrozenRaceParticipant>,
     ais: Vec<FrozenAiRaceParticipant>,
@@ -1055,8 +1639,98 @@ struct SettlementState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SettlementFinalization {
     AwaitingDeadline,
-    Ready { packets: Vec<Vec<u8>> },
-    Failed,
+    Persisting {
+        ranking: SettlementRanking,
+        rewards: Vec<RewardPersistenceEntry>,
+    },
+    Ready {
+        ranking: SettlementRanking,
+        rewards: Vec<RewardPersistenceEntry>,
+        packets: Vec<Vec<u8>>,
+    },
+    Failed(SettlementDeadLetterState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettlementDeadLetterState {
+    ranking: Option<SettlementRanking>,
+    rewards: Vec<RewardPersistenceEntry>,
+    packets: Option<Vec<Vec<u8>>>,
+    failed_user_no: Option<UserNo>,
+    failed_nickname: Option<String>,
+    reason: RewardTerminalReason,
+}
+
+impl SettlementFinalization {
+    fn retain_as_dead_letter(
+        &mut self,
+        reason: RewardTerminalReason,
+        failed_user_no: Option<UserNo>,
+        failed_nickname: Option<String>,
+    ) {
+        let previous = std::mem::replace(self, Self::AwaitingDeadline);
+        let (ranking, rewards, packets) = match previous {
+            Self::Persisting { ranking, rewards } => (Some(ranking), rewards, None),
+            Self::Ready {
+                ranking,
+                rewards,
+                packets,
+            } => (Some(ranking), rewards, Some(packets)),
+            Self::Failed(failed) => {
+                *self = Self::Failed(failed);
+                return;
+            }
+            Self::AwaitingDeadline => (None, Vec::new(), None),
+        };
+        *self = Self::Failed(SettlementDeadLetterState {
+            ranking,
+            rewards,
+            packets,
+            failed_user_no,
+            failed_nickname,
+            reason,
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RewardPersistenceEntry {
+    user_no: UserNo,
+    nickname: String,
+    canonical_nickname: String,
+    player_id: i32,
+    proposed_reward: TimeReward,
+    status: RewardPersistenceStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewardPersistenceStatus {
+    Queued {
+        due_at: Instant,
+        failure_count: u8,
+    },
+    InFlight {
+        attempt_id: RewardAttemptId,
+        failure_count: u8,
+        lease_deadline: Instant,
+    },
+    Durable(AppliedTimeReward),
+}
+
+impl RewardPersistenceStatus {
+    const fn in_flight_attempt_id(self) -> Option<RewardAttemptId> {
+        match self {
+            Self::InFlight { attempt_id, .. } => Some(attempt_id),
+            Self::Queued { .. } | Self::Durable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewardLeaseExpiry {
+    NotCurrent,
+    Active,
+    RetryScheduled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1140,7 +1814,7 @@ impl From<&IdentityBinding> for FrozenParticipantStamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LoadingReadinessCandidate {
     room_id: RoomId,
-    race_epoch: u64,
+    race_epoch: GlobalRaceEpoch,
     participant: FrozenParticipantStamp,
 }
 
@@ -1162,7 +1836,7 @@ struct ProtocolRoomState {
     id: RoomId,
     settings: RoomSettings,
     phase: RoomPhase,
-    race_epoch: u64,
+    race_fence: Option<RaceFence>,
     frozen_race: Option<FrozenRaceRoster>,
     race_progress: RaceProgress,
     loading_handshake: LoadingHandshake,
@@ -1185,7 +1859,7 @@ impl ProtocolRoomState {
             id,
             settings,
             phase: RoomPhase::Lobby,
-            race_epoch: 0,
+            race_fence: None,
             frozen_race: None,
             race_progress: RaceProgress::default(),
             loading_handshake: LoadingHandshake::Dormant,
@@ -1529,6 +2203,13 @@ fn race_team_from_wire(team: u8) -> Result<RaceTeam, RaceError> {
     }
 }
 
+fn reward_retry_delay(failure_count: u8) -> Duration {
+    let shift = u32::from(failure_count.saturating_sub(1)).min(31);
+    REWARD_RETRY_BASE_DELAY
+        .saturating_mul(1_u32 << shift)
+        .min(REWARD_RETRY_MAX_DELAY)
+}
+
 impl Default for World {
     fn default() -> Self {
         Self {
@@ -1544,6 +2225,9 @@ impl Default for World {
             next_session_id: 1,
             next_room_id: 1,
             next_race_epoch: GlobalRaceEpoch::new(1),
+            reward_lanes: HashMap::new(),
+            next_reward_attempt_id: Some(NonZeroU64::MIN),
+            quiescing: false,
         }
     }
 }
@@ -1595,7 +2279,7 @@ impl World {
             debug_assert!(false, "a non-lobby room must have a frozen race roster");
             return Vec::new();
         };
-        debug_assert_eq!(frozen.epoch, room.race_epoch);
+        debug_assert_eq!(Some(frozen.fence), room.race_fence);
         debug_assert_ne!(frozen.concrete_track, 0);
         let Some(source_identity) = self.identities.active_identity_by_user_no(source) else {
             return Vec::new();
@@ -1636,7 +2320,7 @@ impl World {
             return None;
         }
         let frozen = room.frozen_race.as_ref()?;
-        if frozen.epoch != room.race_epoch
+        if Some(frozen.fence) != room.race_fence
             || !frozen
                 .participants
                 .iter()
@@ -1652,7 +2336,7 @@ impl World {
             .contains(&participant)
             .then_some(LoadingReadinessCandidate {
                 room_id,
-                race_epoch: frozen.epoch,
+                race_epoch: frozen.fence.race_epoch,
                 participant,
             })
     }
@@ -1670,13 +2354,15 @@ impl World {
         let Some(room) = self.protocol_rooms.get_mut(&candidate.room_id) else {
             return false;
         };
-        if room.phase != RoomPhase::Loading || room.race_epoch != candidate.race_epoch {
+        if room.phase != RoomPhase::Loading
+            || room.race_fence.map(|fence| fence.race_epoch) != Some(candidate.race_epoch)
+        {
             return false;
         }
         let Some(frozen) = room.frozen_race.as_ref() else {
             return false;
         };
-        if frozen.epoch != candidate.race_epoch
+        if frozen.fence.race_epoch != candidate.race_epoch
             || !frozen
                 .participants
                 .iter()
@@ -1705,6 +2391,16 @@ impl World {
     }
 
     fn advance_loading(&mut self, now: Instant, clock: &ServerClock) {
+        let mut reward_rolls = RandomRewardRollSource;
+        self.advance_loading_with_reward_source(now, clock, &mut reward_rolls);
+    }
+
+    fn advance_loading_with_reward_source(
+        &mut self,
+        now: Instant,
+        clock: &ServerClock,
+        reward_rolls: &mut impl RewardRollSource,
+    ) {
         let loading_rooms = self
             .protocol_rooms
             .iter()
@@ -1738,6 +2434,7 @@ impl World {
                         .is_some_and(|settlement| now >= settlement.deadline)
             });
             if deadline_reached {
+                self.begin_reward_persistence(room_id, now, reward_rolls);
                 self.try_finalize_settlement(room_id);
             } else {
                 self.try_flush_pending_race_fanouts(room_id);
@@ -1821,17 +2518,263 @@ impl World {
     }
 
     fn abort_loading_room(&mut self, room_id: RoomId) {
+        let fence = self
+            .protocol_rooms
+            .get(&room_id)
+            .and_then(|room| room.race_fence);
+        if let Some(fence) = fence {
+            self.release_reward_lanes(fence);
+        }
         let room = self
             .protocol_rooms
             .get_mut(&room_id)
             .expect("the loading room list contains existing rooms");
         room.phase = RoomPhase::Lobby;
+        room.race_fence = None;
         room.frozen_race = None;
         room.race_progress = RaceProgress::default();
         room.loading_handshake = LoadingHandshake::Dormant;
         for member in room.members_by_id.iter_mut().flatten() {
             member.player.player_type = PlayerSlotState::NotReady as i32;
         }
+    }
+
+    fn release_reward_lanes(&mut self, fence: RaceFence) {
+        self.reward_lanes.retain(|_, owned| *owned != fence);
+    }
+
+    fn quiesce(&mut self) {
+        self.quiescing = true;
+    }
+
+    fn reward_drain_status(&self) -> Result<RewardDrainStatus, WorldError> {
+        let mut owned_lanes = self
+            .reward_lanes
+            .iter()
+            .map(|(user_no, fence)| (*user_no, *fence))
+            .collect::<Vec<_>>();
+        owned_lanes.sort_unstable_by_key(|(user_no, fence)| {
+            (fence.room_id.0, fence.race_epoch.get(), user_no.get())
+        });
+        let mut outstanding_lanes = Vec::with_capacity(owned_lanes.len());
+        for (user_no, fence) in owned_lanes {
+            outstanding_lanes.push(self.outstanding_reward_lane(user_no, fence)?);
+        }
+        let dead_letters = self.reward_dead_letters()?;
+        Ok(RewardDrainStatus {
+            quiescing: self.quiescing,
+            outstanding_lanes,
+            dead_letters,
+        })
+    }
+
+    fn outstanding_reward_lane(
+        &self,
+        user_no: UserNo,
+        fence: RaceFence,
+    ) -> Result<OutstandingRewardLane, WorldError> {
+        let invariant = || WorldError::RewardSchedulerInvariant {
+            room_id: fence.room_id.0,
+            user_no: user_no.get(),
+        };
+        let room = self
+            .protocol_rooms
+            .get(&fence.room_id)
+            .filter(|room| room.race_fence == Some(fence))
+            .ok_or_else(invariant)?;
+        let participant = room
+            .frozen_race
+            .as_ref()
+            .and_then(|frozen| {
+                frozen.participants.iter().find(|participant| {
+                    !participant.observer && participant.identity.user_no == user_no
+                })
+            })
+            .ok_or_else(invariant)?;
+        let finalization = room
+            .race_progress
+            .settlement
+            .as_ref()
+            .map(|settlement| &settlement.finalization);
+        let phase = match (room.phase, finalization) {
+            (RoomPhase::Loading, _) => RewardLanePhase::Loading,
+            (RoomPhase::Running, _) => RewardLanePhase::Running,
+            (RoomPhase::Settling, None | Some(SettlementFinalization::AwaitingDeadline)) => {
+                RewardLanePhase::AwaitingDeadline
+            }
+            (RoomPhase::Settling, Some(SettlementFinalization::Persisting { rewards, .. })) => {
+                let reward = rewards
+                    .iter()
+                    .find(|reward| reward.user_no == user_no)
+                    .ok_or_else(invariant)?;
+                match reward.status {
+                    RewardPersistenceStatus::Queued { .. } => RewardLanePhase::Queued,
+                    RewardPersistenceStatus::InFlight { .. } => RewardLanePhase::InFlight,
+                    RewardPersistenceStatus::Durable(_) => {
+                        RewardLanePhase::DurableAwaitingFinalization
+                    }
+                }
+            }
+            (RoomPhase::Settling, Some(SettlementFinalization::Ready { .. })) => {
+                RewardLanePhase::DurableAwaitingFinalization
+            }
+            (RoomPhase::Settling, Some(SettlementFinalization::Failed(_))) => {
+                RewardLanePhase::Terminal
+            }
+            (RoomPhase::Lobby, _) => return Err(invariant()),
+        };
+        Ok(OutstandingRewardLane {
+            fence,
+            user_no,
+            nickname: participant.nickname.clone(),
+            phase,
+        })
+    }
+
+    fn reward_dead_letters(&self) -> Result<Vec<RewardDeadLetter>, WorldError> {
+        let mut failed_rooms = self
+            .protocol_rooms
+            .values()
+            .filter_map(|room| {
+                let fence = room.race_fence?;
+                let settlement = room.race_progress.settlement.as_ref()?;
+                let SettlementFinalization::Failed(failed) = &settlement.finalization else {
+                    return None;
+                };
+                Some((fence, room, failed))
+            })
+            .collect::<Vec<_>>();
+        failed_rooms
+            .sort_unstable_by_key(|(fence, _, _)| (fence.room_id.0, fence.race_epoch.get()));
+        failed_rooms
+            .into_iter()
+            .map(|(fence, room, failed)| {
+                let failed_reward = failed.failed_user_no.and_then(|user_no| {
+                    failed
+                        .rewards
+                        .iter()
+                        .find(|reward| reward.user_no == user_no)
+                });
+                let failed_participant = failed.failed_user_no.and_then(|user_no| {
+                    room.frozen_race.as_ref().and_then(|frozen| {
+                        frozen.participants.iter().find(|participant| {
+                            !participant.observer && participant.identity.user_no == user_no
+                        })
+                    })
+                });
+                let failed_nickname = failed_reward
+                    .map(|reward| reward.nickname.clone())
+                    .or_else(|| failed_participant.map(|participant| participant.nickname.clone()));
+                let failed_attempt_id =
+                    failed_reward.and_then(|reward| reward.status.in_flight_attempt_id());
+                if failed.failed_nickname != failed_nickname {
+                    return Err(WorldError::RewardDeadLetterInvariant {
+                        room_id: fence.room_id.0,
+                        race_epoch: fence.race_epoch.get(),
+                    });
+                }
+                if failed.reason.permits_persistence_retry() && failed_attempt_id.is_none() {
+                    return Err(WorldError::RewardDeadLetterInvariant {
+                        room_id: fence.room_id.0,
+                        race_epoch: fence.race_epoch.get(),
+                    });
+                }
+                Ok(RewardDeadLetter {
+                    fence,
+                    failed_attempt_id,
+                    failed_user_no: failed.failed_user_no,
+                    failed_canonical_nickname: failed_reward
+                        .map(|reward| reward.canonical_nickname.clone())
+                        .or_else(|| failed_nickname.as_deref().map(canonical_nickname_key)),
+                    failed_nickname,
+                    failed_proposed_reward: failed_reward.map(|reward| reward.proposed_reward),
+                    reason: failed.reason,
+                    retained_ranking: failed.ranking.clone(),
+                    retained_rewards: failed.rewards.clone(),
+                    retained_packets: failed.packets.clone(),
+                })
+            })
+            .collect()
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the actor command owns a stable dead-letter snapshot while it is queued"
+    )]
+    fn retry_reward_dead_letter(
+        &mut self,
+        dead_letter: RewardDeadLetter,
+        now: Instant,
+    ) -> Result<(), WorldError> {
+        let room = self
+            .protocol_rooms
+            .get_mut(&dead_letter.fence.room_id)
+            .filter(|room| room.race_fence == Some(dead_letter.fence))
+            .ok_or(WorldError::StaleRewardDeadLetter)?;
+        let settlement = room
+            .race_progress
+            .settlement
+            .as_mut()
+            .ok_or(WorldError::StaleRewardDeadLetter)?;
+        let previous = std::mem::replace(
+            &mut settlement.finalization,
+            SettlementFinalization::AwaitingDeadline,
+        );
+        let SettlementFinalization::Failed(mut failed) = previous else {
+            settlement.finalization = previous;
+            return Err(WorldError::StaleRewardDeadLetter);
+        };
+        if failed.reason != dead_letter.reason
+            || failed.ranking != dead_letter.retained_ranking
+            || failed.rewards != dead_letter.retained_rewards
+            || failed.packets != dead_letter.retained_packets
+        {
+            settlement.finalization = SettlementFinalization::Failed(failed);
+            return Err(WorldError::StaleRewardDeadLetter);
+        }
+        if !failed.reason.permits_persistence_retry() {
+            let reason = failed.reason;
+            settlement.finalization = SettlementFinalization::Failed(failed);
+            return Err(WorldError::RewardDeadLetterNotRetryable { reason });
+        }
+        let failed_reward = failed.failed_user_no.and_then(|user_no| {
+            failed
+                .rewards
+                .iter()
+                .find(|reward| reward.user_no == user_no)
+        });
+        if failed.failed_user_no != dead_letter.failed_user_no
+            || failed.failed_nickname != dead_letter.failed_nickname
+            || failed_reward.and_then(|reward| reward.status.in_flight_attempt_id())
+                != dead_letter.failed_attempt_id
+            || failed_reward.map(|reward| reward.canonical_nickname.as_str())
+                != dead_letter.failed_canonical_nickname.as_deref()
+            || failed_reward.map(|reward| reward.proposed_reward)
+                != dead_letter.failed_proposed_reward
+            || failed.ranking.is_none()
+            || failed.packets.is_some()
+        {
+            settlement.finalization = SettlementFinalization::Failed(failed);
+            return Err(WorldError::StaleRewardDeadLetter);
+        }
+        for reward in &mut failed.rewards {
+            if !matches!(reward.status, RewardPersistenceStatus::Durable(_)) {
+                reward.status = RewardPersistenceStatus::Queued {
+                    due_at: now,
+                    failure_count: 0,
+                };
+            }
+        }
+        let Some(ranking) = failed.ranking else {
+            settlement.finalization = SettlementFinalization::Failed(failed);
+            return Err(WorldError::StaleRewardDeadLetter);
+        };
+        settlement.finalization = SettlementFinalization::Persisting {
+            ranking,
+            rewards: failed.rewards,
+        };
+        self.debug_assert_invariants();
+        Ok(())
     }
 
     fn reconcile_loading_handshake(
@@ -1981,8 +2924,13 @@ impl World {
         true
     }
 
-    fn freeze_settlement_packets(&mut self, room_id: RoomId) {
-        let should_freeze = self.protocol_rooms.get(&room_id).is_some_and(|room| {
+    fn begin_reward_persistence(
+        &mut self,
+        room_id: RoomId,
+        now: Instant,
+        reward_rolls: &mut impl RewardRollSource,
+    ) {
+        let should_begin = self.protocol_rooms.get(&room_id).is_some_and(|room| {
             room.race_progress
                 .settlement
                 .as_ref()
@@ -1993,67 +2941,737 @@ impl World {
                     )
                 })
         });
-        if !should_freeze {
+        if !should_begin {
             return;
         }
 
-        let serialized = {
-            let room = self
+        let planned = self
+            .protocol_rooms
+            .get(&room_id)
+            .ok_or(RaceError::NotInRoom)
+            .and_then(|room| Self::plan_reward_persistence(room, now, reward_rolls));
+        let failed_participant = match &planned {
+            Err(RaceError::RewardSampling { player_id, .. }) => self
                 .protocol_rooms
                 .get(&room_id)
-                .expect("the settlement room list contains existing rooms");
-            Self::settlement_packets(room)
+                .and_then(|room| room.frozen_race.as_ref())
+                .and_then(|frozen| {
+                    frozen.participants.iter().find(|participant| {
+                        !participant.observer && participant.player_id == *player_id
+                    })
+                })
+                .map(|participant| (participant.identity.user_no, participant.nickname.clone())),
+            _ => None,
         };
-        let settlement = self
+        let Some(settlement) = self
             .protocol_rooms
             .get_mut(&room_id)
-            .expect("the settlement room list contains existing rooms")
-            .race_progress
-            .settlement
-            .as_mut()
-            .expect("a Settling room has settlement timing");
-        match serialized {
-            Ok(packets) => {
-                settlement.finalization = SettlementFinalization::Ready { packets };
+            .and_then(|room| room.race_progress.settlement.as_mut())
+        else {
+            return;
+        };
+        match planned {
+            Ok((ranking, rewards)) => {
+                settlement.finalization = SettlementFinalization::Persisting { ranking, rewards };
             }
             Err(error) => {
-                settlement.finalization = SettlementFinalization::Failed;
+                let failure = match error {
+                    RaceError::RewardSampling { .. } => RewardTerminalReason::RewardSampling,
+                    _ => RewardTerminalReason::InvalidRanking,
+                };
+                let (failed_user_no, failed_nickname) = failed_participant
+                    .map_or((None, None), |(user_no, nickname)| {
+                        (Some(user_no), Some(nickname))
+                    });
+                settlement.finalization.retain_as_dead_letter(
+                    failure,
+                    failed_user_no,
+                    failed_nickname,
+                );
                 tracing::error!(
                     room_id = room_id.0,
                     %error,
-                    "frozen race settlement could not be serialized; terminally retaining Settling"
+                    "race rewards could not be frozen; terminally retaining Settling"
                 );
             }
         }
     }
 
+    fn plan_reward_persistence(
+        room: &ProtocolRoomState,
+        now: Instant,
+        reward_rolls: &mut impl RewardRollSource,
+    ) -> Result<(SettlementRanking, Vec<RewardPersistenceEntry>), RaceError> {
+        let ranking = Self::settlement_ranking(room)?;
+        let frozen = room
+            .frozen_race
+            .as_ref()
+            .ok_or(RaceError::InvalidSettlementRoster { racers: 0 })?;
+        let human_count = frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer)
+            .count();
+        if !(1..=ROOM_SLOT_COUNT).contains(&human_count) {
+            return Err(RaceError::InvalidSettlementRoster {
+                racers: human_count,
+            });
+        }
+        let mut rewards = Vec::with_capacity(human_count);
+        for participant in frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer)
+        {
+            let ranked = ranking.by_player_id.get(&participant.player_id).ok_or(
+                RaceError::InvalidSettlementRoster {
+                    racers: human_count,
+                },
+            )?;
+            let rp_roll = reward_rolls.draw_rp();
+            let lucci_roll = reward_rolls.draw_lucci();
+            let ranking =
+                usize::try_from(ranked.rank).map_err(|_| RaceError::InvalidSettlementRoster {
+                    racers: human_count,
+                })?;
+            let proposed_reward =
+                time_reward_from_rolls(ranking, rp_roll, lucci_roll).map_err(|reason| {
+                    RaceError::RewardSampling {
+                        player_id: participant.player_id,
+                        reason,
+                    }
+                })?;
+            rewards.push(RewardPersistenceEntry {
+                user_no: participant.identity.user_no,
+                nickname: participant.nickname.clone(),
+                canonical_nickname: canonical_nickname_key(&participant.nickname),
+                player_id: participant.player_id,
+                proposed_reward,
+                status: RewardPersistenceStatus::Queued {
+                    due_at: now,
+                    failure_count: 0,
+                },
+            });
+        }
+        Ok((ranking, rewards))
+    }
+
+    /// Takes a bounded batch of due reward work and marks every returned item
+    /// in flight before it leaves the actor.
+    pub(crate) fn take_due_reward_tasks(
+        &mut self,
+        now: Instant,
+        maximum: usize,
+    ) -> Result<Vec<RewardSettlementTask>, WorldError> {
+        self.expire_reward_attempt_leases(now)?;
+        let maximum = maximum.min(MAX_DUE_REWARD_TASK_BATCH);
+        if maximum == 0 {
+            return Ok(Vec::new());
+        }
+        let mut candidates = self.due_reward_candidates(now, maximum);
+        self.limit_candidates_to_attempt_id_capacity(&mut candidates)?;
+
+        let mut tasks = Vec::with_capacity(candidates.len());
+        for (room_id, user_no) in candidates {
+            if let Some(task) = self.issue_reward_task(room_id, user_no, now)? {
+                tasks.push(task);
+            }
+        }
+        Ok(tasks)
+    }
+
+    fn due_reward_candidates(&self, now: Instant, maximum: usize) -> Vec<(RoomId, UserNo)> {
+        let mut candidates = self
+            .protocol_rooms
+            .iter()
+            .flat_map(|(room_id, room)| {
+                room.race_progress
+                    .settlement
+                    .as_ref()
+                    .and_then(|settlement| match &settlement.finalization {
+                        SettlementFinalization::Persisting { rewards, .. } => Some(
+                            rewards
+                                .iter()
+                                .filter_map(|reward| match reward.status {
+                                    RewardPersistenceStatus::Queued { due_at, .. }
+                                        if due_at <= now =>
+                                    {
+                                        Some((*room_id, reward.user_no))
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(room_id, user_no)| (room_id.0, user_no.get()));
+        candidates.truncate(maximum);
+        candidates
+    }
+
+    fn limit_candidates_to_attempt_id_capacity(
+        &mut self,
+        candidates: &mut Vec<(RoomId, UserNo)>,
+    ) -> Result<(), WorldError> {
+        if let Some((room_id, user_no)) = candidates.first().copied() {
+            let Some(next_attempt_id) = self.next_reward_attempt_id else {
+                let fence = self
+                    .protocol_rooms
+                    .get(&room_id)
+                    .and_then(|room| room.race_fence);
+                if let Some(settlement) = self
+                    .protocol_rooms
+                    .get_mut(&room_id)
+                    .and_then(|room| room.race_progress.settlement.as_mut())
+                {
+                    let nickname = match &settlement.finalization {
+                        SettlementFinalization::Persisting { rewards, .. } => rewards
+                            .iter()
+                            .find(|reward| reward.user_no == user_no)
+                            .map(|reward| reward.nickname.clone()),
+                        _ => None,
+                    };
+                    settlement.finalization.retain_as_dead_letter(
+                        RewardTerminalReason::RewardAttemptIdExhausted,
+                        Some(user_no),
+                        nickname,
+                    );
+                }
+                let fence = fence.ok_or(WorldError::RewardSchedulerInvariant {
+                    room_id: room_id.0,
+                    user_no: user_no.get(),
+                })?;
+                return Err(WorldError::RewardAttemptIdExhausted {
+                    room_id: fence.room_id.0,
+                    race_epoch: fence.race_epoch.get(),
+                    user_no: user_no.get(),
+                });
+            };
+            if next_attempt_id.get() == u64::MAX {
+                candidates.truncate(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn issue_reward_task(
+        &mut self,
+        room_id: RoomId,
+        user_no: UserNo,
+        now: Instant,
+    ) -> Result<Option<RewardSettlementTask>, WorldError> {
+        let Some(attempt_id) = self.allocate_reward_attempt_id() else {
+            return Err(WorldError::RewardSchedulerInvariant {
+                room_id: room_id.0,
+                user_no: user_no.get(),
+            });
+        };
+        let Some(lease_deadline) = now.checked_add(REWARD_ATTEMPT_LEASE) else {
+            let fence = self
+                .protocol_rooms
+                .get(&room_id)
+                .and_then(|room| room.race_fence);
+            if let Some(settlement) = self
+                .protocol_rooms
+                .get_mut(&room_id)
+                .and_then(|room| room.race_progress.settlement.as_mut())
+            {
+                let nickname = match &settlement.finalization {
+                    SettlementFinalization::Persisting { rewards, .. } => rewards
+                        .iter()
+                        .find(|reward| reward.user_no == user_no)
+                        .map(|reward| reward.nickname.clone()),
+                    _ => None,
+                };
+                settlement.finalization.retain_as_dead_letter(
+                    RewardTerminalReason::RewardAttemptLeaseDeadlineOverflow,
+                    Some(user_no),
+                    nickname,
+                );
+            }
+            let fence = fence.ok_or(WorldError::RewardSchedulerInvariant {
+                room_id: room_id.0,
+                user_no: user_no.get(),
+            })?;
+            return Err(WorldError::RewardAttemptLeaseDeadlineOverflow {
+                room_id: fence.room_id.0,
+                race_epoch: fence.race_epoch.get(),
+                user_no: user_no.get(),
+            });
+        };
+        let Some(room) = self.protocol_rooms.get_mut(&room_id) else {
+            return Ok(None);
+        };
+        let Some(fence) = room.race_fence else {
+            return Ok(None);
+        };
+        let Some(settlement) = room.race_progress.settlement.as_mut() else {
+            return Ok(None);
+        };
+        let SettlementFinalization::Persisting { rewards, .. } = &mut settlement.finalization
+        else {
+            return Ok(None);
+        };
+        let Some(reward) = rewards.iter_mut().find(|reward| reward.user_no == user_no) else {
+            return Ok(None);
+        };
+        let RewardPersistenceStatus::Queued {
+            due_at,
+            failure_count,
+        } = reward.status
+        else {
+            return Ok(None);
+        };
+        if due_at > now {
+            return Ok(None);
+        }
+        reward.status = RewardPersistenceStatus::InFlight {
+            attempt_id,
+            failure_count,
+            lease_deadline,
+        };
+        Ok(Some(RewardSettlementTask {
+            fence,
+            attempt_id,
+            user_no,
+            nickname: reward.nickname.clone(),
+            canonical_nickname: reward.canonical_nickname.clone(),
+            proposed_reward: reward.proposed_reward,
+        }))
+    }
+
+    fn allocate_reward_attempt_id(&mut self) -> Option<RewardAttemptId> {
+        let raw = self.next_reward_attempt_id?;
+        self.next_reward_attempt_id = raw.get().checked_add(1).and_then(NonZeroU64::new);
+        Some(RewardAttemptId(raw))
+    }
+
+    fn expire_reward_attempt_leases(&mut self, now: Instant) -> Result<(), WorldError> {
+        let mut expired = self
+            .protocol_rooms
+            .iter()
+            .flat_map(|(_, room)| {
+                let fence = room.race_fence;
+                room.race_progress
+                    .settlement
+                    .as_ref()
+                    .and_then(|settlement| match &settlement.finalization {
+                        SettlementFinalization::Persisting { rewards, .. } => Some(
+                            rewards
+                                .iter()
+                                .filter_map(|reward| match reward.status {
+                                    RewardPersistenceStatus::InFlight {
+                                        attempt_id,
+                                        lease_deadline,
+                                        ..
+                                    } if lease_deadline <= now => {
+                                        fence.map(|fence| RewardSettlementTask {
+                                            fence,
+                                            attempt_id,
+                                            user_no: reward.user_no,
+                                            nickname: reward.nickname.clone(),
+                                            canonical_nickname: reward.canonical_nickname.clone(),
+                                            proposed_reward: reward.proposed_reward,
+                                        })
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        expired.sort_unstable_by_key(|task| {
+            (
+                task.fence.room_id.0,
+                task.fence.race_epoch.get(),
+                task.user_no.get(),
+            )
+        });
+        for task in expired {
+            self.expire_reward_attempt(&task, now)?;
+        }
+        Ok(())
+    }
+
+    fn current_reward_attempt(&self, task: &RewardSettlementTask) -> Option<(u8, Instant)> {
+        let room = self.protocol_rooms.get(&task.fence.room_id)?;
+        if room.race_fence != Some(task.fence) {
+            return None;
+        }
+        let settlement = room.race_progress.settlement.as_ref()?;
+        let SettlementFinalization::Persisting { rewards, .. } = &settlement.finalization else {
+            return None;
+        };
+        let reward = rewards
+            .iter()
+            .find(|reward| reward.user_no == task.user_no)?;
+        if reward.nickname != task.nickname
+            || reward.canonical_nickname != task.canonical_nickname
+            || reward.proposed_reward != task.proposed_reward
+        {
+            return None;
+        }
+        let RewardPersistenceStatus::InFlight {
+            attempt_id,
+            failure_count,
+            lease_deadline,
+        } = reward.status
+        else {
+            return None;
+        };
+        (attempt_id == task.attempt_id).then_some((failure_count, lease_deadline))
+    }
+
+    fn expire_reward_attempt(
+        &mut self,
+        task: &RewardSettlementTask,
+        now: Instant,
+    ) -> Result<RewardLeaseExpiry, WorldError> {
+        let Some((failure_count, lease_deadline)) = self.current_reward_attempt(task) else {
+            return Ok(RewardLeaseExpiry::NotCurrent);
+        };
+        if lease_deadline > now {
+            return Ok(RewardLeaseExpiry::Active);
+        }
+        let failure_count = failure_count.saturating_add(1);
+        if failure_count >= MAX_REWARD_PERSISTENCE_FAILURES {
+            self.fail_reward_settlement(task, RewardTerminalReason::RewardPersistence)?;
+            return Err(WorldError::RewardAttemptLeaseFailuresExhausted {
+                room_id: task.fence.room_id.0,
+                race_epoch: task.fence.race_epoch.get(),
+                user_no: task.user_no.get(),
+            });
+        }
+        let Some(due_at) = now.checked_add(reward_retry_delay(failure_count)) else {
+            self.fail_reward_settlement(task, RewardTerminalReason::RewardRetryDeadlineOverflow)?;
+            return Err(WorldError::RewardRetryDeadlineOverflow {
+                room_id: task.fence.room_id.0,
+                race_epoch: task.fence.race_epoch.get(),
+                user_no: task.user_no.get(),
+            });
+        };
+        let Some(room) = self.protocol_rooms.get_mut(&task.fence.room_id) else {
+            return Ok(RewardLeaseExpiry::NotCurrent);
+        };
+        let Some(settlement) = room.race_progress.settlement.as_mut() else {
+            return Ok(RewardLeaseExpiry::NotCurrent);
+        };
+        let SettlementFinalization::Persisting { rewards, .. } = &mut settlement.finalization
+        else {
+            return Ok(RewardLeaseExpiry::NotCurrent);
+        };
+        let Some(reward) = rewards
+            .iter_mut()
+            .find(|reward| reward.user_no == task.user_no)
+        else {
+            return Ok(RewardLeaseExpiry::NotCurrent);
+        };
+        if !matches!(
+            reward.status,
+            RewardPersistenceStatus::InFlight {
+                attempt_id,
+                lease_deadline: current_deadline,
+                ..
+            } if attempt_id == task.attempt_id && current_deadline <= now
+        ) {
+            return Ok(RewardLeaseExpiry::NotCurrent);
+        }
+        reward.status = RewardPersistenceStatus::Queued {
+            due_at,
+            failure_count,
+        };
+        Ok(RewardLeaseExpiry::RetryScheduled)
+    }
+
+    fn fail_reward_settlement(
+        &mut self,
+        task: &RewardSettlementTask,
+        reason: RewardTerminalReason,
+    ) -> Result<(), WorldError> {
+        let Some(settlement) = self
+            .protocol_rooms
+            .get_mut(&task.fence.room_id)
+            .filter(|room| room.race_fence == Some(task.fence))
+            .and_then(|room| room.race_progress.settlement.as_mut())
+        else {
+            return Err(WorldError::RewardSchedulerInvariant {
+                room_id: task.fence.room_id.0,
+                user_no: task.user_no.get(),
+            });
+        };
+        settlement.finalization.retain_as_dead_letter(
+            reason,
+            Some(task.user_no),
+            Some(task.nickname.clone()),
+        );
+        Ok(())
+    }
+
+    /// Applies one persistence completion only when all four fence dimensions
+    /// (room, epoch, user and attempt) still name the exact in-flight task.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all completion variants share one exact stamp and lease validation prelude"
+    )]
+    pub(crate) fn complete_reward_task(
+        &mut self,
+        completion: RewardPersistenceCompletion,
+        now: Instant,
+    ) -> Result<RewardCompletionDisposition, WorldError> {
+        let task = completion.task().clone();
+        match self.expire_reward_attempt(&task, now) {
+            Ok(RewardLeaseExpiry::Active) => {}
+            Ok(RewardLeaseExpiry::NotCurrent | RewardLeaseExpiry::RetryScheduled) => {
+                return Ok(RewardCompletionDisposition::IgnoredStale);
+            }
+            Err(
+                WorldError::RewardAttemptLeaseFailuresExhausted { .. }
+                | WorldError::RewardAttemptLeaseDeadlineOverflow { .. }
+                | WorldError::RewardRetryDeadlineOverflow { .. },
+            ) => return Ok(RewardCompletionDisposition::TerminalFailure),
+            Err(error) => return Err(error),
+        }
+        let Some((failure_count, _)) = self.current_reward_attempt(&task) else {
+            return Ok(RewardCompletionDisposition::IgnoredStale);
+        };
+
+        match completion {
+            RewardPersistenceCompletion::RetryableFailure(_) => {
+                let failure_count = failure_count.saturating_add(1);
+                if failure_count >= MAX_REWARD_PERSISTENCE_FAILURES {
+                    self.fail_reward_settlement(&task, RewardTerminalReason::RewardPersistence)?;
+                    return Ok(RewardCompletionDisposition::TerminalFailure);
+                }
+                let Some(due_at) = now.checked_add(reward_retry_delay(failure_count)) else {
+                    self.fail_reward_settlement(
+                        &task,
+                        RewardTerminalReason::RewardRetryDeadlineOverflow,
+                    )?;
+                    return Ok(RewardCompletionDisposition::TerminalFailure);
+                };
+                let Some(room) = self.protocol_rooms.get_mut(&task.fence.room_id) else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                let Some(settlement) = room.race_progress.settlement.as_mut() else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                let SettlementFinalization::Persisting { rewards, .. } =
+                    &mut settlement.finalization
+                else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                let Some(reward) = rewards
+                    .iter_mut()
+                    .find(|reward| reward.user_no == task.user_no)
+                else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                reward.status = RewardPersistenceStatus::Queued {
+                    due_at,
+                    failure_count,
+                };
+                Ok(RewardCompletionDisposition::RetryScheduled { failure_count })
+            }
+            RewardPersistenceCompletion::FatalFailure(_) => {
+                self.fail_reward_settlement(&task, RewardTerminalReason::RewardPersistence)?;
+                Ok(RewardCompletionDisposition::TerminalFailure)
+            }
+            RewardPersistenceCompletion::Durable(receipt) => {
+                let key = receipt.key();
+                let applied = receipt.applied();
+                let receipt_matches = key.run_generation().is_some()
+                    && key.store_id().is_some()
+                    && key.room_id() == task.fence.room_id.0
+                    && key.race_epoch() == task.fence.race_epoch
+                    && key.user_no() == task.user_no.get()
+                    && key.canonical_nickname() == Some(task.canonical_nickname.as_str())
+                    && applied.earned_rp == task.proposed_reward.earned_rp()
+                    && applied.earned_lucci == task.proposed_reward.earned_lucci();
+                if !receipt_matches {
+                    self.fail_reward_settlement(
+                        &task,
+                        RewardTerminalReason::RewardReceiptMismatch,
+                    )?;
+                    return Ok(RewardCompletionDisposition::TerminalFailure);
+                }
+                let participant_exists = self
+                    .protocol_rooms
+                    .get(&task.fence.room_id)
+                    .and_then(|room| room.frozen_race.as_ref())
+                    .is_some_and(|frozen| {
+                        frozen.participants.iter().any(|participant| {
+                            !participant.observer
+                                && participant.identity.user_no == task.user_no
+                                && participant.nickname == task.nickname
+                        })
+                    });
+                if !participant_exists {
+                    self.fail_reward_settlement(
+                        &task,
+                        RewardTerminalReason::RewardParticipantMissing,
+                    )?;
+                    return Ok(RewardCompletionDisposition::TerminalFailure);
+                }
+                let Some(room) = self.protocol_rooms.get_mut(&task.fence.room_id) else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                let Some(settlement) = room.race_progress.settlement.as_mut() else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                let SettlementFinalization::Persisting { rewards, .. } =
+                    &mut settlement.finalization
+                else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                let Some(reward) = rewards
+                    .iter_mut()
+                    .find(|reward| reward.user_no == task.user_no)
+                else {
+                    return Ok(RewardCompletionDisposition::IgnoredStale);
+                };
+                reward.status = RewardPersistenceStatus::Durable(applied);
+                let result = room
+                    .frozen_race
+                    .as_mut()
+                    .and_then(|frozen| {
+                        frozen.participants.iter_mut().find(|participant| {
+                            !participant.observer
+                                && participant.identity.user_no == task.user_no
+                                && participant.nickname == task.nickname
+                        })
+                    })
+                    .and_then(|participant| participant.result.as_mut());
+                let Some(result) = result else {
+                    self.fail_reward_settlement(
+                        &task,
+                        RewardTerminalReason::RewardParticipantMissing,
+                    )?;
+                    return Ok(RewardCompletionDisposition::TerminalFailure);
+                };
+                result.economy = FrozenResultEconomy::Applied(applied);
+
+                self.update_live_room_rp(task.user_no, applied.current_rp);
+                match self.prepare_ready_settlement(task.fence.room_id) {
+                    Ok(()) => Ok(RewardCompletionDisposition::Applied),
+                    Err(RewardTerminalReason::ResultSerialization) => {
+                        Ok(RewardCompletionDisposition::TerminalFailure)
+                    }
+                    Err(_) => Err(WorldError::RewardSchedulerInvariant {
+                        room_id: task.fence.room_id.0,
+                        user_no: task.user_no.get(),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn update_live_room_rp(&mut self, user_no: UserNo, current_rp: u32) {
+        let Some(room_id) = self.protocol_room_by_user.get(&user_no).copied() else {
+            return;
+        };
+        if let Some(member) = self.protocol_rooms.get_mut(&room_id).and_then(|room| {
+            room.members_by_id
+                .iter_mut()
+                .flatten()
+                .find(|member| member.user_no == user_no)
+        }) {
+            member.player.rp = current_rp;
+        }
+    }
+
+    fn prepare_ready_settlement(&mut self, room_id: RoomId) -> Result<(), RewardTerminalReason> {
+        let serialized = self.protocol_rooms.get(&room_id).and_then(|room| {
+            let settlement = room.race_progress.settlement.as_ref()?;
+            let SettlementFinalization::Persisting { ranking, rewards } = &settlement.finalization
+            else {
+                return None;
+            };
+            rewards
+                .iter()
+                .all(|reward| matches!(reward.status, RewardPersistenceStatus::Durable(_)))
+                .then(|| Self::settlement_packets(room, ranking))
+        });
+        let Some(serialized) = serialized else {
+            return Ok(());
+        };
+        let Some(settlement) = self
+            .protocol_rooms
+            .get_mut(&room_id)
+            .and_then(|room| room.race_progress.settlement.as_mut())
+        else {
+            return Ok(());
+        };
+        match serialized {
+            Ok(packets) => {
+                let previous = std::mem::replace(
+                    &mut settlement.finalization,
+                    SettlementFinalization::AwaitingDeadline,
+                );
+                let SettlementFinalization::Persisting { ranking, rewards } = previous else {
+                    settlement.finalization = previous;
+                    return Ok(());
+                };
+                settlement.finalization = SettlementFinalization::Ready {
+                    ranking,
+                    rewards,
+                    packets,
+                };
+                Ok(())
+            }
+            Err(error) => {
+                settlement.finalization.retain_as_dead_letter(
+                    RewardTerminalReason::ResultSerialization,
+                    None,
+                    None,
+                );
+                tracing::error!(
+                    room_id = room_id.0,
+                    %error,
+                    "durable race settlement could not be serialized; terminally retaining Settling"
+                );
+                Err(RewardTerminalReason::ResultSerialization)
+            }
+        }
+    }
+
     fn try_finalize_settlement(&mut self, room_id: RoomId) {
-        self.freeze_settlement_packets(room_id);
         if !self.try_flush_pending_race_fanouts(room_id) {
             return;
         }
         let packets = {
-            let room = self
-                .protocol_rooms
-                .get(&room_id)
-                .expect("the settlement room list contains existing rooms");
-            let settlement = room
-                .race_progress
-                .settlement
-                .as_ref()
-                .expect("a Settling room has settlement timing");
+            let Some(room) = self.protocol_rooms.get(&room_id) else {
+                tracing::error!(
+                    room_id = room_id.0,
+                    "settlement room disappeared before final transition"
+                );
+                return;
+            };
+            let Some(settlement) = room.race_progress.settlement.as_ref() else {
+                tracing::error!(
+                    room_id = room_id.0,
+                    "settlement timing disappeared before final transition"
+                );
+                return;
+            };
             match &settlement.finalization {
-                SettlementFinalization::Ready { packets } => packets.clone(),
-                SettlementFinalization::AwaitingDeadline | SettlementFinalization::Failed => {
+                SettlementFinalization::Ready { packets, .. } => packets.clone(),
+                SettlementFinalization::AwaitingDeadline
+                | SettlementFinalization::Persisting { .. }
+                | SettlementFinalization::Failed(_) => {
                     return;
                 }
             }
         };
         let deliveries = {
-            let room = self
-                .protocol_rooms
-                .get(&room_id)
-                .expect("the settlement room list contains existing rooms");
+            let Some(room) = self.protocol_rooms.get(&room_id) else {
+                return;
+            };
             self.active_frozen_recipient_sessions(room)
                 .into_iter()
                 .map(|(_, session)| (session, OutboundBatch::ordered(packets.clone())))
@@ -2070,14 +3688,17 @@ impl World {
                 return;
             }
             Err(error) => {
-                self.protocol_rooms
+                if let Some(settlement) = self
+                    .protocol_rooms
                     .get_mut(&room_id)
-                    .expect("the settlement room list contains existing rooms")
-                    .race_progress
-                    .settlement
-                    .as_mut()
-                    .expect("a Settling room has settlement timing")
-                    .finalization = SettlementFinalization::Failed;
+                    .and_then(|room| room.race_progress.settlement.as_mut())
+                {
+                    settlement.finalization.retain_as_dead_letter(
+                        RewardTerminalReason::OutboundReservation,
+                        None,
+                        None,
+                    );
+                }
                 tracing::error!(
                     room_id = room_id.0,
                     %error,
@@ -2087,21 +3708,25 @@ impl World {
             }
         };
 
-        let remove_room = self
-            .protocol_rooms
-            .get(&room_id)
-            .expect("the settlement room list contains existing rooms")
-            .is_empty();
+        let (remove_room, fence) = {
+            let Some(room) = self.protocol_rooms.get(&room_id) else {
+                return;
+            };
+            (room.is_empty(), room.race_fence)
+        };
+        if let Some(fence) = fence {
+            self.release_reward_lanes(fence);
+        }
         if remove_room {
             self.protocol_rooms.remove(&room_id);
             self.free_protocol_room_ids
                 .insert(u16::try_from(room_id.0).expect("protocol room ID fits in u16"));
         } else {
-            let room = self
-                .protocol_rooms
-                .get_mut(&room_id)
-                .expect("the settlement room list contains existing rooms");
+            let Some(room) = self.protocol_rooms.get_mut(&room_id) else {
+                return;
+            };
             room.phase = RoomPhase::Lobby;
+            room.race_fence = None;
             room.frozen_race = None;
             room.race_progress = RaceProgress::default();
             room.loading_handshake = LoadingHandshake::Dormant;
@@ -2112,13 +3737,18 @@ impl World {
         Self::publish_reserved(reserved);
     }
 
-    fn settlement_packets(room: &ProtocolRoomState) -> Result<Vec<Vec<u8>>, RaceError> {
-        let settlement = room
-            .race_progress
-            .settlement
-            .as_ref()
-            .expect("a Settling room has settlement timing");
-        let result = Self::serialize_settlement_result(room)?;
+    fn settlement_packets(
+        room: &ProtocolRoomState,
+        ranking: &SettlementRanking,
+    ) -> Result<Vec<Vec<u8>>, RaceError> {
+        let settlement =
+            room.race_progress
+                .settlement
+                .as_ref()
+                .ok_or(RaceError::SettlementInvariant {
+                    detail: "Settling room has no settlement timing",
+                })?;
+        let result = Self::serialize_settlement_result(room, ranking)?;
         Ok(vec![
             serialize_game_next_stage(room.settings.game_type),
             result,
@@ -2129,53 +3759,69 @@ impl World {
         ])
     }
 
-    fn serialize_settlement_result(room: &ProtocolRoomState) -> Result<Vec<u8>, RaceError> {
+    fn serialize_settlement_result(
+        room: &ProtocolRoomState,
+        ranking: &SettlementRanking,
+    ) -> Result<Vec<u8>, RaceError> {
         let frozen = room
             .frozen_race
             .as_ref()
-            .expect("a Settling room has a frozen roster");
-        let ranking = Self::settlement_ranking(room)?;
+            .ok_or(RaceError::SettlementInvariant {
+                detail: "Settling room has no frozen race roster",
+            })?;
         let team_mode = matches!(room.settings.game_type, 3 | 4);
         let humans = frozen
             .participants
             .iter()
             .filter(|participant| !participant.observer)
             .map(|participant| {
-                let ranked = ranking.by_player_id[&participant.player_id];
-                let snapshot = participant
-                    .result
-                    .expect("a frozen human racer has result admission fields");
-                HumanRaceResult {
+                let ranked = ranking.by_player_id.get(&participant.player_id).ok_or(
+                    RaceError::SettlementInvariant {
+                        detail: "human result is missing from frozen ranking",
+                    },
+                )?;
+                let snapshot = participant.result.ok_or(RaceError::SettlementInvariant {
+                    detail: "human racer has no result admission snapshot",
+                })?;
+                let economy = snapshot
+                    .economy
+                    .applied()
+                    .ok_or(RaceError::RewardsNotDurable)?;
+                Ok(HumanRaceResult {
                     player_id: participant.player_id,
                     finish_time: ranked.finish_time,
                     kart_id: snapshot.kart_id,
                     rank: ranked.rank,
-                    current_rp: snapshot.economy.current_rp,
-                    earned_rp: snapshot.economy.earned_rp_without_persistence,
-                    earned_lucci: snapshot.economy.earned_lucci_without_persistence,
-                    current_lucci: snapshot.economy.current_lucci_without_persistence,
+                    current_rp: economy.current_rp,
+                    earned_rp: economy.earned_rp,
+                    earned_lucci: economy.earned_lucci,
+                    current_lucci: economy.current_lucci,
                     team: team_mode.then_some(ranked.team).flatten(),
                     team_points: ranked.team_points,
                     character_id: snapshot.character_id,
                     club_mark_logo: snapshot.club_mark_logo,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, RaceError>>()?;
         let ais = frozen
             .ais
             .iter()
             .map(|participant| {
-                let ranked = ranking.by_player_id[&participant.player_id];
-                AiRaceResult {
+                let ranked = ranking.by_player_id.get(&participant.player_id).ok_or(
+                    RaceError::SettlementInvariant {
+                        detail: "AI result is missing from frozen ranking",
+                    },
+                )?;
+                Ok(AiRaceResult {
                     player_id: participant.player_id,
                     finish_time: ranked.finish_time,
                     kart_id: participant.kart_id,
                     rank: ranked.rank,
                     team: team_mode.then_some(ranked.team).flatten(),
                     team_points: ranked.team_points,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, RaceError>>()?;
         Ok(serialize_game_result(&GameResult {
             winning_team: ranking.winning_team,
             humans: &humans,
@@ -2187,7 +3833,9 @@ impl World {
         let frozen = room
             .frozen_race
             .as_ref()
-            .expect("a Settling room has a frozen roster");
+            .ok_or(RaceError::SettlementInvariant {
+                detail: "settlement ranking has no frozen race roster",
+            })?;
         let mut racers = frozen
             .participants
             .iter()
@@ -2241,7 +3889,9 @@ impl World {
                 player_id,
                 RankedRaceResult {
                     finish_time,
-                    rank: i32::try_from(rank).expect("at most eight race ranks fit in i32"),
+                    rank: i32::try_from(rank).map_err(|_| RaceError::SettlementInvariant {
+                        detail: "bounded race rank does not fit in i32",
+                    })?,
                     team,
                     team_points,
                 },
@@ -2252,14 +3902,21 @@ impl World {
                 .first()
                 .ok_or(RaceError::InvalidSettlementRoster { racers: 0 })?
                 .1;
-            let first_team = by_player_id[&first_player_id]
-                .team
-                .expect("team mode rankings carry a team");
+            let first_team = by_player_id
+                .get(&first_player_id)
+                .and_then(|ranked| ranked.team)
+                .ok_or(RaceError::SettlementInvariant {
+                    detail: "team-mode winner has no frozen team",
+                })?;
             Some(match room.settings.game_type {
                 3 if team_scores[0] > team_scores[1] => ResultTeam::Red,
                 3 if team_scores[1] > team_scores[0] => ResultTeam::Blue,
                 3 | 4 => first_team,
-                _ => unreachable!("team mode contains only game type 3 or 4"),
+                _ => {
+                    return Err(RaceError::SettlementInvariant {
+                        detail: "team-mode ranking has a non-team game type",
+                    });
+                }
             })
         } else {
             None
@@ -2295,15 +3952,54 @@ impl World {
         token: MigrationToken,
         now: Instant,
     ) -> Result<MigrationCompletion, WorldError> {
+        let preflight = self.preflight_migration(destination, user_no, channel_id, token, now)?;
+        self.complete_preflighted_migration(preflight, now)
+    }
+
+    fn preflight_migration(
+        &self,
+        destination: SessionId,
+        user_no: UserNo,
+        channel_id: u16,
+        token: MigrationToken,
+        now: Instant,
+    ) -> Result<MigrationPreflight, WorldError> {
         let destination_ip = self.session_ip(destination)?;
-        let completion = self.identities.complete_migration(
+        Ok(self.identities.preflight_migration(
             destination,
             destination_ip,
             user_no,
             channel_id,
             token,
             now,
-        )?;
+        )?)
+    }
+
+    fn complete_preflighted_migration(
+        &mut self,
+        preflight: MigrationPreflight,
+        now: Instant,
+    ) -> Result<MigrationCompletion, WorldError> {
+        let destination = preflight.destination_session();
+        let current_ip = self.session_ip(destination)?;
+        if current_ip != preflight.destination_ip() {
+            return Err(IdentityError::SourceIpMismatch {
+                expected: preflight.destination_ip(),
+                received: current_ip,
+            }
+            .into());
+        }
+        let completion = self
+            .identities
+            .complete_preflighted_migration(preflight, now)?;
+        Ok(self.commit_migration_completion(completion, now))
+    }
+
+    fn commit_migration_completion(
+        &mut self,
+        completion: MigrationCompletion,
+        now: Instant,
+    ) -> MigrationCompletion {
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Advance {
                 previous: completion.previous_identity.clone(),
@@ -2323,7 +4019,7 @@ impl World {
             self.cancel_session(previous_owner);
         }
         self.deliver(deliveries, now);
-        Ok(completion)
+        completion
     }
 
     fn room_protocol(
@@ -2480,7 +4176,7 @@ impl World {
         ) {
             return Ok(RaceCommandOutcome::IgnoredDuplicate {
                 room_id,
-                race_epoch: room.race_epoch,
+                race_epoch: frozen.fence.race_epoch.get(),
             });
         }
         let deadline = now
@@ -2499,7 +4195,7 @@ impl World {
         };
         Ok(RaceCommandOutcome::LoadingAwaiting {
             room_id,
-            race_epoch: room.race_epoch,
+            race_epoch: frozen.fence.race_epoch.get(),
             expected_participants,
         })
     }
@@ -2614,9 +4310,16 @@ impl World {
             return Err(RaceError::SettlementClosed);
         }
         if room.race_progress.finish_times.contains_key(&player_id) {
+            let race_epoch = room
+                .frozen_race
+                .as_ref()
+                .ok_or(RaceError::NotRunning { actual: room.phase })?
+                .fence
+                .race_epoch
+                .get();
             return Ok(RaceCommandOutcome::IgnoredDuplicate {
                 room_id,
-                race_epoch: room.race_epoch,
+                race_epoch,
             });
         }
         let began_settlement = room.phase == RoomPhase::Running;
@@ -2672,7 +4375,13 @@ impl World {
                 }),
                 begin_settlement: pending_begin,
             });
-        let race_epoch = room.race_epoch;
+        let race_epoch = room
+            .frozen_race
+            .as_ref()
+            .ok_or(RaceError::NotRunning { actual: room.phase })?
+            .fence
+            .race_epoch
+            .get();
         self.try_flush_pending_race_fanouts(room_id);
         Ok(RaceCommandOutcome::FinishRecorded {
             room_id,
@@ -2726,6 +4435,7 @@ impl World {
         let contribution = request.contribution * 0.000_125
             / f32::from(u16::try_from(team_count).expect("a room team count fits in u16"));
         let wire_gauge = (room.race_progress.team_gauge(request.team) + contribution).min(1.0);
+        let race_epoch = frozen.fence.race_epoch.get();
         let packet = serialize_team_booster_gauge(request.team, wire_gauge)?;
         let deliveries = self
             .active_frozen_recipient_sessions(room)
@@ -2742,7 +4452,6 @@ impl World {
         let reached_full = wire_gauge >= 1.0;
         room.race_progress
             .set_team_gauge(request.team, if reached_full { 0.0 } else { wire_gauge });
-        let race_epoch = room.race_epoch;
         Self::publish_reserved(reserved);
         Ok(RaceCommandOutcome::BoosterGaugeUpdated {
             room_id,
@@ -2987,6 +4696,9 @@ impl World {
         identity: &IdentityBinding,
         plan: &StartRoomPlan,
     ) -> Result<LobbyCommandOutcome, LobbyError> {
+        if self.quiescing {
+            return Err(LobbyError::WorldQuiescing);
+        }
         let room_id = self.protocol_room_id(identity)?;
         let room = self
             .protocol_rooms
@@ -3003,31 +4715,21 @@ impl World {
             return Err(LobbyError::AiParticipantsUnsupported);
         }
 
-        let racer_count = room.members_by_id.iter().flatten().count();
-        if racer_count == 0 {
-            return Err(LobbyError::NoRacers);
-        }
-        for (member_id, member) in room
-            .members_by_id
-            .iter()
-            .enumerate()
-            .filter_map(|(member_id, member)| member.as_ref().map(|member| (member_id, member)))
-        {
-            if member_id != requester_id
-                && member.player.player_type != PlayerSlotState::Ready as i32
-            {
-                return Err(LobbyError::RacerNotReady {
-                    user_no: member.user_no.get(),
-                });
-            }
-        }
+        let racer_count = self.validate_start_racers(room, requester_id)?;
 
         let allocated_race_epoch = self.next_race_epoch.ok_or(LobbyError::RaceEpochExhausted)?;
         let race_epoch = allocated_race_epoch.get();
         let following_race_epoch = race_epoch.checked_add(1).and_then(GlobalRaceEpoch::new);
+        let race_fence = RaceFence::new(room_id, allocated_race_epoch);
         let concrete_track =
             room.select_concrete_track(race_epoch, &plan.random_track_candidates)?;
-        let frozen = self.freeze_race_roster(room, race_epoch, concrete_track)?;
+        let frozen = self.freeze_race_roster(room, race_fence, concrete_track)?;
+        let human_users = frozen
+            .participants
+            .iter()
+            .filter(|participant| !participant.observer)
+            .map(|participant| participant.identity.user_no)
+            .collect::<Vec<_>>();
         let observer_count = frozen
             .participants
             .iter()
@@ -3064,11 +4766,18 @@ impl World {
 
         let mut next = room.clone();
         next.phase = RoomPhase::Loading;
-        next.race_epoch = race_epoch;
+        next.race_fence = Some(race_fence);
         next.frozen_race = Some(frozen);
         next.race_progress = RaceProgress::default();
         next.loading_handshake = LoadingHandshake::Dormant;
         self.protocol_rooms.insert(room_id, next);
+        for user_no in human_users {
+            let previous = self.reward_lanes.insert(user_no, race_fence);
+            debug_assert!(
+                previous.is_none(),
+                "reward lane preflight and commit diverged"
+            );
+        }
         self.next_race_epoch = following_race_epoch;
         Self::publish_reserved(reserved);
         self.debug_assert_invariants();
@@ -3081,10 +4790,43 @@ impl World {
         })
     }
 
+    fn validate_start_racers(
+        &self,
+        room: &ProtocolRoomState,
+        requester_id: usize,
+    ) -> Result<usize, LobbyError> {
+        let racer_count = room.members_by_id.iter().flatten().count();
+        if racer_count == 0 {
+            return Err(LobbyError::NoRacers);
+        }
+        for (member_id, member) in room
+            .members_by_id
+            .iter()
+            .enumerate()
+            .filter_map(|(member_id, member)| member.as_ref().map(|member| (member_id, member)))
+        {
+            if member_id != requester_id
+                && member.player.player_type != PlayerSlotState::Ready as i32
+            {
+                return Err(LobbyError::RacerNotReady {
+                    user_no: member.user_no.get(),
+                });
+            }
+            if let Some(fence) = self.reward_lanes.get(&member.user_no) {
+                return Err(LobbyError::RewardLaneOccupied {
+                    user_no: member.user_no.get(),
+                    room_id: fence.room_id.0,
+                    race_epoch: fence.race_epoch.get(),
+                });
+            }
+        }
+        Ok(racer_count)
+    }
+
     fn freeze_race_roster(
         &self,
         room: &ProtocolRoomState,
-        epoch: u64,
+        fence: RaceFence,
         concrete_track: u32,
     ) -> Result<FrozenRaceRoster, LobbyError> {
         let mut participants = Vec::with_capacity(room.user_nos().len());
@@ -3102,6 +4844,7 @@ impl World {
                 })?;
             participants.push(FrozenRaceParticipant {
                 identity,
+                nickname: member.player.nickname.clone(),
                 player_id: i32::try_from(member_id)
                     .expect("the fixed room member ID always fits in i32"),
                 observer: false,
@@ -3118,7 +4861,7 @@ impl World {
                             .expect("the character field is a fixed two-byte slice"),
                     ),
                     club_mark_logo: member.player.club_mark_logo,
-                    economy: FrozenResultEconomy::pending_persistence(member.player.rp),
+                    economy: FrozenResultEconomy::Pending,
                 }),
             });
         }
@@ -3136,6 +4879,7 @@ impl World {
                 })?;
             participants.push(FrozenRaceParticipant {
                 identity,
+                nickname: member.player.nickname.clone(),
                 player_id: i32::try_from(ROOM_SLOT_COUNT + observer_id)
                     .expect("the fixed observer player ID always fits in i32"),
                 observer: true,
@@ -3144,7 +4888,7 @@ impl World {
             });
         }
         Ok(FrozenRaceRoster {
-            epoch,
+            fence,
             concrete_track,
             participants,
             ais: Vec::new(),
@@ -3405,17 +5149,24 @@ impl World {
             return Vec::new();
         };
         let mut remove_room = false;
+        let mut aborted_loading_fence = None;
         let mut broadcast = None;
         if let Some(room) = self.protocol_rooms.get_mut(&room_id) {
             let removed = room.remove_user(user_no);
             debug_assert!(removed, "protocol membership map and room state diverged");
             if room.is_empty() && matches!(room.phase, RoomPhase::Lobby | RoomPhase::Loading) {
                 remove_room = true;
+                if room.phase == RoomPhase::Loading {
+                    aborted_loading_fence = room.race_fence;
+                }
             } else if !room.is_empty() {
                 let packet = serialize_gr_slot_data(&room.slot_data())
                     .expect("validated protocol room state remains serializable after removal");
                 broadcast = Some((room.user_nos(), packet));
             }
+        }
+        if let Some(fence) = aborted_loading_fence {
+            self.release_reward_lanes(fence);
         }
         if remove_room {
             self.protocol_rooms.remove(&room_id);
@@ -3694,6 +5445,7 @@ impl World {
             debug_assert_eq!(seen.len(), self.room_by_identity.len());
 
             let mut seen_users = HashSet::new();
+            let mut expected_reward_lanes = HashMap::new();
             for (room_id, room) in &self.protocol_rooms {
                 debug_assert_eq!(*room_id, room.id);
                 debug_assert!(u16::try_from(room_id.0).is_ok());
@@ -3731,47 +5483,66 @@ impl World {
                     debug_assert!(master < ROOM_SLOT_COUNT);
                     debug_assert!(room.members_by_id[master].is_some());
                 }
-                match (&room.phase, &room.frozen_race) {
-                    (RoomPhase::Lobby, None) => {}
-                    (RoomPhase::Lobby, Some(_)) | (_, None) => {
-                        debug_assert!(false, "room phase and frozen roster diverged");
-                    }
-                    (_, Some(frozen)) => {
-                        debug_assert_ne!(room.race_epoch, 0);
-                        debug_assert_eq!(frozen.epoch, room.race_epoch);
-                        debug_assert!(!is_random_track_selector(frozen.concrete_track));
-                        let mut frozen_users = HashSet::new();
-                        let mut frozen_player_ids = HashSet::new();
-                        for participant in &frozen.participants {
-                            debug_assert!(frozen_users.insert(participant.identity.user_no));
-                            debug_assert!(frozen_player_ids.insert(participant.player_id));
-                            debug_assert_eq!(participant.observer, participant.player_id >= 8);
-                            debug_assert_eq!(participant.observer, participant.result.is_none());
-                            debug_assert!(if participant.observer {
-                                participant.team == 0
-                            } else if matches!(room.settings.game_type, 3 | 4) {
-                                matches!(participant.team, 1 | 2)
-                            } else {
-                                participant.team == 0
-                            });
-                        }
-                        for participant in &frozen.ais {
-                            debug_assert!((0..8).contains(&participant.player_id));
-                            debug_assert!(frozen_player_ids.insert(participant.player_id));
-                        }
-                        debug_assert!(frozen_player_ids.len() <= ROOM_SLOT_COUNT);
-                    }
-                }
+                debug_assert_frozen_race_invariants(*room_id, room, &mut expected_reward_lanes);
                 debug_assert_loading_handshake_invariants(room);
                 debug_assert_race_progress_invariants(room);
             }
             debug_assert_eq!(seen_users.len(), self.protocol_room_by_user.len());
+            debug_assert_eq!(expected_reward_lanes, self.reward_lanes);
             for room_id in &self.free_protocol_room_ids {
                 debug_assert_ne!(*room_id, 0);
                 let room_id = RoomId(u32::from(*room_id));
                 debug_assert!(!self.rooms.contains_key(&room_id));
                 debug_assert!(!self.protocol_rooms.contains_key(&room_id));
             }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_frozen_race_invariants(
+    room_id: RoomId,
+    room: &ProtocolRoomState,
+    expected_reward_lanes: &mut HashMap<UserNo, RaceFence>,
+) {
+    match (&room.phase, &room.frozen_race) {
+        (RoomPhase::Lobby, None) => {
+            debug_assert!(room.race_fence.is_none());
+        }
+        (RoomPhase::Lobby, Some(_)) | (_, None) => {
+            debug_assert!(false, "room phase and frozen roster diverged");
+        }
+        (_, Some(frozen)) => {
+            debug_assert_eq!(room.race_fence, Some(frozen.fence));
+            debug_assert_eq!(frozen.fence.room_id, room_id);
+            debug_assert!(!is_random_track_selector(frozen.concrete_track));
+            let mut frozen_users = HashSet::new();
+            let mut frozen_player_ids = HashSet::new();
+            for participant in &frozen.participants {
+                debug_assert!(frozen_users.insert(participant.identity.user_no));
+                debug_assert!(frozen_player_ids.insert(participant.player_id));
+                debug_assert_eq!(participant.observer, participant.player_id >= 8);
+                debug_assert_eq!(participant.observer, participant.result.is_none());
+                if !participant.observer {
+                    debug_assert!(
+                        expected_reward_lanes
+                            .insert(participant.identity.user_no, frozen.fence)
+                            .is_none()
+                    );
+                }
+                debug_assert!(if participant.observer {
+                    participant.team == 0
+                } else if matches!(room.settings.game_type, 3 | 4) {
+                    matches!(participant.team, 1 | 2)
+                } else {
+                    participant.team == 0
+                });
+            }
+            for participant in &frozen.ais {
+                debug_assert!((0..8).contains(&participant.player_id));
+                debug_assert!(frozen_player_ids.insert(participant.player_id));
+            }
+            debug_assert!(frozen_player_ids.len() <= ROOM_SLOT_COUNT);
         }
     }
 }
@@ -3828,6 +5599,42 @@ fn debug_assert_race_progress_invariants(room: &ProtocolRoomState) {
                 .keys()
                 .all(|player_id| racer_ids.contains(player_id))
         );
+        if let Some(settlement) = &room.race_progress.settlement
+            && let SettlementFinalization::Persisting { ranking, rewards } =
+                &settlement.finalization
+        {
+            let human_count = frozen
+                .participants
+                .iter()
+                .filter(|participant| !participant.observer)
+                .count();
+            debug_assert_eq!(rewards.len(), human_count);
+            debug_assert!(rewards.len() <= ROOM_SLOT_COUNT);
+            let mut reward_users = HashSet::new();
+            for reward in rewards {
+                debug_assert!(reward_users.insert(reward.user_no));
+                debug_assert!(ranking.by_player_id.contains_key(&reward.player_id));
+                let participant = frozen.participants.iter().find(|participant| {
+                    !participant.observer && participant.identity.user_no == reward.user_no
+                });
+                debug_assert!(participant.is_some());
+                if let Some(participant) = participant {
+                    let economy = participant
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.economy.applied());
+                    match reward.status {
+                        RewardPersistenceStatus::Durable(applied) => {
+                            debug_assert_eq!(economy, Some(applied));
+                        }
+                        RewardPersistenceStatus::Queued { .. }
+                        | RewardPersistenceStatus::InFlight { .. } => {
+                            debug_assert!(economy.is_none());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4012,24 +5819,76 @@ async fn dispatch_udp_ingress(
 }
 
 async fn run_world(
+    receiver: mpsc::Receiver<WorldCommand>,
+    udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
+    sidecars: WorldSidecars,
+    clock: ServerClock,
+) -> Result<(), WorldSidecarError> {
+    let world = World {
+        identity_capacity: sidecars.identity_capacity(),
+        ..World::default()
+    };
+    run_world_actor(world, receiver, udp_receiver, sidecars, clock).await
+}
+
+async fn run_world_actor(
+    world: World,
+    receiver: mpsc::Receiver<WorldCommand>,
+    udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
+    sidecars: WorldSidecars,
+    clock: ServerClock,
+) -> Result<(), WorldSidecarError> {
+    run_world_actor_with_timers(
+        world,
+        receiver,
+        udp_receiver,
+        sidecars,
+        clock,
+        WorldActorTimers::new(),
+    )
+    .await
+}
+
+struct WorldActorTimers {
+    migration_expiry: tokio::time::Interval,
+    loading_heartbeat: tokio::time::Interval,
+}
+
+impl WorldActorTimers {
+    fn new() -> Self {
+        let mut migration_expiry = tokio::time::interval(Duration::from_secs(1));
+        migration_expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut loading_heartbeat = tokio::time::interval(LOADING_HEARTBEAT_INTERVAL);
+        loading_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        Self {
+            migration_expiry,
+            loading_heartbeat,
+        }
+    }
+}
+
+async fn run_world_actor_with_timers(
+    mut world: World,
     mut receiver: mpsc::Receiver<WorldCommand>,
     mut udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
     sidecars: WorldSidecars,
     clock: ServerClock,
+    mut timers: WorldActorTimers,
 ) -> Result<(), WorldSidecarError> {
-    let mut world = World {
-        identity_capacity: sidecars.identity_capacity(),
-        ..World::default()
-    };
-    let mut migration_expiry = tokio::time::interval(Duration::from_secs(1));
-    migration_expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut loading_heartbeat = tokio::time::interval(LOADING_HEARTBEAT_INTERVAL);
-    loading_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
     loop {
+        // Expiry is first so a perpetually ready control mailbox cannot retain
+        // ownerless identities forever. Commands still precede heartbeat and
+        // UDP work once the once-per-second maintenance tick is serviced.
         tokio::select! {
             biased;
 
+            _ = timers.migration_expiry.tick() => {
+                let now = Instant::now();
+                world.advance_loading(now, &clock);
+                world.expire_migrations(now);
+                flush_identity_lifecycle(&mut world, &sidecars).await?;
+                world.advance_loading(Instant::now(), &clock);
+            }
             command = receiver.recv() => {
                 let Some(command) = command else {
                     break;
@@ -4042,14 +5901,7 @@ async fn run_world(
                     break;
                 }
             }
-            _ = migration_expiry.tick() => {
-                let now = Instant::now();
-                world.advance_loading(now, &clock);
-                world.expire_migrations(now);
-                flush_identity_lifecycle(&mut world, &sidecars).await?;
-                world.advance_loading(Instant::now(), &clock);
-            }
-            _ = loading_heartbeat.tick() => {
+            _ = timers.loading_heartbeat.tick() => {
                 world.advance_loading(Instant::now(), &clock);
             }
             ingress = receive_udp_ingress(&mut udp_receiver) => {
@@ -4171,12 +6023,35 @@ async fn dispatch_command(
     Ok(false)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the actor utility command dispatcher exhaustively owns every reply path"
+)]
 async fn dispatch_utility_command(
     world: &mut World,
     command: WorldCommand,
     sidecars: &WorldSidecars,
 ) -> Result<bool, WorldSidecarError> {
     match command {
+        WorldCommand::PreflightMigration {
+            destination,
+            user_no,
+            channel_id,
+            token,
+            now,
+            reply,
+        } => {
+            let result = world.preflight_migration(destination, user_no, channel_id, token, now);
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::CompletePreflightedMigration {
+            preflight,
+            now,
+            reply,
+        } => {
+            let result = world.complete_preflighted_migration(preflight, now);
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
         WorldCommand::CreateRoom { reply } => {
             let result = world.create_room();
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
@@ -4209,9 +6084,56 @@ async fn dispatch_utility_command(
             let result = world.sessions.len();
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
-        WorldCommand::Shutdown { reply } => {
-            flush_identity_lifecycle(world, sidecars).await?;
+        WorldCommand::TakeDueRewardTasks {
+            now,
+            maximum,
+            reply,
+        } => {
+            let result = world.take_due_reward_tasks(now, maximum);
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::CompleteRewardTask {
+            completion,
+            now,
+            reply,
+        } => {
+            let result = world.complete_reward_task(completion, now);
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::Quiesce { reply } => {
+            world.quiesce();
+            reply_after_identity_lifecycle(world, sidecars, reply, ()).await?;
+        }
+        WorldCommand::RewardDrainStatus { reply } => {
+            let result = world.reward_drain_status();
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::RetryRewardDeadLetter { dead_letter, reply } => {
+            let result = world.retry_reward_dead_letter(dead_letter, Instant::now());
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::Shutdown { reply } => match world.reward_drain_status() {
+            Ok(status) if status.is_drained() => {
+                let lifecycle = flush_identity_lifecycle(world, sidecars).await;
+                world.cancel_all_sessions();
+                lifecycle?;
+                let _ = reply.send(Ok(()));
+                return Ok(true);
+            }
+            Ok(status) => {
+                let _ = reply.send(Err(WorldError::RewardShutdownBlocked {
+                    outstanding_lanes: status.outstanding_lanes.len(),
+                    dead_letters: status.dead_letters.len(),
+                }));
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        },
+        WorldCommand::ForceShutdown { reply } => {
+            let lifecycle = flush_identity_lifecycle(world, sidecars).await;
             world.cancel_all_sessions();
+            lifecycle?;
             let _ = reply.send(());
             return Ok(true);
         }
@@ -4232,10 +6154,215 @@ async fn dispatch_utility_command(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct DueRewardWorld {
+        pub(crate) handle: WorldHandle,
+        pub(crate) actor: JoinHandle<Result<(), WorldSidecarError>>,
+        pub(crate) outbound_receivers: Vec<mpsc::Receiver<OutboundBatch>>,
+    }
+
+    pub(crate) struct PausedFullMailboxWorld {
+        pub(crate) handle: WorldHandle,
+        pub(crate) actor: JoinHandle<Result<(), WorldSidecarError>>,
+        pub(crate) start: oneshot::Sender<()>,
+    }
+
+    fn register_channel_session(
+        world: &mut World,
+        nickname: &str,
+        source_port: u16,
+    ) -> (SessionId, IdentityBinding, mpsc::Receiver<OutboundBatch>) {
+        let source_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world.register_session(SocketAddr::new(source_ip, source_port), None, None);
+        let claimed = world.claim_identity(source, nickname).unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(source_port).unwrap();
+        world
+            .identities
+            .begin_migration(source, channel, token, Instant::now())
+            .unwrap();
+        let (outbound, receiver) = mpsc::channel(SESSION_OUTBOUND_CAPACITY);
+        let destination = world.register_session(
+            SocketAddr::new(source_ip, source_port + 1),
+            None,
+            Some(outbound),
+        );
+        let completion = world
+            .complete_migration(
+                destination,
+                claimed.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .unwrap();
+        (destination, completion.binding, receiver)
+    }
+
+    fn participant() -> RoomParticipant {
+        RoomParticipant {
+            player: RoomPlayer {
+                player_type: 2,
+                user_no: 1,
+                p2p_address: Ipv4Addr::LOCALHOST,
+                p2p_port: 39_312,
+                nickname: "untrusted".to_owned(),
+                emblem_1: 0,
+                emblem_2: 0,
+                rider_item_snapshot: [0; p5136_core::startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+                card: String::new(),
+                rp: 0,
+                team: 0,
+                ranking: 0,
+                rider_school_level: 0,
+                club_name: String::new(),
+                club_mark_logo: 0,
+            },
+            observer: false,
+            kart_physics: P5136KartPhysicsBlock::from([0; 235]),
+        }
+    }
+
+    fn create_room_request(nickname: &str) -> ChCreateRoomRequest {
+        ChCreateRoomRequest {
+            room_name: format!("{nickname} reward"),
+            password: String::new(),
+            game_type: 1,
+            reserved_after_game_type: 0,
+            ai_count: 0,
+            room_data_header: 0,
+            room_data: [0; ROOM_DATA_LENGTH],
+            connection_context: [0; p5136_core::room_protocol::ROOM_CONNECTION_CONTEXT_LENGTH],
+            reserved_before_ai_switch: 0,
+            ai_switch: 0,
+            reserved_after_ai_switch_1: 0,
+            reserved_after_ai_switch_2: 0,
+            reserved_tail: 0,
+            reserved_last: 0,
+        }
+    }
+
+    fn drain(receiver: &mut mpsc::Receiver<OutboundBatch>) {
+        while receiver.try_recv().is_ok() {}
+    }
+
+    pub(crate) fn spawn_due_reward_world(nicknames: &[&str]) -> DueRewardWorld {
+        let mut world = World::default();
+        let clock = ServerClock::new();
+        let mut outbound_receivers = Vec::with_capacity(nicknames.len());
+        let finished_at = Instant::now()
+            .checked_sub(SETTLEMENT_DELAY + Duration::from_secs(1))
+            .unwrap();
+
+        for (index, nickname) in nicknames.iter().enumerate() {
+            let source_port = 46_000 + u16::try_from(index * 2).unwrap();
+            let (session, identity, mut outbound) =
+                register_channel_session(&mut world, nickname, source_port);
+            world
+                .room_protocol(
+                    session,
+                    RoomCommandPayload::Create {
+                        request: create_room_request(nickname),
+                        participant: participant(),
+                    },
+                )
+                .unwrap();
+            let room_id = world.protocol_room_by_user[&identity.user_no];
+            drain(&mut outbound);
+            world
+                .lobby_command(
+                    session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new(),
+                    )),
+                )
+                .unwrap();
+            drain(&mut outbound);
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            room.phase = RoomPhase::Running;
+            room.loading_handshake = LoadingHandshake::Dormant;
+            room.race_progress = RaceProgress::default();
+            world
+                .race_command_with_clock(
+                    session,
+                    RaceCommandPayload::GameControl(GameControlRequest {
+                        state: 2,
+                        optional_pair: None,
+                        value0: 456,
+                        trailing: Vec::new(),
+                    }),
+                    finished_at,
+                    &clock,
+                )
+                .unwrap();
+            drain(&mut outbound);
+            let deadline = world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .deadline;
+            world.advance_loading(deadline, &clock);
+            outbound_receivers.push(outbound);
+        }
+
+        let (sender, receiver) = mpsc::channel(64);
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+        };
+        let actor = tokio::spawn(async move {
+            run_world_actor(world, receiver, None, WorldSidecars::default(), clock).await
+        });
+        DueRewardWorld {
+            handle,
+            actor,
+            outbound_receivers,
+        }
+    }
+
+    pub(crate) fn spawn_paused_full_mailbox_world() -> PausedFullMailboxWorld {
+        let (sender, receiver) = mpsc::channel(1);
+        let (reply, _response) = oneshot::channel();
+        sender
+            .try_send(WorldCommand::SessionCount { reply })
+            .expect("test World mailbox should accept its single queued command");
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+        };
+        let (start, started) = oneshot::channel();
+        let actor = tokio::spawn(async move {
+            let _ = started.await;
+            run_world_actor(
+                World::default(),
+                receiver,
+                None,
+                WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await
+        });
+        PausedFullMailboxWorld {
+            handle,
+            actor,
+            start,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::HashSet,
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        num::NonZeroU64,
         time::{Duration, Instant},
     };
 
@@ -4283,6 +6410,48 @@ mod tests {
         session: SessionId,
         identity: IdentityBinding,
         outbound: mpsc::Receiver<OutboundBatch>,
+    }
+
+    struct CountingRewardRolls {
+        rp: u8,
+        lucci: u16,
+        rp_draws: usize,
+        lucci_draws: usize,
+    }
+
+    fn spawn_prepared_world(
+        world: World,
+        mailbox_capacity: usize,
+    ) -> (WorldHandle, tokio::task::JoinHandle<()>) {
+        let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+        };
+        let actor = tokio::spawn(async move {
+            let result = super::run_world_actor(
+                world,
+                receiver,
+                None,
+                super::WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await;
+            assert!(result.is_ok());
+        });
+        (handle, actor)
+    }
+
+    impl super::RewardRollSource for CountingRewardRolls {
+        fn draw_rp(&mut self) -> u8 {
+            self.rp_draws += 1;
+            self.rp
+        }
+
+        fn draw_lucci(&mut self) -> u16 {
+            self.lucci_draws += 1;
+            self.lucci
+        }
     }
 
     fn register_channel_session(
@@ -4533,6 +6702,121 @@ mod tests {
         room.race_progress = super::RaceProgress::default();
     }
 
+    fn prepare_single_reward_persistence(
+        nickname: &str,
+        port: u16,
+    ) -> (World, TestChannelSession, RoomId, Instant, ServerClock) {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, nickname, 67, port, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, room_id);
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 456),
+                now,
+                &clock,
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        (world, owner, room_id, deadline, clock)
+    }
+
+    fn add_cancellable_session(world: &mut World, port: u16) -> oneshot::Receiver<()> {
+        let (cancellation, cancelled) = oneshot::channel();
+        world.register_session(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            Some(cancellation),
+            None,
+        );
+        cancelled
+    }
+
+    fn complete_all_due_rewards(
+        world: &mut World,
+        now: Instant,
+    ) -> Vec<super::RewardSettlementTask> {
+        let tasks = world
+            .take_due_reward_tasks(now, super::ROOM_CAPACITY)
+            .unwrap();
+        for (index, task) in tasks.iter().enumerate() {
+            assert_eq!(
+                world
+                    .complete_reward_task(
+                        durable_completion(task, 50_000 + u32::try_from(index).unwrap()),
+                        now,
+                    )
+                    .unwrap(),
+                super::RewardCompletionDisposition::Applied
+            );
+        }
+        tasks
+    }
+
+    fn applied_reward(
+        task: &super::RewardSettlementTask,
+        current_lucci: u32,
+    ) -> p5136_profile::AppliedTimeReward {
+        p5136_profile::AppliedTimeReward {
+            current_rp: p5136_profile::DEFAULT_RP,
+            earned_rp: task.proposed_reward().earned_rp(),
+            earned_lucci: task.proposed_reward().earned_lucci(),
+            current_lucci,
+        }
+    }
+
+    fn durable_completion(
+        task: &super::RewardSettlementTask,
+        current_lucci: u32,
+    ) -> super::RewardPersistenceCompletion {
+        durable_completion_with_key(task, task, current_lucci)
+    }
+
+    fn durable_completion_with_key(
+        task: &super::RewardSettlementTask,
+        key_task: &super::RewardSettlementTask,
+        current_lucci: u32,
+    ) -> super::RewardPersistenceCompletion {
+        let root = tempfile::tempdir().unwrap();
+        let store = p5136_profile::ProfileStore::new(root.path());
+        store.load_or_create(key_task.nickname()).unwrap();
+        let lease = store.acquire_race_run_lease().unwrap();
+        let recipient = store
+            .bind_race_reward_recipient(&lease, key_task.nickname(), key_task.user_no().get())
+            .unwrap();
+        let fence = key_task.fence();
+        let key = p5136_profile::RaceRewardKey::new(
+            &recipient,
+            &lease,
+            fence.room_id().0,
+            fence.race_epoch(),
+        )
+        .unwrap();
+        let receipt = crate::profile_io::DurableRewardReceipt::for_test(
+            task.clone(),
+            key,
+            applied_reward(task, current_lucci),
+        );
+        super::RewardPersistenceCompletion::Durable(receipt)
+    }
+
     fn set_result_admission(
         world: &mut World,
         room_id: RoomId,
@@ -4763,7 +7047,10 @@ mod tests {
 
         let committed = world.protocol_rooms[&room_id].clone();
         assert_eq!(committed.phase, RoomPhase::Loading);
-        assert_eq!(committed.race_epoch, 1);
+        assert_eq!(
+            committed.race_fence.map(|fence| fence.race_epoch.get()),
+            Some(1)
+        );
         assert!(committed.frozen_race.is_some());
         assert!(matches!(
             world.lobby_command(
@@ -5515,6 +7802,9 @@ mod tests {
             adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
         );
         assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Settling);
+        let reward_tasks =
+            complete_all_due_rewards(&mut world, deadline + Duration::from_millis(1));
+        assert_eq!(reward_tasks.len(), 2);
 
         world.advance_loading(deadline + Duration::from_millis(2), &clock);
         for receiver in [&mut owner.outbound, &mut guest.outbound] {
@@ -5534,6 +7824,195 @@ mod tests {
             );
         }
         assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Lobby);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reward_sampling_is_once_retry_stable_and_one_slow_receipt_gates_final() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "RewardOwner", 67, 41_900, 64);
+        let mut guest = register_channel_session(&mut world, "RewardGuest", 67, 41_901, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        force_running(&mut world, room_id);
+
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 123),
+                now,
+                &clock,
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        let mut rolls = CountingRewardRolls {
+            rp: 7,
+            lucci: 11,
+            rp_draws: 0,
+            lucci_draws: 0,
+        };
+        world.advance_loading_with_reward_source(deadline, &clock, &mut rolls);
+        assert_eq!((rolls.rp_draws, rolls.lucci_draws), (2, 2));
+        world.advance_loading_with_reward_source(deadline, &clock, &mut rolls);
+        assert_eq!(
+            (rolls.rp_draws, rolls.lucci_draws),
+            (2, 2),
+            "a heartbeat must not resample frozen rewards"
+        );
+
+        let first = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let first_attempt = first.attempt_id;
+        let first_proposal = first.proposed_reward;
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(first.clone()),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::RetryScheduled { failure_count: 1 }
+        );
+
+        let second = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(second.user_no, first.user_no);
+        let second_applied = applied_reward(&second, 60_000);
+        assert_eq!(
+            world
+                .complete_reward_task(durable_completion(&second, 60_000), deadline,)
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+        assert!(matches!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Persisting { .. }
+        ));
+        assert!(
+            world
+                .take_due_reward_tasks(deadline + Duration::from_millis(99), super::ROOM_CAPACITY,)
+                .unwrap()
+                .is_empty()
+        );
+
+        let retry = world
+            .take_due_reward_tasks(deadline + Duration::from_millis(100), super::ROOM_CAPACITY)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(retry.user_no, first.user_no);
+        assert_eq!(retry.proposed_reward, first_proposal);
+        assert_ne!(retry.attempt_id, first_attempt);
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(retry.clone()),
+                    deadline + Duration::from_millis(100),
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+        let status = world.reward_drain_status().unwrap();
+        assert_eq!(status.outstanding_lanes().len(), 2);
+        assert_eq!(status.terminal_count(), 1);
+        let dead_letter = status.dead_letters()[0].clone();
+        let reset_at = deadline + Duration::from_millis(101);
+        world
+            .retry_reward_dead_letter(dead_letter, reset_at)
+            .unwrap();
+        let settlement = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap();
+        let super::SettlementFinalization::Persisting { rewards, .. } = &settlement.finalization
+        else {
+            panic!("dead-letter reset must restore persistence");
+        };
+        assert!(rewards.iter().any(|reward| {
+            reward.user_no == second.user_no
+                && reward.status == super::RewardPersistenceStatus::Durable(second_applied)
+        }));
+        assert!(rewards.iter().any(|reward| {
+            reward.user_no == first.user_no
+                && matches!(
+                    reward.status,
+                    super::RewardPersistenceStatus::Queued {
+                        due_at,
+                        failure_count: 0,
+                    } if due_at == reset_at
+                )
+        }));
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(retry.clone()),
+                    reset_at,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        let retry_after_reset = world
+            .take_due_reward_tasks(reset_at, super::ROOM_CAPACITY)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(retry_after_reset.user_no, first.user_no);
+        assert_eq!(retry_after_reset.proposed_reward, first_proposal);
+        assert_ne!(retry_after_reset.attempt_id, retry.attempt_id);
+        assert_eq!(
+            world
+                .complete_reward_task(durable_completion(&retry_after_reset, 60_001), reset_at,)
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+        assert!(matches!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Ready { .. }
+        ));
     }
 
     #[test]
@@ -5813,6 +8292,17 @@ mod tests {
             world.protocol_rooms[&room_id].race_progress.finish_times,
             progress.finish_times
         );
+        assert!(matches!(
+            &world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Persisting { rewards, .. } if rewards.len() == 4
+        ));
+        let reward_tasks = complete_all_due_rewards(&mut world, settlement.deadline);
+        assert_eq!(reward_tasks.len(), 4);
         let frozen_final_packets = match &world.protocol_rooms[&room_id]
             .race_progress
             .settlement
@@ -5820,8 +8310,8 @@ mod tests {
             .unwrap()
             .finalization
         {
-            super::SettlementFinalization::Ready { packets } => packets.clone(),
-            state => panic!("deadline must freeze final packets once, got {state:?}"),
+            super::SettlementFinalization::Ready { packets, .. } => packets.clone(),
+            state => panic!("durable receipts must freeze final packets once, got {state:?}"),
         };
         assert!(p1.outbound.try_recv().is_err());
         assert!(p3.outbound.try_recv().is_err());
@@ -5848,7 +8338,7 @@ mod tests {
                 .unwrap()
                 .finalization
             {
-                super::SettlementFinalization::Ready { packets } => packets,
+                super::SettlementFinalization::Ready { packets, .. } => packets,
                 state => panic!("blocked finalization changed state to {state:?}"),
             },
             &frozen_final_packets
@@ -5908,18 +8398,26 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(result[p0_record + 18..p0_record + 22].try_into().unwrap()),
-            3_010
+            p5136_profile::DEFAULT_RP
         );
-        for offset in [22, 26, 30] {
-            assert_eq!(
-                u32::from_le_bytes(
-                    result[p0_record + offset..p0_record + offset + 4]
-                        .try_into()
-                        .unwrap()
-                ),
-                0
-            );
-        }
+        let (p0_reward_index, p0_reward) = reward_tasks
+            .iter()
+            .enumerate()
+            .find(|(_, task)| task.user_no == p0.identity.user_no)
+            .map(|(index, task)| (index, task.proposed_reward))
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(result[p0_record + 22..p0_record + 26].try_into().unwrap()),
+            p0_reward.earned_rp()
+        );
+        assert_eq!(
+            u32::from_le_bytes(result[p0_record + 26..p0_record + 30].try_into().unwrap()),
+            p0_reward.earned_lucci()
+        );
+        assert_eq!(
+            u32::from_le_bytes(result[p0_record + 30..p0_record + 34].try_into().unwrap()),
+            50_000 + u32::try_from(p0_reward_index).unwrap()
+        );
         assert_eq!(
             i32::from_le_bytes(result[p0_record + 63..p0_record + 67].try_into().unwrap()),
             10
@@ -5950,7 +8448,7 @@ mod tests {
         assert_eq!(room.phase, RoomPhase::Lobby);
         assert!(room.frozen_race.is_none());
         assert_eq!(room.race_progress, super::RaceProgress::default());
-        assert_eq!(room.race_epoch, 1);
+        assert!(room.race_fence.is_none());
         assert!(
             room.members_by_id
                 .iter()
@@ -5984,12 +8482,13 @@ mod tests {
             }
         }
         let lobby_snapshot = world.protocol_rooms[&room_id].clone();
+        let fence = super::RaceFence::new(room_id, GlobalRaceEpoch::new(1).unwrap());
         let frozen = world
-            .freeze_race_roster(&lobby_snapshot, 1, 0x1111_2222)
+            .freeze_race_roster(&lobby_snapshot, fence, 0x1111_2222)
             .unwrap();
         let room = world.protocol_rooms.get_mut(&room_id).unwrap();
         room.phase = RoomPhase::Settling;
-        room.race_epoch = 1;
+        room.race_fence = Some(fence);
         room.frozen_race = Some(frozen);
         room.race_progress.settlement = Some(super::SettlementState {
             end_tick: 10_000,
@@ -6172,6 +8671,15 @@ mod tests {
         );
 
         world.advance_loading(deadline, &clock);
+        assert!(world.protocol_rooms.contains_key(&room_id));
+        assert!(
+            !world
+                .free_protocol_room_ids
+                .contains(&u16::try_from(room_id.0).unwrap())
+        );
+        let reward_tasks = complete_all_due_rewards(&mut world, deadline);
+        assert_eq!(reward_tasks.len(), 1);
+        world.advance_loading(deadline + Duration::from_millis(1), &clock);
         assert!(!world.protocol_rooms.contains_key(&room_id));
         assert!(
             world
@@ -6179,6 +8687,982 @@ mod tests {
                 .contains(&u16::try_from(room_id.0).unwrap())
         );
         assert_eq!(create_protocol_room(&mut world, &third, 1), room_id);
+    }
+
+    #[test]
+    fn running_disconnect_keeps_lane_and_reconnect_cannot_start_until_durable_final() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "LaneOwner", 67, 42_311, 64);
+        let old_user = owner.identity.user_no;
+        let old_room = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, old_room);
+        let old_fence = world.reward_lanes[&old_user];
+
+        world.close_session(owner.session, Instant::now());
+        assert_eq!(world.reward_lanes.get(&old_user), Some(&old_fence));
+        assert!(world.protocol_rooms[&old_room].is_empty());
+
+        let mut replacement = register_channel_session(&mut world, "LaneOwner", 67, 42_312, 64);
+        assert_eq!(replacement.identity.user_no, old_user);
+        let new_room = create_protocol_room(&mut world, &replacement, 1);
+        drain_batches(&mut replacement.outbound);
+        assert!(matches!(
+            world.lobby_command(
+                replacement.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            ),
+            Err(WorldError::Lobby(LobbyError::RewardLaneOccupied {
+                user_no,
+                room_id,
+                race_epoch,
+            })) if user_no == old_user.get()
+                && room_id == old_room.0
+                && race_epoch == old_fence.race_epoch.get()
+        ));
+        drain_batches(&mut replacement.outbound);
+
+        let clock = ServerClock::new();
+        let now = Instant::now();
+        world.advance_loading(now, &clock);
+        let deadline = world.protocol_rooms[&old_room]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        assert_eq!(complete_all_due_rewards(&mut world, deadline).len(), 1);
+        world.advance_loading(deadline + Duration::from_millis(1), &clock);
+        assert!(!world.reward_lanes.contains_key(&old_user));
+        assert!(!world.protocol_rooms.contains_key(&old_room));
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    replacement.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new(),
+                    )),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started { room_id, .. } if room_id == new_room
+        ));
+    }
+
+    #[test]
+    fn loading_abort_releases_only_its_exact_reward_lane() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "AbortLane", 67, 42_321, 64);
+        let user_no = owner.identity.user_no;
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        assert!(world.reward_lanes.contains_key(&user_no));
+
+        world
+            .room_protocol(owner.session, RoomCommandPayload::Leave)
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        assert!(!world.protocol_rooms.contains_key(&room_id));
+        assert!(!world.reward_lanes.contains_key(&user_no));
+
+        let next_room = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new(),
+                    )),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started { room_id, .. } if room_id == next_room
+        ));
+    }
+
+    #[test]
+    fn reward_completions_are_fenced_by_room_epoch_user_and_attempt() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "FenceReward", 67, 42_331, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, room_id);
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 321),
+                now,
+                &clock,
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        let task = world
+            .take_due_reward_tasks(deadline, super::ROOM_CAPACITY)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut stale_room = task.clone();
+        stale_room.fence.room_id = RoomId(task.fence.room_id.0 + 1);
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(stale_room),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        let mut stale_epoch = task.clone();
+        stale_epoch.fence.race_epoch =
+            GlobalRaceEpoch::new(task.fence.race_epoch.get() + 1).unwrap();
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(stale_epoch),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        let mut stale_attempt = task.clone();
+        stale_attempt.attempt_id =
+            super::RewardAttemptId(NonZeroU64::new(task.attempt_id.0.get() + 1).unwrap());
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(stale_attempt),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+
+        assert_eq!(
+            world
+                .complete_reward_task(durable_completion(&task, 70_000), deadline)
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+        assert!(matches!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Ready { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reward_task_handle_commands_preserve_actor_fencing() {
+        let (handle, actor) = WorldHandle::spawn(8);
+        assert!(
+            handle
+                .take_due_reward_tasks(Instant::now(), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let task = super::RewardSettlementTask::for_test(
+            RoomId(1),
+            GlobalRaceEpoch::new(1).unwrap(),
+            NonZeroU64::MIN,
+            crate::UserNo::new(1).unwrap(),
+            "NoSuchReward",
+            p5136_profile::time_reward_from_rolls(0, 0, 0).unwrap(),
+        );
+        assert_eq!(
+            handle
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(task),
+                    Instant::now(),
+                )
+                .await
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_migration_timer_precedes_ready_command_mailbox() {
+        let mut world = World::default();
+        let source_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world.register_session(SocketAddr::new(source_ip, 43_250), None, None);
+        let original = world.claim_identity(source, "ExpiredOwnerless").unwrap();
+        let issued_at = Instant::now()
+            .checked_sub(crate::MIGRATION_TTL + Duration::from_secs(1))
+            .unwrap();
+        world
+            .identities
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 67,
+                    game_type: 67,
+                },
+                MigrationToken::new(43_250).unwrap(),
+                issued_at,
+            )
+            .unwrap();
+        world.close_session(source, issued_at + Duration::from_secs(1));
+        let replacement = world.register_session(SocketAddr::new(source_ip, 43_251), None, None);
+
+        let (sender, receiver) = mpsc::channel(4);
+        let (reply, response) = oneshot::channel();
+        sender
+            .try_send(super::WorldCommand::ClaimIdentity {
+                session: replacement,
+                nickname: "ExpiredOwnerless".to_owned(),
+                reply,
+            })
+            .unwrap();
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+        };
+        let mut migration_expiry = tokio::time::interval(Duration::from_secs(60));
+        migration_expiry.tick().await;
+        migration_expiry.reset_immediately();
+        let mut loading_heartbeat = tokio::time::interval(Duration::from_secs(60));
+        loading_heartbeat.tick().await;
+        loading_heartbeat.reset();
+        let actor = tokio::spawn(async move {
+            super::run_world_actor_with_timers(
+                world,
+                receiver,
+                None,
+                super::WorldSidecars::default(),
+                ServerClock::new(),
+                super::WorldActorTimers {
+                    migration_expiry,
+                    loading_heartbeat,
+                },
+            )
+            .await
+        });
+
+        let rebound = response.await.unwrap().unwrap();
+        assert_eq!(rebound.owner, replacement);
+        assert_eq!(rebound.user_no, original.user_no);
+        assert!(rebound.generation.get() > original.generation.get());
+        handle.force_shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn guarded_shutdown_refuses_loading_queued_and_inflight_reward_lanes() {
+        async fn assert_refused(
+            mut world: World,
+            cancellation_port: u16,
+            expected_dead_letters: usize,
+        ) {
+            let mut cancelled = add_cancellable_session(&mut world, cancellation_port);
+            let expected_lanes = world.reward_lanes.len();
+            assert!(expected_lanes > 0);
+            let (handle, actor) = spawn_prepared_world(world, 16);
+            assert!(matches!(
+                handle.shutdown().await,
+                Err(WorldError::RewardShutdownBlocked {
+                    outstanding_lanes,
+                    dead_letters,
+                }) if outstanding_lanes == expected_lanes
+                    && dead_letters == expected_dead_letters
+            ));
+            let status = handle.reward_drain_status().await.unwrap();
+            assert_eq!(status.outstanding_lanes().len(), expected_lanes);
+            assert_eq!(status.dead_letters().len(), expected_dead_letters);
+            assert!(!status.is_drained());
+            assert_eq!(
+                cancelled.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            );
+            handle.force_shutdown().await.unwrap();
+            assert_eq!(cancelled.await, Ok(()));
+            actor.await.unwrap();
+        }
+
+        let mut loading_world = World::default();
+        let mut loading_owner =
+            register_channel_session(&mut loading_world, "ShutdownLoading", 67, 42_360, 64);
+        let loading_room = create_protocol_room(&mut loading_world, &loading_owner, 1);
+        drain_batches(&mut loading_owner.outbound);
+        loading_world
+            .lobby_command(
+                loading_owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut loading_owner.outbound);
+        assert_eq!(
+            loading_world.protocol_rooms[&loading_room].phase,
+            RoomPhase::Loading
+        );
+        assert_refused(loading_world, 42_361, 0).await;
+
+        let (queued_world, _owner, _room_id, _deadline, _clock) =
+            prepare_single_reward_persistence("ShutdownQueued", 42_362);
+        assert_refused(queued_world, 42_363, 0).await;
+
+        let (mut in_flight_world, _owner, _room_id, deadline, _clock) =
+            prepare_single_reward_persistence("ShutdownInFlight", 42_364);
+        assert_eq!(
+            in_flight_world
+                .take_due_reward_tasks(deadline, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_refused(in_flight_world, 42_365, 0).await;
+
+        let (mut failed_world, _owner, _room_id, deadline, _clock) =
+            prepare_single_reward_persistence("ShutdownDeadLetter", 42_367);
+        let task = failed_world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            failed_world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(task),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+        assert_refused(failed_world, 42_368, 1).await;
+    }
+
+    #[tokio::test]
+    async fn drained_shutdown_explicitly_cancels_sessions() {
+        let mut world = World::default();
+        let cancelled = add_cancellable_session(&mut world, 42_366);
+        let (handle, actor) = spawn_prepared_world(world, 8);
+        handle.shutdown().await.unwrap();
+        assert_eq!(cancelled.await, Ok(()));
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_preflight_handle_is_read_only_and_rechecks_destination_liveness() {
+        let (handle, actor) = WorldHandle::spawn(16);
+        let source = handle
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_350))
+            .await
+            .unwrap();
+        let source_identity = handle
+            .claim_identity(source, "PreflightRider")
+            .await
+            .unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let migration_token = MigrationToken::new(777).unwrap();
+        handle
+            .begin_migration(source, channel, migration_token, Instant::now())
+            .await
+            .unwrap();
+        let first_destination = handle
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_351))
+            .await
+            .unwrap();
+        let preflight = handle
+            .preflight_migration(
+                first_destination,
+                source_identity.user_no,
+                channel.channel_id,
+                migration_token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.nickname(), "PreflightRider");
+        assert_eq!(preflight.canonical_nickname(), "preflightrider");
+        assert_eq!(preflight.user_no(), source_identity.user_no);
+        assert_eq!(preflight.source_generation(), source_identity.generation);
+        assert_eq!(
+            handle.authorize_identity(source).await.unwrap(),
+            source_identity
+        );
+
+        handle.session_closed(first_destination).await.unwrap();
+        assert!(matches!(
+            handle
+                .complete_preflighted_migration(preflight, Instant::now())
+                .await,
+            Err(WorldError::UnknownSession(session)) if session == first_destination
+        ));
+
+        let second_destination = handle
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_352))
+            .await
+            .unwrap();
+        let preflight = handle
+            .preflight_migration(
+                second_destination,
+                source_identity.user_no,
+                channel.channel_id,
+                migration_token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let completion = handle
+            .complete_preflighted_migration(preflight, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(completion.binding.owner, second_destination);
+        assert!(completion.binding.generation.get() > source_identity.generation.get());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[test]
+    fn reward_retry_failures_are_bounded_and_end_in_an_observable_terminal_state() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "RetryBound", 67, 42_341, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, room_id);
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 456),
+                now,
+                &clock,
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+
+        let mut due_at = deadline;
+        let mut proposal = None;
+        for failure_count in 1..=super::MAX_REWARD_PERSISTENCE_FAILURES {
+            let task = world
+                .take_due_reward_tasks(due_at, super::ROOM_CAPACITY)
+                .unwrap()
+                .pop()
+                .unwrap();
+            if let Some(proposal) = proposal {
+                assert_eq!(task.proposed_reward, proposal);
+            } else {
+                proposal = Some(task.proposed_reward);
+            }
+            let disposition = world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(task),
+                    due_at,
+                )
+                .unwrap();
+            if failure_count == super::MAX_REWARD_PERSISTENCE_FAILURES {
+                assert_eq!(
+                    disposition,
+                    super::RewardCompletionDisposition::TerminalFailure
+                );
+            } else {
+                assert_eq!(
+                    disposition,
+                    super::RewardCompletionDisposition::RetryScheduled { failure_count }
+                );
+                due_at += super::reward_retry_delay(failure_count);
+            }
+        }
+        assert!(matches!(
+            &world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Failed(failed)
+                if failed.reason == super::RewardTerminalReason::RewardPersistence
+        ));
+        assert!(world.reward_lanes.contains_key(&owner.identity.user_no));
+    }
+
+    #[test]
+    fn abandoned_reward_attempt_lease_requeues_same_proposal_and_fences_late_completion() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "LeaseRetry", 67, 42_342, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, room_id);
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 654),
+                now,
+                &clock,
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        let abandoned = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let lease_expired = deadline + super::REWARD_ATTEMPT_LEASE;
+        assert!(
+            world
+                .take_due_reward_tasks(lease_expired, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            world
+                .complete_reward_task(durable_completion(&abandoned, 80_000), lease_expired,)
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+
+        let retry_at = lease_expired + super::reward_retry_delay(1);
+        let retry = world
+            .take_due_reward_tasks(retry_at, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(retry.fence, abandoned.fence);
+        assert_eq!(retry.user_no, abandoned.user_no);
+        assert_eq!(retry.nickname, abandoned.nickname);
+        assert_eq!(retry.proposed_reward, abandoned.proposed_reward);
+        assert_ne!(retry.attempt_id, abandoned.attempt_id);
+        assert_eq!(
+            world
+                .complete_reward_task(durable_completion(&retry, 80_001), retry_at,)
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+    }
+
+    #[test]
+    fn quiesce_atomically_blocks_new_starts_but_existing_settlement_drains() {
+        let mut lobby_world = World::default();
+        let mut lobby_owner =
+            register_channel_session(&mut lobby_world, "QuiesceLobby", 67, 42_343, 64);
+        let lobby_room = create_protocol_room(&mut lobby_world, &lobby_owner, 1);
+        drain_batches(&mut lobby_owner.outbound);
+        let next_epoch = lobby_world.next_race_epoch;
+        lobby_world.quiesce();
+        lobby_world.quiesce();
+        assert!(matches!(
+            lobby_world.lobby_command(
+                lobby_owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new(),)),
+            ),
+            Err(WorldError::Lobby(LobbyError::WorldQuiescing))
+        ));
+        assert_eq!(lobby_world.next_race_epoch, next_epoch);
+        assert!(lobby_world.reward_lanes.is_empty());
+        assert_eq!(
+            lobby_world.protocol_rooms[&lobby_room].phase,
+            RoomPhase::Lobby
+        );
+        let rejection = take_packets(&mut lobby_owner.outbound);
+        assert_eq!(rejection.len(), 1);
+        assert_eq!(
+            logical_packet_hash(&rejection[0]),
+            adler32::packet_hash(START_ROOM_REPLY_NAME)
+        );
+
+        let (mut settling_world, _owner, room_id, deadline, _clock) =
+            prepare_single_reward_persistence("QuiesceDrain", 42_344);
+        settling_world.quiesce();
+        let task = settling_world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            settling_world
+                .complete_reward_task(durable_completion(&task, 81_000), deadline)
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+        assert!(matches!(
+            settling_world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn completion_at_or_after_lease_deadline_expires_before_it_can_apply() {
+        for (index, lateness) in [Duration::ZERO, Duration::from_nanos(1)]
+            .into_iter()
+            .enumerate()
+        {
+            let port = 42_345 + u16::try_from(index).unwrap();
+            let (mut world, _owner, room_id, deadline, _clock) =
+                prepare_single_reward_persistence(&format!("LeaseBoundary{index}"), port);
+            let task = world
+                .take_due_reward_tasks(deadline, 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let completion_time = deadline + super::REWARD_ATTEMPT_LEASE + lateness;
+            assert_eq!(
+                world
+                    .complete_reward_task(
+                        super::RewardPersistenceCompletion::RetryableFailure(task.clone()),
+                        completion_time,
+                    )
+                    .unwrap(),
+                super::RewardCompletionDisposition::IgnoredStale
+            );
+            let settlement = world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap();
+            let super::SettlementFinalization::Persisting { rewards, .. } =
+                &settlement.finalization
+            else {
+                panic!("expired completion must leave retryable persistence state");
+            };
+            assert!(matches!(
+                rewards[0].status,
+                super::RewardPersistenceStatus::Queued {
+                    due_at,
+                    failure_count: 1,
+                } if due_at == completion_time + super::reward_retry_delay(1)
+            ));
+            assert!(
+                world
+                    .take_due_reward_tasks(completion_time, 1)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_reward_state_is_queryable_inert_and_explicitly_retryable() {
+        let (mut world, owner, room_id, deadline, clock) =
+            prepare_single_reward_persistence("DeadLetterRetry", 42_347);
+        let task = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let proposal = task.proposed_reward();
+        let attempt_id = task.attempt_id();
+        assert_eq!(task.canonical_nickname(), "deadletterretry");
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(task.clone()),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+        let retained = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .finalization
+            .clone();
+        let super::SettlementFinalization::Failed(failed) = &retained else {
+            panic!("fatal persistence must retain a dead letter");
+        };
+        assert!(failed.ranking.is_some());
+        assert_eq!(failed.rewards.len(), 1);
+        assert_eq!(failed.rewards[0].proposed_reward, proposal);
+        assert_eq!(
+            failed.reason,
+            super::RewardTerminalReason::RewardPersistence
+        );
+
+        let status = world.reward_drain_status().unwrap();
+        assert!(!status.is_drained());
+        assert_eq!(status.terminal_count(), 1);
+        assert_eq!(status.outstanding_lanes().len(), 1);
+        assert_eq!(
+            status.outstanding_lanes()[0].phase(),
+            super::RewardLanePhase::Terminal
+        );
+        let dead_letter = status.dead_letters()[0].clone();
+        let original_dead_letter = dead_letter.clone();
+        assert_eq!(dead_letter.fence(), task.fence());
+        assert_eq!(dead_letter.failed_attempt_id(), Some(attempt_id));
+        assert_eq!(dead_letter.failed_user_no(), Some(owner.identity.user_no));
+        assert_eq!(dead_letter.failed_nickname(), Some("DeadLetterRetry"));
+        assert_eq!(
+            dead_letter.failed_canonical_nickname(),
+            Some("deadletterretry")
+        );
+        assert_eq!(dead_letter.failed_proposed_reward(), Some(proposal));
+
+        world.advance_loading(deadline + Duration::from_secs(60), &clock);
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            retained
+        );
+
+        let reset_at = deadline + Duration::from_secs(61);
+        world
+            .retry_reward_dead_letter(dead_letter.clone(), reset_at)
+            .unwrap();
+        let reset_state = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .finalization
+            .clone();
+        let super::SettlementFinalization::Persisting { ranking, rewards } = &reset_state else {
+            panic!("explicit reconciliation must restore persistence");
+        };
+        assert_eq!(ranking, failed.ranking.as_ref().unwrap());
+        assert_eq!(rewards[0].proposed_reward, proposal);
+        assert!(matches!(
+            rewards[0].status,
+            super::RewardPersistenceStatus::Queued {
+                due_at,
+                failure_count: 0,
+            } if due_at == reset_at
+        ));
+        assert!(matches!(
+            world.retry_reward_dead_letter(dead_letter, reset_at),
+            Err(WorldError::StaleRewardDeadLetter)
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            reset_state
+        );
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(task),
+                    reset_at,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        let retry = world
+            .take_due_reward_tasks(reset_at, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(retry.proposed_reward(), proposal);
+        assert_ne!(retry.attempt_id(), attempt_id);
+        let retry_attempt_id = retry.attempt_id();
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(retry),
+                    reset_at,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+        let reterminalized_status = world.reward_drain_status().unwrap();
+        let reterminalized = &reterminalized_status.dead_letters()[0];
+        assert_eq!(reterminalized.fence(), original_dead_letter.fence());
+        assert_eq!(reterminalized.failed_attempt_id(), Some(retry_attempt_id));
+        assert_ne!(
+            reterminalized.failed_attempt_id(),
+            original_dead_letter.failed_attempt_id()
+        );
+        assert!(matches!(
+            world.retry_reward_dead_letter(original_dead_letter, reset_at),
+            Err(WorldError::StaleRewardDeadLetter)
+        ));
+    }
+
+    #[test]
+    fn reward_completion_revalidates_exact_and_canonical_nickname_stamp() {
+        let (mut world, _owner, _room_id, deadline, _clock) =
+            prepare_single_reward_persistence("NicknameStamp", 42_348);
+        let task = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let mut wrong_exact = task.clone();
+        wrong_exact.nickname = "nicknamestamp".to_owned();
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(wrong_exact),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        let mut wrong_canonical = task.clone();
+        wrong_canonical.canonical_nickname.push('x');
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(wrong_canonical),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(task),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+    }
+
+    #[test]
+    fn durable_receipt_key_must_match_the_writer_owned_task_stamp() {
+        let (mut world, _owner, room_id, deadline, _clock) =
+            prepare_single_reward_persistence("ReceiptStamp", 42_349);
+        let task = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let wrong_key_task = super::RewardSettlementTask::for_test(
+            task.fence().room_id(),
+            task.fence().race_epoch(),
+            NonZeroU64::new(task.attempt_id().get()).unwrap(),
+            task.user_no(),
+            "DifferentRecipient",
+            task.proposed_reward(),
+        );
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    durable_completion_with_key(&task, &wrong_key_task, 82_000),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+        let settlement = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            &settlement.finalization,
+            super::SettlementFinalization::Failed(failed)
+                if failed.reason == super::RewardTerminalReason::RewardReceiptMismatch
+        ));
+    }
+
+    #[test]
+    fn dead_letter_alone_never_satisfies_the_shutdown_drain_barrier() {
+        let (mut world, _owner, _room_id, deadline, _clock) =
+            prepare_single_reward_persistence("DeadLetterBarrier", 42_350);
+        let task = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::FatalFailure(task),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::TerminalFailure
+        );
+
+        // Simulate a future invariant regression: the terminal settlement is
+        // still authoritative even if its redundant lane index is missing.
+        world.reward_lanes.clear();
+        let status = world.reward_drain_status().unwrap();
+        assert!(status.outstanding_lanes().is_empty());
+        assert_eq!(status.terminal_count(), 1);
+        assert!(!status.is_drained());
     }
 
     #[test]
@@ -6556,6 +10040,23 @@ mod tests {
             Err(WorldError::Lobby(LobbyError::RaceEpochExhausted))
         ));
         assert_eq!(world.protocol_rooms[&second_room], before);
+    }
+
+    #[test]
+    fn reward_attempt_ids_are_unique_nonzero_and_maximum_is_allocated_once() {
+        let mut world = World::default();
+        let first = world.allocate_reward_attempt_id().unwrap();
+        let second = world.allocate_reward_attempt_id().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first.0.get(), 0);
+        assert_ne!(second.0.get(), 0);
+
+        world.next_reward_attempt_id = NonZeroU64::new(u64::MAX);
+        assert_eq!(
+            world.allocate_reward_attempt_id(),
+            Some(super::RewardAttemptId(NonZeroU64::new(u64::MAX).unwrap()))
+        );
+        assert_eq!(world.allocate_reward_attempt_id(), None);
     }
 
     #[tokio::test]

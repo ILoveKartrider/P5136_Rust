@@ -788,7 +788,11 @@ fn validate_stored_recipient(
     let nickname_matches = key
         .canonical_nickname()
         .is_none_or(|nickname| nickname == recipient.canonical_nickname);
-    if nickname_matches && key.user_no == recipient.user_no {
+    // User numbers are allocated by the server process. They fence recipients
+    // within one durable run, but may legitimately change after a restart.
+    let user_matches =
+        key.run_generation() != Some(recipient.run_generation) || key.user_no == recipient.user_no;
+    if nickname_matches && user_matches {
         Ok(())
     } else {
         Err(recipient_mismatch("persisted", recipient, key))
@@ -893,7 +897,7 @@ pub const fn finish_reward(reward_type: u8) -> TimeReward {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{io, num::NonZeroU32};
 
     use tempfile::tempdir;
 
@@ -1288,7 +1292,9 @@ mod tests {
                 lease_generation,
             }) if recipient_generation.get() == 1 && lease_generation.get() == 2
         ));
-        let second_recipient = bind_recipient(&store, &second_lease, "rIDER", 42);
+        // A restarted server can assign a different process-local user number
+        // when riders reconnect in another order.
+        let second_recipient = bind_recipient(&store, &second_lease, "rIDER", 7);
         let second_key = reward_key(&second_recipient, &second_lease, 8, 1);
         let second = apply_race_reward_once(
             &store,
@@ -1492,6 +1498,48 @@ mod tests {
             store.load_or_create("Rider").unwrap().profile.rider.lucci,
             1_000_000
         );
+    }
+
+    #[test]
+    fn stored_user_number_mismatch_remains_fenced_within_one_run() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let lease = store.acquire_race_run_lease().unwrap();
+        store.load_or_create("Rider").unwrap();
+        let recipient = bind_recipient(&store, &lease, "Rider", 42);
+        let first_key = reward_key(&recipient, &lease, 7, 11);
+        apply_race_reward_once(
+            &store,
+            &lease,
+            &recipient,
+            &first_key,
+            TimeReward::new(3, 7).unwrap(),
+        )
+        .unwrap();
+        store
+            .update("Rider", |profile| {
+                profile.race_reward_receipt.as_mut().unwrap().key.user_no =
+                    NonZeroU32::new(7).unwrap();
+            })
+            .unwrap();
+
+        let next_key = reward_key(&recipient, &lease, 8, 12);
+        assert!(matches!(
+            apply_race_reward_once(
+                &store,
+                &lease,
+                &recipient,
+                &next_key,
+                TimeReward::new(5, 11).unwrap(),
+            ),
+            Err(RaceRewardPersistenceError::Binding(
+                RaceRewardBindingError::RecipientMismatch {
+                    context: "persisted",
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(store.load_or_create("Rider").unwrap().revision, Some(3));
     }
 
     #[test]

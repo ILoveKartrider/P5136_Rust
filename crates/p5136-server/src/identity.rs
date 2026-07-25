@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     net::IpAddr,
     num::NonZeroU16,
     time::{Duration, Instant},
@@ -91,6 +92,109 @@ pub struct MigrationPermit {
     pub expires_at: Instant,
 }
 
+/// Read-only proof that a channel migration request was fully validated.
+///
+/// Fields are private so only [`IdentityRegistry::preflight_migration`] can
+/// mint a ticket. Consuming it revalidates the destination, permit, source
+/// generation/source state and expiry; a ticket is never an authorization
+/// snapshot.
+#[derive(PartialEq, Eq)]
+pub(crate) struct MigrationPreflight {
+    destination_session: SessionId,
+    destination_ip: IpAddr,
+    user_no: UserNo,
+    channel_id: u16,
+    channel: ChannelBinding,
+    token: MigrationToken,
+    source_generation: IdentityGeneration,
+    source_state: MigrationSourceState,
+    source_session: SessionId,
+    expires_at: Instant,
+    nickname: String,
+    canonical_nickname: String,
+}
+
+/// A migration source may only advance from connected to disconnected while a
+/// preflight ticket waits on profile I/O. Reconnection or owner replacement
+/// requires a new ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationSourceState {
+    Connected(SessionId),
+    Disconnected,
+}
+
+impl MigrationSourceState {
+    const fn from_owner(owner: Option<SessionId>) -> Self {
+        match owner {
+            Some(owner) => Self::Connected(owner),
+            None => Self::Disconnected,
+        }
+    }
+
+    fn permits_current(self, current_owner: Option<SessionId>, permit_source: SessionId) -> bool {
+        match (self, current_owner) {
+            (Self::Connected(expected), Some(current)) => {
+                expected == permit_source && current == expected
+            }
+            (Self::Connected(expected), None) => expected == permit_source,
+            (Self::Disconnected, None) => true,
+            (Self::Disconnected, Some(_)) => false,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MigrationPreflight {
+    #[must_use]
+    pub(crate) fn nickname(&self) -> &str {
+        &self.nickname
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_nickname(&self) -> &str {
+        &self.canonical_nickname
+    }
+
+    #[must_use]
+    pub(crate) const fn user_no(&self) -> UserNo {
+        self.user_no
+    }
+
+    #[must_use]
+    pub(crate) const fn source_generation(&self) -> IdentityGeneration {
+        self.source_generation
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_session(&self) -> SessionId {
+        self.destination_session
+    }
+
+    #[must_use]
+    pub(crate) const fn destination_ip(&self) -> IpAddr {
+        self.destination_ip
+    }
+}
+
+impl fmt::Debug for MigrationPreflight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MigrationPreflight")
+            .field("destination_session", &self.destination_session)
+            .field("destination_ip", &self.destination_ip)
+            .field("user_no", &self.user_no)
+            .field("channel_id", &self.channel_id)
+            .field("channel", &self.channel)
+            .field("source_generation", &self.source_generation)
+            .field("source_state", &self.source_state)
+            .field("source_session", &self.source_session)
+            .field("expires_at", &self.expires_at)
+            .field("nickname", &self.nickname)
+            .field("canonical_nickname", &self.canonical_nickname)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationCompletion {
     pub binding: IdentityBinding,
@@ -173,6 +277,9 @@ pub enum IdentityError {
     #[error("the migration permit belongs to a stale identity generation")]
     StaleMigrationGeneration,
 
+    #[error("the migration preflight no longer matches the current permit or source state")]
+    StaleMigrationPreflight,
+
     #[error("identity user-number space is exhausted")]
     UserNoExhausted,
 
@@ -197,6 +304,12 @@ struct ActiveIdentity {
     owner_ip: IpAddr,
     channel: Option<ChannelBinding>,
     permit: Option<MigrationPermit>,
+}
+
+struct ValidatedMigration<'a> {
+    canonical_nickname: &'a str,
+    active: &'a ActiveIdentity,
+    permit: &'a MigrationPermit,
 }
 
 /// Deterministic identity state owned by the server's world actor.
@@ -348,16 +461,50 @@ impl IdentityRegistry {
         Ok(permit)
     }
 
-    /// Transfers ownership to a fresh destination session and generation.
-    pub fn complete_migration(
-        &mut self,
+    /// Validates a migration without changing identity ownership or consuming
+    /// its permit.
+    pub(crate) fn preflight_migration(
+        &self,
         destination_session: SessionId,
         destination_ip: IpAddr,
         user_no: UserNo,
         channel_id: u16,
         token: MigrationToken,
         now: Instant,
-    ) -> Result<MigrationCompletion, IdentityError> {
+    ) -> Result<MigrationPreflight, IdentityError> {
+        let validated = self.validate_migration(
+            destination_session,
+            destination_ip,
+            user_no,
+            channel_id,
+            token,
+            now,
+        )?;
+        Ok(MigrationPreflight {
+            destination_session,
+            destination_ip,
+            user_no,
+            channel_id,
+            channel: validated.permit.channel,
+            token,
+            source_generation: validated.permit.source_generation,
+            source_state: MigrationSourceState::from_owner(validated.active.owner),
+            source_session: validated.permit.source_session,
+            expires_at: validated.permit.expires_at,
+            nickname: validated.active.known.nickname.clone(),
+            canonical_nickname: validated.canonical_nickname.to_owned(),
+        })
+    }
+
+    fn validate_migration(
+        &self,
+        destination_session: SessionId,
+        destination_ip: IpAddr,
+        user_no: UserNo,
+        channel_id: u16,
+        token: MigrationToken,
+        now: Instant,
+    ) -> Result<ValidatedMigration<'_>, IdentityError> {
         if let Some(binding) = self.session_bindings.get(&destination_session) {
             return Err(IdentityError::SessionAlreadyAuthenticated {
                 session: destination_session,
@@ -368,17 +515,16 @@ impl IdentityRegistry {
         let key = self
             .name_by_user_no
             .get(&user_no)
-            .cloned()
             .ok_or(IdentityError::UnknownUserNo(user_no.get()))?;
         let active =
             self.active_by_name
-                .get(&key)
+                .get(key)
                 .ok_or_else(|| IdentityError::NoMigrationPermit {
-                    nickname: self.known_by_name[&key].nickname.clone(),
+                    nickname: self.known_by_name[key].nickname.clone(),
                 })?;
         let permit = active
             .permit
-            .clone()
+            .as_ref()
             .ok_or_else(|| IdentityError::NoMigrationPermit {
                 nickname: active.known.nickname.clone(),
             })?;
@@ -411,12 +557,84 @@ impl IdentityRegistry {
         {
             return Err(IdentityError::StaleMigrationGeneration);
         }
+        Ok(ValidatedMigration {
+            canonical_nickname: key,
+            active,
+            permit,
+        })
+    }
 
-        let previous_owner = active.owner;
-        let previous_identity = released_identity(active);
-        let known = active.known.clone();
+    /// Transfers ownership after immediately minting and consuming a validated
+    /// preflight ticket.
+    pub fn complete_migration(
+        &mut self,
+        destination_session: SessionId,
+        destination_ip: IpAddr,
+        user_no: UserNo,
+        channel_id: u16,
+        token: MigrationToken,
+        now: Instant,
+    ) -> Result<MigrationCompletion, IdentityError> {
+        let preflight = self.preflight_migration(
+            destination_session,
+            destination_ip,
+            user_no,
+            channel_id,
+            token,
+            now,
+        )?;
+        self.complete_preflighted_migration(preflight, now)
+    }
+
+    /// Revalidates and consumes a previously minted migration ticket.
+    pub(crate) fn complete_preflighted_migration(
+        &mut self,
+        preflight: MigrationPreflight,
+        now: Instant,
+    ) -> Result<MigrationCompletion, IdentityError> {
+        let MigrationPreflight {
+            destination_session,
+            destination_ip,
+            user_no,
+            channel_id,
+            channel: expected_channel,
+            token,
+            source_generation,
+            source_state,
+            source_session,
+            expires_at,
+            nickname,
+            canonical_nickname: expected_canonical_nickname,
+        } = preflight;
+        let (canonical_nickname, previous_owner, previous_identity, known, channel) = {
+            let validated = self.validate_migration(
+                destination_session,
+                destination_ip,
+                user_no,
+                channel_id,
+                token,
+                now,
+            )?;
+            if validated.canonical_nickname != expected_canonical_nickname
+                || validated.active.known.nickname != nickname
+                || !source_state
+                    .permits_current(validated.active.owner, validated.permit.source_session)
+                || validated.permit.channel != expected_channel
+                || validated.permit.source_generation != source_generation
+                || validated.permit.source_session != source_session
+                || validated.permit.expires_at != expires_at
+            {
+                return Err(IdentityError::StaleMigrationPreflight);
+            }
+            (
+                validated.canonical_nickname.to_owned(),
+                validated.active.owner,
+                released_identity(validated.active),
+                validated.active.known.clone(),
+                validated.permit.channel,
+            )
+        };
         let generation = self.allocate_generation()?;
-        let channel = permit.channel;
         let binding = IdentityBinding {
             nickname: known.nickname.clone(),
             user_no: known.user_no,
@@ -428,8 +646,8 @@ impl IdentityRegistry {
 
         let active = self
             .active_by_name
-            .get_mut(&key)
-            .expect("migration validation keeps the identity active");
+            .get_mut(&canonical_nickname)
+            .ok_or(IdentityError::StaleMigrationPreflight)?;
         active.generation = generation;
         active.owner = Some(destination_session);
         active.owner_ip = destination_ip;
@@ -473,10 +691,9 @@ impl IdentityRegistry {
             };
         }
 
-        let active = self
-            .active_by_name
-            .remove(&key)
-            .expect("the current owner has an active identity");
+        let Some(active) = self.active_by_name.remove(&key) else {
+            return DisconnectOutcome::Stale(binding);
+        };
         DisconnectOutcome::Released(released_identity(&active))
     }
 
@@ -587,7 +804,7 @@ mod tests {
         MigrationToken, UserNo,
     };
     use crate::SessionId;
-    use p5136_core::nickname::NicknameError;
+    use p5136_core::nickname::{NicknameError, canonical_nickname_key};
 
     const SOURCE_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
     const OTHER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
@@ -763,6 +980,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(complete.binding.channel, Some(replacement_channel));
+    }
+
+    #[test]
+    fn migration_preflight_is_read_only_and_success_is_revalidated_on_consume() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(375), now)
+            .unwrap();
+        let before = identities.authorize(session(1)).unwrap();
+
+        let preflight = identities
+            .preflight_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap();
+        assert_eq!(preflight.nickname(), "Rider");
+        assert_eq!(preflight.canonical_nickname(), "rider");
+        assert_eq!(preflight.user_no(), source.user_no);
+        assert_eq!(preflight.source_generation(), source.generation);
+        assert_eq!(preflight.destination_session(), session(2));
+        assert_eq!(preflight.destination_ip(), SOURCE_IP);
+        assert_eq!(identities.authorize(session(1)).unwrap(), before);
+
+        let completed = identities
+            .complete_preflighted_migration(preflight, now)
+            .unwrap();
+        assert_eq!(completed.binding.owner, session(2));
+        assert_eq!(completed.binding.channel, Some(CHANNEL));
+        assert!(completed.binding.generation.get() > source.generation.get());
+    }
+
+    #[test]
+    fn migration_preflight_allows_source_disconnect_before_consume() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(376), now)
+            .unwrap();
+        let owner_bound = identities
+            .preflight_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap();
+        assert!(matches!(
+            identities.disconnect(session(1), now),
+            DisconnectOutcome::Deferred { .. }
+        ));
+        let completed = identities
+            .complete_preflighted_migration(owner_bound, now)
+            .unwrap();
+        assert_eq!(completed.previous_owner, None);
+        assert_eq!(completed.binding.owner, session(2));
+        assert!(completed.binding.generation.get() > source.generation.get());
+    }
+
+    #[test]
+    fn migration_preflight_rejects_exact_expiry() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(376), now)
+            .unwrap();
+        let preflight = identities
+            .preflight_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            identities.complete_preflighted_migration(preflight, permit.expires_at),
+            Err(IdentityError::MigrationExpired)
+        );
+    }
+
+    #[test]
+    fn ownerless_migration_preflight_rejects_source_reconnection() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(378), now)
+            .unwrap();
+        assert!(matches!(
+            identities.disconnect(session(1), now),
+            DisconnectOutcome::Deferred { .. }
+        ));
+        let preflight = identities
+            .preflight_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap();
+
+        identities
+            .active_by_name
+            .get_mut(&canonical_nickname_key("Rider"))
+            .unwrap()
+            .owner = Some(session(1));
+
+        assert_eq!(
+            identities.complete_preflighted_migration(preflight, now),
+            Err(IdentityError::StaleMigrationPreflight)
+        );
+    }
+
+    #[test]
+    fn migration_preflight_rejects_same_token_channel_and_expiry_with_changed_game_type() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(377), now)
+            .unwrap();
+        let preflight = identities
+            .preflight_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap();
+        let replacement_channel = ChannelBinding {
+            channel_id: CHANNEL.channel_id,
+            game_type: CHANNEL.game_type.wrapping_add(1),
+        };
+        let replacement = identities
+            .begin_migration(session(1), replacement_channel, permit.token, now)
+            .unwrap();
+        assert_eq!(replacement.token, permit.token);
+        assert_eq!(replacement.channel.channel_id, permit.channel.channel_id);
+        assert_eq!(replacement.expires_at, permit.expires_at);
+
+        assert_eq!(
+            identities.complete_preflighted_migration(preflight, now),
+            Err(IdentityError::StaleMigrationPreflight)
+        );
     }
 
     #[test]

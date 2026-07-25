@@ -5,6 +5,7 @@ mod identity;
 mod messenger_hub;
 mod messenger_runtime;
 mod myroom_hub;
+mod profile_io;
 mod runtime;
 mod session;
 mod udp_runtime;
@@ -29,7 +30,10 @@ pub use messenger_runtime::{
     MessengerGenerationAdvanceOutcome, MessengerIdentityReleaseOutcome, MessengerRuntimeConfig,
     MessengerServiceError, MessengerServiceHandle, MessengerServiceSnapshot, read_messenger_frame,
 };
-pub use runtime::{BoundServer, ServerError, ServerHandle};
+pub use profile_io::{
+    ProfileIoConfigError, ProfileIoError, ProfileIoRuntimeError, ProfileIoShutdownError,
+};
+pub use runtime::{BoundServer, RewardPersistenceRuntimeError, ServerError, ServerHandle};
 pub use session::{LoginSessionError, read_encrypted_frame};
 pub use udp_runtime::{
     DEFAULT_MAX_ACTIVE_UDP_IDENTITIES, DEFAULT_MAX_RELAY_TARGETS, DEFAULT_UDP_ADMISSION_CAPACITY,
@@ -43,4 +47,8 @@ pub use udp_state::{
     CurrentUdpEndpoint, UdpEndpointBindStatus, UdpEndpointBinding, UdpEndpointState,
     UdpEndpointStateError, UdpIngressBinding, UdpTransport,
 };
-pub use world::{RoomError, RoomId, RoomSnapshot, SessionId, SlotId, WorldError, WorldHandle};
+pub use world::{
+    OutstandingRewardLane, RaceFence, RewardDeadLetter, RewardDrainStatus, RewardLanePhase,
+    RewardTerminalReason, RoomError, RoomId, RoomSnapshot, SessionId, SlotId, WorldError,
+    WorldHandle,
+};
