@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use p5136_core::myroom_protocol::{MyRoomInfo, MyRoomProtocolError, validate_myroom_info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -111,6 +112,15 @@ impl Default for Rider {
             udp_port: 0,
             extra: ExtraFields::new(),
         }
+    }
+}
+
+impl Rider {
+    /// Replaces the two persisted main-emblem selections without disturbing
+    /// forward-compatible rider fields.
+    pub fn set_main_emblems(&mut self, emblem_1: i16, emblem_2: i16) {
+        self.emblem1 = emblem_1;
+        self.emblem2 = emblem_2;
     }
 }
 
@@ -284,6 +294,50 @@ impl Default for MyRoom {
     }
 }
 
+impl MyRoom {
+    /// Builds a wire-facing snapshot after applying the core protocol bounds.
+    ///
+    /// Persisted profiles can predate the Rust server and are therefore not
+    /// assumed to contain wire-safe password lengths.
+    pub fn try_to_protocol_info(&self) -> Result<MyRoomInfo, MyRoomProtocolError> {
+        let info = MyRoomInfo {
+            room_id: self.my_room,
+            bgm: self.my_room_bgm,
+            use_room_password: self.use_room_pwd,
+            use_item_password: self.use_item_pwd,
+            talk_lock: self.talk_lock,
+            room_password: self.room_pwd.clone(),
+            item_password: self.item_pwd.clone(),
+            kart_1: self.my_room_kart1,
+            kart_2: self.my_room_kart2,
+        };
+        validate_myroom_info(&info)?;
+        Ok(info)
+    }
+
+    /// Applies a wire-facing snapshot only when all core protocol bounds pass.
+    ///
+    /// The validation happens before any assignment, so an error leaves this
+    /// value unchanged. Flattened unknown profile fields are intentionally
+    /// retained.
+    pub fn try_apply_protocol_info(
+        &mut self,
+        info: &MyRoomInfo,
+    ) -> Result<(), MyRoomProtocolError> {
+        validate_myroom_info(info)?;
+        self.my_room = info.room_id;
+        self.my_room_bgm = info.bgm;
+        self.use_room_pwd = info.use_room_password;
+        self.use_item_pwd = info.use_item_password;
+        self.talk_lock = info.talk_lock;
+        self.room_pwd.clone_from(&info.room_password);
+        self.item_pwd.clone_from(&info.item_password);
+        self.my_room_kart1 = info.kart_1;
+        self.my_room_kart2 = info.kart_2;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameOptions {
@@ -394,9 +448,12 @@ impl Default for GameOptions {
 
 #[cfg(test)]
 mod tests {
+    use p5136_core::myroom_protocol::{
+        MAX_MYROOM_PASSWORD_UTF16_UNITS, MyRoomInfo, MyRoomProtocolError,
+    };
     use serde_json::json;
 
-    use super::Profile;
+    use super::{MyRoom, Profile, Rider};
 
     #[test]
     fn defaults_match_the_p5136_csharp_profile() {
@@ -473,5 +530,90 @@ mod tests {
         let key = &encoded["P5136RustRaceRewardReceipt"]["Key"];
         assert!(key.get("RunId").is_some());
         assert!(key.get("RunGeneration").is_none());
+    }
+
+    #[test]
+    fn myroom_protocol_conversion_validates_persisted_values() {
+        let mut my_room = MyRoom {
+            my_room: 17,
+            my_room_bgm: 3,
+            use_room_pwd: 1,
+            use_item_pwd: 1,
+            talk_lock: 0,
+            room_pwd: "room".to_owned(),
+            item_pwd: "item".to_owned(),
+            my_room_kart1: 41,
+            my_room_kart2: 42,
+            ..MyRoom::default()
+        };
+        my_room.extra.insert("Future".to_owned(), json!({"x": 1}));
+
+        assert_eq!(
+            my_room.try_to_protocol_info().unwrap(),
+            MyRoomInfo {
+                room_id: 17,
+                bgm: 3,
+                use_room_password: 1,
+                use_item_password: 1,
+                talk_lock: 0,
+                room_password: "room".to_owned(),
+                item_password: "item".to_owned(),
+                kart_1: 41,
+                kart_2: 42,
+            }
+        );
+
+        my_room.room_pwd = "x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1);
+        assert!(matches!(
+            my_room.try_to_protocol_info(),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom room password",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn myroom_protocol_apply_is_atomic_and_preserves_unknown_fields() {
+        let mut my_room = MyRoom::default();
+        my_room
+            .extra
+            .insert("FutureMyRoomField".to_owned(), json!([1, 2, 3]));
+        let original = my_room.clone();
+        let invalid = MyRoomInfo {
+            room_id: 99,
+            room_password: "x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1),
+            ..MyRoomInfo::default()
+        };
+        assert!(my_room.try_apply_protocol_info(&invalid).is_err());
+        assert_eq!(my_room, original);
+
+        let valid = MyRoomInfo {
+            room_id: 99,
+            bgm: 4,
+            use_room_password: 1,
+            use_item_password: 1,
+            talk_lock: 0,
+            room_password: "new-room".to_owned(),
+            item_password: "new-item".to_owned(),
+            kart_1: 7,
+            kart_2: 8,
+        };
+        my_room.try_apply_protocol_info(&valid).unwrap();
+        assert_eq!(my_room.try_to_protocol_info().unwrap(), valid);
+        assert_eq!(my_room.extra["FutureMyRoomField"], json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn setting_main_emblems_preserves_unknown_rider_fields() {
+        let mut rider = Rider::default();
+        rider
+            .extra
+            .insert("FutureRiderField".to_owned(), json!({"keep": true}));
+
+        rider.set_main_emblems(11, 12);
+
+        assert_eq!((rider.emblem1, rider.emblem2), (11, 12));
+        assert_eq!(rider.extra["FutureRiderField"]["keep"], true);
     }
 }

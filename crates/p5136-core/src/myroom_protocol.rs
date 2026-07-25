@@ -431,7 +431,10 @@ pub fn serialize_owner_emblems(emblems: &[i16]) -> Result<Vec<u8>, MyRoomProtoco
             maximum: MAX_MYROOM_EMBLEMS,
         });
     }
-    let count = i32::try_from(emblems.len()).expect("the bounded MyRoom emblem count fits in i32");
+    let count = i32::try_from(emblems.len()).map_err(|_| MyRoomProtocolError::TooManyEmblems {
+        actual: emblems.len(),
+        maximum: MAX_MYROOM_EMBLEMS,
+    })?;
     let mut packet = PacketWriter::named(OWNER_EMBLEMS_NAME);
     packet.write_i32(1);
     packet.write_i32(1);
@@ -483,7 +486,7 @@ pub fn serialize_owner_item_enchants(
     let mut packets = Vec::with_capacity(tunes.len().div_ceil(MYROOM_ITEM_CHUNK_SIZE));
     for chunk in tunes.chunks(MYROOM_ITEM_CHUNK_SIZE) {
         let mut packet = PacketWriter::named(OWNER_ITEM_ENCHANT_NAME);
-        packet.write_i32(wire_len(chunk.len()));
+        packet.write_i32(wire_count("tune chunk", chunk.len())?);
         for tune in chunk {
             packet.write_i16(3);
             packet.write_i16(tune.item_id);
@@ -531,25 +534,22 @@ pub fn serialize_owner_items(
 
     let kart_chunk_count = karts.len().div_ceil(MYROOM_ITEM_CHUNK_SIZE);
     let parts_chunk_count = parts.len().div_ceil(MYROOM_ITEM_CHUNK_SIZE);
-    let all_count = kart_chunk_count
-        .checked_add(parts_chunk_count)
-        .and_then(|count| i32::try_from(count).ok())
-        .ok_or(MyRoomProtocolError::ItemCollectionTooLarge {
+    let total_chunk_count = kart_chunk_count.checked_add(parts_chunk_count).ok_or(
+        MyRoomProtocolError::ItemCollectionTooLarge {
             field: "owner item packet",
             actual: karts.len().saturating_add(parts.len()),
-        })?;
-    let mut packets = Vec::with_capacity(
-        usize::try_from(all_count).expect("a non-negative bounded packet count fits in usize"),
-    );
+        },
+    )?;
+    let all_count = wire_count("owner item packet", total_chunk_count)?;
+    let mut packets = Vec::with_capacity(total_chunk_count);
     let kart_chunks = wire_chunk_count("kart", karts.len())?;
     let parts_chunks = wire_chunk_count("parts", parts.len())?;
-    let mut ordinal = 1_i32;
 
     for (index, chunk) in karts.chunks(MYROOM_ITEM_CHUNK_SIZE).enumerate() {
         let mut packet = PacketWriter::named(OWNER_ITEM_NAME);
         packet.write_i32(kart_chunks);
-        packet.write_i32(wire_index(index));
-        packet.write_i32(wire_len(chunk.len()));
+        packet.write_i32(wire_index("kart", index)?);
+        packet.write_i32(wire_count("kart chunk", chunk.len())?);
         for kart in chunk {
             packet.write_u16(3);
             packet.write_u16(kart.kart_id);
@@ -565,27 +565,30 @@ pub fn serialize_owner_items(
         }
         packet.write_bytes(&[0; 8]);
         packet.write_i32(all_count);
-        packet.write_i32(ordinal);
-        ordinal += 1;
+        packet.write_i32(wire_index("owner item packet", index)?);
         packets.push(packet.into_inner());
     }
 
     for (index, chunk) in parts.chunks(MYROOM_ITEM_CHUNK_SIZE).enumerate() {
+        let global_index = kart_chunk_count.checked_add(index).ok_or(
+            MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "owner item packet",
+                actual: karts.len().saturating_add(parts.len()),
+            },
+        )?;
         let mut packet = PacketWriter::named(OWNER_ITEM_NAME);
         packet.write_i32(parts_chunks);
-        packet.write_i32(wire_index(index));
+        packet.write_i32(wire_index("parts", index)?);
         packet.write_i32(0);
         packet.write_i32(0);
-        packet.write_i32(wire_len(chunk.len()));
+        packet.write_i32(wire_count("parts chunk", chunk.len())?);
         for part in chunk {
             write_owner_part(&mut packet, part);
         }
         packet.write_i32(all_count);
-        packet.write_i32(ordinal);
-        ordinal += 1;
+        packet.write_i32(wire_index("owner item packet", global_index)?);
         packets.push(packet.into_inner());
     }
-    debug_assert_eq!(ordinal - 1, all_count);
     Ok(packets)
 }
 
@@ -667,12 +670,19 @@ fn wire_chunk_count(field: &'static str, len: usize) -> Result<i32, MyRoomProtoc
         .map_err(|_| MyRoomProtocolError::ItemCollectionTooLarge { field, actual: len })
 }
 
-fn wire_len(len: usize) -> i32 {
-    i32::try_from(len).expect("a 26-entry MyRoom item chunk fits in i32")
+fn wire_count(field: &'static str, len: usize) -> Result<i32, MyRoomProtocolError> {
+    i32::try_from(len)
+        .map_err(|_| MyRoomProtocolError::ItemCollectionTooLarge { field, actual: len })
 }
 
-fn wire_index(zero_based_index: usize) -> i32 {
-    i32::try_from(zero_based_index + 1).expect("the validated MyRoom item chunk index fits in i32")
+fn wire_index(field: &'static str, zero_based_index: usize) -> Result<i32, MyRoomProtocolError> {
+    zero_based_index
+        .checked_add(1)
+        .and_then(|index| i32::try_from(index).ok())
+        .ok_or(MyRoomProtocolError::ItemCollectionTooLarge {
+            field,
+            actual: zero_based_index,
+        })
 }
 
 fn parse_empty_request(packet: &[u8], name: &'static str) -> Result<(), MyRoomProtocolError> {
@@ -842,6 +852,7 @@ mod tests {
         serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
         serialize_rider_echo, serialize_secede_reply, serialize_slot_data,
         serialize_update_main_emblem_reply, validate_myroom_info, validate_myroom_player_slot,
+        wire_count, wire_index,
     };
     use crate::{
         adler32,
@@ -1091,6 +1102,26 @@ mod tests {
         assert!(matches!(
             serialize_owner_emblems(&excessive),
             Err(MyRoomProtocolError::TooManyEmblems { .. })
+        ));
+    }
+
+    #[test]
+    fn wire_counter_overflow_is_a_typed_error() {
+        assert_eq!(wire_count("test", 26).unwrap(), 26);
+        assert_eq!(wire_index("test", 25).unwrap(), 26);
+        assert!(matches!(
+            wire_count("test", usize::MAX),
+            Err(MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "test",
+                actual: usize::MAX,
+            })
+        ));
+        assert!(matches!(
+            wire_index("test", usize::MAX),
+            Err(MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "test",
+                actual: usize::MAX,
+            })
         ));
     }
 

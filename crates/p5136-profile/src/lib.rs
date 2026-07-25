@@ -21,7 +21,7 @@ pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,
 };
 pub use myroom_items::{
-    MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_ITEM_STATE_BYTES, MyRoomItemStateError,
+    MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_ITEM_STATE_BYTES, MyRoomItemFileType, MyRoomItemStateError,
     MyRoomOwnerInventory,
 };
 pub use progression::{

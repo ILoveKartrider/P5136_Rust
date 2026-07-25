@@ -3,7 +3,7 @@
 use std::{
     cell::Cell,
     fmt,
-    fs::File,
+    fs::{self, File},
     io::{Read, Take},
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -33,6 +33,12 @@ pub struct MyRoomOwnerInventory {
 impl MyRoomOwnerInventory {
     /// Loads the exact C# sidecar filenames below one already-resolved rider
     /// directory. Missing files represent empty collections.
+    ///
+    /// The caller (normally [`crate::ProfileStore`]) must validate and own the
+    /// parent path. This loader rejects stationary symbolic links, Windows
+    /// reparse points, and non-regular sidecar entries using safe `std`
+    /// metadata checks. Those checks do not make an attacker-writable parent
+    /// directory race-free.
     pub fn load(rider_directory: impl AsRef<Path>) -> Result<Self, MyRoomItemStateError> {
         let rider_directory = rider_directory.as_ref();
         let tunes = load_records::<TuneState>(&rider_directory.join(TUNE_FILENAME), "tune")?
@@ -55,6 +61,23 @@ impl MyRoomOwnerInventory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MyRoomItemFileType {
+    SymbolicLink,
+    WindowsReparsePoint,
+    NonRegular,
+}
+
+impl fmt::Display for MyRoomItemFileType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SymbolicLink => formatter.write_str("symbolic link"),
+            Self::WindowsReparsePoint => formatter.write_str("Windows reparse point"),
+            Self::NonRegular => formatter.write_str("non-regular file"),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MyRoomItemStateError {
     #[error("failed to {operation} MyRoom item state file {path}")]
@@ -70,6 +93,12 @@ pub enum MyRoomItemStateError {
         path: PathBuf,
         actual: u64,
         maximum: u64,
+    },
+
+    #[error("MyRoom item state path {path} is a disallowed {kind}")]
+    DisallowedFileType {
+        path: PathBuf,
+        kind: MyRoomItemFileType,
     },
 
     #[error("MyRoom item state JSON at {path} is invalid")]
@@ -297,6 +326,9 @@ where
 }
 
 fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>, MyRoomItemStateError> {
+    if !regular_sidecar_exists(path)? {
+        return Ok(None);
+    }
     let file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -308,14 +340,18 @@ fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>, MyRoomItemState
             });
         }
     };
-    let length = file
-        .metadata()
-        .map_err(|source| MyRoomItemStateError::Io {
-            operation: "inspect",
+    let opened_metadata = file.metadata().map_err(|source| MyRoomItemStateError::Io {
+        operation: "inspect",
+        path: path.to_owned(),
+        source,
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(MyRoomItemStateError::DisallowedFileType {
             path: path.to_owned(),
-            source,
-        })?
-        .len();
+            kind: MyRoomItemFileType::NonRegular,
+        });
+    }
+    let length = opened_metadata.len();
     if length > MAX_MYROOM_ITEM_STATE_BYTES {
         return Err(MyRoomItemStateError::TooLarge {
             path: path.to_owned(),
@@ -344,6 +380,47 @@ fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>, MyRoomItemState
     Ok(Some(bytes))
 }
 
+fn regular_sidecar_exists(path: &Path) -> Result<bool, MyRoomItemStateError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(MyRoomItemStateError::Io {
+                operation: "inspect path",
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(MyRoomItemStateError::DisallowedFileType {
+                path: path.to_owned(),
+                kind: MyRoomItemFileType::WindowsReparsePoint,
+            });
+        }
+    }
+
+    if metadata.file_type().is_symlink() {
+        return Err(MyRoomItemStateError::DisallowedFileType {
+            path: path.to_owned(),
+            kind: MyRoomItemFileType::SymbolicLink,
+        });
+    }
+    if !metadata.file_type().is_file() {
+        return Err(MyRoomItemStateError::DisallowedFileType {
+            path: path.to_owned(),
+            kind: MyRoomItemFileType::NonRegular,
+        });
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -351,8 +428,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_ITEM_STATE_BYTES, MyRoomItemStateError,
-        MyRoomOwnerInventory,
+        MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_ITEM_STATE_BYTES, MyRoomItemFileType,
+        MyRoomItemStateError, MyRoomOwnerInventory,
     };
     use p5136_core::myroom_protocol::{MyRoomKart, MyRoomParts, MyRoomTune};
 
@@ -453,6 +530,71 @@ mod tests {
                 actual,
                 maximum: MAX_MYROOM_ITEM_STATE_BYTES,
             }) if path == oversized && actual == MAX_MYROOM_ITEM_STATE_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn a_non_regular_sidecar_is_rejected() {
+        let root = tempdir().unwrap();
+        let sidecar = root.path().join("NewKart.json");
+        fs::create_dir(&sidecar).unwrap();
+
+        assert!(matches!(
+            MyRoomOwnerInventory::load(root.path()),
+            Err(MyRoomItemStateError::DisallowedFileType {
+                path,
+                kind: MyRoomItemFileType::NonRegular,
+            }) if path == sidecar
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_sidecar_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let target = root.path().join("target.json");
+        let sidecar = root.path().join("NewKart.json");
+        fs::write(&target, b"[]").unwrap();
+        symlink(&target, &sidecar).unwrap();
+
+        assert!(matches!(
+            MyRoomOwnerInventory::load(root.path()),
+            Err(MyRoomItemStateError::DisallowedFileType {
+                path,
+                kind: MyRoomItemFileType::SymbolicLink,
+            }) if path == sidecar
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_symlink_reparse_sidecar_is_rejected_when_supported() {
+        use std::io::ErrorKind;
+        use std::os::windows::fs::symlink_file;
+
+        let root = tempdir().unwrap();
+        let target = root.path().join("target.json");
+        let sidecar = root.path().join("NewKart.json");
+        fs::write(&target, b"[]").unwrap();
+        match symlink_file(&target, &sidecar) {
+            Ok(()) => {}
+            Err(source)
+                if source.kind() == ErrorKind::PermissionDenied
+                    || source.raw_os_error() == Some(1314) =>
+            {
+                return;
+            }
+            Err(source) => panic!("failed to create Windows test symlink: {source}"),
+        }
+
+        assert!(matches!(
+            MyRoomOwnerInventory::load(root.path()),
+            Err(MyRoomItemStateError::DisallowedFileType {
+                path,
+                kind: MyRoomItemFileType::WindowsReparsePoint,
+            }) if path == sidecar
         ));
     }
 
