@@ -48,6 +48,12 @@ pub const MYROOM_PLAYER_RESERVED_LENGTH: usize = 29;
 
 const _: () = assert!(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH == 65);
 const _: () = assert!(MYROOM_EMPTY_SLOT_WIRE_LENGTH == 123);
+const NAMED_PACKET_HEADER_LENGTH: usize = 4;
+const OWNER_ENCHANT_PACKET_OVERHEAD: usize = NAMED_PACKET_HEADER_LENGTH + 4;
+const OWNER_ITEM_PACKET_OVERHEAD: usize = NAMED_PACKET_HEADER_LENGTH + 28;
+const OWNER_TUNE_WIRE_LENGTH: usize = 24;
+const OWNER_KART_WIRE_LENGTH: usize = 18;
+const OWNER_PARTS_WIRE_LENGTH: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MyRoomRequest {
@@ -185,6 +191,29 @@ pub struct MyRoomParts {
     pub booster_value: i16,
     pub coating: i16,
     pub tail_lamp: i16,
+}
+
+/// Exact allocation plan for the complete owner-item response.
+///
+/// The plan includes both enchant packets and kart/parts packets, including
+/// the original server's early-return behavior that emits one empty owner-item
+/// packet and omits every parts record when the kart collection is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MyRoomOwnerItemWirePlan {
+    packet_count: usize,
+    byte_len: usize,
+}
+
+impl MyRoomOwnerItemWirePlan {
+    #[must_use]
+    pub const fn packet_count(self) -> usize {
+        self.packet_count
+    }
+
+    #[must_use]
+    pub const fn byte_len(self) -> usize {
+        self.byte_len
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +535,92 @@ pub fn serialize_owner_item_enchants(
     Ok(packets)
 }
 
+/// Computes the exact packet count and aggregate byte length produced by
+/// [`serialize_owner_item_enchants`] followed by [`serialize_owner_items`].
+///
+/// This performs only checked arithmetic and does not allocate packet buffers,
+/// allowing a server to enforce operational response limits before
+/// serialization.
+pub fn plan_owner_item_packets(
+    tune_count: usize,
+    kart_count: usize,
+    parts_count: usize,
+) -> Result<MyRoomOwnerItemWirePlan, MyRoomProtocolError> {
+    checked_collection_len("tune", tune_count)?;
+    checked_collection_len("kart", kart_count)?;
+    checked_collection_len("parts", parts_count)?;
+
+    let tune_packets = tune_count.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
+    let tune_bytes = checked_wire_collection_len(
+        "tune wire bytes",
+        tune_packets,
+        OWNER_ENCHANT_PACKET_OVERHEAD,
+        tune_count,
+        OWNER_TUNE_WIRE_LENGTH,
+    )?;
+
+    let (item_packets, item_bytes) = if kart_count == 0 {
+        // The early-return packet deliberately omits every parts record.
+        (1, OWNER_ITEM_PACKET_OVERHEAD)
+    } else {
+        let kart_packets = kart_count.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
+        let parts_packets = parts_count.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
+        let item_packets = kart_packets.checked_add(parts_packets).ok_or(
+            MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "owner item packet",
+                actual: kart_count.saturating_add(parts_count),
+            },
+        )?;
+        // This aggregate is written into every owner-item packet's `all_count`
+        // i32. Validating each per-type chunk count is insufficient because
+        // their sum can still exceed the wire counter on 64-bit targets.
+        wire_count("owner item packet", item_packets)?;
+        let kart_bytes = checked_wire_collection_len(
+            "kart wire bytes",
+            kart_packets,
+            OWNER_ITEM_PACKET_OVERHEAD,
+            kart_count,
+            OWNER_KART_WIRE_LENGTH,
+        )?;
+        let parts_bytes = checked_wire_collection_len(
+            "parts wire bytes",
+            parts_packets,
+            OWNER_ITEM_PACKET_OVERHEAD,
+            parts_count,
+            OWNER_PARTS_WIRE_LENGTH,
+        )?;
+        let item_bytes = kart_bytes.checked_add(parts_bytes).ok_or(
+            MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "owner item wire bytes",
+                actual: kart_count.saturating_add(parts_count),
+            },
+        )?;
+        (item_packets, item_bytes)
+    };
+
+    let packet_count = tune_packets.checked_add(item_packets).ok_or(
+        MyRoomProtocolError::ItemCollectionTooLarge {
+            field: "owner item packet",
+            actual: tune_count
+                .saturating_add(kart_count)
+                .saturating_add(parts_count),
+        },
+    )?;
+    let byte_len =
+        tune_bytes
+            .checked_add(item_bytes)
+            .ok_or(MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "owner item wire bytes",
+                actual: tune_count
+                    .saturating_add(kart_count)
+                    .saturating_add(parts_count),
+            })?;
+    Ok(MyRoomOwnerItemWirePlan {
+        packet_count,
+        byte_len,
+    })
+}
+
 /// Serializes the Korean P5136 owner kart/parts stream.
 ///
 /// Packet ordinals are global across both item types while the first two
@@ -663,6 +778,26 @@ fn write_owner_part(packet: &mut PacketWriter, part: &MyRoomParts) {
 
 fn checked_collection_len(field: &'static str, len: usize) -> Result<(), MyRoomProtocolError> {
     wire_chunk_count(field, len).map(|_| ())
+}
+
+fn checked_wire_collection_len(
+    field: &'static str,
+    packet_count: usize,
+    packet_overhead: usize,
+    record_count: usize,
+    record_wire_length: usize,
+) -> Result<usize, MyRoomProtocolError> {
+    packet_count
+        .checked_mul(packet_overhead)
+        .and_then(|overhead| {
+            record_count
+                .checked_mul(record_wire_length)
+                .and_then(|records| overhead.checked_add(records))
+        })
+        .ok_or(MyRoomProtocolError::ItemCollectionTooLarge {
+            field,
+            actual: record_count,
+        })
 }
 
 fn wire_chunk_count(field: &'static str, len: usize) -> Result<i32, MyRoomProtocolError> {
@@ -846,7 +981,7 @@ mod tests {
         UPDATE_MAIN_EMBLEM_REQUEST_NAME, classify_myroom_request, parse_character_position,
         parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
         parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
-        parse_secede_request, parse_update_info, parse_update_main_emblem,
+        parse_secede_request, parse_update_info, parse_update_main_emblem, plan_owner_item_packets,
         serialize_character_position, serialize_check_password_reply, serialize_enter_error,
         serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
         serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
@@ -1196,6 +1331,37 @@ mod tests {
         assert_eq!(reader.read_i32().unwrap(), 1);
         assert_eq!(reader.read_i32().unwrap(), 1);
         assert!(reader.remaining().is_empty());
+    }
+
+    #[test]
+    fn owner_item_wire_plan_exactly_matches_both_serializers() {
+        for (tune_count, kart_count, parts_count) in
+            [(0, 0, 0), (1, 0, 1), (26, 1, 0), (27, 26, 27), (53, 27, 52)]
+        {
+            let tunes = vec![MyRoomTune::default(); tune_count];
+            let karts = vec![MyRoomKart::default(); kart_count];
+            let parts = vec![MyRoomParts::default(); parts_count];
+            let plan = plan_owner_item_packets(tune_count, kart_count, parts_count).unwrap();
+            let mut packets = serialize_owner_item_enchants(&tunes).unwrap();
+            packets.extend(serialize_owner_items(&karts, &parts, false).unwrap());
+            assert_eq!(plan.packet_count(), packets.len());
+            assert_eq!(plan.byte_len(), packets.iter().map(Vec::len).sum::<usize>());
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn owner_item_wire_plan_rejects_an_aggregate_packet_count_that_exceeds_i32() {
+        let chunks_per_type = i32::MAX as usize / 2 + 1;
+        let records_per_type = chunks_per_type.checked_mul(MYROOM_ITEM_CHUNK_SIZE).unwrap();
+
+        assert!(matches!(
+            plan_owner_item_packets(0, records_per_type, records_per_type),
+            Err(MyRoomProtocolError::ItemCollectionTooLarge {
+                field: "owner item packet",
+                ..
+            })
+        ));
     }
 
     #[test]

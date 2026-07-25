@@ -6,10 +6,9 @@
 //! commit. Commits are revision-checked, so an old plan can never overwrite
 //! newer state.
 
-#![allow(dead_code)] // Remove when the world/session integration consumes this module.
-
 use std::{
     collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr},
     num::NonZeroUsize,
 };
 
@@ -22,7 +21,7 @@ use p5136_core::{
 };
 use thiserror::Error;
 
-use crate::{IdentityBinding, UserNo};
+use crate::{IdentityBinding, ReleasedIdentity, UserNo};
 
 #[cfg(test)]
 pub(crate) const MAX_MYROOM_IDENTITIES: usize = 256;
@@ -33,6 +32,13 @@ const MAX_TRANSITION_MEMBERSHIPS: usize = MYROOM_SLOT_COUNT;
 // can prune the owner, seven ejected visitors, and the visited-room owner.
 const MAX_TRANSITION_GENERATIONS: usize = MYROOM_SLOT_COUNT + 1;
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom command tranche consumes room entry"
+    )
+)]
 const VISITOR_SLOTS: [MyRoomSlotIndex; VISITOR_CAPACITY] = [
     MyRoomSlotIndex(1),
     MyRoomSlotIndex(2),
@@ -107,22 +113,47 @@ impl MyRoomParticipant {
     }
 
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "the TCP MyRoom command boundary needs exact identity access"
+    )]
     pub(crate) fn identity(&self) -> &IdentityBinding {
         &self.identity
     }
 
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the TCP MyRoom command boundary needs presentation access"
+        )
+    )]
     pub(crate) fn player(&self) -> &MyRoomPlayerSlot {
         &self.player
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom entry command consumes owner input"
+    )
+)]
 pub(crate) struct MyRoomOwner {
     participant: MyRoomParticipant,
     info: MyRoomInfo,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom entry command consumes owner input"
+    )
+)]
 impl MyRoomOwner {
     pub(crate) fn new(
         participant: MyRoomParticipant,
@@ -158,6 +189,13 @@ pub(crate) enum RoomEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom entry command consumes this outcome"
+    )
+)]
 pub(crate) enum EnterOutcome {
     Reentered {
         slot: MyRoomSlotIndex,
@@ -172,6 +210,13 @@ pub(crate) enum EnterOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom leave command consumes this outcome"
+    )
+)]
 pub(crate) struct LeaveEffects {
     pub(crate) room: RoomEffect,
 }
@@ -201,7 +246,20 @@ pub(crate) struct PeerAudience {
     pub(crate) peers: Vec<IdentityBinding>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MyRoomMembershipInfo {
+    pub(crate) owner: UserNo,
+    pub(crate) slot: MyRoomSlotIndex,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom info command consumes this outcome"
+    )
+)]
 pub(crate) struct OwnerInfoUpdate {
     pub(crate) owner: UserNo,
     pub(crate) previous: MyRoomInfo,
@@ -209,6 +267,13 @@ pub(crate) struct OwnerInfoUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the profile refresh integration consumes this outcome"
+    )
+)]
 pub(crate) struct ParticipantRefreshEffects {
     /// Membership room first, then a distinct owned room.
     pub(crate) publications: Vec<RoomPublication>,
@@ -239,11 +304,6 @@ pub(crate) struct MyRoomTransition<T> {
 }
 
 impl<T> MyRoomTransition<T> {
-    #[must_use]
-    pub(crate) fn base_revision(&self) -> MyRoomRevision {
-        self.base_revision
-    }
-
     #[must_use]
     pub(crate) fn outcome(&self) -> &T {
         &self.outcome
@@ -295,6 +355,13 @@ impl<T> MyRoomTransition<T> {
 }
 
 #[derive(Debug, Error)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom command tranche exercises remaining rejection variants"
+    )
+)]
 pub(crate) enum MyRoomHubError {
     #[error(transparent)]
     Wire(#[from] MyRoomProtocolError),
@@ -370,6 +437,13 @@ pub(crate) enum MyRoomHubError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom command tranche exercises the full invariant audit"
+    )
+)]
 pub(crate) enum MyRoomInvariantViolation {
     #[error("room {owner:?} has no mapped members")]
     EmptyRoom { owner: UserNo },
@@ -425,11 +499,22 @@ struct Membership {
 #[derive(Debug, Clone)]
 struct RoomState {
     owner: MyRoomParticipant,
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the TCP MyRoom info command reads this field")
+    )]
     info: MyRoomInfo,
     owner_present: bool,
     visitors: [Option<MyRoomParticipant>; VISITOR_CAPACITY],
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom entry command consumes remaining room mutations"
+    )
+)]
 impl RoomState {
     fn new(owner: MyRoomOwner) -> Self {
         Self {
@@ -637,6 +722,10 @@ struct GenerationChange {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the TCP MyRoom entry command consumes this plan")
+)]
 struct EnterPlan<'a> {
     member: &'a MyRoomParticipant,
     owner: &'a MyRoomOwner,
@@ -668,6 +757,13 @@ pub(crate) struct MyRoomHub {
     identity_capacity: NonZeroUsize,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom command tranche consumes remaining request APIs"
+    )
+)]
 impl MyRoomHub {
     /// Constructs a hub whose identity bound matches the runtime admission
     /// limit. Production callers cannot silently fall back to a fixed cap.
@@ -704,6 +800,16 @@ impl MyRoomHub {
     #[must_use]
     pub(crate) fn member_count(&self) -> usize {
         self.memberships.len()
+    }
+
+    #[must_use]
+    pub(crate) fn generation_count(&self) -> usize {
+        self.generations.len()
+    }
+
+    #[must_use]
+    pub(crate) const fn identity_capacity(&self) -> NonZeroUsize {
+        self.identity_capacity
     }
 
     pub(crate) fn enter(
@@ -860,6 +966,40 @@ impl MyRoomHub {
         Ok(self.membership_exact(identity)?.owner.user_no())
     }
 
+    /// Returns membership only when the supplied full binding is the current
+    /// tracked generation. An identity which has never entered a `MyRoom` is a
+    /// normal `None`; a stale or forged binding is rejected.
+    pub(crate) fn membership_if_member(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomMembershipInfo>, MyRoomHubError> {
+        let membership = self.memberships.get(&identity.user_no).copied();
+        let owns_room = self.rooms.contains_key(&OwnerKey(identity.user_no));
+        if membership.is_none() && !owns_room {
+            if self.generations.contains_key(&identity.user_no) {
+                return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration {
+                    user_no: identity.user_no,
+                }
+                .into());
+            }
+            return Ok(None);
+        }
+        let canonical = self.generations.get(&identity.user_no).ok_or(
+            MyRoomInvariantViolation::MissingCanonicalGeneration {
+                user_no: identity.user_no,
+            },
+        )?;
+        require_same_binding(canonical, identity)?;
+        let Some(membership) = membership else {
+            return Ok(None);
+        };
+        self.require_exact_member(identity, membership)?;
+        Ok(Some(MyRoomMembershipInfo {
+            owner: membership.owner.user_no(),
+            slot: membership.slot,
+        }))
+    }
+
     pub(crate) fn first_snapshot(
         &self,
         identity: &IdentityBinding,
@@ -884,6 +1024,27 @@ impl MyRoomHub {
             sender_slot: membership.slot,
             peers,
         })
+    }
+
+    /// Exact-generation UDP query with a non-member fast path.
+    pub(crate) fn peer_audience_if_member(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<PeerAudience>, MyRoomHubError> {
+        let Some(membership) = self.membership_if_member(identity)? else {
+            return Ok(None);
+        };
+        let peers = self
+            .room(OwnerKey(membership.owner))?
+            .audience()
+            .into_iter()
+            .filter(|peer| peer.user_no != identity.user_no)
+            .collect();
+        Ok(Some(PeerAudience {
+            owner: membership.owner,
+            sender_slot: membership.slot,
+            peers,
+        }))
     }
 
     #[must_use]
@@ -949,27 +1110,7 @@ impl MyRoomHub {
         replacement: MyRoomParticipant,
     ) -> Result<MyRoomTransition<IdentityAdvanceEffects>, MyRoomHubError> {
         self.require_canonical_identity(previous)?;
-        if previous.user_no != replacement.identity.user_no {
-            return Err(MyRoomHubError::IdentityAdvanceUserMismatch {
-                previous: previous.user_no,
-                replacement: replacement.identity.user_no,
-            });
-        }
-        if canonical_nickname_key(&previous.nickname)
-            != canonical_nickname_key(&replacement.identity.nickname)
-        {
-            return Err(MyRoomHubError::IdentityAdvanceNicknameMismatch {
-                previous: previous.nickname.clone(),
-                replacement: replacement.identity.nickname.clone(),
-            });
-        }
-        if replacement.identity.generation.get() <= previous.generation.get() {
-            return Err(MyRoomHubError::NonAdvancingGeneration {
-                user_no: previous.user_no,
-                previous: previous.generation.get(),
-                replacement: replacement.identity.generation.get(),
-            });
-        }
+        validate_identity_advance(previous, &replacement.identity)?;
         let next_revision = self.next_revision()?;
         let (rooms, publications) = self.replacement_rooms(previous.user_no, &replacement)?;
         self.transition(
@@ -986,6 +1127,51 @@ impl MyRoomHub {
                 publications,
             },
         )
+    }
+
+    /// Advances a migrated generation without requiring profile I/O.
+    ///
+    /// Every role retains its own presentation fields. Only fields controlled
+    /// by the actor-minted identity are replaced: user number, nickname,
+    /// generation/owner/channel binding, and the source IPv4 address encoded
+    /// by the legacy `MyRoom` wire format. IPv6 sources intentionally map to the
+    /// unspecified IPv4 address, matching the login-session projection.
+    pub(crate) fn advance_migrated_identity_if_tracked(
+        &self,
+        previous: &IdentityBinding,
+        replacement: &IdentityBinding,
+    ) -> Result<Option<MyRoomTransition<IdentityAdvanceEffects>>, MyRoomHubError> {
+        let has_role = self.memberships.contains_key(&previous.user_no)
+            || self.rooms.contains_key(&OwnerKey(previous.user_no));
+        if !has_role {
+            if self.generations.contains_key(&previous.user_no) {
+                return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration {
+                    user_no: previous.user_no,
+                }
+                .into());
+            }
+            return Ok(None);
+        }
+        self.require_canonical_identity(previous)?;
+        validate_identity_advance(previous, replacement)?;
+
+        let next_revision = self.next_revision()?;
+        let (rooms, publications) =
+            self.migrated_replacement_rooms(previous.user_no, replacement)?;
+        Ok(Some(self.transition(
+            next_revision,
+            rooms,
+            Vec::new(),
+            vec![GenerationChange {
+                user_no: previous.user_no,
+                value: Some(replacement.clone()),
+            }],
+            IdentityAdvanceEffects {
+                previous: previous.clone(),
+                current: replacement.clone(),
+                publications,
+            },
+        )?))
     }
 
     pub(crate) fn leave(
@@ -1099,6 +1285,41 @@ impl MyRoomHub {
             owned,
             next_revision,
         })
+    }
+
+    /// Plans cleanup from an identity-registry release capability.
+    ///
+    /// `ReleasedIdentity` deliberately has no session owner. All other
+    /// actor-minted fields must still match the canonical `MyRoom` generation,
+    /// so an expired or reconstructed stamp cannot close a newer room.
+    pub(crate) fn disconnect_released(
+        &self,
+        released: &ReleasedIdentity,
+    ) -> Result<MyRoomTransition<MyRoomDisconnectOutcome>, MyRoomHubError> {
+        let has_role = self.memberships.contains_key(&released.user_no)
+            || self.rooms.contains_key(&OwnerKey(released.user_no));
+        if !has_role {
+            if self.generations.contains_key(&released.user_no) {
+                return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration {
+                    user_no: released.user_no,
+                }
+                .into());
+            }
+            return self.transition(
+                self.revision,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                MyRoomDisconnectOutcome::NotTracked,
+            );
+        }
+        let canonical = self.generations.get(&released.user_no).ok_or(
+            MyRoomInvariantViolation::MissingCanonicalGeneration {
+                user_no: released.user_no,
+            },
+        )?;
+        require_same_released_binding(canonical, released)?;
+        self.disconnect(canonical)
     }
 
     fn build_disconnect_transition(
@@ -1220,6 +1441,49 @@ impl MyRoomHub {
         if owns_room && membership.is_none_or(|mapped| mapped.owner != owned_key) {
             let mut room = self.room(owned_key)?.clone();
             room.replace_owner_presentation(replacement.clone())?;
+            publications.push(publication(owned_key, &room));
+            changes.push(RoomChange {
+                owner: owned_key,
+                value: Some(room),
+            });
+        }
+        Ok((changes, publications))
+    }
+
+    fn migrated_replacement_rooms(
+        &self,
+        user_no: UserNo,
+        replacement: &IdentityBinding,
+    ) -> Result<(Vec<RoomChange>, Vec<RoomPublication>), MyRoomHubError> {
+        let membership = self.memberships.get(&user_no).copied();
+        let owned_key = OwnerKey(user_no);
+        let owns_room = self.rooms.contains_key(&owned_key);
+        if membership.is_none() && !owns_room {
+            return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration { user_no }.into());
+        }
+
+        let mut changes = Vec::with_capacity(MAX_TRANSITION_ROOMS);
+        let mut publications = Vec::with_capacity(MAX_TRANSITION_ROOMS);
+        if let Some(membership) = membership {
+            let mut room = self.room(membership.owner)?.clone();
+            let current = room.participant(membership.slot).ok_or(
+                MyRoomInvariantViolation::MembershipSlotMismatch {
+                    member: user_no,
+                    slot: membership.slot.get(),
+                },
+            )?;
+            let migrated = migrated_participant(current, replacement)?;
+            room.replace_participant(membership.slot, migrated)?;
+            publications.push(publication(membership.owner, &room));
+            changes.push(RoomChange {
+                owner: membership.owner,
+                value: Some(room),
+            });
+        }
+        if owns_room && membership.is_none_or(|mapped| mapped.owner != owned_key) {
+            let mut room = self.room(owned_key)?.clone();
+            let migrated = migrated_participant(&room.owner, replacement)?;
+            room.replace_owner_presentation(migrated)?;
             publications.push(publication(owned_key, &room));
             changes.push(RoomChange {
                 owner: owned_key,
@@ -1536,6 +1800,13 @@ fn publication(owner: OwnerKey, room: &RoomState) -> RoomPublication {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom command audit consumes full snapshot validation"
+    )
+)]
 fn validate_player_snapshot(
     owner: UserNo,
     slot: u8,
@@ -1572,6 +1843,76 @@ fn require_same_binding(
     Ok(())
 }
 
+fn require_same_released_binding(
+    canonical: &IdentityBinding,
+    released: &ReleasedIdentity,
+) -> Result<(), MyRoomHubError> {
+    if canonical.user_no != released.user_no || canonical.generation != released.generation {
+        return Err(MyRoomHubError::StaleGeneration {
+            user_no: released.user_no,
+            expected: canonical.generation.get(),
+            actual: released.generation.get(),
+        });
+    }
+    if canonical.nickname != released.nickname
+        || canonical.source_ip != released.source_ip
+        || canonical.channel != released.channel
+    {
+        return Err(MyRoomHubError::IdentityBindingMismatch {
+            user_no: released.user_no,
+            generation: released.generation.get(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_identity_advance(
+    previous: &IdentityBinding,
+    replacement: &IdentityBinding,
+) -> Result<(), MyRoomHubError> {
+    if previous.user_no != replacement.user_no {
+        return Err(MyRoomHubError::IdentityAdvanceUserMismatch {
+            previous: previous.user_no,
+            replacement: replacement.user_no,
+        });
+    }
+    if canonical_nickname_key(&previous.nickname) != canonical_nickname_key(&replacement.nickname) {
+        return Err(MyRoomHubError::IdentityAdvanceNicknameMismatch {
+            previous: previous.nickname.clone(),
+            replacement: replacement.nickname.clone(),
+        });
+    }
+    if replacement.generation.get() <= previous.generation.get() {
+        return Err(MyRoomHubError::NonAdvancingGeneration {
+            user_no: previous.user_no,
+            previous: previous.generation.get(),
+            replacement: replacement.generation.get(),
+        });
+    }
+    Ok(())
+}
+
+fn migrated_participant(
+    current: &MyRoomParticipant,
+    replacement: &IdentityBinding,
+) -> Result<MyRoomParticipant, MyRoomHubError> {
+    let mut player = current.player.clone();
+    player.user_no = replacement.user_no.get();
+    player.nickname.clone_from(&replacement.nickname);
+    player.p2p_address = match replacement.source_ip {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+    };
+    MyRoomParticipant::new(replacement.clone(), player)
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP MyRoom entry command consumes generation insertion"
+    )
+)]
 fn push_generation_set(changes: &mut Vec<GenerationChange>, identity: IdentityBinding) {
     if let Some(change) = changes
         .iter_mut()
@@ -1647,7 +1988,7 @@ mod tests {
         MyRoomTransition, OwnerKey, ParticipantRefreshEffects, RoomChange, RoomEffect, RoomState,
         VISITOR_CAPACITY,
     };
-    use crate::{IdentityBinding, IdentityRegistry, SessionId};
+    use crate::{IdentityBinding, IdentityRegistry, ReleasedIdentity, SessionId};
 
     fn claim(registry: &mut IdentityRegistry, session: u64, nickname: &str) -> IdentityBinding {
         registry
@@ -1667,6 +2008,16 @@ mod tests {
     ) -> IdentityBinding {
         let _ = registry.disconnect(SessionId::new(old_session), Instant::now());
         claim(registry, new_session, nickname)
+    }
+
+    fn released(identity: &IdentityBinding) -> ReleasedIdentity {
+        ReleasedIdentity {
+            nickname: identity.nickname.clone(),
+            user_no: identity.user_no,
+            generation: identity.generation,
+            source_ip: identity.source_ip,
+            channel: identity.channel,
+        }
     }
 
     fn participant(identity: &IdentityBinding) -> MyRoomParticipant {
@@ -1993,6 +2344,65 @@ mod tests {
     }
 
     #[test]
+    fn migration_advance_preserves_distinct_owned_and_visited_presentations() {
+        let mut registry = IdentityRegistry::new();
+        let visited_owner = claim(&mut registry, 1, "VisitedOwner");
+        let migrating_g1 = claim(&mut registry, 2, "Migrating");
+        let owned_visitor = claim(&mut registry, 3, "OwnedVisitor");
+        let mut hub = MyRoomHub::new();
+
+        enter(
+            &mut hub,
+            participant_with_rp(&migrating_g1, 100),
+            owner_with_state(&migrating_g1, 100, 20),
+        )
+        .unwrap();
+        enter(
+            &mut hub,
+            participant(&owned_visitor),
+            owner_with_state(&migrating_g1, 999, 999),
+        )
+        .unwrap();
+        enter(&mut hub, participant(&visited_owner), owner(&visited_owner)).unwrap();
+        enter(
+            &mut hub,
+            participant_with_rp(&migrating_g1, 200),
+            owner(&visited_owner),
+        )
+        .unwrap();
+
+        let mut migrating_g2 = replacement_identity(&mut registry, 2, 4, "Migrating");
+        migrating_g2.source_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        let transition = hub
+            .advance_migrated_identity_if_tracked(&migrating_g1, &migrating_g2)
+            .unwrap()
+            .unwrap();
+        let effects = transition.commit(&mut hub).unwrap();
+        assert_eq!(effects.publications.len(), 2);
+
+        let visited = hub.first_snapshot(&migrating_g2).unwrap();
+        let MyRoomSlot::Player(visited_presentation) = &visited.slots[1] else {
+            panic!("migrating visitor must remain in slot one");
+        };
+        assert_eq!(visited_presentation.rp, 200);
+        assert_eq!(
+            visited_presentation.p2p_address,
+            Ipv4Addr::new(203, 0, 113, 44)
+        );
+
+        let owned = hub.first_snapshot(&owned_visitor).unwrap();
+        let MyRoomSlot::Player(owned_presentation) = &owned.slots[0] else {
+            panic!("migrating owner presentation must remain in slot zero");
+        };
+        assert_eq!(owned_presentation.rp, 100);
+        assert_eq!(
+            owned_presentation.p2p_address,
+            Ipv4Addr::new(203, 0, 113, 44)
+        );
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
     fn explicit_participant_refresh_updates_only_canonical_roles() {
         let mut registry = IdentityRegistry::new();
         let owner_id = claim(&mut registry, 1, "Owner");
@@ -2193,6 +2603,58 @@ mod tests {
         ));
         assert_eq!(hub.membership_owner(&visitor).unwrap(), owner_g2.user_no);
         hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn nonmember_queries_hide_only_genuinely_untracked_identities() {
+        let mut registry = IdentityRegistry::new();
+        let identity = claim(&mut registry, 1, "Untracked");
+        let mut hub = MyRoomHub::new();
+        assert_eq!(hub.membership_if_member(&identity).unwrap(), None);
+        assert!(matches!(
+            hub.disconnect_released(&released(&identity))
+                .unwrap()
+                .outcome(),
+            MyRoomDisconnectOutcome::NotTracked
+        ));
+
+        enter(&mut hub, participant(&identity), owner(&identity)).unwrap();
+        hub.memberships.clear();
+        hub.rooms.clear();
+        assert!(matches!(
+            hub.membership_if_member(&identity),
+            Err(MyRoomHubError::Invariant(
+                MyRoomInvariantViolation::OrphanCanonicalGeneration { .. }
+            ))
+        ));
+        assert!(matches!(
+            hub.disconnect_released(&released(&identity)),
+            Err(MyRoomHubError::Invariant(
+                MyRoomInvariantViolation::OrphanCanonicalGeneration { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn role_without_canonical_generation_is_never_treated_as_untracked() {
+        let mut registry = IdentityRegistry::new();
+        let identity = claim(&mut registry, 1, "MissingCanonical");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&identity), owner(&identity)).unwrap();
+        hub.generations.clear();
+
+        assert!(matches!(
+            hub.membership_if_member(&identity),
+            Err(MyRoomHubError::Invariant(
+                MyRoomInvariantViolation::MissingCanonicalGeneration { .. }
+            ))
+        ));
+        assert!(matches!(
+            hub.disconnect_released(&released(&identity)),
+            Err(MyRoomHubError::Invariant(
+                MyRoomInvariantViolation::MissingCanonicalGeneration { .. }
+            ))
+        ));
     }
 
     #[test]

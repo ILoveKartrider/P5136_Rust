@@ -4,7 +4,7 @@ use std::{
     array,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     time::{Duration, Instant},
 };
 
@@ -15,6 +15,7 @@ use p5136_core::{
         serialize_change_team_reply, serialize_set_slot_state_reply, serialize_slot_state,
         serialize_start_room_reply,
     },
+    myroom_protocol::{MyRoomProtocolError, MyRoomSlot, serialize_slot_data},
     nickname::canonical_nickname_key,
     race_protocol::{
         AiGoalInRequest, GameControlRequest, RaceProtocolError, RaceTeam, ServerGameControl,
@@ -58,6 +59,10 @@ use crate::identity::{
 };
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
+use crate::myroom_hub::{
+    IdentityAdvanceEffects, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
+    MyRoomTransition, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
+};
 use crate::profile_io::DurableRewardReceipt;
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
@@ -67,6 +72,7 @@ use crate::udp_state::UdpEndpointStateError;
 
 pub const ROOM_CAPACITY: usize = 8;
 pub(crate) const SESSION_OUTBOUND_CAPACITY: usize = 64;
+const DEFAULT_WORLD_IDENTITY_CAPACITY: usize = 256;
 const LOADING_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RACE_START_DELAY: Duration = Duration::from_secs(1);
 const LOADING_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
@@ -783,10 +789,55 @@ impl RaceError {
     }
 }
 
+/// Fatal failure while reconciling actor-owned identity and `MyRoom` state.
+///
+/// Identity release and migration mutate the registry before dependent
+/// generation-bound state can be published. Any error at this boundary stops
+/// the world actor; continuing would expose a split identity/MyRoom view.
+#[derive(Debug, Error)]
+pub(crate) enum MyRoomLifecycleError {
+    #[error("MyRoom {operation} transition planning failed")]
+    Hub {
+        operation: &'static str,
+        #[source]
+        source: MyRoomHubError,
+    },
+
+    #[error("MyRoom slot snapshot serialization failed: {0}")]
+    Serialization(#[from] MyRoomProtocolError),
+
+    #[error(
+        "MyRoom audience identity {user_no:?} expected generation {expected_generation}, active generation is {actual_generation:?}"
+    )]
+    AudienceIdentityMismatch {
+        user_no: UserNo,
+        expected_generation: u64,
+        actual_generation: Option<u64>,
+    },
+
+    #[error("MyRoom outbound queue for session {session:?} is unavailable")]
+    OutboundUnavailable { session: SessionId },
+
+    #[error(
+        "MyRoom shutdown drain retained {rooms} rooms, {memberships} memberships, and {generations} generations"
+    )]
+    ShutdownStateRetained {
+        rooms: usize,
+        memberships: usize,
+        generations: usize,
+    },
+
+    #[error(transparent)]
+    Commit(#[from] MyRoomCommitError),
+}
+
 #[derive(Debug, Error)]
 pub enum WorldError {
     #[error("world actor has stopped")]
     Stopped,
+
+    #[error("world is quiescing and no longer accepts new sessions")]
+    SessionRegistrationClosed,
 
     #[error(transparent)]
     Room(#[from] RoomError),
@@ -867,6 +918,9 @@ pub enum WorldError {
 
     #[error("reward dead-letter reason {reason:?} is not eligible for persistence retry")]
     RewardDeadLetterNotRetryable { reason: RewardTerminalReason },
+
+    #[error("session shutdown drain requires the world to be quiescing")]
+    SessionDrainRequiresQuiesce,
 }
 
 /// A terminal failure while publishing actor-owned state to a process sidecar.
@@ -875,12 +929,54 @@ pub enum WorldError {
 /// continue to report ordinary command failures without hiding a world/sidecar
 /// divergence that requires the central runtime to stop.
 #[derive(Debug, Error)]
-pub enum WorldSidecarError {
+pub(crate) enum WorldSidecarError {
     #[error("world messenger sidecar failed: {0}")]
     Messenger(#[from] MessengerServiceError),
 
     #[error("world UDP sidecar failed: {0}")]
     Udp(#[from] UdpServiceError),
+
+    #[error("world MyRoom lifecycle failed: {0}")]
+    MyRoom(#[from] MyRoomLifecycleError),
+
+    #[error("world identity capacity must be nonzero")]
+    InvalidIdentityCapacity,
+}
+
+#[derive(Debug)]
+enum WorldOperationError {
+    Command(WorldError),
+    MyRoom(MyRoomLifecycleError),
+}
+
+impl From<WorldError> for WorldOperationError {
+    fn from(error: WorldError) -> Self {
+        Self::Command(error)
+    }
+}
+
+impl From<IdentityError> for WorldOperationError {
+    fn from(error: IdentityError) -> Self {
+        Self::Command(error.into())
+    }
+}
+
+impl From<RoomProtocolError> for WorldOperationError {
+    fn from(error: RoomProtocolError) -> Self {
+        Self::Command(error.into())
+    }
+}
+
+impl From<EquipmentProtocolError> for WorldOperationError {
+    fn from(error: EquipmentProtocolError) -> Self {
+        Self::Command(error.into())
+    }
+}
+
+impl From<MyRoomLifecycleError> for WorldOperationError {
+    fn from(error: MyRoomLifecycleError) -> Self {
+        Self::MyRoom(error)
+    }
 }
 
 #[derive(Debug)]
@@ -889,7 +985,7 @@ enum WorldCommand {
         peer: SocketAddr,
         cancellation: Option<oneshot::Sender<()>>,
         outbound: Option<mpsc::Sender<OutboundBatch>>,
-        reply: oneshot::Sender<SessionId>,
+        reply: oneshot::Sender<Result<SessionId, WorldError>>,
     },
     SessionClosed {
         id: SessionId,
@@ -993,6 +1089,9 @@ enum WorldCommand {
     Quiesce {
         reply: oneshot::Sender<()>,
     },
+    DrainSessions {
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
     RewardDrainStatus {
         reply: oneshot::Sender<Result<RewardDrainStatus, WorldError>>,
     },
@@ -1067,6 +1166,9 @@ impl WorldHandle {
                 Err(WorldSidecarError::Messenger(error)) => Err(error),
                 Err(WorldSidecarError::Udp(_)) => {
                     unreachable!("messenger-only world cannot report a UDP sidecar failure")
+                }
+                Err(WorldSidecarError::MyRoom(_) | WorldSidecarError::InvalidIdentityCapacity) => {
+                    unreachable!("messenger-only test world has no MyRoom mutation commands")
                 }
             }
         });
@@ -1145,7 +1247,7 @@ impl WorldHandle {
             })
             .await
             .map_err(|_| WorldError::Stopped)?;
-        response.await.map_err(|_| WorldError::Stopped)
+        response.await.map_err(|_| WorldError::Stopped)?
     }
 
     pub async fn session_closed(&self, id: SessionId) -> Result<(), WorldError> {
@@ -1490,6 +1592,17 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)
     }
 
+    /// Cancels and retires every session through the World actor before the
+    /// transport tasks are aborted by the runtime supervisor.
+    pub(crate) async fn drain_sessions(&self) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::DrainSessions { reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub async fn reward_drain_status(&self) -> Result<RewardDrainStatus, WorldError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -1538,13 +1651,14 @@ impl WorldHandle {
 struct World {
     sessions: HashMap<SessionId, SessionState>,
     identities: IdentityRegistry,
+    myroom: MyRoomHub,
     rooms: HashMap<RoomId, RoomSnapshot>,
     room_by_identity: HashMap<String, RoomId>,
     protocol_rooms: HashMap<RoomId, ProtocolRoomState>,
     protocol_room_by_user: HashMap<UserNo, RoomId>,
     free_protocol_room_ids: BTreeSet<u16>,
     identity_lifecycle: VecDeque<IdentityLifecycleEvent>,
-    identity_capacity: Option<usize>,
+    identity_capacity: NonZeroUsize,
     next_session_id: u64,
     next_room_id: u32,
     /// The next process-global epoch is consumed only after a race start and
@@ -1851,6 +1965,37 @@ type OutboundDelivery = (SessionId, OutboundBatch);
 struct ReservedOutbound {
     permit: mpsc::OwnedPermit<OutboundBatch>,
     batch: OutboundBatch,
+}
+
+/// Exact generations that the actor has already revoked as one bounded batch.
+///
+/// Shutdown and same-tick migration expiry may retire many identities before
+/// their dependent `MyRoom` transitions are committed. Indexing once by the
+/// registry-unique user number keeps recipient classification O(1) without
+/// weakening the full binding comparison.
+#[derive(Default)]
+struct UnavailableReleaseIndex<'a> {
+    by_user: HashMap<UserNo, &'a ReleasedIdentity>,
+}
+
+impl<'a> UnavailableReleaseIndex<'a> {
+    fn from_released(released: &'a [ReleasedIdentity]) -> Self {
+        let mut by_user = HashMap::with_capacity(released.len());
+        for identity in released {
+            let previous = by_user.insert(identity.user_no, identity);
+            debug_assert!(
+                previous.is_none(),
+                "the identity registry must mint unique active user numbers"
+            );
+        }
+        Self { by_user }
+    }
+
+    fn contains_exact(&self, binding: &IdentityBinding) -> bool {
+        self.by_user
+            .get(&binding.user_no)
+            .is_some_and(|released| released_matches_binding(released, binding))
+    }
 }
 
 impl ProtocolRoomState {
@@ -2212,16 +2357,19 @@ fn reward_retry_delay(failure_count: u8) -> Duration {
 
 impl Default for World {
     fn default() -> Self {
+        let identity_capacity = NonZeroUsize::new(DEFAULT_WORLD_IDENTITY_CAPACITY)
+            .expect("the default world identity capacity is nonzero");
         Self {
             sessions: HashMap::new(),
             identities: IdentityRegistry::new(),
+            myroom: MyRoomHub::with_identity_capacity(identity_capacity),
             rooms: HashMap::new(),
             room_by_identity: HashMap::new(),
             protocol_rooms: HashMap::new(),
             protocol_room_by_user: HashMap::new(),
             free_protocol_room_ids: BTreeSet::new(),
             identity_lifecycle: VecDeque::new(),
-            identity_capacity: None,
+            identity_capacity,
             next_session_id: 1,
             next_room_id: 1,
             next_race_epoch: GlobalRaceEpoch::new(1),
@@ -2238,7 +2386,10 @@ impl World {
         peer: SocketAddr,
         cancellation: Option<oneshot::Sender<()>>,
         outbound: Option<mpsc::Sender<OutboundBatch>>,
-    ) -> SessionId {
+    ) -> Result<SessionId, WorldError> {
+        if self.quiescing {
+            return Err(WorldError::SessionRegistrationClosed);
+        }
         let id = SessionId::new(self.next_session_id);
         self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
         self.sessions.insert(
@@ -2249,7 +2400,7 @@ impl World {
                 outbound,
             },
         );
-        id
+        Ok(id)
     }
 
     fn session_ip(&self, session: SessionId) -> Result<IpAddr, WorldError> {
@@ -2300,6 +2451,16 @@ impl World {
                 self.exact_identity_in_protocol_room(*room_id, &participant.identity)
             })
             .collect()
+    }
+
+    fn myroom_udp_targets(
+        &self,
+        source: &IdentityBinding,
+    ) -> Result<Vec<IdentityBinding>, MyRoomLifecycleError> {
+        self.myroom
+            .peer_audience_if_member(source)
+            .map(|audience| audience.map_or_else(Vec::new, |audience| audience.peers))
+            .map_err(|error| myroom_hub_error("UDP audience query", error))
     }
 
     fn loading_readiness_candidate(
@@ -2545,6 +2706,41 @@ impl World {
 
     fn quiesce(&mut self) {
         self.quiescing = true;
+    }
+
+    fn drain_sessions_for_shutdown(&mut self) -> Result<(), WorldOperationError> {
+        if !self.quiescing {
+            return Err(WorldError::SessionDrainRequiresQuiesce.into());
+        }
+
+        // Session tasks receive cancellation while their receivers still
+        // exist. The actor then revokes every connected or ownerless identity
+        // in one exact release set before any transport task can report a
+        // duplicate close.
+        self.cancel_all_sessions();
+        self.sessions.clear();
+        let released = self.identities.drain_active();
+        let unavailable = UnavailableReleaseIndex::from_released(&released);
+        for identity in &released {
+            // Every possible recipient belongs to this same shutdown release
+            // set, so actor state is fully reconciled without publishing a
+            // snapshot to transports that are about to be aborted.
+            drop(self.release_identity_state_skipping(identity, &unavailable)?);
+        }
+
+        let rooms = self.myroom.room_count();
+        let memberships = self.myroom.member_count();
+        let generations = self.myroom.generation_count();
+        if rooms != 0 || memberships != 0 || generations != 0 {
+            return Err(MyRoomLifecycleError::ShutdownStateRetained {
+                rooms,
+                memberships,
+                generations,
+            }
+            .into());
+        }
+        self.debug_assert_invariants();
+        Ok(())
     }
 
     fn reward_drain_status(&self) -> Result<RewardDrainStatus, WorldError> {
@@ -3933,9 +4129,8 @@ impl World {
         nickname: &str,
     ) -> Result<IdentityBinding, WorldError> {
         let source_ip = self.session_ip(session)?;
-        if let Some(maximum) = self.identity_capacity
-            && self.identities.active_count() >= maximum
-        {
+        let maximum = self.identity_capacity.get();
+        if self.identities.active_count() >= maximum {
             return Err(WorldError::IdentityLimitReached { maximum });
         }
         let binding = self.identities.claim(session, source_ip, nickname)?;
@@ -3951,7 +4146,7 @@ impl World {
         channel_id: u16,
         token: MigrationToken,
         now: Instant,
-    ) -> Result<MigrationCompletion, WorldError> {
+    ) -> Result<MigrationCompletion, WorldOperationError> {
         let preflight = self.preflight_migration(destination, user_no, channel_id, token, now)?;
         self.complete_preflighted_migration(preflight, now)
     }
@@ -3979,7 +4174,7 @@ impl World {
         &mut self,
         preflight: MigrationPreflight,
         now: Instant,
-    ) -> Result<MigrationCompletion, WorldError> {
+    ) -> Result<MigrationCompletion, WorldOperationError> {
         let destination = preflight.destination_session();
         let current_ip = self.session_ip(destination)?;
         if current_ip != preflight.destination_ip() {
@@ -3992,14 +4187,26 @@ impl World {
         let completion = self
             .identities
             .complete_preflighted_migration(preflight, now)?;
-        Ok(self.commit_migration_completion(completion, now))
+        Ok(self.commit_migration_completion(completion, now)?)
     }
 
     fn commit_migration_completion(
         &mut self,
         completion: MigrationCompletion,
         now: Instant,
-    ) -> MigrationCompletion {
+    ) -> Result<MigrationCompletion, MyRoomLifecycleError> {
+        if let Some(transition) = self
+            .myroom
+            .advance_migrated_identity_if_tracked(&completion.previous_binding, &completion.binding)
+            .map_err(|error| myroom_hub_error("identity migration", error))?
+        {
+            self.commit_myroom_transition(
+                transition,
+                |world, effects: &IdentityAdvanceEffects| {
+                    world.myroom_publication_deliveries(&effects.publications)
+                },
+            )?;
+        }
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Advance {
                 previous: completion.previous_identity.clone(),
@@ -4018,15 +4225,15 @@ impl World {
         if let Some(previous_owner) = completion.previous_owner {
             self.cancel_session(previous_owner);
         }
-        self.deliver(deliveries, now);
-        completion
+        self.deliver(deliveries, now)?;
+        Ok(completion)
     }
 
     fn room_protocol(
         &mut self,
         session: SessionId,
         payload: RoomCommandPayload,
-    ) -> Result<(), WorldError> {
+    ) -> Result<(), WorldOperationError> {
         let identity = self.identities.authorize(session)?;
         match payload {
             RoomCommandPayload::List(request) => {
@@ -4040,10 +4247,7 @@ impl World {
                 request,
                 participant,
             } => self.protocol_join_room(session, &identity, &request, participant),
-            RoomCommandPayload::Leave => {
-                self.protocol_leave_room(session, &identity);
-                Ok(())
-            }
+            RoomCommandPayload::Leave => self.protocol_leave_room(session, &identity),
             RoomCommandPayload::FirstState => self.protocol_first_state(session, &identity),
         }
     }
@@ -4052,7 +4256,7 @@ impl World {
         &mut self,
         session: SessionId,
         snapshot: [u8; 65],
-    ) -> Result<(), WorldError> {
+    ) -> Result<(), WorldOperationError> {
         let identity = self.identities.authorize(session)?;
         let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
             return Ok(());
@@ -4074,7 +4278,7 @@ impl World {
         let updated = room.set_equipment_snapshot(identity.user_no, snapshot);
         debug_assert!(updated, "protocol membership map and room state diverged");
         let deliveries = self.deliveries_for_users(recipients, &OutboundBatch::single(packet));
-        self.deliver(deliveries, Instant::now());
+        self.deliver(deliveries, Instant::now())?;
         self.debug_assert_invariants();
         Ok(())
     }
@@ -4917,7 +5121,7 @@ impl World {
         session: SessionId,
         identity: &IdentityBinding,
         request: ChGetRoomListRequest,
-    ) -> Result<(), WorldError> {
+    ) -> Result<(), WorldOperationError> {
         let mut entries = Vec::new();
         if let Some(channel) = identity.channel
             && expected_room_game_type(channel.game_type) == Some(request.room_list_type)
@@ -4945,7 +5149,7 @@ impl World {
         self.deliver(
             vec![(session, OutboundBatch::single(packet))],
             Instant::now(),
-        );
+        )?;
         Ok(())
     }
 
@@ -4993,7 +5197,7 @@ impl World {
         identity: &IdentityBinding,
         request: ChCreateRoomRequest,
         participant: RoomParticipant,
-    ) -> Result<(), WorldError> {
+    ) -> Result<(), WorldOperationError> {
         let game_type = request.game_type;
         let channel = identity.channel;
         let accepted = channel.and_then(|channel| expected_room_game_type(channel.game_type))
@@ -5035,7 +5239,7 @@ impl World {
                 OutboundBatch::single(serialize_ch_create_room_reply(outcome, game_type)),
             )],
             Instant::now(),
-        );
+        )?;
         self.debug_assert_invariants();
         Ok(())
     }
@@ -5046,7 +5250,7 @@ impl World {
         identity: &IdentityBinding,
         request: &ChJoinRoomRequest,
         participant: RoomParticipant,
-    ) -> Result<(), WorldError> {
+    ) -> Result<(), WorldOperationError> {
         let room_id = RoomId(u32::from(request.room_id));
         let mut replacement = None;
         let (status, game_type) = match self.protocol_rooms.get(&room_id) {
@@ -5094,12 +5298,16 @@ impl World {
                 OutboundBatch::single(serialize_ch_join_room_reply(status, game_type)),
             )],
             Instant::now(),
-        );
+        )?;
         self.debug_assert_invariants();
         Ok(())
     }
 
-    fn protocol_leave_room(&mut self, session: SessionId, identity: &IdentityBinding) {
+    fn protocol_leave_room(
+        &mut self,
+        session: SessionId,
+        identity: &IdentityBinding,
+    ) -> Result<(), WorldOperationError> {
         let left = self.protocol_room_by_user.contains_key(&identity.user_no);
         let mut deliveries = vec![(
             session,
@@ -5108,15 +5316,16 @@ impl World {
         if left {
             deliveries.extend(self.remove_protocol_user(identity.user_no));
         }
-        self.deliver(deliveries, Instant::now());
+        self.deliver(deliveries, Instant::now())?;
         self.debug_assert_invariants();
+        Ok(())
     }
 
     fn protocol_first_state(
         &mut self,
         session: SessionId,
         identity: &IdentityBinding,
-    ) -> Result<(), WorldError> {
+    ) -> Result<(), WorldOperationError> {
         let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
             return Ok(());
         };
@@ -5140,7 +5349,7 @@ impl World {
                 deliveries.push((recipient.owner, OutboundBatch::single(slot_packet.clone())));
             }
         }
-        self.deliver(deliveries, Instant::now());
+        self.deliver(deliveries, Instant::now())?;
         Ok(())
     }
 
@@ -5244,6 +5453,120 @@ impl World {
             .collect())
     }
 
+    fn commit_myroom_transition<T>(
+        &mut self,
+        transition: MyRoomTransition<T>,
+        prepare_fanout: impl FnOnce(&Self, &T) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError>,
+    ) -> Result<T, MyRoomLifecycleError> {
+        // Serialization, exact-generation audience resolution, and every
+        // bounded queue reservation complete before the first state mutation.
+        let deliveries = prepare_fanout(self, transition.outcome())?;
+        let reserved = self.reserve_myroom_outbound(deliveries)?;
+        let outcome = transition.commit(&mut self.myroom)?;
+        debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
+        Self::publish_reserved(reserved);
+        Ok(outcome)
+    }
+
+    fn myroom_publication_deliveries(
+        &self,
+        publications: &[MyRoomPublication],
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        let mut serialized = Vec::with_capacity(publications.len());
+        for publication in publications {
+            serialized.push((
+                publication.audience.as_slice(),
+                serialize_slot_data(&publication.snapshot.slots)?,
+            ));
+        }
+        self.myroom_deliveries_from_serialized(serialized, &UnavailableReleaseIndex::default())
+    }
+
+    fn myroom_disconnect_deliveries(
+        &self,
+        outcome: &MyRoomDisconnectOutcome,
+        unavailable_releases: &UnavailableReleaseIndex<'_>,
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        let MyRoomDisconnectOutcome::Applied(effects) = outcome else {
+            return Ok(Vec::new());
+        };
+        let mut serialized = Vec::with_capacity(2);
+        if let Some(MyRoomEffect::Updated(publication)) = &effects.membership_room {
+            serialized.push((
+                publication.audience.as_slice(),
+                serialize_slot_data(&publication.snapshot.slots)?,
+            ));
+        }
+        if let Some(closed) = &effects.closed_owned_room {
+            let empty_slots: [MyRoomSlot; p5136_core::myroom_protocol::MYROOM_SLOT_COUNT] =
+                std::array::from_fn(|_| MyRoomSlot::Empty);
+            serialized.push((
+                closed.ejected.as_slice(),
+                serialize_slot_data(&empty_slots)?,
+            ));
+        }
+        self.myroom_deliveries_from_serialized(serialized, unavailable_releases)
+    }
+
+    fn myroom_deliveries_from_serialized(
+        &self,
+        serialized: Vec<(&[IdentityBinding], Vec<u8>)>,
+        unavailable_releases: &UnavailableReleaseIndex<'_>,
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        let mut grouped: Vec<(SessionId, Vec<Vec<u8>>)> = Vec::new();
+        for (audience, packet) in serialized {
+            for recipient in audience {
+                let active = self
+                    .identities
+                    .active_identity_by_user_no(recipient.user_no);
+                if active.is_none() && self.identities.is_current_ownerless_binding(recipient) {
+                    continue;
+                }
+                if active.is_none() && unavailable_releases.contains_exact(recipient) {
+                    continue;
+                }
+                if active.as_ref() != Some(recipient) {
+                    return Err(MyRoomLifecycleError::AudienceIdentityMismatch {
+                        user_no: recipient.user_no,
+                        expected_generation: recipient.generation.get(),
+                        actual_generation: active.map(|identity| identity.generation.get()),
+                    });
+                }
+                if let Some((_, packets)) = grouped
+                    .iter_mut()
+                    .find(|(session, _)| *session == recipient.owner)
+                {
+                    packets.push(packet.clone());
+                } else {
+                    grouped.push((recipient.owner, vec![packet.clone()]));
+                }
+            }
+        }
+        Ok(grouped
+            .into_iter()
+            .map(|(session, packets)| (session, OutboundBatch::ordered(packets)))
+            .collect())
+    }
+
+    fn reserve_myroom_outbound(
+        &self,
+        deliveries: Vec<OutboundDelivery>,
+    ) -> Result<Vec<ReservedOutbound>, MyRoomLifecycleError> {
+        let mut reserved = Vec::with_capacity(deliveries.len());
+        for (session, batch) in deliveries {
+            let outbound = self
+                .sessions
+                .get(&session)
+                .and_then(|state| state.outbound.clone())
+                .ok_or(MyRoomLifecycleError::OutboundUnavailable { session })?;
+            let permit = outbound
+                .try_reserve_owned()
+                .map_err(|_| MyRoomLifecycleError::OutboundUnavailable { session })?;
+            reserved.push(ReservedOutbound { permit, batch });
+        }
+        Ok(reserved)
+    }
+
     fn reserve_outbound(
         &self,
         deliveries: Vec<OutboundDelivery>,
@@ -5269,7 +5592,11 @@ impl World {
         }
     }
 
-    fn deliver(&mut self, deliveries: Vec<OutboundDelivery>, now: Instant) {
+    fn deliver(
+        &mut self,
+        deliveries: Vec<OutboundDelivery>,
+        now: Instant,
+    ) -> Result<(), MyRoomLifecycleError> {
         let mut pending = VecDeque::from(deliveries);
         let mut failed_sessions = HashSet::new();
         while let Some((session, batch)) = pending.pop_front() {
@@ -5282,9 +5609,10 @@ impl World {
                 None => self.sessions.contains_key(&session),
             };
             if failed && failed_sessions.insert(session) {
-                pending.extend(self.close_session_state(session, now));
+                pending.extend(self.close_session_state(session, now)?);
             }
         }
+        Ok(())
     }
 
     fn cancel_session(&mut self, session: SessionId) {
@@ -5305,12 +5633,20 @@ impl World {
         }
     }
 
-    fn close_session(&mut self, session: SessionId, now: Instant) {
-        let deliveries = self.close_session_state(session, now);
-        self.deliver(deliveries, now);
+    fn close_session(
+        &mut self,
+        session: SessionId,
+        now: Instant,
+    ) -> Result<(), MyRoomLifecycleError> {
+        let deliveries = self.close_session_state(session, now)?;
+        self.deliver(deliveries, now)
     }
 
-    fn close_session_state(&mut self, session: SessionId, now: Instant) -> Vec<OutboundDelivery> {
+    fn close_session_state(
+        &mut self,
+        session: SessionId,
+        now: Instant,
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
         if let Some(mut state) = self.sessions.remove(&session)
             && let Some(cancellation) = state.cancellation.take()
         {
@@ -5320,20 +5656,39 @@ impl World {
             DisconnectOutcome::Released(identity) => self.release_identity_state(&identity),
             DisconnectOutcome::Unauthenticated
             | DisconnectOutcome::Stale(_)
-            | DisconnectOutcome::Deferred { .. } => Vec::new(),
+            | DisconnectOutcome::Deferred { .. } => Ok(Vec::new()),
         }
     }
 
-    fn expire_migrations(&mut self, now: Instant) {
+    fn expire_migrations(&mut self, now: Instant) -> Result<(), MyRoomLifecycleError> {
         let identities = self.identities.expire_migrations(now);
-        let deliveries = identities
-            .iter()
-            .flat_map(|identity| self.release_identity_state(identity))
-            .collect();
-        self.deliver(deliveries, now);
+        let unavailable = UnavailableReleaseIndex::from_released(&identities);
+        let mut deliveries = Vec::new();
+        for identity in &identities {
+            deliveries.extend(self.release_identity_state_skipping(identity, &unavailable)?);
+        }
+        self.deliver(deliveries, now)
     }
 
-    fn release_identity_state(&mut self, identity: &ReleasedIdentity) -> Vec<OutboundDelivery> {
+    fn release_identity_state(
+        &mut self,
+        identity: &ReleasedIdentity,
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        self.release_identity_state_skipping(identity, &UnavailableReleaseIndex::default())
+    }
+
+    fn release_identity_state_skipping(
+        &mut self,
+        identity: &ReleasedIdentity,
+        unavailable_releases: &UnavailableReleaseIndex<'_>,
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        let transition = self
+            .myroom
+            .disconnect_released(identity)
+            .map_err(|error| myroom_hub_error("identity release", error))?;
+        self.commit_myroom_transition(transition, |world, outcome: &MyRoomDisconnectOutcome| {
+            world.myroom_disconnect_deliveries(outcome, unavailable_releases)
+        })?;
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Release(identity.clone()));
         if let Some(room_id) = self.room_by_identity.remove(&identity.nickname)
@@ -5347,7 +5702,7 @@ impl World {
         }
         let deliveries = self.remove_protocol_user(identity.user_no);
         self.debug_assert_invariants();
-        deliveries
+        Ok(deliveries)
     }
 
     fn create_room(&mut self) -> RoomId {
@@ -5740,6 +6095,18 @@ async fn flush_identity_lifecycle(
     Ok(())
 }
 
+fn myroom_hub_error(operation: &'static str, source: MyRoomHubError) -> MyRoomLifecycleError {
+    MyRoomLifecycleError::Hub { operation, source }
+}
+
+fn released_matches_binding(released: &ReleasedIdentity, binding: &IdentityBinding) -> bool {
+    released.nickname == binding.nickname
+        && released.user_no == binding.user_no
+        && released.generation == binding.generation
+        && released.source_ip == binding.source_ip
+        && released.channel == binding.channel
+}
+
 async fn reply_after_identity_lifecycle<T>(
     world: &mut World,
     sidecars: &WorldSidecars,
@@ -5749,6 +6116,21 @@ async fn reply_after_identity_lifecycle<T>(
     flush_identity_lifecycle(world, sidecars).await?;
     let _ = reply.send(value);
     Ok(())
+}
+
+async fn reply_after_world_operation<T>(
+    world: &mut World,
+    sidecars: &WorldSidecars,
+    reply: oneshot::Sender<Result<T, WorldError>>,
+    value: Result<T, WorldOperationError>,
+) -> Result<(), WorldSidecarError> {
+    match value {
+        Ok(value) => reply_after_identity_lifecycle(world, sidecars, reply, Ok(value)).await,
+        Err(WorldOperationError::Command(error)) => {
+            reply_after_identity_lifecycle(world, sidecars, reply, Err(error)).await
+        }
+        Err(WorldOperationError::MyRoom(error)) => Err(WorldSidecarError::MyRoom(error)),
+    }
 }
 
 async fn receive_udp_ingress(
@@ -5785,13 +6167,12 @@ async fn dispatch_udp_ingress(
     let readiness_candidate = matches!(&ingress.body, UdpIngressBody::PqUdpTimeSync(_))
         .then(|| world.loading_readiness_candidate(&identity))
         .flatten();
+    let room_targets = world.myroom_udp_targets(&identity)?;
     let request = UdpDispatchRequest {
         ingress,
         identity,
         racing_targets: world.racing_udp_targets(user_no),
-        // MyRoom is a distinct feature and does not share protocol-room
-        // membership. Its audience remains empty until that state is ported.
-        room_targets: Vec::new(),
+        room_targets,
     };
 
     match udp.dispatch(request).await {
@@ -5824,10 +6205,17 @@ async fn run_world(
     sidecars: WorldSidecars,
     clock: ServerClock,
 ) -> Result<(), WorldSidecarError> {
+    let identity_capacity = sidecars
+        .identity_capacity()
+        .unwrap_or(DEFAULT_WORLD_IDENTITY_CAPACITY);
+    let identity_capacity =
+        NonZeroUsize::new(identity_capacity).ok_or(WorldSidecarError::InvalidIdentityCapacity)?;
     let world = World {
-        identity_capacity: sidecars.identity_capacity(),
+        identity_capacity,
+        myroom: MyRoomHub::with_identity_capacity(identity_capacity),
         ..World::default()
     };
+    debug_assert_eq!(world.myroom.identity_capacity(), world.identity_capacity);
     run_world_actor(world, receiver, udp_receiver, sidecars, clock).await
 }
 
@@ -5885,7 +6273,7 @@ async fn run_world_actor_with_timers(
             _ = timers.migration_expiry.tick() => {
                 let now = Instant::now();
                 world.advance_loading(now, &clock);
-                world.expire_migrations(now);
+                world.expire_migrations(now)?;
                 flush_identity_lifecycle(&mut world, &sidecars).await?;
                 world.advance_loading(Instant::now(), &clock);
             }
@@ -5941,7 +6329,7 @@ async fn dispatch_command(
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::SessionClosed { id, reply } => {
-            world.close_session(id, Instant::now());
+            world.close_session(id, Instant::now())?;
             flush_identity_lifecycle(world, sidecars).await?;
             if let Some(reply) = reply {
                 let _ = reply.send(());
@@ -5984,7 +6372,7 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.complete_migration(destination, user_no, channel_id, token, now);
-            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::RoomProtocol {
             session,
@@ -5992,7 +6380,7 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.room_protocol(session, *payload);
-            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::PublishRoomEquipment {
             session,
@@ -6000,7 +6388,7 @@ async fn dispatch_command(
             reply,
         } => {
             let result = world.publish_room_equipment(session, *snapshot);
-            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::Lobby {
             session,
@@ -6017,6 +6405,10 @@ async fn dispatch_command(
         } => {
             let result = world.race_command_with_clock(session, payload, Instant::now(), clock);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::DrainSessions { reply } => {
+            let result = world.drain_sessions_for_shutdown();
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         command => return dispatch_utility_command(world, command, sidecars).await,
     }
@@ -6050,7 +6442,7 @@ async fn dispatch_utility_command(
             reply,
         } => {
             let result = world.complete_preflighted_migration(preflight, now);
-            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::CreateRoom { reply } => {
             let result = world.create_room();
@@ -6146,7 +6538,8 @@ async fn dispatch_utility_command(
         | WorldCommand::RoomProtocol { .. }
         | WorldCommand::PublishRoomEquipment { .. }
         | WorldCommand::Lobby { .. }
-        | WorldCommand::Race { .. } => {
+        | WorldCommand::Race { .. }
+        | WorldCommand::DrainSessions { .. } => {
             unreachable!("identity-affecting commands are dispatched by dispatch_command")
         }
     }
@@ -6175,7 +6568,9 @@ pub(crate) mod test_support {
         source_port: u16,
     ) -> (SessionId, IdentityBinding, mpsc::Receiver<OutboundBatch>) {
         let source_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let source = world.register_session(SocketAddr::new(source_ip, source_port), None, None);
+        let source = world
+            .register_session(SocketAddr::new(source_ip, source_port), None, None)
+            .unwrap();
         let claimed = world.claim_identity(source, nickname).unwrap();
         let channel = ChannelBinding {
             channel_id: 67,
@@ -6187,11 +6582,13 @@ pub(crate) mod test_support {
             .begin_migration(source, channel, token, Instant::now())
             .unwrap();
         let (outbound, receiver) = mpsc::channel(SESSION_OUTBOUND_CAPACITY);
-        let destination = world.register_session(
-            SocketAddr::new(source_ip, source_port + 1),
-            None,
-            Some(outbound),
-        );
+        let destination = world
+            .register_session(
+                SocketAddr::new(source_ip, source_port + 1),
+                None,
+                Some(outbound),
+            )
+            .unwrap();
         let completion = world
             .complete_migration(
                 destination,
@@ -6372,6 +6769,9 @@ mod tests {
             CHANGE_TEAM_REPLY_NAME, PlayerSlotState, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
         },
+        myroom_protocol::{
+            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot, serialize_slot_data,
+        },
         race_protocol::{
             AiGoalInRequest, GAME_AI_MASTER_NOTICE_NAME, GAME_CONTROL_PACKET_NAME,
             GAME_NEXT_STAGE_PACKET_NAME, GAME_RACE_TIME_PACKET_NAME, GameControlRequest, RaceTeam,
@@ -6394,10 +6794,12 @@ mod tests {
 
     use super::{
         GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
-        LobbyCommandPayload, LobbyError, OutboundBatch, ROOM_CAPACITY, RaceCommandOutcome,
-        RaceCommandPayload, RaceError, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
-        RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
+        LobbyCommandPayload, LobbyError, MyRoomLifecycleError, OutboundBatch, ROOM_CAPACITY,
+        RaceCommandOutcome, RaceCommandPayload, RaceError, RoomCommandPayload, RoomError, RoomId,
+        RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError,
+        WorldHandle, WorldOperationError, WorldSidecarError, WorldSidecars, dispatch_command,
     };
+    use crate::myroom_hub::{MyRoomOwner, MyRoomParticipant};
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
         MessengerServiceError, MessengerServiceHandle, MigrationToken, ServerClock,
@@ -6462,7 +6864,9 @@ mod tests {
         outbound_capacity: usize,
     ) -> TestChannelSession {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let source = world.register_session(SocketAddr::new(ip, port), None, None);
+        let source = world
+            .register_session(SocketAddr::new(ip, port), None, None)
+            .unwrap();
         let claimed = world.claim_identity(source, nickname).unwrap();
         let channel = ChannelBinding {
             channel_id: u16::from(channel_game_type),
@@ -6474,11 +6878,13 @@ mod tests {
             .begin_migration(source, channel, token, Instant::now())
             .unwrap();
         let (outbound, receiver) = mpsc::channel(outbound_capacity);
-        let destination = world.register_session(
-            SocketAddr::new(ip, port.wrapping_add(1)),
-            None,
-            Some(outbound),
-        );
+        let destination = world
+            .register_session(
+                SocketAddr::new(ip, port.wrapping_add(1)),
+                None,
+                Some(outbound),
+            )
+            .unwrap();
         let completion = world
             .complete_migration(
                 destination,
@@ -6523,11 +6929,13 @@ mod tests {
             .begin_migration(source.session, channel, token, Instant::now())
             .unwrap();
         let (outbound, receiver) = mpsc::channel(outbound_capacity);
-        let destination = world.register_session(
-            SocketAddr::new(source.identity.source_ip, destination_port),
-            None,
-            Some(outbound),
-        );
+        let destination = world
+            .register_session(
+                SocketAddr::new(source.identity.source_ip, destination_port),
+                None,
+                Some(outbound),
+            )
+            .unwrap();
         let completion = world
             .complete_migration(
                 destination,
@@ -6542,6 +6950,55 @@ mod tests {
             identity: completion.binding,
             outbound: receiver,
         }
+    }
+
+    fn myroom_participant(
+        identity: &IdentityBinding,
+        presented_ip: Ipv4Addr,
+        rp: u32,
+    ) -> MyRoomParticipant {
+        MyRoomParticipant::new(
+            identity.clone(),
+            MyRoomPlayerSlot {
+                user_no: identity.user_no.get(),
+                p2p_address: presented_ip,
+                p2p_port: 39_312,
+                nickname: identity.nickname.clone(),
+                rider_item_snapshot: [identity.user_no.get().to_le_bytes()[0];
+                    RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+                rp,
+                club_name: format!("club-{}", identity.user_no.get()),
+            },
+        )
+        .unwrap()
+    }
+
+    fn myroom_owner(identity: &IdentityBinding, presented_ip: Ipv4Addr) -> MyRoomOwner {
+        MyRoomOwner::new(
+            myroom_participant(identity, presented_ip, 100),
+            MyRoomInfo {
+                room_id: i16::try_from(identity.user_no.get()).unwrap(),
+                ..MyRoomInfo::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn enter_myroom(
+        world: &mut World,
+        member: &IdentityBinding,
+        owner: &IdentityBinding,
+        member_ip: Ipv4Addr,
+        owner_ip: Ipv4Addr,
+    ) {
+        let transition = world
+            .myroom
+            .enter(
+                &myroom_participant(member, member_ip, 200),
+                &myroom_owner(owner, owner_ip),
+            )
+            .unwrap();
+        transition.commit(&mut world.myroom).unwrap();
     }
 
     fn room_participant() -> RoomParticipant {
@@ -6741,11 +7198,13 @@ mod tests {
 
     fn add_cancellable_session(world: &mut World, port: u16) -> oneshot::Receiver<()> {
         let (cancellation, cancelled) = oneshot::channel();
-        world.register_session(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-            Some(cancellation),
-            None,
-        );
+        world
+            .register_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                Some(cancellation),
+                None,
+            )
+            .unwrap();
         cancelled
     }
 
@@ -7423,7 +7882,7 @@ mod tests {
             .race_command(owner.session, game_control_request(0), now)
             .unwrap();
 
-        world.close_session(guest.session, now);
+        world.close_session(guest.session, now).unwrap();
         world.advance_loading(now, &ServerClock::new());
         let room = &world.protocol_rooms[&room_id];
         assert_eq!(room.frozen_race, frozen);
@@ -7438,7 +7897,7 @@ mod tests {
         assert!(expected.contains(&super::FrozenParticipantStamp::from(&observer.identity)));
         assert!(ready.is_empty());
 
-        world.close_session(owner.session, now);
+        world.close_session(owner.session, now).unwrap();
         world.advance_loading(now, &ServerClock::new());
         let room = &world.protocol_rooms[&room_id];
         assert_eq!(room.phase, RoomPhase::Lobby);
@@ -8265,7 +8724,7 @@ mod tests {
         let progress = world.protocol_rooms[&room_id].race_progress.clone();
         let settlement = progress.settlement.as_ref().unwrap().clone();
 
-        world.close_session(p0.session, now);
+        world.close_session(p0.session, now).unwrap();
         drain_batches(&mut p1.outbound);
         drain_batches(&mut p2.outbound);
         drain_batches(&mut p3.outbound);
@@ -8706,7 +9165,7 @@ mod tests {
         force_running(&mut world, old_room);
         let old_fence = world.reward_lanes[&old_user];
 
-        world.close_session(owner.session, Instant::now());
+        world.close_session(owner.session, Instant::now()).unwrap();
         assert_eq!(world.reward_lanes.get(&old_user), Some(&old_fence));
         assert!(world.protocol_rooms[&old_room].is_empty());
 
@@ -8923,7 +9382,9 @@ mod tests {
     async fn ready_migration_timer_precedes_ready_command_mailbox() {
         let mut world = World::default();
         let source_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let source = world.register_session(SocketAddr::new(source_ip, 43_250), None, None);
+        let source = world
+            .register_session(SocketAddr::new(source_ip, 43_250), None, None)
+            .unwrap();
         let original = world.claim_identity(source, "ExpiredOwnerless").unwrap();
         let issued_at = Instant::now()
             .checked_sub(crate::MIGRATION_TTL + Duration::from_secs(1))
@@ -8940,8 +9401,12 @@ mod tests {
                 issued_at,
             )
             .unwrap();
-        world.close_session(source, issued_at + Duration::from_secs(1));
-        let replacement = world.register_session(SocketAddr::new(source_ip, 43_251), None, None);
+        world
+            .close_session(source, issued_at + Duration::from_secs(1))
+            .unwrap();
+        let replacement = world
+            .register_session(SocketAddr::new(source_ip, 43_251), None, None)
+            .unwrap();
 
         let (sender, receiver) = mpsc::channel(4);
         let (reply, response) = oneshot::channel();
@@ -10373,7 +10838,9 @@ mod tests {
 
         assert!(matches!(
             world.room_protocol(source.session, RoomCommandPayload::Leave),
-            Err(WorldError::Identity(IdentityError::StaleSession(session)))
+            Err(WorldOperationError::Command(WorldError::Identity(
+                IdentityError::StaleSession(session)
+            )))
                 if session == source.session
         ));
         assert_eq!(
@@ -10446,7 +10913,9 @@ mod tests {
         let mut destination = migrate_channel_session(&mut world, &owner, 47_130, 16);
         assert!(matches!(
             world.publish_room_equipment(owner.session, [0x33; 65]),
-            Err(WorldError::Identity(IdentityError::StaleSession(session)))
+            Err(WorldOperationError::Command(WorldError::Identity(
+                IdentityError::StaleSession(session)
+            )))
                 if session == owner.session
         ));
         assert!(peer.outbound.try_recv().is_err());
@@ -10580,10 +11049,12 @@ mod tests {
                     participant,
                 },
             ),
-            Err(WorldError::RoomProtocol(RoomProtocolError::LimitExceeded {
-                field: "rider card",
-                ..
-            }))
+            Err(WorldOperationError::Command(WorldError::RoomProtocol(
+                RoomProtocolError::LimitExceeded {
+                    field: "rider card",
+                    ..
+                }
+            )))
         ));
         assert!(
             !world
@@ -10696,6 +11167,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_session_drain_flushes_exact_sidecar_releases_before_reply() {
+        let (messenger, messenger_task) =
+            MessengerServiceHandle::spawn(MessengerRuntimeConfig::default()).unwrap();
+        let (world, world_task) = WorldHandle::spawn_with_messenger(16, messenger.clone());
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let now = Instant::now();
+        let ownerless_session = world
+            .register_session(SocketAddr::new(ip, 53_100))
+            .await
+            .unwrap();
+        world
+            .claim_identity(ownerless_session, "DrainSidecarOwnerless")
+            .await
+            .unwrap();
+        let connected_session = world
+            .register_session(SocketAddr::new(ip, 53_101))
+            .await
+            .unwrap();
+        world
+            .claim_identity(connected_session, "DrainSidecarConnected")
+            .await
+            .unwrap();
+        world
+            .begin_migration(
+                ownerless_session,
+                ChannelBinding {
+                    channel_id: 67,
+                    game_type: 67,
+                },
+                MigrationToken::new(0xD513).unwrap(),
+                now,
+            )
+            .await
+            .unwrap();
+        world.session_closed(ownerless_session).await.unwrap();
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 2);
+
+        world.quiesce().await.unwrap();
+        world.drain_sessions().await.unwrap();
+        assert_eq!(world.session_count().await.unwrap(), 0);
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 0);
+        assert!(matches!(
+            world.authorize_identity(connected_session).await,
+            Err(WorldError::Identity(
+                IdentityError::UnauthenticatedSession(id)
+            )) if id == connected_session
+        ));
+
+        world.session_closed(ownerless_session).await.unwrap();
+        world.session_closed(connected_session).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+        messenger.shutdown().await.unwrap();
+        messenger_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quiesce_permanently_closes_session_registration() {
+        let (world, world_task) = WorldHandle::spawn(16);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53_102);
+
+        world.quiesce().await.unwrap();
+        assert!(matches!(
+            world.register_session(peer).await,
+            Err(WorldError::SessionRegistrationClosed)
+        ));
+
+        world.drain_sessions().await.unwrap();
+        assert!(matches!(
+            world.register_login_session(peer).await,
+            Err(WorldError::SessionRegistrationClosed)
+        ));
+        assert_eq!(world.session_count().await.unwrap(), 0);
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn udp_lifecycle_is_committed_before_replies_and_limits_world_capacity() {
         let messenger_config = MessengerRuntimeConfig {
             max_identities: 3,
@@ -10804,6 +11354,388 @@ mod tests {
         udp_runtime.shutdown().await;
         messenger.shutdown().await.unwrap();
         messenger_task.await.unwrap();
+    }
+
+    #[test]
+    fn myroom_udp_audience_is_exact_generation_and_nonmembers_are_empty() {
+        let mut world = World::default();
+        assert_eq!(world.myroom.identity_capacity(), world.identity_capacity);
+        let owner = register_channel_session(&mut world, "MyOwner", 67, 56_100, 8);
+        let guest = register_channel_session(&mut world, "MyGuest", 67, 56_110, 8);
+        let outsider = register_channel_session(&mut world, "Outsider", 67, 56_120, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 2),
+            Ipv4Addr::new(192, 0, 2, 1),
+        );
+
+        assert_eq!(
+            world.myroom_udp_targets(&owner.identity).unwrap(),
+            vec![guest.identity.clone()]
+        );
+        assert!(
+            world
+                .myroom_udp_targets(&outsider.identity)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut forged = owner.identity.clone();
+        forged.owner = guest.session;
+        assert!(matches!(
+            world.myroom_udp_targets(&forged),
+            Err(MyRoomLifecycleError::Hub { .. })
+        ));
+    }
+
+    #[test]
+    fn myroom_disconnect_publishes_consistent_snapshot_and_owner_close_ejects() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "CloseOwner", 67, 56_200, 8);
+        let guest = register_channel_session(&mut world, "CloseGuest", 67, 56_210, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(192, 0, 2, 10),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 11),
+            Ipv4Addr::new(192, 0, 2, 10),
+        );
+
+        world.close_session(guest.session, Instant::now()).unwrap();
+        let snapshot = world.myroom.first_snapshot(&owner.identity).unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_slot_data(&snapshot.slots).unwrap()
+        );
+        assert_eq!(world.myroom.member_count(), 1);
+        assert_eq!(
+            world.myroom.membership_if_member(&guest.identity).unwrap(),
+            None
+        );
+
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "EjectOwner", 67, 56_220, 8);
+        let mut guest = register_channel_session(&mut world, "EjectGuest", 67, 56_230, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 20),
+            Ipv4Addr::new(192, 0, 2, 20),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 21),
+            Ipv4Addr::new(192, 0, 2, 20),
+        );
+        world.close_session(owner.session, Instant::now()).unwrap();
+        let empty: [MyRoomSlot; MYROOM_SLOT_COUNT] = std::array::from_fn(|_| MyRoomSlot::Empty);
+        assert_eq!(
+            take_single_packet(&mut guest.outbound),
+            serialize_slot_data(&empty).unwrap()
+        );
+        assert_eq!(world.myroom.room_count(), 0);
+        assert_eq!(world.myroom.member_count(), 0);
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn myroom_migration_preserves_role_snapshot_and_advances_exact_generation() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "MoveOwner", 67, 56_300, 8);
+        let mut guest = register_channel_session(&mut world, "MoveGuest", 67, 56_310, 8);
+        let stale_presented_ip = Ipv4Addr::new(192, 0, 2, 30);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            stale_presented_ip,
+            stale_presented_ip,
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 31),
+            stale_presented_ip,
+        );
+
+        let mut migrated = migrate_channel_session(&mut world, &owner, 56_320, 8);
+        assert!(migrated.identity.generation.get() > owner.identity.generation.get());
+        assert!(matches!(
+            world.myroom_udp_targets(&owner.identity),
+            Err(MyRoomLifecycleError::Hub { .. })
+        ));
+        assert_eq!(
+            world.myroom_udp_targets(&migrated.identity).unwrap(),
+            vec![guest.identity.clone()]
+        );
+
+        let snapshot = world.myroom.first_snapshot(&migrated.identity).unwrap();
+        let MyRoomSlot::Player(presentation) = &snapshot.slots[0] else {
+            panic!("migrated owner must remain in slot zero");
+        };
+        assert_eq!(presentation.p2p_address, Ipv4Addr::LOCALHOST);
+        assert_eq!(presentation.p2p_port, 39_312);
+        assert_eq!(presentation.rp, 100);
+        let packet = serialize_slot_data(&snapshot.slots).unwrap();
+        assert_eq!(take_single_packet(&mut migrated.outbound), packet);
+        assert_eq!(take_single_packet(&mut guest.outbound), packet);
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_myroom_fanout_rolls_back_and_is_actor_terminal() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "FullOwner", 67, 56_400, 1);
+        let mut guest = register_channel_session(&mut world, "FullGuest", 67, 56_410, 1);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 40),
+            Ipv4Addr::new(192, 0, 2, 40),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 41),
+            Ipv4Addr::new(192, 0, 2, 40),
+        );
+        world.sessions[&guest.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(vec![0xA5]))
+            .unwrap();
+        let revision = world.myroom.revision();
+        let (reply, response) = oneshot::channel();
+
+        let result = dispatch_command(
+            &mut world,
+            WorldCommand::SessionClosed {
+                id: owner.session,
+                reply: Some(reply),
+            },
+            &WorldSidecars::default(),
+            &ServerClock::new(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(WorldSidecarError::MyRoom(
+                MyRoomLifecycleError::OutboundUnavailable { session }
+            )) if session == guest.session
+        ));
+        assert!(response.await.is_err());
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(world.myroom.room_count(), 1);
+        assert_eq!(world.myroom.member_count(), 2);
+        assert_eq!(take_single_packet(&mut guest.outbound), vec![0xA5]);
+    }
+
+    #[test]
+    fn shutdown_session_drain_retires_closed_connected_and_ownerless_myroom_peers() {
+        let now = Instant::now();
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "DrainOwner", 67, 56_450, 8);
+        let guest = register_channel_session(&mut world, "DrainGuest", 67, 56_460, 8);
+        let owner_session = owner.session;
+        let guest_session = guest.session;
+        let expected_users = [owner.identity.user_no, guest.identity.user_no];
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 45),
+            Ipv4Addr::new(192, 0, 2, 45),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 46),
+            Ipv4Addr::new(192, 0, 2, 45),
+        );
+        world
+            .identities
+            .begin_migration(
+                guest_session,
+                guest.identity.channel.unwrap(),
+                MigrationToken::new(945).unwrap(),
+                now,
+            )
+            .unwrap();
+        world.close_session(guest_session, now).unwrap();
+        assert!(
+            world
+                .identities
+                .is_current_ownerless_binding(&guest.identity)
+        );
+        drop(owner.outbound);
+        drop(guest.outbound);
+
+        assert!(matches!(
+            world.drain_sessions_for_shutdown(),
+            Err(WorldOperationError::Command(
+                WorldError::SessionDrainRequiresQuiesce
+            ))
+        ));
+        world.quiesce();
+        world.drain_sessions_for_shutdown().unwrap();
+
+        assert!(world.sessions.is_empty());
+        assert_eq!(world.identities.active_count(), 0);
+        assert_eq!(world.myroom.room_count(), 0);
+        assert_eq!(world.myroom.member_count(), 0);
+        assert_eq!(world.myroom.generation_count(), 0);
+        let released_users = world
+            .identity_lifecycle
+            .iter()
+            .filter_map(|event| match event {
+                super::IdentityLifecycleEvent::Release(identity) => Some(identity.user_no),
+                super::IdentityLifecycleEvent::Announce(_)
+                | super::IdentityLifecycleEvent::Advance { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            expected_users
+                .iter()
+                .all(|user_no| released_users.contains(user_no))
+        );
+
+        world.close_session(owner_session, now).unwrap();
+        world.close_session(guest_session, now).unwrap();
+        world.drain_sessions_for_shutdown().unwrap();
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn ownerless_migration_recipient_is_skipped_without_masking_stale_bindings() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "WaitOwner", 67, 56_500, 8);
+        let guest = register_channel_session(&mut world, "WaitGuest", 67, 56_510, 8);
+        let leaver = register_channel_session(&mut world, "WaitLeaver", 67, 56_520, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 50),
+            Ipv4Addr::new(192, 0, 2, 50),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 51),
+            Ipv4Addr::new(192, 0, 2, 50),
+        );
+        enter_myroom(
+            &mut world,
+            &leaver.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 52),
+            Ipv4Addr::new(192, 0, 2, 50),
+        );
+
+        let token = MigrationToken::new(901).unwrap();
+        world
+            .identities
+            .begin_migration(
+                guest.session,
+                guest.identity.channel.unwrap(),
+                token,
+                Instant::now(),
+            )
+            .unwrap();
+        world.close_session(guest.session, Instant::now()).unwrap();
+        assert!(
+            world
+                .identities
+                .is_current_ownerless_binding(&guest.identity)
+        );
+
+        world.close_session(leaver.session, Instant::now()).unwrap();
+        let snapshot = world.myroom.first_snapshot(&owner.identity).unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_slot_data(&snapshot.slots).unwrap()
+        );
+        assert_eq!(world.myroom.member_count(), 2);
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn same_tick_ownerless_expiry_skips_other_actor_minted_releases() {
+        let issued_at = Instant::now();
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "SweepOwner", 67, 56_600, 8);
+        let first = register_channel_session(&mut world, "SweepFirst", 67, 56_610, 8);
+        let second = register_channel_session(&mut world, "SweepSecond", 67, 56_620, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 60),
+            Ipv4Addr::new(192, 0, 2, 60),
+        );
+        enter_myroom(
+            &mut world,
+            &first.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 61),
+            Ipv4Addr::new(192, 0, 2, 60),
+        );
+        enter_myroom(
+            &mut world,
+            &second.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 62),
+            Ipv4Addr::new(192, 0, 2, 60),
+        );
+        for (identity, token_value) in [(&first, 902), (&second, 903)] {
+            world
+                .identities
+                .begin_migration(
+                    identity.session,
+                    identity.identity.channel.unwrap(),
+                    MigrationToken::new(token_value).unwrap(),
+                    issued_at,
+                )
+                .unwrap();
+            world.close_session(identity.session, issued_at).unwrap();
+        }
+
+        world
+            .expire_migrations(issued_at + crate::MIGRATION_TTL)
+            .unwrap();
+        assert_eq!(world.myroom.member_count(), 1);
+        assert_eq!(world.myroom.room_count(), 1);
+        let mut publications = 0;
+        while owner.outbound.try_recv().is_ok() {
+            publications += 1;
+        }
+        assert_eq!(publications, 2);
+        world.myroom.audit_invariants().unwrap();
     }
 
     #[tokio::test]

@@ -641,8 +641,22 @@ impl ProfileJobAdmission {
             .map_err(|_| ProfileIoError::RuntimeStopped { operation })?
     }
 
-    fn submit_with_completion<T, F, C>(self, operation: &'static str, run: F, completion: C)
-    where
+    /// Transfers an accepted job, its profile lane, and its completion
+    /// capability to the profile runtime.
+    ///
+    /// Unlike [`Self::run`], the completion is not tied to a request future.
+    /// Once this method returns, cancelling that requester cannot discard the
+    /// callback or release the lane before the blocking job completes.
+    ///
+    /// The callback executes on the profile supervisor task and must remain
+    /// non-blocking. A panic is caught, drains already accepted work, and then
+    /// terminates the profile runtime as an infrastructure failure.
+    pub(crate) fn submit_with_completion<T, F, C>(
+        self,
+        operation: &'static str,
+        run: F,
+        completion: C,
+    ) where
         T: Send + 'static,
         F: FnOnce(&ProfileStore, &RaceRunLease, &ProfileSubject) -> T + Send + 'static,
         C: FnOnce(Result<ProfileIoCompletion<T>, ProfileIoError>) + Send + 'static,
@@ -947,6 +961,59 @@ mod tests {
         release.send(()).unwrap();
         shutdown.await.unwrap().unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_completion_callback_survives_requester_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let bootstrap =
+            ProfileIoBootstrap::acquire(root.path().to_owned(), ProfileIoLimits::for_tests(2, 2))
+                .unwrap();
+        let (handle, runtime) = bootstrap.spawn();
+        let admission = handle.admit("Rider", "callback ownership").await.unwrap();
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (submitted, submitted_rx) = oneshot::channel();
+        let (completion, completion_rx) = oneshot::channel();
+        let requester = tokio::spawn(async move {
+            admission.submit_with_completion(
+                "callback ownership",
+                move |_, _, _| {
+                    let _ = entered.send(());
+                    release_rx.recv().unwrap();
+                    5_136_u16
+                },
+                move |result| {
+                    let _ = completion.send(result);
+                },
+            );
+            let _ = submitted.send(());
+            std::future::pending::<()>().await;
+        });
+        submitted_rx.await.unwrap();
+        entered_rx.await.unwrap();
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+
+        release.send(()).unwrap();
+        let completed = completion_rx.await.unwrap().unwrap();
+        assert_eq!(completed.value, 5_136);
+
+        let mut same_lane = Box::pin(handle.admit("rider", "completion owns lane"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut same_lane)
+                .await
+                .is_err(),
+            "the callback consumer must retain the canonical lane"
+        );
+        drop(completed);
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), same_lane)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -115,6 +115,15 @@ pub enum ServerError {
     #[error("world actor stopped after a UDP publication or dispatch failure")]
     WorldActorUdp(#[source] UdpServiceError),
 
+    #[error("world actor stopped after a MyRoom lifecycle failure")]
+    WorldActorMyRoom {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    #[error("world actor was configured with a zero identity capacity")]
+    WorldActorInvalidIdentityCapacity,
+
     #[error("failed to start the UDP runtime")]
     UdpRuntimeStart(#[from] UdpRuntimeStartError),
 
@@ -1189,11 +1198,45 @@ fn retain_cleanup_error(
     error: ServerError,
     secondary_context: &'static str,
 ) {
-    if retained.is_none() {
-        *retained = Some(error);
-    } else {
-        tracing::error!(%error, "{secondary_context}");
+    match retained {
+        None => *retained = Some(error),
+        Some(current)
+            if is_provisional_world_stopped(current)
+                && is_authoritative_world_actor_error(&error) =>
+        {
+            tracing::error!(
+                error = %current,
+                "provisional World stop observation was superseded by the actor task cause"
+            );
+            *current = error;
+        }
+        Some(_) => tracing::error!(%error, "{secondary_context}"),
     }
+}
+
+fn is_provisional_world_stopped(error: &ServerError) -> bool {
+    matches!(
+        error,
+        ServerError::World(WorldError::Stopped)
+            | ServerError::RewardPersistence(RewardPersistenceRuntimeError::World(
+                WorldError::Stopped
+            ))
+    )
+}
+
+fn is_authoritative_world_actor_error(error: &ServerError) -> bool {
+    matches!(
+        error,
+        ServerError::WorldActorStopped
+            | ServerError::WorldActorMessenger(_)
+            | ServerError::WorldActorUdp(_)
+            | ServerError::WorldActorMyRoom { .. }
+            | ServerError::WorldActorInvalidIdentityCapacity
+            | ServerError::ActorTask {
+                service: "world",
+                ..
+            }
+    )
 }
 
 async fn stop_reward_runtime(
@@ -1212,6 +1255,27 @@ async fn stop_reward_runtime(
             service: "reward persistence",
             source,
         }),
+    }
+}
+
+async fn quiesce_and_drain_sessions(
+    world: &WorldHandle,
+    world_state: RuntimeTaskState,
+) -> Option<ServerError> {
+    if !world_state.is_running() {
+        return None;
+    }
+    if let Err(error) = world.quiesce().await {
+        // A closed command reply is only provisional evidence: the actor task
+        // join below owns the typed terminal cause, if one exists.
+        if matches!(error, WorldError::Stopped) {
+            return None;
+        }
+        return Some(error.into());
+    }
+    match world.drain_sessions().await {
+        Ok(()) | Err(WorldError::Stopped) => None,
+        Err(error) => Some(error.into()),
     }
 }
 
@@ -1257,7 +1321,16 @@ async fn stop_world_runtime(
     } else {
         request_world_shutdown(&world).await
     };
+    let provisional_stopped = matches!(error, Some(ServerError::World(WorldError::Stopped)));
+    if provisional_stopped {
+        // `Stopped` means the reply channel closed, not why the actor stopped.
+        // Defer the public error until the unique actor JoinHandle is observed.
+        error = None;
+    }
     match task.await {
+        Ok(Ok(())) if provisional_stopped => {
+            error = Some(ServerError::WorldActorStopped);
+        }
         Ok(Ok(())) => {}
         Ok(Err(source)) => retain_cleanup_error(
             &mut error,
@@ -1316,14 +1389,8 @@ async fn finish_supervisor(
     } = actors;
     let mut cleanup_error = None;
 
-    if world_state.is_running()
-        && let Err(error) = world.quiesce().await
-    {
-        let expected_forced_stop = force_shutdown_requested.load(Ordering::Acquire)
-            && matches!(error, WorldError::Stopped);
-        if !expected_forced_stop {
-            cleanup_error = Some(error.into());
-        }
+    if let Some(error) = quiesce_and_drain_sessions(&world, world_state).await {
+        cleanup_error = Some(error);
     }
 
     sessions.abort_all();
@@ -1446,6 +1513,12 @@ fn world_sidecar_error(error: WorldSidecarError) -> ServerError {
     match error {
         WorldSidecarError::Messenger(source) => ServerError::WorldActorMessenger(source),
         WorldSidecarError::Udp(source) => ServerError::WorldActorUdp(source),
+        WorldSidecarError::MyRoom(source) => ServerError::WorldActorMyRoom {
+            source: Box::new(source),
+        },
+        WorldSidecarError::InvalidIdentityCapacity => {
+            ServerError::WorldActorInvalidIdentityCapacity
+        }
     }
 }
 
@@ -1671,8 +1744,8 @@ mod tests {
         RewardTaskContext, RuntimeTaskState, ServerError, ServerHandle, SupervisorJoin,
         SupervisorTransports, is_expected_forced_reward_exit, is_expected_forced_world_exit,
         is_terminal_reward_scheduler_error, load_catalog, messenger_runtime_config,
-        request_world_shutdown, run_supervisor, stop_reward_runtime, udp_runtime_config,
-        unexpected_profile_exit,
+        request_world_shutdown, retain_cleanup_error, run_supervisor, stop_reward_runtime,
+        stop_world_runtime, udp_runtime_config, unexpected_profile_exit, world_sidecar_error,
     };
     use crate::{
         ChannelBinding, MessengerServiceHandle, MigrationToken, ProfileIoConfigError,
@@ -1682,9 +1755,9 @@ mod tests {
         profile_io::{ProfileIoBootstrap, ProfileIoLimits},
         read_encrypted_frame,
         world::{
-            LobbyCommandPayload, RewardCompletionDisposition, RewardLanePhase,
-            RewardPersistenceCompletion, RoomCommandPayload, RoomParticipant, StartRoomPlan,
-            WorldSidecarError,
+            LobbyCommandPayload, MyRoomLifecycleError, RewardCompletionDisposition,
+            RewardLanePhase, RewardPersistenceCompletion, RoomCommandPayload, RoomParticipant,
+            StartRoomPlan, WorldSidecarError,
             test_support::{spawn_due_reward_world, spawn_paused_full_mailbox_world},
         },
     };
@@ -2222,6 +2295,80 @@ mod tests {
             &Ok(Err(RewardPersistenceRuntimeError::World(
                 WorldError::Stopped
             )))
+        ));
+    }
+
+    #[test]
+    fn myroom_world_terminal_preserves_its_typed_error_source() {
+        let session = crate::SessionId::new(77);
+        let error = world_sidecar_error(WorldSidecarError::MyRoom(
+            MyRoomLifecycleError::OutboundUnavailable { session },
+        ));
+        let ServerError::WorldActorMyRoom { source } = error else {
+            panic!("MyRoom terminal must retain its supervisor error category");
+        };
+        assert!(matches!(
+            source.downcast_ref::<MyRoomLifecycleError>(),
+            Some(MyRoomLifecycleError::OutboundUnavailable { session: actual })
+                if *actual == session
+        ));
+    }
+
+    #[tokio::test]
+    async fn world_join_cause_replaces_provisional_stopped_reply() {
+        let (world, stopped_actor) = WorldHandle::spawn(4);
+        world.force_shutdown().await.unwrap();
+        stopped_actor.await.unwrap();
+
+        let session = crate::SessionId::new(78);
+        let actor = tokio::spawn(async move {
+            Err(WorldSidecarError::MyRoom(
+                MyRoomLifecycleError::OutboundUnavailable { session },
+            ))
+        });
+        let error = stop_world_runtime(
+            world,
+            actor,
+            RuntimeTaskState::Running,
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect("the typed actor failure must survive cleanup");
+
+        let ServerError::WorldActorMyRoom { source } = error else {
+            panic!("the actor JoinHandle must outrank a provisional WorldError::Stopped");
+        };
+        assert!(matches!(
+            source.downcast_ref::<MyRoomLifecycleError>(),
+            Some(MyRoomLifecycleError::OutboundUnavailable { session: actual })
+                if *actual == session
+        ));
+    }
+
+    #[test]
+    fn cleanup_selection_replaces_only_provisional_world_stop_observations() {
+        let session = crate::SessionId::new(79);
+        let typed_world_error = || {
+            world_sidecar_error(WorldSidecarError::MyRoom(
+                MyRoomLifecycleError::OutboundUnavailable { session },
+            ))
+        };
+
+        let mut direct = Some(ServerError::World(WorldError::Stopped));
+        retain_cleanup_error(&mut direct, typed_world_error(), "test secondary");
+        assert!(matches!(direct, Some(ServerError::WorldActorMyRoom { .. })));
+
+        let mut reward = Some(ServerError::RewardPersistence(
+            RewardPersistenceRuntimeError::World(WorldError::Stopped),
+        ));
+        retain_cleanup_error(&mut reward, typed_world_error(), "test secondary");
+        assert!(matches!(reward, Some(ServerError::WorldActorMyRoom { .. })));
+
+        let mut meaningful = Some(ServerError::ProfileIoRuntimeStopped);
+        retain_cleanup_error(&mut meaningful, typed_world_error(), "test secondary");
+        assert!(matches!(
+            meaningful,
+            Some(ServerError::ProfileIoRuntimeStopped)
         ));
     }
 

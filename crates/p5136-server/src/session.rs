@@ -34,6 +34,10 @@ use p5136_core::{
         LegacyTime, LoginError, PrLoginFields, parse_pq_login, serialize_pr_cn_authen_login,
         serialize_pr_login,
     },
+    myroom_protocol::{
+        MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError,
+        plan_owner_item_packets, serialize_owner_item_enchants, serialize_owner_items,
+    },
     packet::PacketError,
     race_protocol::{
         RaceProtocolError, RaceRequest, classify_race_request, parse_ai_goal_in_request,
@@ -52,8 +56,9 @@ use p5136_core::{
     track::P5136_FALLBACK_TRACK_ID,
 };
 use p5136_profile::{
-    CatalogInventory, EquipmentExceptions, EquipmentStateError, InventoryBuildError, Profile,
-    ProfileMutation, ProfileStoreError, ProfileTransaction, apply_rider_item_selection,
+    CatalogInventory, EquipmentExceptions, EquipmentStateError, InventoryBuildError,
+    MAX_MYROOM_ITEM_RECORDS, MyRoomItemStateError, MyRoomOwnerInventory, Profile, ProfileMutation,
+    ProfileStoreError, ProfileTransaction, apply_rider_item_selection,
     build_inventory_snapshot_with_equipment, is_grant_item, rider_item_snapshot,
 };
 use rand::Rng;
@@ -76,6 +81,12 @@ use crate::{
 };
 
 const MAX_OUTBOUND_BATCH_BURST: usize = 8;
+/// A single owner-item request is one ordered TCP write batch. Capping it at
+/// the exact loader maximum keeps the response bounded without rejecting any
+/// valid combination of the three independently bounded C# sidecars.
+const MAX_MYROOM_OWNER_ITEM_PACKETS: usize =
+    3 * MAX_MYROOM_ITEM_RECORDS.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
+const MAX_MYROOM_OWNER_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 enum SessionReadEvent {
     Outbound(Option<OutboundBatch>),
@@ -160,6 +171,12 @@ pub enum LoginSessionError {
     EquipmentProtocol(#[from] EquipmentProtocolError),
 
     #[error(transparent)]
+    MyRoomProtocol(#[from] MyRoomProtocolError),
+
+    #[error(transparent)]
+    MyRoomItemState(#[from] MyRoomItemStateError),
+
+    #[error(transparent)]
     ProfileIo(#[from] ProfileIoError),
 
     #[error(transparent)]
@@ -223,6 +240,25 @@ pub enum LoginSessionError {
     #[error("an unconditional profile mutation unexpectedly produced no revision")]
     ProfileMutationUnchanged,
 
+    #[error("MyRoom owner-item response has {actual} packets; operational maximum is {maximum}")]
+    MyRoomOwnerItemPacketLimit { actual: usize, maximum: usize },
+
+    #[error("MyRoom owner-item response has {actual} bytes; operational maximum is {maximum}")]
+    MyRoomOwnerItemByteLimit { actual: usize, maximum: usize },
+
+    #[error("MyRoom owner-item response byte length overflowed usize")]
+    MyRoomOwnerItemByteLengthOverflow,
+
+    #[error(
+        "MyRoom owner-item serializer diverged from its checked wire plan: planned {planned_packets} packets/{planned_bytes} bytes, produced {actual_packets} packets/{actual_bytes} bytes"
+    )]
+    MyRoomOwnerItemWirePlanMismatch {
+        planned_packets: usize,
+        planned_bytes: usize,
+        actual_packets: usize,
+        actual_bytes: usize,
+    },
+
     #[error(
         "identity changed while profile I/O was in flight: expected session {expected_owner:?}, user {expected_user_no:?}, generation {expected_generation:?}; received session {actual_owner:?}, user {actual_user_no:?}, generation {actual_generation:?}"
     )]
@@ -249,6 +285,88 @@ pub(crate) struct ProfileCoordinator {
     catalog: Option<Arc<CatalogInventory>>,
     #[cfg(test)]
     blocking_update_hook: Option<Arc<BlockingUpdateHook>>,
+}
+
+/// A fully serialized owner-item response that has passed the server's
+/// aggregate packet-count and byte-size limits.
+#[derive(Debug, PartialEq, Eq)]
+struct MyRoomOwnerItemPacketBatch {
+    packets: Vec<Vec<u8>>,
+}
+
+impl MyRoomOwnerItemPacketBatch {
+    fn from_inventory(
+        inventory: &MyRoomOwnerInventory,
+        prevent_item: bool,
+    ) -> Result<Self, LoginSessionError> {
+        let plan = plan_owner_item_packets(
+            inventory.tunes.len(),
+            inventory.karts.len(),
+            inventory.parts.len(),
+        )?;
+        Self::enforce_wire_plan(
+            plan.packet_count(),
+            plan.byte_len(),
+            MAX_MYROOM_OWNER_ITEM_PACKETS,
+            MAX_MYROOM_OWNER_ITEM_BYTES,
+        )?;
+
+        // Both operational limits have been checked before either serializer
+        // allocates its packet buffers.
+        let mut packets = serialize_owner_item_enchants(&inventory.tunes)?;
+        packets.extend(serialize_owner_items(
+            &inventory.karts,
+            &inventory.parts,
+            prevent_item,
+        )?);
+        let actual_packets = packets.len();
+        let actual_bytes = packets
+            .iter()
+            .try_fold(0_usize, |total, packet| total.checked_add(packet.len()));
+        let actual_bytes =
+            actual_bytes.ok_or(LoginSessionError::MyRoomOwnerItemByteLengthOverflow)?;
+        if actual_packets != plan.packet_count() || actual_bytes != plan.byte_len() {
+            return Err(LoginSessionError::MyRoomOwnerItemWirePlanMismatch {
+                planned_packets: plan.packet_count(),
+                planned_bytes: plan.byte_len(),
+                actual_packets,
+                actual_bytes,
+            });
+        }
+        Ok(Self { packets })
+    }
+
+    fn enforce_wire_plan(
+        packet_count: usize,
+        byte_len: usize,
+        maximum_packets: usize,
+        maximum_bytes: usize,
+    ) -> Result<(), LoginSessionError> {
+        if packet_count > maximum_packets {
+            return Err(LoginSessionError::MyRoomOwnerItemPacketLimit {
+                actual: packet_count,
+                maximum: maximum_packets,
+            });
+        }
+        if byte_len > maximum_bytes {
+            return Err(LoginSessionError::MyRoomOwnerItemByteLimit {
+                actual: byte_len,
+                maximum: maximum_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the pending MyRoom session-dispatch integration"
+        )
+    )]
+    fn into_packets(self) -> Vec<Vec<u8>> {
+        self.packets
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +469,80 @@ impl ProfileCoordinator {
             },
             lane,
         ))
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the pending MyRoom session-dispatch integration"
+        )
+    )]
+    async fn load_myroom_owner_profile(
+        &self,
+        nickname: String,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, MyRoomInfo, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run("load MyRoom owner profile", move |store, _, subject| {
+                if !store.profile_exists(subject.nickname())? {
+                    return Err(LoginSessionError::ProfileCreationDenied { nickname });
+                }
+                let loaded = store.load_or_create(subject.nickname())?;
+                let info = loaded.profile.my_room.try_to_protocol_info()?;
+                Ok::<_, LoginSessionError>((
+                    ProfileSnapshot {
+                        profile: loaded.profile,
+                        revision: loaded.revision,
+                        source_path: loaded.source_path,
+                    },
+                    info,
+                ))
+            })
+            .await?;
+        let (loaded, lane) = completed.into_parts();
+        let (profile, info) = loaded?;
+        Ok((profile, info, lane))
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the pending MyRoom session-dispatch integration"
+        )
+    )]
+    async fn load_myroom_owner_items(
+        &self,
+        nickname: String,
+        admission: ProfileJobAdmission,
+    ) -> Result<(MyRoomOwnerItemPacketBatch, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run("load MyRoom owner items", move |store, _, subject| {
+                if !store.profile_exists(subject.nickname())? {
+                    return Err(LoginSessionError::ProfileCreationDenied { nickname });
+                }
+                let loaded = store.load_or_create(subject.nickname())?;
+                let rider_directory = loaded
+                    .source_path
+                    .parent()
+                    .map(std::path::Path::to_owned)
+                    .ok_or(LoginSessionError::ProfileDirectoryUnavailable)?;
+                let inventory = MyRoomOwnerInventory::load(rider_directory)?;
+                // The C# server reads a race-prone process-global value that
+                // is overwritten by whichever profile loaded last. Binding
+                // this flag to the requested owner is the deterministic Rust
+                // compatibility policy.
+                MyRoomOwnerItemPacketBatch::from_inventory(
+                    &inventory,
+                    loaded.profile.server_setting.prevent_item_use != 0,
+                )
+            })
+            .await?;
+        let (packets, lane) = completed.into_parts();
+        Ok((packets?, lane))
     }
 
     async fn update_game_options(
@@ -1507,10 +1699,7 @@ fn room_participant_from_profile(
         );
     }
     let observer = matches!(profile.rider.pmap, 590 | 718);
-    let p2p_address = match identity.source_ip {
-        IpAddr::V4(address) => address,
-        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-    };
+    let (p2p_address, p2p_port) = profile_p2p_endpoint(identity.source_ip, profile);
     let club_name = if profile.rider.club_mark_logo == 0 {
         String::new()
     } else {
@@ -1521,7 +1710,7 @@ fn room_participant_from_profile(
             player_type: if observer { 4 } else { 2 },
             user_no: identity.user_no.get(),
             p2p_address,
-            p2p_port: u16::try_from(profile.rider.p2p_port).unwrap_or_default(),
+            p2p_port,
             nickname: identity.nickname.clone(),
             emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
             emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
@@ -1537,6 +1726,44 @@ fn room_participant_from_profile(
         observer,
         kart_physics: physics.block,
     })
+}
+
+fn profile_p2p_endpoint(source_ip: IpAddr, profile: &Profile) -> (Ipv4Addr, u16) {
+    let address = match source_ip {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+    };
+    let port = u16::try_from(profile.rider.p2p_port).unwrap_or_default();
+    (address, port)
+}
+
+/// Builds the profile-owned portion of a `MyRoom` player slot and binds its
+/// identity fields to one exact World generation.
+///
+/// Callers must still reauthorize that binding in the World actor after any
+/// profile I/O. The actor may overwrite `user_no` and `nickname` from its
+/// authoritative binding before committing a hub transition.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the pending MyRoom session-dispatch integration"
+    )
+)]
+fn myroom_player_slot_from_profile(
+    identity: &IdentityBinding,
+    profile: &Profile,
+) -> MyRoomPlayerSlot {
+    let (p2p_address, p2p_port) = profile_p2p_endpoint(identity.source_ip, profile);
+    MyRoomPlayerSlot {
+        user_no: identity.user_no.get(),
+        p2p_address,
+        p2p_port,
+        nickname: identity.nickname.clone(),
+        rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
+        rp: profile.rider.rp,
+        club_name: profile.rider.club_name.clone(),
+    }
 }
 
 async fn handle_startup_request(
@@ -1760,7 +1987,7 @@ mod tests {
     use std::{
         fmt::Write as _,
         fs,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -1773,6 +2000,10 @@ mod tests {
         frame::{DEFAULT_MAX_PAYLOAD, encode_encrypted},
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
+        myroom_protocol::{
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MyRoomProtocolError, OWNER_ITEM_NAME,
+            plan_owner_item_packets,
+        },
         packet::PacketWriter,
         race_protocol::{
             GameControlRequest, RaceProtocolError, RaceRequest, parse_game_control_request,
@@ -1784,21 +2015,23 @@ mod tests {
         startup::GameOptions,
     };
     use p5136_profile::{
-        CatalogInventory, EquipmentExceptions, GrantedKart, Profile, ProfileStore,
-        rider_item_snapshot,
+        CatalogInventory, EquipmentExceptions, GrantedKart, MyRoomItemStateError, Profile,
+        ProfileStore, rider_item_snapshot,
     };
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::sync::{mpsc, oneshot};
     use tokio::time;
 
     use super::{
-        BlockingUpdateHook, LoginSessionError, MAX_OUTBOUND_BATCH_BURST, ProfileCoordinator,
-        RoomKartBaseResolution, RoomPhysicsFallbackReason, SessionContext, SessionReadEvent,
-        SessionServices, dispatch_packet, handle_channel_move_in, handle_equipment_request,
-        handle_get_rider, handle_lobby_request, handle_race_request, handle_room_request,
-        read_encrypted_frame, read_session_frame, room_participant_from_profile,
-        room_physics_metadata, select_session_read_event, update_game_options,
-        validate_rider_item_selection, write_session_bytes,
+        BlockingUpdateHook, LoginSessionError, MAX_MYROOM_ITEM_RECORDS,
+        MAX_MYROOM_OWNER_ITEM_BYTES, MAX_MYROOM_OWNER_ITEM_PACKETS, MAX_OUTBOUND_BATCH_BURST,
+        MyRoomOwnerItemPacketBatch, ProfileCoordinator, RoomKartBaseResolution,
+        RoomPhysicsFallbackReason, SessionContext, SessionReadEvent, SessionServices,
+        dispatch_packet, handle_channel_move_in, handle_equipment_request, handle_get_rider,
+        handle_lobby_request, handle_race_request, handle_room_request,
+        myroom_player_slot_from_profile, read_encrypted_frame, read_session_frame,
+        room_participant_from_profile, room_physics_metadata, select_session_read_event,
+        update_game_options, validate_rider_item_selection, write_session_bytes,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
@@ -2613,6 +2846,224 @@ mod tests {
             resolved.block,
             build_p5136_kart_physics_block(&expected_snapshot).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn myroom_player_slot_uses_exact_identity_and_profile_presentation() {
+        let (world, world_task) = WorldHandle::spawn(8);
+        let rider = register_lobby_session(&world, "MyRoomRider", 49_736).await;
+        let mut profile = Profile::default();
+        profile.rider.p2p_port = 48_888;
+        profile.rider.rp = 51_360;
+        profile.rider.club_name = "DirectClubName".to_owned();
+        profile.rider.club_mark_logo = 0;
+        profile.rider_item.character = 1_234;
+        profile.rider_item.kart = 5_136;
+
+        let slot = myroom_player_slot_from_profile(&rider.identity, &profile);
+        assert_eq!(slot.user_no, rider.identity.user_no.get());
+        assert_eq!(slot.nickname, rider.identity.nickname);
+        assert_eq!(slot.p2p_address, Ipv4Addr::LOCALHOST);
+        assert_eq!(slot.p2p_port, 48_888);
+        assert_eq!(slot.rider_item_snapshot.len(), 65);
+        assert_eq!(
+            slot.rider_item_snapshot,
+            rider_item_snapshot(&profile.rider_item)
+        );
+        assert_eq!(slot.rp, 51_360);
+        assert_eq!(
+            slot.club_name, "DirectClubName",
+            "MyRoom writes the persisted club name directly even without a club-mark logo"
+        );
+
+        let ipv6_identity = IdentityBinding {
+            source_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ..rider.identity.clone()
+        };
+        profile.rider.p2p_port = 70_000;
+        let ipv6_slot = myroom_player_slot_from_profile(&ipv6_identity, &profile);
+        assert_eq!(ipv6_slot.p2p_address, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(ipv6_slot.p2p_port, 0);
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[test]
+    fn myroom_owner_item_operational_limits_are_checked_from_the_wire_plan() {
+        let maximum_loader_response = plan_owner_item_packets(
+            MAX_MYROOM_ITEM_RECORDS,
+            MAX_MYROOM_ITEM_RECORDS,
+            MAX_MYROOM_ITEM_RECORDS,
+        )
+        .unwrap();
+        assert_eq!(maximum_loader_response.packet_count(), 7_563);
+        assert_eq!(maximum_loader_response.byte_len(), 5_555_382);
+        assert_eq!(MAX_MYROOM_OWNER_ITEM_PACKETS, 7_563);
+        assert!(
+            MyRoomOwnerItemPacketBatch::enforce_wire_plan(
+                maximum_loader_response.packet_count(),
+                maximum_loader_response.byte_len(),
+                MAX_MYROOM_OWNER_ITEM_PACKETS,
+                MAX_MYROOM_OWNER_ITEM_BYTES,
+            )
+            .is_ok()
+        );
+
+        assert!(matches!(
+            MyRoomOwnerItemPacketBatch::enforce_wire_plan(
+                MAX_MYROOM_OWNER_ITEM_PACKETS + 1,
+                maximum_loader_response.byte_len(),
+                MAX_MYROOM_OWNER_ITEM_PACKETS,
+                MAX_MYROOM_OWNER_ITEM_BYTES,
+            ),
+            Err(LoginSessionError::MyRoomOwnerItemPacketLimit {
+                actual,
+                maximum: MAX_MYROOM_OWNER_ITEM_PACKETS,
+            }) if actual == MAX_MYROOM_OWNER_ITEM_PACKETS + 1
+        ));
+
+        let small = plan_owner_item_packets(0, 1, 0).unwrap();
+        assert!(matches!(
+            MyRoomOwnerItemPacketBatch::enforce_wire_plan(
+                small.packet_count(),
+                small.byte_len(),
+                usize::MAX,
+                small.byte_len() - 1,
+            ),
+            Err(LoginSessionError::MyRoomOwnerItemByteLimit {
+                actual,
+                maximum,
+            }) if actual == small.byte_len() && maximum == small.byte_len() - 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn myroom_owner_profile_load_is_canonical_and_conversion_errors_are_typed() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let mut profile = Profile::default();
+        profile.my_room.my_room = 17;
+        profile.my_room.my_room_bgm = 3;
+        profile.my_room.room_pwd = "room".to_owned();
+        profile.my_room.item_pwd = "item".to_owned();
+        store.save("MyRoomOwner", &profile).unwrap();
+
+        let (profiles, runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let admission = profiles
+            .admit("myroomowner", "test MyRoom owner profile load")
+            .await
+            .unwrap();
+        let (snapshot, info, lane) = profiles
+            .load_myroom_owner_profile("MYROOMOWNER".to_owned(), admission)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.revision, Some(1));
+        assert_eq!(snapshot.profile.my_room.my_room, 17);
+        assert_eq!(info.room_id, 17);
+        assert_eq!(info.bgm, 3);
+        assert_eq!(info.room_password, "room");
+        assert_eq!(info.item_password, "item");
+        drop(lane);
+        runtime.shutdown().await.unwrap();
+
+        let invalid_root = tempfile::tempdir().unwrap();
+        let invalid_store = ProfileStore::new(invalid_root.path());
+        let mut invalid = Profile::default();
+        invalid.my_room.room_pwd = "x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1);
+        invalid_store.save("InvalidMyRoom", &invalid).unwrap();
+        let (profiles, runtime) =
+            ProfileCoordinator::new_test(invalid_root.path().to_owned(), None);
+        let admission = profiles
+            .admit("InvalidMyRoom", "test invalid MyRoom conversion")
+            .await
+            .unwrap();
+        assert!(matches!(
+            profiles
+                .load_myroom_owner_profile("invalidmyroom".to_owned(), admission)
+                .await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::StringTooLong {
+                    field: "MyRoom room password",
+                    ..
+                }
+            ))
+        ));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn myroom_owner_item_read_preserves_kart_empty_quirk_and_typed_sidecar_errors() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let mut profile = Profile::default();
+        profile.server_setting.prevent_item_use = 1;
+        let saved = store.save("ItemOwner", &profile).unwrap();
+        let rider_directory = saved.path.parent().unwrap();
+        let parts_path = rider_directory.join("PartsData.json");
+        let karts_path = rider_directory.join("NewKart.json");
+        fs::write(
+            &parts_path,
+            br#"[{"ID":5136,"SN":1,"Engine":2,"EngineGrade":3,"EngineValue":4}]"#,
+        )
+        .unwrap();
+
+        let (profiles, runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let admission = profiles
+            .admit("itemowner", "test MyRoom owner item load")
+            .await
+            .unwrap();
+        let (batch, lane) = profiles
+            .load_myroom_owner_items("ITEMOWNER".to_owned(), admission)
+            .await
+            .unwrap();
+        let packets = batch.into_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].len(), 32);
+        assert_eq!(
+            u32::from_le_bytes(packets[0][..4].try_into().unwrap()),
+            p5136_core::adler32::packet_hash(OWNER_ITEM_NAME)
+        );
+        drop(lane);
+
+        fs::write(
+            &karts_path,
+            br#"[{"KartID":5136,"KartSN":7,"FutureField":true}]"#,
+        )
+        .unwrap();
+        let admission = profiles
+            .admit("ItemOwner", "test deterministic MyRoom prevent-item flag")
+            .await
+            .unwrap();
+        let (batch, lane) = profiles
+            .load_myroom_owner_items("itemowner".to_owned(), admission)
+            .await
+            .unwrap();
+        let packets = batch.into_packets();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            u32::from_le_bytes(packets[0][..4].try_into().unwrap()),
+            p5136_core::adler32::packet_hash(OWNER_ITEM_NAME)
+        );
+        assert_eq!(packets[0][24], 1);
+        drop(lane);
+
+        fs::write(&parts_path, b"[{").unwrap();
+        let admission = profiles
+            .admit("ItemOwner", "test malformed MyRoom owner item load")
+            .await
+            .unwrap();
+        assert!(matches!(
+            profiles
+                .load_myroom_owner_items("itemowner".to_owned(), admission)
+                .await,
+            Err(LoginSessionError::MyRoomItemState(
+                MyRoomItemStateError::Json { path, .. }
+            )) if path == parts_path
+        ));
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

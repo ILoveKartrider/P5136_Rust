@@ -198,6 +198,12 @@ impl fmt::Debug for MigrationPreflight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationCompletion {
     pub binding: IdentityBinding,
+    /// Exact actor-minted binding for the generation that was transferred.
+    ///
+    /// This remains available even when the source socket disconnected before
+    /// completion, so generation-bound sidecars never have to reconstruct the
+    /// former owner from [`previous_owner`](Self::previous_owner).
+    pub previous_binding: IdentityBinding,
     /// Exact pre-transfer stamp used to advance generation-bound sidecars.
     pub previous_identity: ReleasedIdentity,
     /// `Some` when the old owner was still connected at transfer time. The
@@ -606,7 +612,14 @@ impl IdentityRegistry {
             nickname,
             canonical_nickname: expected_canonical_nickname,
         } = preflight;
-        let (canonical_nickname, previous_owner, previous_identity, known, channel) = {
+        let (
+            canonical_nickname,
+            previous_owner,
+            previous_binding,
+            previous_identity,
+            known,
+            channel,
+        ) = {
             let validated = self.validate_migration(
                 destination_session,
                 destination_ip,
@@ -629,6 +642,7 @@ impl IdentityRegistry {
             (
                 validated.canonical_nickname.to_owned(),
                 validated.active.owner,
+                identity_binding(validated.active, validated.permit.source_session),
                 released_identity(validated.active),
                 validated.active.known.clone(),
                 validated.permit.channel,
@@ -658,6 +672,7 @@ impl IdentityRegistry {
 
         Ok(MigrationCompletion {
             binding,
+            previous_binding,
             previous_identity,
             previous_owner,
         })
@@ -744,9 +759,66 @@ impl IdentityRegistry {
         active_identity_binding(active)
     }
 
+    /// Confirms that an exact binding is the temporarily ownerless source
+    /// generation retained by a registry-owned migration permit.
+    ///
+    /// `MyRoom` keeps this generation in its bounded audience until migration
+    /// completion or the expiry sweep. This includes a deadline-reached permit
+    /// which the actor has not swept yet. Callers may skip delivery to this
+    /// exact state, but must not mistake an arbitrary inactive or stale binding
+    /// for the registry-retained generation.
+    pub(crate) fn is_current_ownerless_binding(&self, binding: &IdentityBinding) -> bool {
+        let Some(key) = self.name_by_user_no.get(&binding.user_no) else {
+            return false;
+        };
+        let Some(active) = self.active_by_name.get(key) else {
+            return false;
+        };
+        let Some(permit) = active.permit.as_ref() else {
+            return false;
+        };
+        active.owner.is_none()
+            && identity_binding(active, permit.source_session) == *binding
+            && permit.source_generation == binding.generation
+    }
+
+    /// Iterates over exact bindings for identities that currently have an
+    /// owning session. Ownerless migration generations are deliberately
+    /// omitted until a destination completes the transfer.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the pending random MyRoom entry command consumes active identities"
+        )
+    )]
+    pub(crate) fn active_identities(&self) -> impl Iterator<Item = IdentityBinding> + '_ {
+        self.active_by_name
+            .values()
+            .filter_map(active_identity_binding)
+    }
+
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.active_by_name.len()
+    }
+
+    /// Releases every connected or ownerless active generation during the
+    /// actor-owned server shutdown barrier.
+    ///
+    /// Stable nickname/user-number assignments remain available for the
+    /// lifetime of the registry, while all session authorization and
+    /// migration permits are revoked atomically before dependent world state
+    /// is retired.
+    pub(crate) fn drain_active(&mut self) -> Vec<ReleasedIdentity> {
+        self.session_bindings.clear();
+        let mut released = self
+            .active_by_name
+            .drain()
+            .map(|(_, active)| released_identity(&active))
+            .collect::<Vec<_>>();
+        released.sort_unstable_by_key(|identity| identity.user_no.get());
+        released
     }
 
     fn allocate_user_no(&mut self) -> Result<UserNo, IdentityError> {
@@ -782,14 +854,18 @@ fn released_identity(active: &ActiveIdentity) -> ReleasedIdentity {
 
 fn active_identity_binding(active: &ActiveIdentity) -> Option<IdentityBinding> {
     let owner = active.owner?;
-    Some(IdentityBinding {
+    Some(identity_binding(active, owner))
+}
+
+fn identity_binding(active: &ActiveIdentity, owner: SessionId) -> IdentityBinding {
+    IdentityBinding {
         nickname: active.known.nickname.clone(),
         user_no: active.known.user_no,
         generation: active.generation,
         owner,
         source_ip: active.owner_ip,
         channel: active.channel,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -923,6 +999,107 @@ mod tests {
     }
 
     #[test]
+    fn ownerless_binding_check_accepts_only_registry_retained_exact_generation() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Retained").unwrap();
+        identities
+            .begin_migration(session(1), CHANNEL, token(352), now)
+            .unwrap();
+        assert!(matches!(
+            identities.disconnect(session(1), now),
+            DisconnectOutcome::Deferred { .. }
+        ));
+        assert!(identities.is_current_ownerless_binding(&source));
+
+        let mut forged = source.clone();
+        forged.owner = session(99);
+        assert!(!identities.is_current_ownerless_binding(&forged));
+
+        let expired = identities.expire_migrations(now + MIGRATION_TTL);
+        assert_eq!(expired.len(), 1);
+        assert!(!identities.is_current_ownerless_binding(&source));
+    }
+
+    #[test]
+    fn active_identity_iteration_omits_ownerless_migration_generations() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let source = identities.claim(session(1), SOURCE_IP, "Rider").unwrap();
+        let other = identities.claim(session(9), OTHER_IP, "Other").unwrap();
+        let permit = identities
+            .begin_migration(session(1), CHANNEL, token(351), now)
+            .unwrap();
+
+        let mut connected = identities.active_identities().collect::<Vec<_>>();
+        connected.sort_by_key(|binding| binding.owner.get());
+        assert_eq!(connected, vec![source.clone(), other.clone()]);
+
+        assert!(matches!(
+            identities.disconnect(session(1), now),
+            DisconnectOutcome::Deferred { .. }
+        ));
+        assert_eq!(
+            identities.active_identities().collect::<Vec<_>>(),
+            vec![other.clone()]
+        );
+
+        let destination = identities
+            .complete_migration(
+                session(2),
+                SOURCE_IP,
+                source.user_no,
+                CHANNEL.channel_id,
+                permit.token,
+                now,
+            )
+            .unwrap()
+            .binding;
+        let connected = identities.active_identities().collect::<Vec<_>>();
+        assert_eq!(connected.len(), 2);
+        assert!(connected.contains(&other));
+        assert!(connected.contains(&destination));
+    }
+
+    #[test]
+    fn shutdown_drain_releases_connected_and_ownerless_generations_but_keeps_stable_identity() {
+        let now = Instant::now();
+        let mut identities = IdentityRegistry::new();
+        let ownerless = identities
+            .claim(session(1), SOURCE_IP, "Ownerless")
+            .unwrap();
+        let connected = identities.claim(session(2), OTHER_IP, "Connected").unwrap();
+        identities
+            .begin_migration(session(1), CHANNEL, token(353), now)
+            .unwrap();
+        assert!(matches!(
+            identities.disconnect(session(1), now),
+            DisconnectOutcome::Deferred { .. }
+        ));
+
+        let released = identities.drain_active();
+        assert_eq!(
+            released
+                .iter()
+                .map(|identity| identity.user_no)
+                .collect::<Vec<_>>(),
+            vec![ownerless.user_no, connected.user_no]
+        );
+        assert_eq!(identities.active_count(), 0);
+        assert!(matches!(
+            identities.authorize(session(2)),
+            Err(IdentityError::UnauthenticatedSession(id)) if id == session(2)
+        ));
+        assert!(identities.drain_active().is_empty());
+
+        let replacement = identities
+            .claim(session(3), SOURCE_IP, "ownerless")
+            .unwrap();
+        assert_eq!(replacement.user_no, ownerless.user_no);
+        assert!(replacement.generation.get() > ownerless.generation.get());
+    }
+
+    #[test]
     fn latest_migration_permit_wins() {
         let now = Instant::now();
         let mut identities = IdentityRegistry::new();
@@ -1044,6 +1221,7 @@ mod tests {
             .complete_preflighted_migration(owner_bound, now)
             .unwrap();
         assert_eq!(completed.previous_owner, None);
+        assert_eq!(completed.previous_binding, source);
         assert_eq!(completed.binding.owner, session(2));
         assert!(completed.binding.generation.get() > source.generation.get());
     }
@@ -1323,6 +1501,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(complete.previous_owner, Some(session(1)));
+        assert_eq!(complete.previous_binding, source);
         assert_eq!(complete.previous_identity.nickname, source.nickname);
         assert_eq!(complete.previous_identity.user_no, source.user_no);
         assert_eq!(complete.previous_identity.generation, source.generation);
