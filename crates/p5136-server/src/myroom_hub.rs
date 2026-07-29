@@ -252,6 +252,13 @@ pub(crate) struct MyRoomMembershipInfo {
     pub(crate) slot: MyRoomSlotIndex,
 }
 
+impl MyRoomMembershipInfo {
+    #[must_use]
+    pub(crate) fn is_present_owner(self, user_no: UserNo) -> bool {
+        self.owner == user_no && self.slot == MyRoomSlotIndex::OWNER
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     not(test),

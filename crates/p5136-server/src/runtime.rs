@@ -115,7 +115,7 @@ pub enum ServerError {
     #[error("world actor stopped after a UDP publication or dispatch failure")]
     WorldActorUdp(#[source] UdpServiceError),
 
-    #[error("world actor stopped after a MyRoom lifecycle failure")]
+    #[error("world actor stopped after a MyRoom failure")]
     WorldActorMyRoom {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
@@ -475,21 +475,29 @@ impl ServerHandle {
             .await
     }
 
-    /// Explicitly abandons in-memory reward recovery and stops the World.
+    /// Explicitly abandons in-memory actor publication/recovery state and
+    /// stops the World.
     ///
     /// This is intended for an operator-confirmed emergency exit after
     /// [`Self::shutdown`] reports a retained dead letter. Durable profile
-    /// writes remain on disk, but unresolved actor-owned recovery state is
-    /// discarded. Once first polled, this future transfers the World stop
-    /// request to an owned runtime task, so cancelling the caller cannot leave
-    /// the supervisor in force mode without a corresponding stop request.
+    /// jobs are still drained and accepted writes may commit to disk, but
+    /// unresolved reward recovery and any pending `MyRoom` Hub publication,
+    /// reserved owner echo, or final request reply are discarded. If `MyRoom`
+    /// outcomes are pending, the World emits a structured warning with the
+    /// pending ticket and user-index counts before stopping. `Ok(())` means
+    /// forced teardown joined successfully; it does not mean those actor
+    /// publications completed. Prefer [`Self::shutdown`] whenever publication
+    /// must complete.
+    /// Once first polled, this future transfers the World stop request to an
+    /// owned runtime task, so cancelling the caller cannot leave the supervisor
+    /// in force mode without a corresponding stop request.
     pub async fn force_shutdown(&self) -> Result<(), ServerError> {
         self.force_shutdown_requested.store(true, Ordering::Release);
         let _ = self.shutdown.send(true);
         let world = self.world.clone();
         let force_request = tokio::spawn(async move { world.force_shutdown().await });
         match force_request.await {
-            Ok(Ok(()) | Err(WorldError::Stopped)) => {}
+            Ok(Ok(_) | Err(WorldError::Stopped)) => {}
             Ok(Err(error)) => return Err(error.into()),
             Err(source) => {
                 return Err(ServerError::ActorTask {
@@ -1367,6 +1375,20 @@ async fn stop_messenger_runtime(
     }
 }
 
+async fn stop_profile_runtime(
+    profile_runtime: ProfileIoRuntime,
+    state: RuntimeTaskState,
+) -> Option<ServerError> {
+    let result = match state {
+        RuntimeTaskState::Running => profile_runtime.shutdown().await,
+        RuntimeTaskState::Completed => {
+            profile_runtime.finish_completed();
+            Ok(())
+        }
+    };
+    result.err().map(ServerError::from)
+}
+
 async fn finish_supervisor(
     mut sessions: JoinSet<()>,
     actors: CoreActors,
@@ -1412,33 +1434,50 @@ async fn finish_supervisor(
             );
         }
     }
-    // Whether it had already completed or was joined immediately above, the
-    // reward runtime is now unavailable. A guarded World refusal must
-    // therefore take the explicit process-fatal force path rather than await a
-    // still-live actor forever.
-    if let Some(error) =
-        stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
-    {
-        retain_cleanup_error(
-            &mut cleanup_error,
-            error,
-            "World shutdown also failed during cleanup",
-        );
-    }
-
-    let profile_shutdown = match profile_state {
-        RuntimeTaskState::Running => profile_runtime.shutdown().await,
-        RuntimeTaskState::Completed => {
-            profile_runtime.finish_completed();
-            Ok(())
+    // Reward workers no longer need profile admission. Graceful teardown keeps
+    // World alive until every accepted profile job has synchronously queued
+    // its completion and the dedicated FIFO barrier has been observed.
+    if force_shutdown_requested.load(Ordering::Acquire) {
+        if let Some(error) =
+            stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
+        {
+            retain_cleanup_error(
+                &mut cleanup_error,
+                error,
+                "World force shutdown also failed during cleanup",
+            );
         }
-    };
-    if let Err(error) = profile_shutdown {
-        retain_cleanup_error(
-            &mut cleanup_error,
-            error.into(),
-            "profile I/O drain also failed during server cleanup",
-        );
+        if let Some(error) = stop_profile_runtime(profile_runtime, profile_state).await {
+            retain_cleanup_error(
+                &mut cleanup_error,
+                error,
+                "profile I/O drain also failed after forced World shutdown",
+            );
+        }
+    } else {
+        if let Some(error) = stop_profile_runtime(profile_runtime, profile_state).await {
+            retain_cleanup_error(
+                &mut cleanup_error,
+                error,
+                "profile I/O drain also failed during server cleanup",
+            );
+        }
+        if world_state.is_running()
+            && let Err(error) = world.drain_myroom_completions().await
+        {
+            // The World task is the authoritative source for a closed or
+            // failed completion barrier and is joined immediately below.
+            tracing::error!(%error, "MyRoom completion drain barrier failed");
+        }
+        if let Some(error) =
+            stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
+        {
+            retain_cleanup_error(
+                &mut cleanup_error,
+                error,
+                "World shutdown also failed during cleanup",
+            );
+        }
     }
 
     udp.shutdown().await;
@@ -1514,6 +1553,9 @@ fn world_sidecar_error(error: WorldSidecarError) -> ServerError {
         WorldSidecarError::Messenger(source) => ServerError::WorldActorMessenger(source),
         WorldSidecarError::Udp(source) => ServerError::WorldActorUdp(source),
         WorldSidecarError::MyRoom(source) => ServerError::WorldActorMyRoom {
+            source: Box::new(source),
+        },
+        WorldSidecarError::MyRoomPersistence(source) => ServerError::WorldActorMyRoom {
             source: Box::new(source),
         },
         WorldSidecarError::InvalidIdentityCapacity => {
@@ -1713,6 +1755,7 @@ mod tests {
         frame, handshake,
         login::{LegacyTime, serialize_pr_cn_authen_login},
         messenger::{encode_frame as encode_messenger_frame, serialize_guild_chat},
+        myroom_protocol::MyRoomInfo,
         packet::{PacketReader, PacketWriter},
         race_start_protocol::P5136KartPhysicsBlock,
         room_protocol::{
@@ -1735,7 +1778,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
-        sync::oneshot,
+        sync::{mpsc, oneshot},
         time,
     };
 
@@ -1752,13 +1795,16 @@ mod tests {
         ProfileIoError, ProfileIoRuntimeError, ProfileIoShutdownError, ServerClock, ServerConfig,
         ServerEndpoints, UdpIngress, UdpIngressBody, UdpRuntime, UdpTransport, WorldError,
         WorldHandle, decode_udp_ingress,
+        myroom_persistence::{MyRoomInfoPublication, MyRoomInfoWriteError},
         profile_io::{ProfileIoBootstrap, ProfileIoLimits},
         read_encrypted_frame,
         world::{
             LobbyCommandPayload, MyRoomLifecycleError, RewardCompletionDisposition,
             RewardLanePhase, RewardPersistenceCompletion, RoomCommandPayload, RoomParticipant,
             StartRoomPlan, WorldSidecarError,
-            test_support::{spawn_due_reward_world, spawn_paused_full_mailbox_world},
+            test_support::{
+                spawn_due_reward_world, spawn_myroom_world, spawn_paused_full_mailbox_world,
+            },
         },
     };
 
@@ -1927,6 +1973,17 @@ mod tests {
         world: WorldHandle,
         world_task: tokio::task::JoinHandle<Result<(), WorldSidecarError>>,
     ) -> Result<ServerHandle, Box<dyn Error + Send + Sync>> {
+        let (server, _profile_io) =
+            supervised_prepared_server_with_profile_io(profile_root, world, world_task).await?;
+        Ok(server)
+    }
+
+    async fn supervised_prepared_server_with_profile_io(
+        profile_root: &Path,
+        world: WorldHandle,
+        world_task: tokio::task::JoinHandle<Result<(), WorldSidecarError>>,
+    ) -> Result<(ServerHandle, crate::profile_io::ProfileIoHandle), Box<dyn Error + Send + Sync>>
+    {
         let loopback = Ipv4Addr::LOCALHOST;
         let config = ServerConfig {
             bind_address: IpAddr::V4(loopback),
@@ -1936,6 +1993,7 @@ mod tests {
             ..ServerConfig::default()
         };
         let (profile_io, profile_runtime) = test_profile_bootstrap(&config).spawn();
+        let test_profile_io = profile_io.clone();
         let game_udp = UdpSocket::bind((loopback, 0)).await?;
         let p2p_udp = UdpSocket::bind((loopback, 0)).await?;
         let udp = UdpRuntime::spawn_with_clock(
@@ -1969,13 +2027,16 @@ mod tests {
             supervisor_force_shutdown,
         ));
 
-        Ok(ServerHandle {
-            endpoints: loopback_endpoints(),
-            shutdown,
-            world,
-            force_shutdown_requested,
-            supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor)),
-        })
+        Ok((
+            ServerHandle {
+                endpoints: loopback_endpoints(),
+                shutdown,
+                world,
+                force_shutdown_requested,
+                supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor)),
+            },
+            test_profile_io,
+        ))
     }
 
     async fn inject_loading_reward_lane(
@@ -2497,6 +2558,143 @@ mod tests {
             .unwrap()
             .unwrap();
         profile_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn graceful_supervisor_keeps_world_alive_until_myroom_profile_completion_drains()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let root = tempfile::tempdir()?;
+        ProfileStore::new(root.path()).save("SessionMyRoomOwner", &Profile::default())?;
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let owner_session = fixture.owner.session;
+        let owner_nickname = fixture.owner.identity.nickname.clone();
+        let (server, profile_io) =
+            supervised_prepared_server_with_profile_io(root.path(), fixture.handle, fixture.actor)
+                .await?;
+        let world = server.world();
+        let admission = profile_io
+            .admit(&owner_nickname, "test blocked MyRoom supervisor drain")
+            .await?;
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let hook = Arc::new(move || {
+            worker_entered.wait();
+            worker_release.wait();
+        });
+        let proposed = MyRoomInfo {
+            room_id: 5136,
+            bgm: 7,
+            ..MyRoomInfo::default()
+        };
+        let persisted = proposed.clone();
+        let write_world = world.clone();
+        let write = tokio::spawn(async move {
+            write_world
+                .persist_myroom_owner_info_with_test_hook(owner_session, proposed, admission, hook)
+                .await
+        });
+        RewardFailureBarriers::rendezvous(entered).await;
+
+        let mut shutdown = Box::pin(server.shutdown());
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "graceful shutdown must wait for the accepted profile worker"
+        );
+        world.reward_drain_status().await?;
+
+        RewardFailureBarriers::rendezvous(release).await;
+        let receipt = time::timeout(Duration::from_secs(1), write).await???;
+        assert_eq!(receipt.info(), &persisted);
+        assert_eq!(
+            receipt.publication(),
+            MyRoomInfoPublication::PersistedAfterRelease,
+            "session drain releases the owner before the durable completion is published"
+        );
+        time::timeout(Duration::from_secs(1), &mut shutdown).await??;
+        let loaded = ProfileStore::new(root.path()).load_or_create("SessionMyRoomOwner")?;
+        assert_eq!(loaded.revision, Some(2));
+        assert_eq!(loaded.profile.my_room.try_to_protocol_info()?, persisted);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forced_supervisor_drains_disk_after_abandoning_myroom_publication()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let root = tempfile::tempdir()?;
+        ProfileStore::new(root.path()).save("SessionMyRoomOwner", &Profile::default())?;
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let owner_session = fixture.owner.session;
+        let owner_nickname = fixture.owner.identity.nickname.clone();
+        let mut owner_outbound = fixture.owner.outbound;
+        let _visitor_outbound = fixture.visitor.outbound;
+        let (server, profile_io) =
+            supervised_prepared_server_with_profile_io(root.path(), fixture.handle, fixture.actor)
+                .await?;
+        let world = server.world();
+        let admission = profile_io
+            .admit(&owner_nickname, "test blocked forced MyRoom drain")
+            .await?;
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let hook = Arc::new(move || {
+            worker_entered.wait();
+            worker_release.wait();
+        });
+        let proposed = MyRoomInfo {
+            room_id: 5136,
+            bgm: 9,
+            ..MyRoomInfo::default()
+        };
+        let persisted = proposed.clone();
+        let write_world = world.clone();
+        let write = tokio::spawn(async move {
+            write_world
+                .persist_myroom_owner_info_with_test_hook(owner_session, proposed, admission, hook)
+                .await
+        });
+        RewardFailureBarriers::rendezvous(entered).await;
+
+        let mut force = Box::pin(server.force_shutdown());
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut force)
+                .await
+                .is_err(),
+            "forced teardown must still drain the accepted profile worker"
+        );
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                match world.reward_drain_status().await {
+                    Err(WorldError::Stopped) => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected World status while forcing shutdown: {error}"),
+                }
+            }
+        })
+        .await?;
+
+        let write_result = time::timeout(Duration::from_secs(1), write).await??;
+        assert!(matches!(
+            write_result,
+            Err(MyRoomInfoWriteError::WorldStopped)
+        ));
+        assert_eq!(
+            owner_outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "force shutdown must abandon the reserved owner echo"
+        );
+
+        RewardFailureBarriers::rendezvous(release).await;
+        time::timeout(Duration::from_secs(1), &mut force).await??;
+        let loaded = ProfileStore::new(root.path()).load_or_create("SessionMyRoomOwner")?;
+        assert_eq!(loaded.revision, Some(2));
+        assert_eq!(loaded.profile.my_room.try_to_protocol_info()?, persisted);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

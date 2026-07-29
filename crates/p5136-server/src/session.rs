@@ -35,8 +35,9 @@ use p5136_core::{
         serialize_pr_login,
     },
     myroom_protocol::{
-        MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError,
-        plan_owner_item_packets, serialize_owner_item_enchants, serialize_owner_items,
+        MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest,
+        classify_myroom_request, parse_update_info, plan_owner_item_packets, serialize_myroom_info,
+        serialize_owner_item_enchants, serialize_owner_items,
     },
     packet::PacketError,
     race_protocol::{
@@ -73,10 +74,13 @@ use tokio::{
 use crate::{
     ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ServerConfig, SessionId,
     UserNo, WorldError, WorldHandle,
+    myroom_persistence::{
+        MYROOM_INFO_WRITE_OPERATION, MyRoomInfoWriteError, MyRoomInfoWriteReceipt,
+    },
     profile_io::{ProfileIoError, ProfileIoHandle, ProfileJobAdmission, ProfileLanePermit},
     world::{
-        LobbyCommandPayload, LobbyError, OutboundBatch, RaceCommandPayload, RoomCommandPayload,
-        RoomParticipant, StartRoomPlan,
+        LobbyCommandPayload, LobbyError, MyRoomSessionRole, OutboundBatch, RaceCommandPayload,
+        RoomCommandPayload, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -175,6 +179,12 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     MyRoomItemState(#[from] MyRoomItemStateError),
+
+    #[error("MyRoom owner-info write failed")]
+    MyRoomInfoWrite {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 
     #[error(transparent)]
     ProfileIo(#[from] ProfileIoError),
@@ -866,6 +876,27 @@ impl SessionContext {
             .filter(|bound| bound.identity.generation == identity.generation)
             .ok_or(LoginSessionError::ProfileNotBound)
     }
+
+    fn apply_myroom_info_write(
+        &mut self,
+        identity: &IdentityBinding,
+        receipt: &MyRoomInfoWriteReceipt,
+    ) -> Result<(), LoginSessionError> {
+        let bound = self
+            .profile
+            .as_mut()
+            .filter(|bound| bound.identity.owner == identity.owner)
+            .filter(|bound| bound.identity.user_no == identity.user_no)
+            .filter(|bound| bound.identity.generation == identity.generation)
+            .ok_or(LoginSessionError::ProfileNotBound)?;
+        bound
+            .profile
+            .profile
+            .my_room
+            .try_apply_protocol_info(receipt.info())?;
+        bound.profile.revision = Some(receipt.revision());
+        Ok(())
+    }
 }
 
 fn ensure_identity_fence(
@@ -1215,6 +1246,18 @@ async fn dispatch_packet(
         return handle_race_request(services.world, services.session_id, request, packet).await;
     }
 
+    if let Some(request) = classify_myroom_request(hash) {
+        return handle_myroom_request(
+            services.world,
+            services.profiles,
+            services.session_id,
+            request,
+            packet,
+            context,
+        )
+        .await;
+    }
+
     if let Some(request) = classify_equipment_request(hash) {
         return dispatch_equipment_request(services, request, packet, context).await;
     }
@@ -1488,6 +1531,55 @@ async fn handle_race_request(
         Err(error) => return Err(error.into()),
     }
     Ok(Vec::new())
+}
+
+async fn handle_myroom_request(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    request: MyRoomRequest,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    if request != MyRoomRequest::UpdateInfo {
+        let identity = world.authorize_identity(session_id).await?;
+        let _ = context.profile_for(&identity)?;
+        return Ok(Vec::new());
+    }
+
+    let Some(view) = world.myroom_session_view(session_id).await? else {
+        return Ok(Vec::new());
+    };
+    if view.role() == MyRoomSessionRole::Visitor {
+        return Ok(vec![serialize_myroom_info(view.info())?]);
+    }
+
+    let proposed = parse_update_info(packet)?;
+    let before = world.authorize_identity(session_id).await?;
+    let _ = context.profile_for(&before)?;
+    let admission = profiles
+        .admit(&before.nickname, MYROOM_INFO_WRITE_OPERATION)
+        .await?;
+    let receipt = world
+        .persist_myroom_owner_info(session_id, proposed, admission)
+        .await
+        .map_err(myroom_info_write_error)?;
+    let after = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after)?;
+    context.apply_myroom_info_write(&after, &receipt)?;
+    tracing::trace!(
+        nickname = %after.nickname,
+        revision = receipt.revision(),
+        publication = ?receipt.publication(),
+        "applied durable MyRoom owner info to the bound session profile"
+    );
+    Ok(Vec::new())
+}
+
+fn myroom_info_write_error(source: MyRoomInfoWriteError) -> LoginSessionError {
+    LoginSessionError::MyRoomInfoWrite {
+        source: Box::new(source),
+    }
 }
 
 async fn dispatch_equipment_request(
@@ -2001,8 +2093,8 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MyRoomProtocolError, OWNER_ITEM_NAME,
-            plan_owner_item_packets,
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MyRoomInfo, MyRoomProtocolError, OWNER_ITEM_NAME,
+            plan_owner_item_packets, serialize_myroom_info,
         },
         packet::PacketWriter,
         race_protocol::{
@@ -2036,6 +2128,7 @@ mod tests {
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
         WorldError, WorldHandle,
+        world::test_support::spawn_myroom_world,
         world::{OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload},
     };
 
@@ -2092,6 +2185,37 @@ mod tests {
             </KartCatalog>"#
         );
         Arc::new(CatalogInventory::from_xml(xml.as_bytes()).unwrap())
+    }
+
+    async fn bind_test_profile(
+        profiles: &ProfileCoordinator,
+        identity: &IdentityBinding,
+    ) -> SessionContext {
+        let admission = profiles
+            .admit(&identity.nickname, "bind test profile")
+            .await
+            .unwrap();
+        let (profile, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        let mut context = SessionContext::default();
+        context.bind_profile(identity.clone(), profile);
+        drop(lane);
+        context
+    }
+
+    async fn shutdown_myroom_test(
+        world: &WorldHandle,
+        profile_runtime: crate::profile_io::ProfileIoRuntime,
+        actor: tokio::task::JoinHandle<Result<(), crate::world::WorldSidecarError>>,
+    ) {
+        world.quiesce().await.unwrap();
+        world.drain_sessions().await.unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     fn rider_selection() -> RiderItemSelection {
@@ -2887,6 +3011,167 @@ mod tests {
 
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_info_dispatch_is_silent_for_nonmember_and_skips_visitor_body() {
+        let initial = MyRoomInfo {
+            room_id: 17,
+            bgm: 3,
+            room_password: "initial room".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(initial.clone());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            owner: _owner,
+            visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let visitor_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        let malformed_visitor_packet = PacketWriter::named("RmNotiMyRoomInfoPacket").into_inner();
+        assert_eq!(
+            dispatch_packet(
+                &visitor_services,
+                &malformed_visitor_packet,
+                &mut visitor_context,
+            )
+            .await
+            .unwrap(),
+            vec![serialize_myroom_info(&initial).unwrap()],
+            "a visitor receives the owner's current info without parsing its malformed body"
+        );
+
+        let outsider_session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_737))
+            .await
+            .unwrap();
+        let outsider_identity = world
+            .claim_identity(outsider_session, "SessionMyRoomOutsider")
+            .await
+            .unwrap();
+        let mut outsider_context = bind_test_profile(&profiles, &outsider_identity).await;
+        let outsider_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: outsider_session,
+        };
+        assert!(
+            dispatch_packet(
+                &outsider_services,
+                &malformed_visitor_packet,
+                &mut outsider_context,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a nonmember is ignored before its malformed body is parsed"
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_owner_info_dispatch_persists_before_exact_echo_and_context_refresh() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let proposed = MyRoomInfo {
+            room_id: 5136,
+            bgm: 7,
+            use_room_password: 1,
+            room_password: "durable room".to_owned(),
+            item_password: "durable item".to_owned(),
+            kart_1: 1450,
+            kart_2: 1453,
+            ..MyRoomInfo::default()
+        };
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        assert!(
+            dispatch_packet(
+                &owner_services,
+                &serialize_myroom_info(&proposed).unwrap(),
+                &mut owner_context,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the actor-owned outbound queue carries the owner's echo"
+        );
+        let echo = time::timeout(Duration::from_secs(1), owner.outbound.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_packets();
+        assert_eq!(echo, vec![serialize_myroom_info(&proposed).unwrap()]);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "owner info updates echo only to the owner"
+        );
+
+        let current = world.authorize_identity(owner.session).await.unwrap();
+        assert_eq!(
+            owner_context
+                .profile_for(&current)
+                .unwrap()
+                .my_room
+                .try_to_protocol_info()
+                .unwrap(),
+            proposed
+        );
+        assert_eq!(
+            owner_context
+                .bound_profile_for(&current)
+                .unwrap()
+                .profile
+                .revision,
+            Some(2)
+        );
+        let persisted = ProfileStore::new(profile_root.path())
+            .load_or_create(&owner.identity.nickname)
+            .unwrap();
+        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(
+            persisted.profile.my_room.try_to_protocol_info().unwrap(),
+            proposed
+        );
+        assert_eq!(
+            world
+                .myroom_session_view(owner.session)
+                .await
+                .unwrap()
+                .unwrap()
+                .info(),
+            &proposed
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[test]

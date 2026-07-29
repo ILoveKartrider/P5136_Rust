@@ -843,9 +843,14 @@ fn resolve_reward_transaction(
     transaction: ProfileTransaction<Result<PersistedRaceRewardReceipt, RaceRewardPersistenceError>>,
 ) -> Result<ProfileTransaction<PersistedRaceRewardReceipt>, RaceRewardPersistenceError> {
     match transaction {
-        ProfileTransaction::Unchanged { value, profile } => Ok(ProfileTransaction::Unchanged {
+        ProfileTransaction::Unchanged {
+            value,
+            profile,
+            saved,
+        } => Ok(ProfileTransaction::Unchanged {
             value: value?,
             profile,
+            saved,
         }),
         ProfileTransaction::Committed {
             value,
@@ -1177,7 +1182,7 @@ mod tests {
         )
         .unwrap();
         match duplicate {
-            ProfileTransaction::Unchanged { value, profile } => {
+            ProfileTransaction::Unchanged { value, profile, .. } => {
                 assert_eq!(value, receipt);
                 assert_eq!(value.applied.earned_rp, 37);
                 assert_eq!(value.applied.earned_lucci, 25);
@@ -1229,7 +1234,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             retry,
-            ProfileTransaction::Unchanged { value, profile }
+            ProfileTransaction::Unchanged { value, profile, .. }
                 if value == first_receipt
                     && profile.rider.rp == 123
                     && profile.rider.lucci == 1_000_107
@@ -1623,6 +1628,7 @@ mod tests {
             ProfileTransaction::Unchanged {
                 value,
                 profile,
+                ..
             } if value == receipt && profile.rider.lucci == 1_000_040
         ));
         assert_eq!(store.load_or_create("Rider").unwrap().revision, Some(2));

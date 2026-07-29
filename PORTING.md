@@ -1,5 +1,7 @@
 # Porting ledger
 
+Current resumable checkpoint: [PORTING_STATUS.md](PORTING_STATUS.md)
+
 This ledger keeps “port complete” tied to the behavior of the P5136 C# source.
 A checked item needs Rust tests or an end-to-end capture; compilation alone is
 not completion evidence.

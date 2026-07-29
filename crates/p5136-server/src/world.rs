@@ -15,7 +15,9 @@ use p5136_core::{
         serialize_change_team_reply, serialize_set_slot_state_reply, serialize_slot_state,
         serialize_start_room_reply,
     },
-    myroom_protocol::{MyRoomProtocolError, MyRoomSlot, serialize_slot_data},
+    myroom_protocol::{
+        MyRoomInfo, MyRoomProtocolError, MyRoomSlot, serialize_myroom_info, serialize_slot_data,
+    },
     nickname::canonical_nickname_key,
     race_protocol::{
         AiGoalInRequest, GameControlRequest, RaceProtocolError, RaceTeam, ServerGameControl,
@@ -63,7 +65,13 @@ use crate::myroom_hub::{
     IdentityAdvanceEffects, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
     MyRoomTransition, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
 };
-use crate::profile_io::DurableRewardReceipt;
+use crate::myroom_persistence::{
+    MyRoomCompletionBridge, MyRoomCompletionDrainError, MyRoomInfoPublication,
+    MyRoomInfoWriteError, MyRoomInfoWriteReceipt, MyRoomPersistenceInvariantError,
+    MyRoomProfileCompletion, MyRoomProfileJobResult, MyRoomProfileTicketId,
+    PreparedMyRoomInfoWrite, RegisteredMyRoomInfoWrite,
+};
+use crate::profile_io::{DurableRewardReceipt, ProfileJobAdmission};
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
     UdpIngressBody, UdpService, UdpServiceError,
@@ -462,6 +470,25 @@ impl RewardDrainStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorldForceShutdownReport {
+    pending_myroom_tickets: usize,
+    pending_myroom_user_indexes: usize,
+}
+
+impl WorldForceShutdownReport {
+    fn capture(world: &World) -> Self {
+        Self {
+            pending_myroom_tickets: world.pending_myroom_writes.len(),
+            pending_myroom_user_indexes: world.pending_myroom_by_user.len(),
+        }
+    }
+
+    fn has_abandoned_myroom_publications(self) -> bool {
+        self.pending_myroom_tickets != 0 || self.pending_myroom_user_indexes != 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlotId(pub u8);
 
@@ -831,6 +858,28 @@ pub(crate) enum MyRoomLifecycleError {
     Commit(#[from] MyRoomCommitError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MyRoomSessionRole {
+    PresentOwner,
+    Visitor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomSessionView {
+    role: MyRoomSessionRole,
+    info: MyRoomInfo,
+}
+
+impl MyRoomSessionView {
+    pub(crate) const fn role(&self) -> MyRoomSessionRole {
+        self.role
+    }
+
+    pub(crate) fn info(&self) -> &MyRoomInfo {
+        &self.info
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WorldError {
     #[error("world actor has stopped")]
@@ -921,6 +970,11 @@ pub enum WorldError {
 
     #[error("session shutdown drain requires the world to be quiescing")]
     SessionDrainRequiresQuiesce,
+
+    #[error(
+        "world shutdown refused while {pending} MyRoom profile writes remain ({indexed} user indexes)"
+    )]
+    MyRoomPersistenceShutdownBlocked { pending: usize, indexed: usize },
 }
 
 /// A terminal failure while publishing actor-owned state to a process sidecar.
@@ -939,6 +993,9 @@ pub(crate) enum WorldSidecarError {
     #[error("world MyRoom lifecycle failed: {0}")]
     MyRoom(#[from] MyRoomLifecycleError),
 
+    #[error("world MyRoom persistence failed: {0}")]
+    MyRoomPersistence(#[from] MyRoomPersistenceInvariantError),
+
     #[error("world identity capacity must be nonzero")]
     InvalidIdentityCapacity,
 }
@@ -947,6 +1004,27 @@ pub(crate) enum WorldSidecarError {
 enum WorldOperationError {
     Command(WorldError),
     MyRoom(MyRoomLifecycleError),
+}
+
+#[derive(Debug)]
+enum MyRoomInfoRegistrationError {
+    Request(Box<MyRoomInfoWriteError>),
+    MyRoom(Box<MyRoomLifecycleError>),
+    Terminal(Box<MyRoomPersistenceInvariantError>),
+}
+
+impl MyRoomInfoRegistrationError {
+    fn request(error: MyRoomInfoWriteError) -> Self {
+        Self::Request(Box::new(error))
+    }
+
+    fn myroom(error: MyRoomLifecycleError) -> Self {
+        Self::MyRoom(Box::new(error))
+    }
+
+    fn terminal(error: MyRoomPersistenceInvariantError) -> Self {
+        Self::Terminal(Box::new(error))
+    }
 }
 
 impl From<WorldError> for WorldOperationError {
@@ -1092,6 +1170,16 @@ enum WorldCommand {
     DrainSessions {
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
+    RegisterMyRoomInfoWrite {
+        session: SessionId,
+        prepared: PreparedMyRoomInfoWrite,
+        request_reply: oneshot::Sender<Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError>>,
+        reply: oneshot::Sender<Result<RegisteredMyRoomInfoWrite, MyRoomInfoWriteError>>,
+    },
+    MyRoomSessionView {
+        session: SessionId,
+        reply: oneshot::Sender<Result<Option<MyRoomSessionView>, WorldError>>,
+    },
     RewardDrainStatus {
         reply: oneshot::Sender<Result<RewardDrainStatus, WorldError>>,
     },
@@ -1103,7 +1191,7 @@ enum WorldCommand {
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     ForceShutdown {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<WorldForceShutdownReport>,
     },
 }
 
@@ -1111,6 +1199,7 @@ enum WorldCommand {
 pub struct WorldHandle {
     sender: mpsc::Sender<WorldCommand>,
     udp_sender: Option<mpsc::Sender<UdpIngress>>,
+    myroom_completions: MyRoomCompletionBridge,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1134,13 +1223,24 @@ impl WorldHandle {
     #[must_use]
     pub fn spawn(mailbox_capacity: usize) -> (Self, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let completion_capacity = NonZeroUsize::new(DEFAULT_WORLD_IDENTITY_CAPACITY)
+            .expect("the default World identity capacity is nonzero");
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(completion_capacity);
         let handle = Self {
             sender,
             udp_sender: None,
+            myroom_completions,
         };
         let task = tokio::spawn(async move {
-            let result =
-                run_world(receiver, None, WorldSidecars::default(), ServerClock::new()).await;
+            let result = run_world(
+                receiver,
+                completion_receiver,
+                None,
+                WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await;
             debug_assert!(result.is_ok());
         });
         (handle, task)
@@ -1152,22 +1252,43 @@ impl WorldHandle {
         messenger: MessengerServiceHandle,
     ) -> (Self, JoinHandle<Result<(), MessengerServiceError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
-        let handle = Self {
-            sender,
-            udp_sender: None,
-        };
         let sidecars = WorldSidecars {
             messenger: Some(messenger),
             udp: None,
         };
+        let completion_capacity = NonZeroUsize::new(
+            sidecars
+                .identity_capacity()
+                .unwrap_or(DEFAULT_WORLD_IDENTITY_CAPACITY),
+        )
+        .expect("messenger identity capacity is validated before World startup");
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(completion_capacity);
+        let handle = Self {
+            sender,
+            udp_sender: None,
+            myroom_completions,
+        };
         let task = tokio::spawn(async move {
-            match run_world(receiver, None, sidecars, ServerClock::new()).await {
+            match run_world(
+                receiver,
+                completion_receiver,
+                None,
+                sidecars,
+                ServerClock::new(),
+            )
+            .await
+            {
                 Ok(()) => Ok(()),
                 Err(WorldSidecarError::Messenger(error)) => Err(error),
                 Err(WorldSidecarError::Udp(_)) => {
                     unreachable!("messenger-only world cannot report a UDP sidecar failure")
                 }
-                Err(WorldSidecarError::MyRoom(_) | WorldSidecarError::InvalidIdentityCapacity) => {
+                Err(
+                    WorldSidecarError::MyRoom(_)
+                    | WorldSidecarError::MyRoomPersistence(_)
+                    | WorldSidecarError::InvalidIdentityCapacity,
+                ) => {
                     unreachable!("messenger-only test world has no MyRoom mutation commands")
                 }
             }
@@ -1184,15 +1305,32 @@ impl WorldHandle {
     ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
         let (udp_sender, udp_receiver) = mpsc::channel(udp_mailbox_capacity);
-        let handle = Self {
-            sender,
-            udp_sender: Some(udp_sender),
-        };
         let sidecars = WorldSidecars {
             messenger: Some(messenger),
             udp: Some(udp),
         };
-        let task = tokio::spawn(run_world(receiver, Some(udp_receiver), sidecars, clock));
+        let completion_capacity = NonZeroUsize::new(
+            sidecars
+                .identity_capacity()
+                .unwrap_or(DEFAULT_WORLD_IDENTITY_CAPACITY),
+        )
+        // A zero sidecar capacity remains a typed World startup error. The
+        // one-slot mailbox only lets that actor task own and report the error.
+        .unwrap_or(NonZeroUsize::MIN);
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(completion_capacity);
+        let handle = Self {
+            sender,
+            udp_sender: Some(udp_sender),
+            myroom_completions,
+        };
+        let task = tokio::spawn(run_world(
+            receiver,
+            completion_receiver,
+            Some(udp_receiver),
+            sidecars,
+            clock,
+        ));
         (handle, task)
     }
 
@@ -1603,6 +1741,76 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn persist_myroom_owner_info(
+        &self,
+        session: SessionId,
+        proposed: MyRoomInfo,
+        admission: ProfileJobAdmission,
+    ) -> Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError> {
+        let completion = self.myroom_completions.reserve().await?;
+        let prepared = PreparedMyRoomInfoWrite::new(admission, proposed, completion);
+        self.persist_prepared_myroom_owner_info(session, prepared)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_myroom_owner_info_with_test_hook(
+        &self,
+        session: SessionId,
+        proposed: MyRoomInfo,
+        admission: ProfileJobAdmission,
+        test_hook: crate::myroom_persistence::MyRoomPersistenceTestHook,
+    ) -> Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError> {
+        let completion = self.myroom_completions.reserve().await?;
+        let prepared =
+            PreparedMyRoomInfoWrite::new(admission, proposed, completion).with_test_hook(test_hook);
+        self.persist_prepared_myroom_owner_info(session, prepared)
+            .await
+    }
+
+    async fn persist_prepared_myroom_owner_info(
+        &self,
+        session: SessionId,
+        prepared: PreparedMyRoomInfoWrite,
+    ) -> Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError> {
+        let (request_reply, request_response) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::RegisterMyRoomInfoWrite {
+                session,
+                prepared,
+                request_reply,
+                reply,
+            })
+            .await
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)?;
+        let registered = response
+            .await
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)??;
+        // No await is allowed between receiving the actor-minted capability
+        // and transferring it to the profile runtime.
+        registered.submit();
+        request_response
+            .await
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)?
+    }
+
+    pub(crate) async fn myroom_session_view(
+        &self,
+        session: SessionId,
+    ) -> Result<Option<MyRoomSessionView>, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::MyRoomSessionView { session, reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn drain_myroom_completions(&self) -> Result<(), MyRoomCompletionDrainError> {
+        self.myroom_completions.drain_barrier().await
+    }
+
     pub async fn reward_drain_status(&self) -> Result<RewardDrainStatus, WorldError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -1637,7 +1845,7 @@ impl WorldHandle {
     ///
     /// Normal shutdown must use [`Self::shutdown`], whose reward-lane barrier
     /// prevents silent loss of issued or dead-lettered work.
-    pub(crate) async fn force_shutdown(&self) -> Result<(), WorldError> {
+    pub(crate) async fn force_shutdown(&self) -> Result<WorldForceShutdownReport, WorldError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WorldCommand::ForceShutdown { reply })
@@ -1668,6 +1876,9 @@ struct World {
     /// and room membership changes and are released only by their exact fence.
     reward_lanes: HashMap<UserNo, RaceFence>,
     next_reward_attempt_id: Option<NonZeroU64>,
+    pending_myroom_writes: HashMap<MyRoomProfileTicketId, PendingMyRoomInfoWrite>,
+    pending_myroom_by_user: HashMap<UserNo, MyRoomProfileTicketId>,
+    next_myroom_ticket: Option<MyRoomProfileTicketId>,
     quiescing: bool,
 }
 
@@ -1686,6 +1897,22 @@ struct SessionState {
     peer: SocketAddr,
     cancellation: Option<oneshot::Sender<()>>,
     outbound: Option<mpsc::Sender<OutboundBatch>>,
+}
+
+#[derive(Debug)]
+struct PendingMyRoomInfoWrite {
+    expected: IdentityBinding,
+    proposed: MyRoomInfo,
+    echo: ReservedOutbound,
+    reply: oneshot::Sender<Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MyRoomCompletionIdentityState {
+    Active,
+    Ownerless,
+    Superseded,
+    Released,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1962,6 +2189,7 @@ struct ProtocolRoomState {
 
 type OutboundDelivery = (SessionId, OutboundBatch);
 
+#[derive(Debug)]
 struct ReservedOutbound {
     permit: mpsc::OwnedPermit<OutboundBatch>,
     batch: OutboundBatch,
@@ -2375,6 +2603,9 @@ impl Default for World {
             next_race_epoch: GlobalRaceEpoch::new(1),
             reward_lanes: HashMap::new(),
             next_reward_attempt_id: Some(NonZeroU64::MIN),
+            pending_myroom_writes: HashMap::new(),
+            pending_myroom_by_user: HashMap::new(),
+            next_myroom_ticket: Some(MyRoomProfileTicketId::FIRST),
             quiescing: false,
         }
     }
@@ -2706,6 +2937,335 @@ impl World {
 
     fn quiesce(&mut self) {
         self.quiescing = true;
+    }
+
+    fn register_myroom_info_write(
+        &mut self,
+        session: SessionId,
+        prepared: PreparedMyRoomInfoWrite,
+        reply: oneshot::Sender<Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError>>,
+    ) -> Result<RegisteredMyRoomInfoWrite, MyRoomInfoRegistrationError> {
+        if self.quiescing {
+            return Err(MyRoomInfoRegistrationError::request(
+                MyRoomInfoWriteError::WorldQuiescing,
+            ));
+        }
+        let identity = self.identities.authorize(session).map_err(|_| {
+            MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::UnauthenticatedSession {
+                session,
+            })
+        })?;
+        if canonical_nickname_key(prepared.admitted_nickname())
+            != canonical_nickname_key(&identity.nickname)
+        {
+            return Err(MyRoomInfoRegistrationError::request(
+                MyRoomInfoWriteError::ProfileSubjectMismatch {
+                    admitted: prepared.admitted_nickname().to_owned(),
+                    active: identity.nickname,
+                },
+            ));
+        }
+        let membership = self
+            .myroom
+            .membership_if_member(&identity)
+            .map_err(|source| {
+                MyRoomInfoRegistrationError::myroom(MyRoomLifecycleError::Hub {
+                    operation: "owner-info registration",
+                    source,
+                })
+            })?
+            .ok_or_else(|| {
+                MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::NotMember {
+                    user_no: identity.user_no,
+                })
+            })?;
+        if !membership.is_present_owner(identity.user_no) {
+            return Err(MyRoomInfoRegistrationError::request(
+                MyRoomInfoWriteError::NotPresentOwner {
+                    user_no: identity.user_no,
+                },
+            ));
+        }
+        if self.pending_myroom_by_user.contains_key(&identity.user_no) {
+            return Err(MyRoomInfoRegistrationError::request(
+                MyRoomInfoWriteError::AlreadyPending {
+                    user_no: identity.user_no,
+                },
+            ));
+        }
+
+        let packet = serialize_myroom_info(prepared.proposed())
+            .map_err(MyRoomInfoWriteError::from)
+            .map_err(MyRoomInfoRegistrationError::request)?;
+        let outbound = self
+            .sessions
+            .get(&session)
+            .and_then(|state| state.outbound.clone())
+            .ok_or_else(|| {
+                MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
+                    session,
+                })
+            })?;
+        let permit = outbound.try_reserve_owned().map_err(|_| {
+            MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
+                session,
+            })
+        })?;
+
+        let ticket = self.next_myroom_ticket.ok_or_else(|| {
+            MyRoomInfoRegistrationError::terminal(
+                MyRoomPersistenceInvariantError::TicketIdExhausted,
+            )
+        })?;
+        self.next_myroom_ticket = ticket.successor();
+        let pending = PendingMyRoomInfoWrite {
+            expected: identity.clone(),
+            proposed: prepared.proposed().clone(),
+            echo: ReservedOutbound {
+                permit,
+                batch: OutboundBatch::single(packet),
+            },
+            reply,
+        };
+        let replaced = self.pending_myroom_writes.insert(ticket, pending);
+        debug_assert!(replaced.is_none(), "MyRoom ticket IDs are never reused");
+        let replaced = self.pending_myroom_by_user.insert(identity.user_no, ticket);
+        debug_assert!(
+            replaced.is_none(),
+            "one user cannot own two pending MyRoom profile tickets"
+        );
+        self.debug_assert_myroom_persistence();
+        Ok(prepared.register(ticket))
+    }
+
+    fn myroom_session_view(
+        &self,
+        session: SessionId,
+    ) -> Result<Option<MyRoomSessionView>, WorldOperationError> {
+        let identity = self.identities.authorize(session)?;
+        let Some(membership) = self
+            .myroom
+            .membership_if_member(&identity)
+            .map_err(|source| MyRoomLifecycleError::Hub {
+                operation: "session info query",
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        let info =
+            self.myroom
+                .room_info(membership.owner)
+                .cloned()
+                .ok_or(MyRoomLifecycleError::Hub {
+                    operation: "session info query",
+                    source: MyRoomHubError::RoomMissing {
+                        owner: membership.owner,
+                    },
+                })?;
+        let role = if membership.is_present_owner(identity.user_no) {
+            MyRoomSessionRole::PresentOwner
+        } else {
+            MyRoomSessionRole::Visitor
+        };
+        Ok(Some(MyRoomSessionView { role, info }))
+    }
+
+    fn handle_myroom_profile_completion(
+        &mut self,
+        completion: MyRoomProfileCompletion,
+    ) -> Result<(), MyRoomPersistenceInvariantError> {
+        match completion {
+            MyRoomProfileCompletion::AbortedBeforeSubmission { ticket } => {
+                let pending = self.take_pending_myroom_write(ticket)?;
+                let _ = pending
+                    .reply
+                    .send(Err(MyRoomInfoWriteError::AbortedBeforeSubmission));
+                Ok(())
+            }
+            MyRoomProfileCompletion::AcceptedOutcomeLost { ticket } => {
+                drop(self.take_pending_myroom_write(ticket)?);
+                Err(MyRoomPersistenceInvariantError::AcceptedOutcomeLost {
+                    ticket: ticket.get(),
+                })
+            }
+            MyRoomProfileCompletion::Finished { ticket, result } => {
+                self.finish_myroom_profile_write(ticket, *result)
+            }
+            MyRoomProfileCompletion::DrainBarrier { reply } => {
+                let pending = self.pending_myroom_writes.len();
+                let indexed = self.pending_myroom_by_user.len();
+                if pending == 0 && indexed == 0 {
+                    let _ = reply.send(Ok(()));
+                    Ok(())
+                } else {
+                    let _ = reply.send(Err(MyRoomCompletionDrainError::Pending {
+                        pending,
+                        indexed,
+                    }));
+                    Err(MyRoomPersistenceInvariantError::PendingAtDrain { pending, indexed })
+                }
+            }
+        }
+    }
+
+    fn finish_myroom_profile_write(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+        result: MyRoomProfileJobResult,
+    ) -> Result<(), MyRoomPersistenceInvariantError> {
+        let PendingMyRoomInfoWrite {
+            expected,
+            proposed,
+            echo,
+            reply,
+        } = self.take_pending_myroom_write(ticket)?;
+        let completion =
+            result.map_err(
+                |source| MyRoomPersistenceInvariantError::ProfileInfrastructure {
+                    ticket: ticket.get(),
+                    source,
+                },
+            )?;
+        let (result, lane) = completion.into_parts();
+        let subject_matches = lane
+            .subject()
+            .matches_nickname(&expected.nickname)
+            .map_err(crate::profile_io::ProfileIoError::from)
+            .map_err(
+                |source| MyRoomPersistenceInvariantError::ProfileInfrastructure {
+                    ticket: ticket.get(),
+                    source,
+                },
+            )?;
+        if !subject_matches {
+            return Err(MyRoomPersistenceInvariantError::CompletionSubjectMismatch {
+                ticket: ticket.get(),
+                expected: expected.nickname,
+                actual: lane.subject().nickname().to_owned(),
+            });
+        }
+        let durable = match result {
+            Ok(durable) => durable,
+            Err(error) => {
+                drop(lane);
+                let _ = reply.send(Err(MyRoomInfoWriteError::Persistence(error)));
+                return Ok(());
+            }
+        };
+        if durable.info() != &proposed {
+            return Err(MyRoomPersistenceInvariantError::DurableValueMismatch {
+                ticket: ticket.get(),
+            });
+        }
+
+        let publication =
+            self.publish_durable_myroom_info(ticket, &expected, durable.info(), echo)?;
+
+        let _ = reply.send(Ok(durable.into_receipt(publication)));
+        drop(lane);
+        self.debug_assert_myroom_persistence();
+        Ok(())
+    }
+
+    fn publish_durable_myroom_info(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+        expected: &IdentityBinding,
+        persisted: &MyRoomInfo,
+        echo: ReservedOutbound,
+    ) -> Result<MyRoomInfoPublication, MyRoomPersistenceInvariantError> {
+        let active = self.identities.active_identity_by_user_no(expected.user_no);
+        let identity_state = if active.as_ref() == Some(expected) {
+            MyRoomCompletionIdentityState::Active
+        } else if active.is_none() && self.identities.is_current_ownerless_binding(expected) {
+            MyRoomCompletionIdentityState::Ownerless
+        } else if active.is_some() {
+            MyRoomCompletionIdentityState::Superseded
+        } else {
+            MyRoomCompletionIdentityState::Released
+        };
+        let (operation, success, publish_echo) = match identity_state {
+            MyRoomCompletionIdentityState::Active => (
+                "active owner-info completion",
+                MyRoomInfoPublication::ActiveOwnerEchoed,
+                true,
+            ),
+            MyRoomCompletionIdentityState::Ownerless => (
+                "ownerless owner-info completion",
+                MyRoomInfoPublication::OwnerlessGenerationUpdated,
+                false,
+            ),
+            MyRoomCompletionIdentityState::Superseded => {
+                drop(echo);
+                return Ok(MyRoomInfoPublication::PersistedAfterSupersession);
+            }
+            MyRoomCompletionIdentityState::Released => {
+                drop(echo);
+                return Ok(MyRoomInfoPublication::PersistedAfterRelease);
+            }
+        };
+
+        let transition = match self.myroom.update_owner_info(expected, persisted.clone()) {
+            Ok(transition) => transition,
+            Err(MyRoomHubError::NotMember { .. } | MyRoomHubError::NotPresentOwner { .. }) => {
+                drop(echo);
+                return Ok(MyRoomInfoPublication::PersistedAfterRoleChange);
+            }
+            Err(source) => {
+                return Err(MyRoomPersistenceInvariantError::Hub {
+                    ticket: ticket.get(),
+                    operation,
+                    source,
+                });
+            }
+        };
+        transition.commit(&mut self.myroom).map_err(|source| {
+            MyRoomPersistenceInvariantError::Commit {
+                ticket: ticket.get(),
+                source,
+            }
+        })?;
+        debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
+        if publish_echo {
+            Self::publish_reserved(vec![echo]);
+        } else {
+            drop(echo);
+        }
+        Ok(success)
+    }
+
+    fn take_pending_myroom_write(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+    ) -> Result<PendingMyRoomInfoWrite, MyRoomPersistenceInvariantError> {
+        let pending = self.pending_myroom_writes.remove(&ticket).ok_or(
+            MyRoomPersistenceInvariantError::UnknownTicket {
+                ticket: ticket.get(),
+            },
+        )?;
+        let actual = self
+            .pending_myroom_by_user
+            .remove(&pending.expected.user_no);
+        if actual != Some(ticket) {
+            return Err(MyRoomPersistenceInvariantError::PendingIndexMismatch {
+                user_no: pending.expected.user_no,
+                expected: ticket.get(),
+                actual: actual.map(MyRoomProfileTicketId::get),
+            });
+        }
+        self.debug_assert_myroom_persistence();
+        Ok(pending)
+    }
+
+    fn debug_assert_myroom_persistence(&self) {
+        debug_assert_eq!(
+            self.pending_myroom_writes.len(),
+            self.pending_myroom_by_user.len()
+        );
+        debug_assert!(self.pending_myroom_writes.iter().all(|(ticket, pending)| {
+            self.pending_myroom_by_user.get(&pending.expected.user_no) == Some(ticket)
+        }));
     }
 
     fn drain_sessions_for_shutdown(&mut self) -> Result<(), WorldOperationError> {
@@ -6142,6 +6702,15 @@ async fn receive_udp_ingress(
     }
 }
 
+async fn receive_myroom_completion(
+    receiver: &mut Option<mpsc::Receiver<MyRoomProfileCompletion>>,
+) -> Option<MyRoomProfileCompletion> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn dispatch_udp_ingress(
     world: &mut World,
     udp: &UdpService,
@@ -6201,6 +6770,7 @@ async fn dispatch_udp_ingress(
 
 async fn run_world(
     receiver: mpsc::Receiver<WorldCommand>,
+    completion_receiver: mpsc::Receiver<MyRoomProfileCompletion>,
     udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
     sidecars: WorldSidecars,
     clock: ServerClock,
@@ -6216,12 +6786,21 @@ async fn run_world(
         ..World::default()
     };
     debug_assert_eq!(world.myroom.identity_capacity(), world.identity_capacity);
-    run_world_actor(world, receiver, udp_receiver, sidecars, clock).await
+    run_world_actor(
+        world,
+        receiver,
+        completion_receiver,
+        udp_receiver,
+        sidecars,
+        clock,
+    )
+    .await
 }
 
 async fn run_world_actor(
     world: World,
     receiver: mpsc::Receiver<WorldCommand>,
+    completion_receiver: mpsc::Receiver<MyRoomProfileCompletion>,
     udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
     sidecars: WorldSidecars,
     clock: ServerClock,
@@ -6229,6 +6808,7 @@ async fn run_world_actor(
     run_world_actor_with_timers(
         world,
         receiver,
+        completion_receiver,
         udp_receiver,
         sidecars,
         clock,
@@ -6258,11 +6838,13 @@ impl WorldActorTimers {
 async fn run_world_actor_with_timers(
     mut world: World,
     mut receiver: mpsc::Receiver<WorldCommand>,
+    completion_receiver: mpsc::Receiver<MyRoomProfileCompletion>,
     mut udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
     sidecars: WorldSidecars,
     clock: ServerClock,
     mut timers: WorldActorTimers,
 ) -> Result<(), WorldSidecarError> {
+    let mut completion_receiver = Some(completion_receiver);
     loop {
         // Expiry is first so a perpetually ready control mailbox cannot retain
         // ownerless identities forever. Commands still precede heartbeat and
@@ -6275,6 +6857,22 @@ async fn run_world_actor_with_timers(
                 world.advance_loading(now, &clock);
                 world.expire_migrations(now)?;
                 flush_identity_lifecycle(&mut world, &sidecars).await?;
+                world.advance_loading(Instant::now(), &clock);
+            }
+            completion = receive_myroom_completion(&mut completion_receiver) => {
+                let Some(completion) = completion else {
+                    if !world.pending_myroom_writes.is_empty()
+                        || !world.pending_myroom_by_user.is_empty()
+                    {
+                        return Err(
+                            MyRoomPersistenceInvariantError::CompletionMailboxClosed.into()
+                        );
+                    }
+                    completion_receiver = None;
+                    continue;
+                };
+                world.advance_loading(Instant::now(), &clock);
+                world.handle_myroom_profile_completion(completion)?;
                 world.advance_loading(Instant::now(), &clock);
             }
             command = receiver.recv() => {
@@ -6329,11 +6927,7 @@ async fn dispatch_command(
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::SessionClosed { id, reply } => {
-            world.close_session(id, Instant::now())?;
-            flush_identity_lifecycle(world, sidecars).await?;
-            if let Some(reply) = reply {
-                let _ = reply.send(());
-            }
+            dispatch_session_closed(world, sidecars, id, reply).await?;
         }
         WorldCommand::ClaimIdentity {
             session,
@@ -6344,11 +6938,7 @@ async fn dispatch_command(
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::AuthorizeIdentity { session, reply } => {
-            let result = world
-                .identities
-                .authorize(session)
-                .map_err(WorldError::from);
-            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            dispatch_authorize_identity(world, sidecars, session, reply).await?;
         }
         WorldCommand::BeginMigration {
             session,
@@ -6406,6 +6996,16 @@ async fn dispatch_command(
             let result = world.race_command_with_clock(session, payload, Instant::now(), clock);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
+        WorldCommand::MyRoomSessionView { session, reply } => {
+            let result = world.myroom_session_view(session);
+            reply_after_world_operation(world, sidecars, reply, result).await?;
+        }
+        WorldCommand::RegisterMyRoomInfoWrite {
+            session,
+            prepared,
+            request_reply,
+            reply,
+        } => dispatch_myroom_info_registration(world, session, prepared, request_reply, reply)?,
         WorldCommand::DrainSessions { reply } => {
             let result = world.drain_sessions_for_shutdown();
             reply_after_world_operation(world, sidecars, reply, result).await?;
@@ -6413,6 +7013,56 @@ async fn dispatch_command(
         command => return dispatch_utility_command(world, command, sidecars).await,
     }
     Ok(false)
+}
+
+async fn dispatch_session_closed(
+    world: &mut World,
+    sidecars: &WorldSidecars,
+    session: SessionId,
+    reply: Option<oneshot::Sender<()>>,
+) -> Result<(), WorldSidecarError> {
+    world.close_session(session, Instant::now())?;
+    flush_identity_lifecycle(world, sidecars).await?;
+    if let Some(reply) = reply {
+        let _ = reply.send(());
+    }
+    Ok(())
+}
+
+async fn dispatch_authorize_identity(
+    world: &mut World,
+    sidecars: &WorldSidecars,
+    session: SessionId,
+    reply: oneshot::Sender<Result<IdentityBinding, WorldError>>,
+) -> Result<(), WorldSidecarError> {
+    let result = world
+        .identities
+        .authorize(session)
+        .map_err(WorldError::from);
+    reply_after_identity_lifecycle(world, sidecars, reply, result).await
+}
+
+fn dispatch_myroom_info_registration(
+    world: &mut World,
+    session: SessionId,
+    prepared: PreparedMyRoomInfoWrite,
+    request_reply: oneshot::Sender<Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError>>,
+    reply: oneshot::Sender<Result<RegisteredMyRoomInfoWrite, MyRoomInfoWriteError>>,
+) -> Result<(), WorldSidecarError> {
+    match world.register_myroom_info_write(session, prepared, request_reply) {
+        Ok(registered) => {
+            let _ = reply.send(Ok(registered));
+            Ok(())
+        }
+        Err(MyRoomInfoRegistrationError::Request(error)) => {
+            let _ = reply.send(Err(*error));
+            Ok(())
+        }
+        Err(MyRoomInfoRegistrationError::MyRoom(error)) => Err(WorldSidecarError::MyRoom(*error)),
+        Err(MyRoomInfoRegistrationError::Terminal(error)) => {
+            Err(WorldSidecarError::MyRoomPersistence(*error))
+        }
+    }
 }
 
 #[allow(
@@ -6505,12 +7155,22 @@ async fn dispatch_utility_command(
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::Shutdown { reply } => match world.reward_drain_status() {
-            Ok(status) if status.is_drained() => {
+            Ok(status)
+                if status.is_drained()
+                    && world.pending_myroom_writes.is_empty()
+                    && world.pending_myroom_by_user.is_empty() =>
+            {
                 let lifecycle = flush_identity_lifecycle(world, sidecars).await;
                 world.cancel_all_sessions();
                 lifecycle?;
                 let _ = reply.send(Ok(()));
                 return Ok(true);
+            }
+            Ok(status) if status.is_drained() => {
+                let _ = reply.send(Err(WorldError::MyRoomPersistenceShutdownBlocked {
+                    pending: world.pending_myroom_writes.len(),
+                    indexed: world.pending_myroom_by_user.len(),
+                }));
             }
             Ok(status) => {
                 let _ = reply.send(Err(WorldError::RewardShutdownBlocked {
@@ -6523,10 +7183,18 @@ async fn dispatch_utility_command(
             }
         },
         WorldCommand::ForceShutdown { reply } => {
+            let report = WorldForceShutdownReport::capture(world);
+            if report.has_abandoned_myroom_publications() {
+                tracing::warn!(
+                    pending_myroom_tickets = report.pending_myroom_tickets,
+                    pending_myroom_user_indexes = report.pending_myroom_user_indexes,
+                    "force shutdown is abandoning durable MyRoom outcomes before Hub publication, owner echo, and final request reply"
+                );
+            }
             let lifecycle = flush_identity_lifecycle(world, sidecars).await;
             world.cancel_all_sessions();
             lifecycle?;
-            let _ = reply.send(());
+            let _ = reply.send(report);
             return Ok(true);
         }
         WorldCommand::RegisterSession { .. }
@@ -6539,6 +7207,8 @@ async fn dispatch_utility_command(
         | WorldCommand::PublishRoomEquipment { .. }
         | WorldCommand::Lobby { .. }
         | WorldCommand::Race { .. }
+        | WorldCommand::RegisterMyRoomInfoWrite { .. }
+        | WorldCommand::MyRoomSessionView { .. }
         | WorldCommand::DrainSessions { .. } => {
             unreachable!("identity-affecting commands are dispatched by dispatch_command")
         }
@@ -6549,6 +7219,8 @@ async fn dispatch_utility_command(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::myroom_hub::{MyRoomOwner, MyRoomParticipant};
+    use p5136_core::myroom_protocol::MyRoomPlayerSlot;
 
     pub(crate) struct DueRewardWorld {
         pub(crate) handle: WorldHandle,
@@ -6560,6 +7232,19 @@ pub(crate) mod test_support {
         pub(crate) handle: WorldHandle,
         pub(crate) actor: JoinHandle<Result<(), WorldSidecarError>>,
         pub(crate) start: oneshot::Sender<()>,
+    }
+
+    pub(crate) struct TestMyRoomSession {
+        pub(crate) session: SessionId,
+        pub(crate) identity: IdentityBinding,
+        pub(crate) outbound: mpsc::Receiver<OutboundBatch>,
+    }
+
+    pub(crate) struct MyRoomWorld {
+        pub(crate) handle: WorldHandle,
+        pub(crate) actor: JoinHandle<Result<(), WorldSidecarError>>,
+        pub(crate) owner: TestMyRoomSession,
+        pub(crate) visitor: TestMyRoomSession,
     }
 
     fn register_channel_session(
@@ -6648,6 +7333,77 @@ pub(crate) mod test_support {
         while receiver.try_recv().is_ok() {}
     }
 
+    fn myroom_participant(identity: &IdentityBinding) -> MyRoomParticipant {
+        MyRoomParticipant::new(
+            identity.clone(),
+            MyRoomPlayerSlot {
+                user_no: identity.user_no.get(),
+                p2p_address: Ipv4Addr::LOCALHOST,
+                p2p_port: 39_312,
+                nickname: identity.nickname.clone(),
+                rider_item_snapshot: [0; p5136_core::startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+                rp: 20_000_000,
+                club_name: String::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn spawn_myroom_world(owner_info: MyRoomInfo) -> MyRoomWorld {
+        let mut world = World::default();
+        let (owner_session, owner_identity, owner_outbound) =
+            register_channel_session(&mut world, "SessionMyRoomOwner", 47_000);
+        let (visitor_session, visitor_identity, visitor_outbound) =
+            register_channel_session(&mut world, "SessionMyRoomVisitor", 47_100);
+        let owner = MyRoomOwner::new(myroom_participant(&owner_identity), owner_info).unwrap();
+        world
+            .myroom
+            .enter(&myroom_participant(&owner_identity), &owner)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
+        world
+            .myroom
+            .enter(&myroom_participant(&visitor_identity), &owner)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel(32);
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(world.identity_capacity);
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+            myroom_completions,
+        };
+        let actor = tokio::spawn(async move {
+            run_world_actor(
+                world,
+                receiver,
+                completion_receiver,
+                None,
+                WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await
+        });
+        MyRoomWorld {
+            handle,
+            actor,
+            owner: TestMyRoomSession {
+                session: owner_session,
+                identity: owner_identity,
+                outbound: owner_outbound,
+            },
+            visitor: TestMyRoomSession {
+                session: visitor_session,
+                identity: visitor_identity,
+                outbound: visitor_outbound,
+            },
+        }
+    }
+
     pub(crate) fn spawn_due_reward_world(nicknames: &[&str]) -> DueRewardWorld {
         let mut world = World::default();
         let clock = ServerClock::new();
@@ -6710,12 +7466,24 @@ pub(crate) mod test_support {
         }
 
         let (sender, receiver) = mpsc::channel(64);
+        let completion_capacity = world.identity_capacity;
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(completion_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: None,
+            myroom_completions,
         };
         let actor = tokio::spawn(async move {
-            run_world_actor(world, receiver, None, WorldSidecars::default(), clock).await
+            run_world_actor(
+                world,
+                receiver,
+                completion_receiver,
+                None,
+                WorldSidecars::default(),
+                clock,
+            )
+            .await
         });
         DueRewardWorld {
             handle,
@@ -6730,9 +7498,14 @@ pub(crate) mod test_support {
         sender
             .try_send(WorldCommand::SessionCount { reply })
             .expect("test World mailbox should accept its single queued command");
+        let completion_capacity = NonZeroUsize::new(DEFAULT_WORLD_IDENTITY_CAPACITY)
+            .expect("default test World identity capacity is nonzero");
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(completion_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: None,
+            myroom_completions,
         };
         let (start, started) = oneshot::channel();
         let actor = tokio::spawn(async move {
@@ -6740,6 +7513,7 @@ pub(crate) mod test_support {
             run_world_actor(
                 World::default(),
                 receiver,
+                completion_receiver,
                 None,
                 WorldSidecars::default(),
                 ServerClock::new(),
@@ -6770,7 +7544,8 @@ mod tests {
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
         },
         myroom_protocol::{
-            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot, serialize_slot_data,
+            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot, serialize_myroom_info,
+            serialize_slot_data,
         },
         race_protocol::{
             AiGoalInRequest, GAME_AI_MASTER_NOTICE_NAME, GAME_CONTROL_PACKET_NAME,
@@ -6787,6 +7562,7 @@ mod tests {
         },
         startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
     };
+    use p5136_profile::{Profile, ProfileStore};
     use tokio::{
         net::UdpSocket,
         sync::{mpsc, oneshot},
@@ -6800,6 +7576,10 @@ mod tests {
         WorldHandle, WorldOperationError, WorldSidecarError, WorldSidecars, dispatch_command,
     };
     use crate::myroom_hub::{MyRoomOwner, MyRoomParticipant};
+    use crate::myroom_persistence::{
+        MyRoomInfoPublication, MyRoomInfoWriteError, PreparedMyRoomInfoWrite,
+    };
+    use crate::profile_io::{ProfileIoBootstrap, ProfileIoLimits};
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
         MessengerServiceError, MessengerServiceHandle, MigrationToken, ServerClock,
@@ -6826,14 +7606,19 @@ mod tests {
         mailbox_capacity: usize,
     ) -> (WorldHandle, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let completion_capacity = world.identity_capacity;
+        let (myroom_completions, completion_receiver) =
+            crate::myroom_persistence::MyRoomCompletionBridge::channel(completion_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: None,
+            myroom_completions,
         };
         let actor = tokio::spawn(async move {
             let result = super::run_world_actor(
                 world,
                 receiver,
+                completion_receiver,
                 None,
                 super::WorldSidecars::default(),
                 ServerClock::new(),
@@ -6842,6 +7627,34 @@ mod tests {
             assert!(result.is_ok());
         });
         (handle, actor)
+    }
+
+    fn spawn_test_profile_io(
+        root: &std::path::Path,
+    ) -> (
+        crate::profile_io::ProfileIoHandle,
+        crate::profile_io::ProfileIoRuntime,
+    ) {
+        ProfileIoBootstrap::acquire(root.to_owned(), ProfileIoLimits::for_tests(8, 8))
+            .unwrap()
+            .spawn()
+    }
+
+    fn prepare_myroom_owner(
+        nickname: &str,
+        port: u16,
+        outbound_capacity: usize,
+    ) -> (World, TestChannelSession) {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, nickname, 67, port, outbound_capacity);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        (world, owner)
     }
 
     impl super::RewardRollSource for CountingRewardRolls {
@@ -9417,9 +10230,13 @@ mod tests {
                 reply,
             })
             .unwrap();
+        let completion_capacity = world.identity_capacity;
+        let (myroom_completions, completion_receiver) =
+            crate::myroom_persistence::MyRoomCompletionBridge::channel(completion_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: None,
+            myroom_completions,
         };
         let mut migration_expiry = tokio::time::interval(Duration::from_secs(60));
         migration_expiry.tick().await;
@@ -9431,6 +10248,7 @@ mod tests {
             super::run_world_actor_with_timers(
                 world,
                 receiver,
+                completion_receiver,
                 None,
                 super::WorldSidecars::default(),
                 ServerClock::new(),
@@ -11354,6 +12172,323 @@ mod tests {
         udp_runtime.shutdown().await;
         messenger.shutdown().await.unwrap();
         messenger_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_myroom_owner_write_commits_disk_hub_and_exact_echo() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let initial = store
+            .save("DurableActorOwner", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let (world, mut owner) = prepare_myroom_owner("DurableActorOwner", 56_050, 8);
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(world, 16);
+        let proposed = MyRoomInfo {
+            room_id: 5136,
+            bgm: 7,
+            room_password: "owner room".to_owned(),
+            ..MyRoomInfo::default()
+        };
+
+        let admission = profiles
+            .admit("durableactorowner", "test durable MyRoom actor write")
+            .await
+            .unwrap();
+        let receipt = world
+            .persist_myroom_owner_info(session, proposed.clone(), admission)
+            .await
+            .unwrap();
+        assert_eq!(receipt.info(), &proposed);
+        assert_eq!(receipt.revision(), initial.revision + 1);
+        assert_eq!(
+            receipt.publication(),
+            MyRoomInfoPublication::ActiveOwnerEchoed
+        );
+        let view = world.myroom_session_view(session).await.unwrap().unwrap();
+        assert_eq!(view.info(), &proposed);
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_myroom_info(&proposed).unwrap()
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        let loaded = store.load_or_create("DURABLEACTOROWNER").unwrap();
+        assert_eq!(loaded.revision, Some(receipt.revision()));
+        assert_eq!(
+            loaded.profile.my_room.try_to_protocol_info().unwrap(),
+            proposed
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_myroom_write_survives_request_result_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let initial = store
+            .save("CancelledActorOwner", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let (world, mut owner) = prepare_myroom_owner("CancelledActorOwner", 56_060, 8);
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(world, 16);
+        let proposed = MyRoomInfo {
+            room_id: 6060,
+            bgm: 6,
+            ..MyRoomInfo::default()
+        };
+
+        let completion = world.myroom_completions.reserve().await.unwrap();
+        let admission = profiles
+            .admit("cancelledactorowner", "test cancelled MyRoom request")
+            .await
+            .unwrap();
+        let prepared = PreparedMyRoomInfoWrite::new(admission, proposed.clone(), completion);
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        world
+            .sender
+            .send(WorldCommand::RegisterMyRoomInfoWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        let registered = registration_result.await.unwrap().unwrap();
+        registered.submit();
+        drop(request_result);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        let view = world.myroom_session_view(session).await.unwrap().unwrap();
+        assert_eq!(view.info(), &proposed);
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_myroom_info(&proposed).unwrap()
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        let loaded = store.load_or_create("CancelledActorOwner").unwrap();
+        assert_eq!(loaded.revision, Some(initial.revision + 1));
+        assert_eq!(
+            loaded.profile.my_room.try_to_protocol_info().unwrap(),
+            proposed
+        );
+
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_registration_reply_aborts_ticket_and_releases_profile_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let initial = store
+            .save("DroppedCapabilityOwner", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let (world, owner) = prepare_myroom_owner("DroppedCapabilityOwner", 56_070, 8);
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(world, 16);
+
+        let completion = world.myroom_completions.reserve().await.unwrap();
+        let admission = profiles
+            .admit(
+                "droppedcapabilityowner",
+                "test dropped MyRoom registration reply",
+            )
+            .await
+            .unwrap();
+        let prepared = PreparedMyRoomInfoWrite::new(admission, MyRoomInfo::default(), completion);
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        drop(registration_result);
+        world
+            .sender
+            .send(WorldCommand::RegisterMyRoomInfoWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            request_result.await,
+            Ok(Err(MyRoomInfoWriteError::AbortedBeforeSubmission))
+        ));
+        world.drain_myroom_completions().await.unwrap();
+
+        let replacement = profiles
+            .admit(
+                "DROPPEDCAPABILITYOWNER",
+                "test released MyRoom profile lane",
+            )
+            .await
+            .unwrap();
+        drop(replacement);
+        let loaded = store.load_or_create("DroppedCapabilityOwner").unwrap();
+        assert_eq!(loaded.revision, Some(initial.revision));
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_owner_outbound_rejects_myroom_write_before_disk_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let initial = store.save("FullWriteOwner", &Profile::default()).unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let (prepared_world, mut owner) = prepare_myroom_owner("FullWriteOwner", 56_080, 1);
+        prepared_world.sessions[&owner.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(vec![0xA5]))
+            .unwrap();
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+        let admission = profiles
+            .admit("fullwriteowner", "test full MyRoom outbound")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            world
+                .persist_myroom_owner_info(
+                    session,
+                    MyRoomInfo {
+                        room_id: 8080,
+                        ..MyRoomInfo::default()
+                    },
+                    admission,
+                )
+                .await,
+            Err(MyRoomInfoWriteError::OutboundUnavailable { session: actual })
+                if actual == session
+        ));
+        let loaded = store.load_or_create("FullWriteOwner").unwrap();
+        assert_eq!(loaded.revision, Some(initial.revision));
+        assert_eq!(take_single_packet(&mut owner.outbound), vec![0xA5]);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_shutdown_waits_for_registered_myroom_ticket_to_abort() {
+        let root = tempfile::tempdir().unwrap();
+        ProfileStore::new(root.path())
+            .save("PendingShutdownOwner", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let (prepared_world, owner) = prepare_myroom_owner("PendingShutdownOwner", 56_090, 8);
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+
+        let completion = world.myroom_completions.reserve().await.unwrap();
+        let admission = profiles
+            .admit("pendingshutdownowner", "test pending MyRoom shutdown")
+            .await
+            .unwrap();
+        let prepared = PreparedMyRoomInfoWrite::new(admission, MyRoomInfo::default(), completion);
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        world
+            .sender
+            .send(WorldCommand::RegisterMyRoomInfoWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        let registered = registration_result.await.unwrap().unwrap();
+
+        assert!(matches!(
+            world.shutdown().await,
+            Err(WorldError::MyRoomPersistenceShutdownBlocked {
+                pending: 1,
+                indexed: 1,
+            })
+        ));
+        drop(registered);
+        assert!(matches!(
+            request_result.await,
+            Ok(Err(MyRoomInfoWriteError::AbortedBeforeSubmission))
+        ));
+        world.drain_myroom_completions().await.unwrap();
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_shutdown_reports_abandoned_myroom_ticket_and_user_index() {
+        let root = tempfile::tempdir().unwrap();
+        ProfileStore::new(root.path())
+            .save("ForcePendingOwner", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let (prepared_world, mut owner) = prepare_myroom_owner("ForcePendingOwner", 56_095, 8);
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+
+        let completion = world.myroom_completions.reserve().await.unwrap();
+        let admission = profiles
+            .admit("forcependingowner", "test forced MyRoom shutdown")
+            .await
+            .unwrap();
+        let prepared = PreparedMyRoomInfoWrite::new(admission, MyRoomInfo::default(), completion);
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        world
+            .sender
+            .send(WorldCommand::RegisterMyRoomInfoWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        let registered = registration_result.await.unwrap().unwrap();
+
+        assert!(matches!(
+            world.shutdown().await,
+            Err(WorldError::MyRoomPersistenceShutdownBlocked {
+                pending: 1,
+                indexed: 1,
+            })
+        ));
+        let report = world.force_shutdown().await.unwrap();
+        assert_eq!(report.pending_myroom_tickets, 1);
+        assert_eq!(report.pending_myroom_user_indexes, 1);
+
+        actor.await.unwrap();
+        assert!(
+            request_result.await.is_err(),
+            "force shutdown must close the deliberately abandoned final reply"
+        );
+        assert_eq!(
+            owner.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected),
+            "force shutdown must not publish the reserved owner echo"
+        );
+        drop(registered);
+        profile_runtime.shutdown().await.unwrap();
     }
 
     #[test]

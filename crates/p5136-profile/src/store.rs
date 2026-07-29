@@ -298,6 +298,7 @@ pub enum ProfileTransaction<T> {
     Unchanged {
         value: T,
         profile: Profile,
+        saved: Option<SavedProfile>,
     },
     Committed {
         value: T,
@@ -670,9 +671,11 @@ impl ProfileStore {
     /// still wins the create-if-absent compare-and-swap.
     ///
     /// `ProfileMutation::Unchanged` does not publish a revision, but it does
-    /// explicitly sync the containing directory. A failure is returned as
-    /// `CommittedButDurabilityUncertain` for the loaded revision, preserving a
-    /// previous uncertain commit until a later retry confirms durability.
+    /// explicitly sync the containing directory. On success, `saved` is the
+    /// immutable receipt for that exact loaded snapshot, or `None` when the
+    /// snapshot did not come from an immutable revision. A failure is returned
+    /// as `CommittedButDurabilityUncertain` for the loaded revision, preserving
+    /// a previous uncertain commit until a later retry confirms durability.
     pub fn transaction<T, F>(
         &self,
         nickname: &str,
@@ -690,9 +693,10 @@ impl ProfileStore {
                 ProfileMutation::Unchanged(value) => {
                     let durability = self.confirm_snapshot_durability(&nickname, &snapshot);
                     return match durability {
-                        Ok(_) => Ok(ProfileTransaction::Unchanged {
+                        Ok(saved) => Ok(ProfileTransaction::Unchanged {
                             value,
                             profile: snapshot.profile,
+                            saved,
                         }),
                         Err(error @ ProfileStoreError::CommittedButDurabilityUncertain { .. }) => {
                             let Some(saved) = saved_profile_from_snapshot(&nickname, &snapshot)
@@ -2257,9 +2261,21 @@ mod tests {
             })
             .unwrap();
         match outcome {
-            ProfileTransaction::Unchanged { value, profile } => {
+            ProfileTransaction::Unchanged {
+                value,
+                profile,
+                saved,
+            } => {
                 assert_eq!(value, initial.profile.rider.lucci);
                 assert_eq!(profile, initial.profile);
+                assert_eq!(
+                    saved,
+                    Some(super::SavedProfile {
+                        nickname: "rIDER".to_owned(),
+                        revision: initial.revision.unwrap(),
+                        path: initial.source_path,
+                    })
+                );
             }
             other => panic!("expected an unchanged transaction, got {other:?}"),
         }
@@ -2272,6 +2288,46 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn unchanged_transaction_preserves_the_loaded_snapshot_receipt_when_head_advances() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let competing_store = ProfileStore::new(root.path());
+        let initial = store.load_or_create("Rider").unwrap();
+        let expected_saved = super::SavedProfile {
+            nickname: "Rider".to_owned(),
+            revision: initial.revision.unwrap(),
+            path: initial.source_path.clone(),
+        };
+        let mut newer_profile = initial.profile.clone();
+        newer_profile.rider.lucci += 1;
+
+        let outcome = store
+            .transaction("Rider", |profile| {
+                assert_eq!(profile, &initial.profile);
+                let newer_saved = competing_store.save("Rider", &newer_profile).unwrap();
+                assert_eq!(newer_saved.revision, expected_saved.revision + 1);
+                ProfileMutation::Unchanged(())
+            })
+            .unwrap();
+
+        match outcome {
+            ProfileTransaction::Unchanged {
+                profile,
+                saved: Some(saved),
+                ..
+            } => {
+                assert_eq!(profile, initial.profile);
+                assert_eq!(saved, expected_saved);
+            }
+            other => panic!("expected an unchanged transaction with a receipt, got {other:?}"),
+        }
+
+        let latest = store.load_or_create("Rider").unwrap();
+        assert_eq!(latest.revision, Some(expected_saved.revision + 1));
+        assert_eq!(latest.profile, newer_profile);
     }
 
     #[test]

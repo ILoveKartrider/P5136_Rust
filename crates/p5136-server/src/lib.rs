@@ -5,6 +5,7 @@ mod identity;
 mod messenger_hub;
 mod messenger_runtime;
 mod myroom_hub;
+mod myroom_persistence;
 mod profile_io;
 mod runtime;
 mod session;
