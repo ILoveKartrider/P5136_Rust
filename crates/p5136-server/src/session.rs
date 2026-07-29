@@ -1,4 +1,5 @@
 use std::{
+    array,
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -36,8 +37,9 @@ use p5136_core::{
     },
     myroom_protocol::{
         MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest,
-        classify_myroom_request, parse_update_info, plan_owner_item_packets, serialize_myroom_info,
-        serialize_owner_item_enchants, serialize_owner_items,
+        classify_myroom_request, parse_first_request, parse_secede_request, parse_update_info,
+        plan_owner_item_packets, serialize_myroom_info, serialize_owner_item_enchants,
+        serialize_owner_items,
     },
     packet::PacketError,
     race_protocol::{
@@ -74,13 +76,14 @@ use tokio::{
 use crate::{
     ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ServerConfig, SessionId,
     UserNo, WorldError, WorldHandle,
+    myroom_hub::{MyRoomWirePlan, MyRoomWireProjection},
     myroom_persistence::{
         MYROOM_INFO_WRITE_OPERATION, MyRoomInfoWriteError, MyRoomInfoWriteReceipt,
     },
     profile_io::{ProfileIoError, ProfileIoHandle, ProfileJobAdmission, ProfileLanePermit},
     world::{
-        LobbyCommandPayload, LobbyError, MyRoomSessionRole, OutboundBatch, RaceCommandPayload,
-        RoomCommandPayload, RoomParticipant, StartRoomPlan,
+        LobbyCommandPayload, LobbyError, MyRoomCommandPayload, MyRoomSessionRole, OutboundBatch,
+        RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -91,6 +94,7 @@ const MAX_OUTBOUND_BATCH_BURST: usize = 8;
 const MAX_MYROOM_OWNER_ITEM_PACKETS: usize =
     3 * MAX_MYROOM_ITEM_RECORDS.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
 const MAX_MYROOM_OWNER_ITEM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MYROOM_WIRE_PLAN_ATTEMPTS: usize = 3;
 
 enum SessionReadEvent {
     Outbound(Option<OutboundBatch>),
@@ -179,6 +183,12 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     MyRoomItemState(#[from] MyRoomItemStateError),
+
+    #[error("live MyRoom wire projection failed")]
+    MyRoomWireProjection {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 
     #[error("MyRoom owner-info write failed")]
     MyRoomInfoWrite {
@@ -479,6 +489,38 @@ impl ProfileCoordinator {
             },
             lane,
         ))
+    }
+
+    /// Reloads each occupied `MyRoom` slot through its own canonical profile
+    /// lane. Lanes are released one at a time: holding several rider lanes
+    /// together would permit an A-visits-B/B-visits-A deadlock.
+    async fn load_myroom_wire_projection(
+        &self,
+        plan: &MyRoomWirePlan,
+    ) -> Result<MyRoomWireProjection, LoginSessionError> {
+        let identities = plan
+            .slot_identities()
+            .map(Option::<&IdentityBinding>::cloned)
+            .collect::<Vec<_>>();
+        let mut players: [Option<MyRoomPlayerSlot>;
+            p5136_core::myroom_protocol::MYROOM_SLOT_COUNT] = array::from_fn(|_| None);
+        for (slot, identity) in identities.into_iter().enumerate() {
+            let Some(identity) = identity else {
+                continue;
+            };
+            let admission = self
+                .admit(&identity.nickname, "load live MyRoom wire profile")
+                .await?;
+            let (profile, lane) = self
+                .load(identity.nickname.clone(), false, admission)
+                .await?;
+            players[slot] = Some(myroom_player_slot_from_profile(&identity, &profile.profile));
+            drop(lane);
+        }
+        plan.project(players)
+            .map_err(|source| LoginSessionError::MyRoomWireProjection {
+                source: Box::new(source),
+            })
     }
 
     #[cfg_attr(
@@ -1541,10 +1583,37 @@ async fn handle_myroom_request(
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
-    if request != MyRoomRequest::UpdateInfo {
-        let identity = world.authorize_identity(session_id).await?;
-        let _ = context.profile_for(&identity)?;
-        return Ok(Vec::new());
+    match request {
+        MyRoomRequest::FirstState => {
+            parse_first_request(packet)?;
+            execute_live_myroom_command(
+                world,
+                profiles,
+                session_id,
+                MyRoomCommandPayload::FirstState,
+                context,
+            )
+            .await?;
+            return Ok(Vec::new());
+        }
+        MyRoomRequest::Secede => {
+            parse_secede_request(packet)?;
+            execute_live_myroom_command(
+                world,
+                profiles,
+                session_id,
+                MyRoomCommandPayload::Secede,
+                context,
+            )
+            .await?;
+            return Ok(Vec::new());
+        }
+        MyRoomRequest::UpdateInfo => {}
+        _ => {
+            let identity = world.authorize_identity(session_id).await?;
+            let _ = context.profile_for(&identity)?;
+            return Ok(Vec::new());
+        }
     }
 
     let Some(view) = world.myroom_session_view(session_id).await? else {
@@ -1574,6 +1643,37 @@ async fn handle_myroom_request(
         "applied durable MyRoom owner info to the bound session profile"
     );
     Ok(Vec::new())
+}
+
+async fn execute_live_myroom_command(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    payload: MyRoomCommandPayload,
+    context: &SessionContext,
+) -> Result<(), LoginSessionError> {
+    for attempt in 0..MAX_MYROOM_WIRE_PLAN_ATTEMPTS {
+        let plan = world.prepare_myroom_command(session_id).await?;
+        let _ = context.profile_for(plan.expected_identity())?;
+        let projection = match plan.wire_plan() {
+            Some(wire) => Some(profiles.load_myroom_wire_projection(wire).await?),
+            None => None,
+        };
+        let prepared = plan.complete(projection)?;
+        match world.myroom_command(session_id, payload, prepared).await {
+            Err(WorldError::MyRoomWirePlanStale { .. })
+                if attempt + 1 < MAX_MYROOM_WIRE_PLAN_ATTEMPTS =>
+            {
+                tracing::trace!(
+                    session_id = session_id.get(),
+                    attempt = attempt + 1,
+                    "retrying MyRoom command after live roster changed during profile I/O"
+                );
+            }
+            result => return Ok(result?),
+        }
+    }
+    unreachable!("the bounded MyRoom wire-plan loop always returns on its final attempt")
 }
 
 fn myroom_info_write_error(source: MyRoomInfoWriteError) -> LoginSessionError {
@@ -1835,13 +1935,6 @@ fn profile_p2p_endpoint(source_ip: IpAddr, profile: &Profile) -> (Ipv4Addr, u16)
 /// Callers must still reauthorize that binding in the World actor after any
 /// profile I/O. The actor may overwrite `user_no` and `nickname` from its
 /// authoritative binding before committing a hub transition.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the pending MyRoom session-dispatch integration"
-    )
-)]
 fn myroom_player_slot_from_profile(
     identity: &IdentityBinding,
     profile: &Profile,
@@ -2093,8 +2186,9 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MyRoomInfo, MyRoomProtocolError, OWNER_ITEM_NAME,
-            plan_owner_item_packets, serialize_myroom_info,
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomProtocolError,
+            MyRoomSlot, OWNER_ITEM_NAME, plan_owner_item_packets, serialize_myroom_info,
+            serialize_secede_reply, serialize_slot_data,
         },
         packet::PacketWriter,
         race_protocol::{
@@ -3011,6 +3105,269 @@ mod tests {
 
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_first_dispatch_ignores_body_and_uses_actor_outbound_for_all_roles() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (outsider_session, _outsider_cancelled, mut outsider_outbound) = world
+            .register_login_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_735))
+            .await
+            .unwrap();
+        let outsider_identity = world
+            .claim_identity(outsider_session, "SessionMyRoomFirstOutsider")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let mut outsider_context = bind_test_profile(&profiles, &outsider_identity).await;
+        let store = ProfileStore::new(profile_root.path());
+        let (_, owner_profile) = store
+            .update(&owner.identity.nickname, |profile| {
+                profile.rider.p2p_port = 41_001;
+                profile.rider.rp = 111_222;
+                profile.rider.club_name = "FreshOwnerClub".to_owned();
+                profile.rider_item.character = 1_111;
+                profile.rider_item.kart = 2_222;
+            })
+            .unwrap();
+        let (_, visitor_profile) = store
+            .update(&visitor.identity.nickname, |profile| {
+                profile.rider.p2p_port = 41_002;
+                profile.rider.rp = 333_444;
+                profile.rider.club_name = "FreshVisitorClub".to_owned();
+                profile.rider_item.character = 3_333;
+                profile.rider_item.kart = 4_444;
+            })
+            .unwrap();
+        let mut expected_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] =
+            std::array::from_fn(|_| MyRoomSlot::Empty);
+        expected_slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(
+            &owner.identity,
+            &owner_profile,
+        ));
+        expected_slots[1] = MyRoomSlot::Player(myroom_player_slot_from_profile(
+            &visitor.identity,
+            &visitor_profile,
+        ));
+        let expected_member_packet = serialize_slot_data(&expected_slots).unwrap();
+        let mut request = PacketWriter::named("RmFirstRequestPacket").into_inner();
+        request.extend_from_slice(&[0x00, 0xff, 0x51, 0x36, 0xaa]);
+
+        for (session_id, context) in [
+            (owner.session, &mut owner_context),
+            (visitor.session, &mut visitor_context),
+            (outsider_session, &mut outsider_context),
+        ] {
+            let services = SessionServices {
+                config: &config,
+                world: &world,
+                profiles: &profiles,
+                session_id,
+            };
+            assert!(
+                dispatch_packet(&services, &request, context)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "FirstState is delivered only through the actor-owned outbound queue"
+            );
+        }
+
+        let owner_packets = owner.outbound.try_recv().unwrap().into_packets();
+        let visitor_packets = visitor.outbound.try_recv().unwrap().into_packets();
+        let outsider_packets = outsider_outbound.try_recv().unwrap().into_packets();
+        assert_eq!(owner_packets.len(), 1);
+        assert_eq!(visitor_packets, owner_packets);
+        assert_eq!(
+            owner_packets[0], expected_member_packet,
+            "FirstState must reload every occupied slot instead of using the entry-time Hub cache"
+        );
+        assert_eq!(outsider_packets.len(), 1);
+        let empty: [MyRoomSlot; MYROOM_SLOT_COUNT] = std::array::from_fn(|_| MyRoomSlot::Empty);
+        assert_eq!(outsider_packets[0], serialize_slot_data(&empty).unwrap());
+        assert_ne!(owner_packets, outsider_packets);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+        assert!(outsider_outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_secede_dispatch_is_actor_owned_and_replies_for_member_and_nonmember() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let mut secede = PacketWriter::named("ChRqSecedeMyRoomPacket").into_inner();
+        secede.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let visitor_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+
+        assert!(
+            dispatch_packet(&visitor_services, &secede, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_secede_reply()]
+        );
+        let post_leave = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(post_leave.len(), 1);
+
+        let first = PacketWriter::named("RmFirstRequestPacket").into_inner();
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        assert!(
+            dispatch_packet(&owner_services, &first, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            post_leave,
+            "Secede peer fan-out must be the same post-leave snapshot returned by FirstState"
+        );
+
+        assert!(
+            dispatch_packet(&visitor_services, &secede, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a nonmember Secede remains a protocol success"
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_secede_reply()]
+        );
+        assert!(
+            owner.outbound.try_recv().is_err(),
+            "nonmember Secede must not publish a peer snapshot"
+        );
+
+        assert!(
+            dispatch_packet(&owner_services, &secede, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_secede_reply()]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        assert!(
+            dispatch_packet(&owner_services, &first, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let empty: [MyRoomSlot; MYROOM_SLOT_COUNT] = std::array::from_fn(|_| MyRoomSlot::Empty);
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_slot_data(&empty).unwrap()]
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_owner_secede_broadcast_reloads_live_tombstone_profile() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let _visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let store = ProfileStore::new(profile_root.path());
+        let (_, owner_profile) = store
+            .update(&owner.identity.nickname, |profile| {
+                profile.rider.p2p_port = 42_001;
+                profile.rider.rp = 515_136;
+                profile.rider.club_name = "FreshTombstone".to_owned();
+                profile.rider_item.character = 5_001;
+                profile.rider_item.kart = 5_002;
+            })
+            .unwrap();
+        let visitor_profile = store
+            .load_or_create(&visitor.identity.nickname)
+            .unwrap()
+            .profile;
+        let mut expected_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] =
+            std::array::from_fn(|_| MyRoomSlot::Empty);
+        expected_slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(
+            &owner.identity,
+            &owner_profile,
+        ));
+        expected_slots[1] = MyRoomSlot::Player(myroom_player_slot_from_profile(
+            &visitor.identity,
+            &visitor_profile,
+        ));
+
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let mut secede = PacketWriter::named("ChRqSecedeMyRoomPacket").into_inner();
+        secede.extend_from_slice(&[0xa5, 0x51, 0x36]);
+        assert!(
+            dispatch_packet(&services, &secede, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_secede_reply()]
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_slot_data(&expected_slots).unwrap()],
+            "owner leave must render the retained slot-zero tombstone from the latest disk profile"
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

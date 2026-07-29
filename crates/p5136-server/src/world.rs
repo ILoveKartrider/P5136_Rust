@@ -16,7 +16,8 @@ use p5136_core::{
         serialize_start_room_reply,
     },
     myroom_protocol::{
-        MyRoomInfo, MyRoomProtocolError, MyRoomSlot, serialize_myroom_info, serialize_slot_data,
+        MyRoomInfo, MyRoomProtocolError, MyRoomSlot, serialize_myroom_info, serialize_secede_reply,
+        serialize_slot_data,
     },
     nickname::canonical_nickname_key,
     race_protocol::{
@@ -63,7 +64,8 @@ use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 use crate::myroom_hub::{
     IdentityAdvanceEffects, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
-    MyRoomTransition, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
+    MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError,
+    RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
 };
 use crate::myroom_persistence::{
     MyRoomCompletionBridge, MyRoomCompletionDrainError, MyRoomInfoPublication,
@@ -830,6 +832,9 @@ pub(crate) enum MyRoomLifecycleError {
         source: MyRoomHubError,
     },
 
+    #[error(transparent)]
+    WireProjection(#[from] MyRoomWireProjectionError),
+
     #[error("MyRoom slot snapshot serialization failed: {0}")]
     Serialization(#[from] MyRoomProtocolError),
 
@@ -856,6 +861,60 @@ pub(crate) enum MyRoomLifecycleError {
 
     #[error(transparent)]
     Commit(#[from] MyRoomCommitError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MyRoomCommandPayload {
+    FirstState,
+    Secede,
+}
+
+/// Actor-minted topology fence for one profile-backed `MyRoom` command.
+///
+/// A member plan is intentionally incomplete until the session profile runtime
+/// reloads every occupied slot from disk. Completing the plan validates that
+/// the projection belongs to this exact opaque topology before it can cross
+/// back into the World actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomCommandPlan {
+    expected: IdentityBinding,
+    wire: Option<MyRoomWirePlan>,
+}
+
+impl MyRoomCommandPlan {
+    pub(crate) fn expected_identity(&self) -> &IdentityBinding {
+        &self.expected
+    }
+
+    pub(crate) fn wire_plan(&self) -> Option<&MyRoomWirePlan> {
+        self.wire.as_ref()
+    }
+
+    pub(crate) fn complete(
+        self,
+        projection: Option<MyRoomWireProjection>,
+    ) -> Result<MyRoomPreparedCommand, WorldError> {
+        let projection_matches = match (&self.wire, &projection) {
+            (None, None) => true,
+            (Some(plan), Some(projected)) => projected.plan() == plan,
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !projection_matches {
+            return Err(WorldError::MyRoomWireProjectionMismatch {
+                session: self.expected.owner,
+            });
+        }
+        Ok(MyRoomPreparedCommand {
+            expected: self.expected,
+            projection,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MyRoomPreparedCommand {
+    expected: IdentityBinding,
+    projection: Option<MyRoomWireProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -911,6 +970,19 @@ pub enum WorldError {
 
     #[error("active identity limit {maximum} reached")]
     IdentityLimitReached { maximum: usize },
+
+    #[error("MyRoom command could not reserve the outbound queue for session {session:?}")]
+    MyRoomCommandOutboundUnavailable { session: SessionId },
+
+    #[error(
+        "MyRoom topology changed while live slot profiles were being loaded for session {session:?}"
+    )]
+    MyRoomWirePlanStale { session: SessionId },
+
+    #[error(
+        "MyRoom live profile projection does not belong to the actor-minted plan for session {session:?}"
+    )]
+    MyRoomWireProjectionMismatch { session: SessionId },
 
     #[error(
         "reward attempt ID space exhausted for room {room_id}, epoch {race_epoch}, user {user_no}"
@@ -1168,6 +1240,16 @@ enum WorldCommand {
         reply: oneshot::Sender<()>,
     },
     DrainSessions {
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    PrepareMyRoom {
+        session: SessionId,
+        reply: oneshot::Sender<Result<MyRoomCommandPlan, WorldError>>,
+    },
+    MyRoom {
+        session: SessionId,
+        payload: MyRoomCommandPayload,
+        prepared: Box<MyRoomPreparedCommand>,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     RegisterMyRoomInfoWrite {
@@ -1741,6 +1823,37 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn prepare_myroom_command(
+        &self,
+        session: SessionId,
+    ) -> Result<MyRoomCommandPlan, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::PrepareMyRoom { session, reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn myroom_command(
+        &self,
+        session: SessionId,
+        payload: MyRoomCommandPayload,
+        prepared: MyRoomPreparedCommand,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::MyRoom {
+                session,
+                payload,
+                prepared: Box::new(prepared),
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub(crate) async fn persist_myroom_owner_info(
         &self,
         session: SessionId,
@@ -2188,6 +2301,11 @@ struct ProtocolRoomState {
 }
 
 type OutboundDelivery = (SessionId, OutboundBatch);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MyRoomOutboundReservationError {
+    session: SessionId,
+}
 
 #[derive(Debug)]
 struct ReservedOutbound {
@@ -2937,6 +3055,99 @@ impl World {
 
     fn quiesce(&mut self) {
         self.quiescing = true;
+    }
+
+    fn prepare_myroom_command(
+        &self,
+        session: SessionId,
+    ) -> Result<MyRoomCommandPlan, WorldOperationError> {
+        let expected = self.identities.authorize(session)?;
+        let wire = self
+            .myroom
+            .wire_plan_if_member(&expected)
+            .map_err(|source| myroom_hub_error("live wire-plan query", source))?;
+        Ok(MyRoomCommandPlan { expected, wire })
+    }
+
+    fn myroom_command(
+        &mut self,
+        session: SessionId,
+        payload: MyRoomCommandPayload,
+        prepared: MyRoomPreparedCommand,
+    ) -> Result<(), WorldOperationError> {
+        let identity = self.identities.authorize(session)?;
+        if identity != prepared.expected {
+            return Err(WorldError::MyRoomWirePlanStale { session }.into());
+        }
+        let projection = match prepared.projection {
+            None => {
+                let current = self
+                    .myroom
+                    .wire_plan_if_member(&identity)
+                    .map_err(|source| myroom_hub_error("live nonmember revalidation", source))?;
+                if current.is_some() {
+                    return Err(WorldError::MyRoomWirePlanStale { session }.into());
+                }
+                None
+            }
+            Some(projection) => {
+                if let Err(source) = self
+                    .myroom
+                    .revalidate_wire_plan(&identity, projection.plan())
+                {
+                    if source.is_wire_plan_stale() {
+                        return Err(WorldError::MyRoomWirePlanStale { session }.into());
+                    }
+                    return Err(myroom_hub_error("live wire-plan revalidation", source).into());
+                }
+                Some(projection)
+            }
+        };
+        match payload {
+            MyRoomCommandPayload::FirstState => {
+                let slots = projection.map_or_else(
+                    || array::from_fn(|_| MyRoomSlot::Empty),
+                    |projection| projection.snapshot().slots,
+                );
+                let packet = serialize_slot_data(&slots).map_err(MyRoomLifecycleError::from)?;
+                let reserved = self
+                    .try_reserve_myroom_outbound(vec![(session, OutboundBatch::single(packet))])
+                    .map_err(|error| WorldError::MyRoomCommandOutboundUnavailable {
+                        session: error.session,
+                    })?;
+                Self::publish_reserved(reserved);
+            }
+            MyRoomCommandPayload::Secede => {
+                let reply = serialize_secede_reply();
+                let Some(projection) = projection else {
+                    let reserved = self
+                        .try_reserve_myroom_outbound(vec![(session, OutboundBatch::single(reply))])
+                        .map_err(|error| WorldError::MyRoomCommandOutboundUnavailable {
+                            session: error.session,
+                        })?;
+                    Self::publish_reserved(reserved);
+                    return Ok(());
+                };
+
+                let transition = self
+                    .myroom
+                    .leave(&identity)
+                    .map_err(|source| myroom_hub_error("secede", source))?;
+                self.commit_myroom_command_transition(transition, move |world, outcome| {
+                    let mut deliveries = Vec::new();
+                    if let MyRoomEffect::Updated(publication) = &outcome.room {
+                        let projected = projection.overlay_publication(publication)?;
+                        deliveries.extend(
+                            world
+                                .myroom_publication_deliveries(std::slice::from_ref(&projected))?,
+                        );
+                    }
+                    deliveries.push((session, OutboundBatch::single(reply)));
+                    Ok(deliveries)
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn register_myroom_info_write(
@@ -6028,6 +6239,29 @@ impl World {
         Ok(outcome)
     }
 
+    fn commit_myroom_command_transition<T>(
+        &mut self,
+        transition: MyRoomTransition<T>,
+        prepare_fanout: impl FnOnce(&Self, &T) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError>,
+    ) -> Result<T, WorldOperationError> {
+        // A normal TCP request may encounter bounded backpressure without
+        // making the actor inconsistent. Reserve the requester response and
+        // every peer publication first; a failed reservation drops all prior
+        // permits and leaves the transition uncommitted.
+        let deliveries = prepare_fanout(self, transition.outcome())?;
+        let reserved = self
+            .try_reserve_myroom_outbound(deliveries)
+            .map_err(|error| WorldError::MyRoomCommandOutboundUnavailable {
+                session: error.session,
+            })?;
+        let outcome = transition
+            .commit(&mut self.myroom)
+            .map_err(MyRoomLifecycleError::from)?;
+        debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
+        Self::publish_reserved(reserved);
+        Ok(outcome)
+    }
+
     fn myroom_publication_deliveries(
         &self,
         publications: &[MyRoomPublication],
@@ -6112,16 +6346,26 @@ impl World {
         &self,
         deliveries: Vec<OutboundDelivery>,
     ) -> Result<Vec<ReservedOutbound>, MyRoomLifecycleError> {
+        self.try_reserve_myroom_outbound(deliveries)
+            .map_err(|error| MyRoomLifecycleError::OutboundUnavailable {
+                session: error.session,
+            })
+    }
+
+    fn try_reserve_myroom_outbound(
+        &self,
+        deliveries: Vec<OutboundDelivery>,
+    ) -> Result<Vec<ReservedOutbound>, MyRoomOutboundReservationError> {
         let mut reserved = Vec::with_capacity(deliveries.len());
         for (session, batch) in deliveries {
             let outbound = self
                 .sessions
                 .get(&session)
                 .and_then(|state| state.outbound.clone())
-                .ok_or(MyRoomLifecycleError::OutboundUnavailable { session })?;
+                .ok_or(MyRoomOutboundReservationError { session })?;
             let permit = outbound
                 .try_reserve_owned()
-                .map_err(|_| MyRoomLifecycleError::OutboundUnavailable { session })?;
+                .map_err(|_| MyRoomOutboundReservationError { session })?;
             reserved.push(ReservedOutbound { permit, batch });
         }
         Ok(reserved)
@@ -6996,19 +7240,17 @@ async fn dispatch_command(
             let result = world.race_command_with_clock(session, payload, Instant::now(), clock);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
-        WorldCommand::MyRoomSessionView { session, reply } => {
-            let result = world.myroom_session_view(session);
-            reply_after_world_operation(world, sidecars, reply, result).await?;
-        }
         WorldCommand::RegisterMyRoomInfoWrite {
             session,
             prepared,
             request_reply,
             reply,
         } => dispatch_myroom_info_registration(world, session, prepared, request_reply, reply)?,
-        WorldCommand::DrainSessions { reply } => {
-            let result = world.drain_sessions_for_shutdown();
-            reply_after_world_operation(world, sidecars, reply, result).await?;
+        command @ (WorldCommand::MyRoomSessionView { .. }
+        | WorldCommand::PrepareMyRoom { .. }
+        | WorldCommand::MyRoom { .. }
+        | WorldCommand::DrainSessions { .. }) => {
+            dispatch_guarded_world_command(world, sidecars, command).await?;
         }
         command => return dispatch_utility_command(world, command, sidecars).await,
     }
@@ -7040,6 +7282,37 @@ async fn dispatch_authorize_identity(
         .authorize(session)
         .map_err(WorldError::from);
     reply_after_identity_lifecycle(world, sidecars, reply, result).await
+}
+
+async fn dispatch_guarded_world_command(
+    world: &mut World,
+    sidecars: &WorldSidecars,
+    command: WorldCommand,
+) -> Result<(), WorldSidecarError> {
+    match command {
+        WorldCommand::MyRoomSessionView { session, reply } => {
+            let result = world.myroom_session_view(session);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        WorldCommand::PrepareMyRoom { session, reply } => {
+            let result = world.prepare_myroom_command(session);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        WorldCommand::MyRoom {
+            session,
+            payload,
+            prepared,
+            reply,
+        } => {
+            let result = world.myroom_command(session, payload, *prepared);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        WorldCommand::DrainSessions { reply } => {
+            let result = world.drain_sessions_for_shutdown();
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        _ => unreachable!("only guarded World commands are routed to this dispatcher"),
+    }
 }
 
 fn dispatch_myroom_info_registration(
@@ -7207,6 +7480,8 @@ async fn dispatch_utility_command(
         | WorldCommand::PublishRoomEquipment { .. }
         | WorldCommand::Lobby { .. }
         | WorldCommand::Race { .. }
+        | WorldCommand::PrepareMyRoom { .. }
+        | WorldCommand::MyRoom { .. }
         | WorldCommand::RegisterMyRoomInfoWrite { .. }
         | WorldCommand::MyRoomSessionView { .. }
         | WorldCommand::DrainSessions { .. } => {
@@ -7531,6 +7806,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::{
+        array,
         collections::HashSet,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroU64,
@@ -7545,8 +7821,9 @@ mod tests {
         },
         myroom_protocol::{
             MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot, serialize_myroom_info,
-            serialize_slot_data,
+            serialize_secede_reply, serialize_slot_data,
         },
+        nickname::canonical_nickname_key,
         race_protocol::{
             AiGoalInRequest, GAME_AI_MASTER_NOTICE_NAME, GAME_CONTROL_PACKET_NAME,
             GAME_NEXT_STAGE_PACKET_NAME, GAME_RACE_TIME_PACKET_NAME, GameControlRequest, RaceTeam,
@@ -7570,10 +7847,12 @@ mod tests {
 
     use super::{
         GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
-        LobbyCommandPayload, LobbyError, MyRoomLifecycleError, OutboundBatch, ROOM_CAPACITY,
+        LobbyCommandPayload, LobbyError, MyRoomCommandPayload, MyRoomLifecycleError,
+        MyRoomPreparedCommand, MyRoomWireProjection, OutboundBatch, ROOM_CAPACITY,
         RaceCommandOutcome, RaceCommandPayload, RaceError, RoomCommandPayload, RoomError, RoomId,
         RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError,
         WorldHandle, WorldOperationError, WorldSidecarError, WorldSidecars, dispatch_command,
+        source_ipv4,
     };
     use crate::myroom_hub::{MyRoomOwner, MyRoomParticipant};
     use crate::myroom_persistence::{
@@ -7812,6 +8091,57 @@ mod tests {
             )
             .unwrap();
         transition.commit(&mut world.myroom).unwrap();
+    }
+
+    fn prepare_test_myroom_command(
+        world: &World,
+        session: SessionId,
+    ) -> (MyRoomPreparedCommand, Option<MyRoomWireProjection>) {
+        let plan = world.prepare_myroom_command(session).unwrap();
+        let projection = plan.wire_plan().map(|wire| {
+            let topology = world
+                .myroom
+                .first_snapshot(wire.requester())
+                .expect("a member wire plan has a current room snapshot");
+            let identities = wire
+                .slot_identities()
+                .map(Option::<&IdentityBinding>::cloned)
+                .collect::<Vec<_>>();
+            let players = array::from_fn(|slot| {
+                let identity = identities[slot].as_ref()?;
+                let MyRoomSlot::Player(mut player) = topology.slots[slot].clone() else {
+                    panic!("wire plan occupancy and cached topology must agree");
+                };
+                player.p2p_address = source_ipv4(identity.source_ip);
+                Some(player)
+            });
+            wire.project(players).unwrap()
+        });
+        let prepared = plan.complete(projection.clone()).unwrap();
+        (prepared, projection)
+    }
+
+    fn projected_slots_for_topology(
+        projection: &MyRoomWireProjection,
+        topology: &crate::myroom_hub::MyRoomSnapshot,
+    ) -> [MyRoomSlot; MYROOM_SLOT_COUNT] {
+        let projected = projection.snapshot().slots;
+        array::from_fn(|slot| match &topology.slots[slot] {
+            MyRoomSlot::Empty => MyRoomSlot::Empty,
+            MyRoomSlot::Player(topology_player) => projected
+                .iter()
+                .find_map(|candidate| match candidate {
+                    MyRoomSlot::Player(player)
+                        if player.user_no == topology_player.user_no
+                            && canonical_nickname_key(&player.nickname)
+                                == canonical_nickname_key(&topology_player.nickname) =>
+                    {
+                        Some(MyRoomSlot::Player(player.clone()))
+                    }
+                    MyRoomSlot::Empty | MyRoomSlot::Player(_) => None,
+                })
+                .expect("post-command topology contains only projected live identities"),
+        })
     }
 
     fn room_participant() -> RoomParticipant {
@@ -12172,6 +12502,411 @@ mod tests {
         udp_runtime.shutdown().await;
         messenger.shutdown().await.unwrap();
         messenger_task.await.unwrap();
+    }
+
+    #[test]
+    fn myroom_first_state_queues_exact_member_or_all_empty_snapshot() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "FirstOwner", 67, 56_010, 8);
+        let mut visitor = register_channel_session(&mut world, "FirstVisitor", 67, 56_020, 8);
+        let mut outsider = register_channel_session(&mut world, "FirstOutsider", 67, 56_030, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(192, 0, 2, 10),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 11),
+            Ipv4Addr::new(192, 0, 2, 10),
+        );
+        let (owner_prepared, owner_projection) = prepare_test_myroom_command(&world, owner.session);
+        let member_packet =
+            serialize_slot_data(&owner_projection.unwrap().snapshot().slots).unwrap();
+        let (visitor_prepared, _) = prepare_test_myroom_command(&world, visitor.session);
+        let (outsider_prepared, _) = prepare_test_myroom_command(&world, outsider.session);
+
+        world
+            .myroom_command(
+                owner.session,
+                MyRoomCommandPayload::FirstState,
+                owner_prepared,
+            )
+            .unwrap();
+        world
+            .myroom_command(
+                visitor.session,
+                MyRoomCommandPayload::FirstState,
+                visitor_prepared,
+            )
+            .unwrap();
+        world
+            .myroom_command(
+                outsider.session,
+                MyRoomCommandPayload::FirstState,
+                outsider_prepared,
+            )
+            .unwrap();
+
+        assert_eq!(take_single_packet(&mut owner.outbound), member_packet);
+        assert_eq!(take_single_packet(&mut visitor.outbound), member_packet);
+        let empty: [MyRoomSlot; MYROOM_SLOT_COUNT] = std::array::from_fn(|_| MyRoomSlot::Empty);
+        assert_eq!(
+            take_single_packet(&mut outsider.outbound),
+            serialize_slot_data(&empty).unwrap()
+        );
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn myroom_secede_is_always_success_and_preserves_owner_tombstone() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "SecedeOwner", 67, 56_040, 8);
+        let mut visitor = register_channel_session(&mut world, "SecedeVisitor", 67, 56_050, 8);
+        let mut outsider = register_channel_session(&mut world, "SecedeOutsider", 67, 56_060, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 20),
+            Ipv4Addr::new(192, 0, 2, 20),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 21),
+            Ipv4Addr::new(192, 0, 2, 20),
+        );
+
+        let revision = world.myroom.revision();
+        let (outsider_prepared, _) = prepare_test_myroom_command(&world, outsider.session);
+        world
+            .myroom_command(
+                outsider.session,
+                MyRoomCommandPayload::Secede,
+                outsider_prepared,
+            )
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut outsider.outbound),
+            serialize_secede_reply()
+        );
+        assert_eq!(world.myroom.revision(), revision);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let (owner_prepared, owner_projection) = prepare_test_myroom_command(&world, owner.session);
+        world
+            .myroom_command(owner.session, MyRoomCommandPayload::Secede, owner_prepared)
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_secede_reply()
+        );
+        let tombstone_packet = take_single_packet(&mut visitor.outbound);
+        let visitor_snapshot = world
+            .myroom
+            .first_snapshot_if_member(&visitor.identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tombstone_packet,
+            serialize_slot_data(&projected_slots_for_topology(
+                owner_projection.as_ref().unwrap(),
+                &visitor_snapshot,
+            ))
+            .unwrap()
+        );
+        assert!(matches!(
+            &visitor_snapshot.slots[0],
+            MyRoomSlot::Player(player)
+                if player.user_no == owner.identity.user_no.get()
+                    && player.nickname == owner.identity.nickname
+        ));
+        assert_eq!(
+            world
+                .myroom
+                .first_snapshot_if_member(&owner.identity)
+                .unwrap(),
+            None
+        );
+
+        let (owner_prepared, _) = prepare_test_myroom_command(&world, owner.session);
+        world
+            .myroom_command(
+                owner.session,
+                MyRoomCommandPayload::FirstState,
+                owner_prepared,
+            )
+            .unwrap();
+        let empty: [MyRoomSlot; MYROOM_SLOT_COUNT] = std::array::from_fn(|_| MyRoomSlot::Empty);
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_slot_data(&empty).unwrap()
+        );
+
+        let (visitor_prepared, _) = prepare_test_myroom_command(&world, visitor.session);
+        world
+            .myroom_command(
+                visitor.session,
+                MyRoomCommandPayload::Secede,
+                visitor_prepared,
+            )
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut visitor.outbound),
+            serialize_secede_reply()
+        );
+        assert_eq!(world.myroom.room_count(), 0);
+        assert_eq!(world.myroom.member_count(), 0);
+        assert_eq!(world.myroom.generation_count(), 0);
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn myroom_secede_backpressure_releases_prior_permits_and_rolls_back() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "BackpressureOwner", 67, 56_070, 1);
+        let mut visitor =
+            register_channel_session(&mut world, "BackpressureVisitor", 67, 56_080, 1);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 30),
+            Ipv4Addr::new(192, 0, 2, 30),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 31),
+            Ipv4Addr::new(192, 0, 2, 30),
+        );
+        world.sessions[&visitor.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(vec![0xA5]))
+            .unwrap();
+        let revision = world.myroom.revision();
+        let snapshot = world.myroom.first_snapshot(&visitor.identity).unwrap();
+        let (visitor_prepared, _) = prepare_test_myroom_command(&world, visitor.session);
+
+        assert!(matches!(
+            world.myroom_command(
+                visitor.session,
+                MyRoomCommandPayload::Secede,
+                visitor_prepared
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == visitor.session
+        ));
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(
+            world.myroom.first_snapshot(&visitor.identity).unwrap(),
+            snapshot
+        );
+        assert_eq!(take_single_packet(&mut visitor.outbound), vec![0xA5]);
+        assert!(matches!(
+            owner.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        world.sessions[&owner.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(vec![0xB6]))
+            .unwrap();
+        let (visitor_prepared, _) = prepare_test_myroom_command(&world, visitor.session);
+        assert!(matches!(
+            world.myroom_command(
+                visitor.session,
+                MyRoomCommandPayload::Secede,
+                visitor_prepared
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == owner.session
+        ));
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(
+            world.myroom.first_snapshot(&visitor.identity).unwrap(),
+            snapshot
+        );
+        assert_eq!(take_single_packet(&mut owner.outbound), vec![0xB6]);
+        assert!(matches!(
+            visitor.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_myroom_command_ack_still_commits_and_publishes() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "DroppedAckOwner", 67, 56_090, 8);
+        let mut visitor = register_channel_session(&mut world, "DroppedAckVisitor", 67, 56_100, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 40),
+            Ipv4Addr::new(192, 0, 2, 40),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 41),
+            Ipv4Addr::new(192, 0, 2, 40),
+        );
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        let (prepared, projection) = prepare_test_myroom_command(&world, visitor.session);
+
+        assert!(
+            !dispatch_command(
+                &mut world,
+                WorldCommand::MyRoom {
+                    session: visitor.session,
+                    payload: MyRoomCommandPayload::Secede,
+                    prepared: Box::new(prepared),
+                    reply,
+                },
+                &WorldSidecars::default(),
+                &ServerClock::new(),
+            )
+            .await
+            .unwrap()
+        );
+
+        assert_eq!(
+            take_single_packet(&mut visitor.outbound),
+            serialize_secede_reply()
+        );
+        let owner_snapshot = world.myroom.first_snapshot(&owner.identity).unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_slot_data(&projected_slots_for_topology(
+                projection.as_ref().unwrap(),
+                &owner_snapshot,
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            world
+                .myroom
+                .first_snapshot_if_member(&visitor.identity)
+                .unwrap(),
+            None
+        );
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn stale_myroom_session_cannot_secede_the_current_generation() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "FenceOwner", 67, 56_110, 8);
+        let visitor = register_channel_session(&mut world, "FenceVisitor", 67, 56_120, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 50),
+            Ipv4Addr::new(192, 0, 2, 50),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 51),
+            Ipv4Addr::new(192, 0, 2, 50),
+        );
+        let (stale_prepared, _) = prepare_test_myroom_command(&world, visitor.session);
+        let mut migrated = migrate_channel_session(&mut world, &visitor, 56_130, 8);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut migrated.outbound);
+
+        assert!(matches!(
+            world.myroom_command(
+                visitor.session,
+                MyRoomCommandPayload::Secede,
+                stale_prepared
+            ),
+            Err(WorldOperationError::Command(WorldError::Identity(
+                IdentityError::StaleSession(session)
+            ))) if session == visitor.session
+        ));
+        assert!(
+            world
+                .myroom
+                .first_snapshot_if_member(&migrated.identity)
+                .unwrap()
+                .is_some()
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(migrated.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn stale_myroom_wire_projection_is_retryable_and_side_effect_free() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "PlanOwner", 67, 56_140, 8);
+        let mut visitor = register_channel_session(&mut world, "PlanVisitor", 67, 56_150, 8);
+        let newcomer = register_channel_session(&mut world, "PlanNewcomer", 67, 56_160, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 60),
+            Ipv4Addr::new(192, 0, 2, 60),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 61),
+            Ipv4Addr::new(192, 0, 2, 60),
+        );
+        let (stale_prepared, _) = prepare_test_myroom_command(&world, visitor.session);
+
+        enter_myroom(
+            &mut world,
+            &newcomer.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 62),
+            Ipv4Addr::new(192, 0, 2, 60),
+        );
+        let revision = world.myroom.revision();
+        let snapshot = world.myroom.first_snapshot(&visitor.identity).unwrap();
+
+        assert!(matches!(
+            world.myroom_command(
+                visitor.session,
+                MyRoomCommandPayload::Secede,
+                stale_prepared
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomWirePlanStale { session }
+            )) if session == visitor.session
+        ));
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(
+            world.myroom.first_snapshot(&visitor.identity).unwrap(),
+            snapshot
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

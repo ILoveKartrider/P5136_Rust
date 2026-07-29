@@ -316,7 +316,7 @@ pub fn parse_enter_request(packet: &[u8]) -> Result<EnterMyRoomRequest, MyRoomPr
 }
 
 pub fn parse_first_request(packet: &[u8]) -> Result<(), MyRoomProtocolError> {
-    parse_empty_request(packet, FIRST_MYROOM_REQUEST_NAME)
+    parse_hash_only_request(packet, FIRST_MYROOM_REQUEST_NAME)
 }
 
 pub fn parse_request_items(packet: &[u8]) -> Result<(), MyRoomProtocolError> {
@@ -348,7 +348,7 @@ pub fn parse_character_position(
 }
 
 pub fn parse_secede_request(packet: &[u8]) -> Result<(), MyRoomProtocolError> {
-    parse_empty_request(packet, SECEDE_MYROOM_REQUEST_NAME)
+    parse_hash_only_request(packet, SECEDE_MYROOM_REQUEST_NAME)
 }
 
 pub fn parse_rider_talk(packet: &[u8]) -> Result<RiderTalkRequest, MyRoomProtocolError> {
@@ -826,6 +826,13 @@ fn parse_empty_request(packet: &[u8], name: &'static str) -> Result<(), MyRoomPr
     ensure_exhausted(&reader, name)
 }
 
+/// Mirrors the C# First/Secede handlers: validate the dispatch hash, then
+/// deliberately ignore every unread body byte.
+fn parse_hash_only_request(packet: &[u8], name: &'static str) -> Result<(), MyRoomProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, name)
+}
+
 fn read_myroom_info(reader: &mut PacketReader<'_>) -> Result<MyRoomInfo, MyRoomProtocolError> {
     let room_id = reader.read_i16()?;
     let bgm = reader.read_u8()?;
@@ -1091,28 +1098,70 @@ mod tests {
     }
 
     #[test]
-    fn parses_empty_enter_and_profile_requests_with_complete_consumption() {
+    fn strict_empty_requests_require_complete_consumption() {
         for (name, parser) in [
             (
                 REENTER_MYROOM_REQUEST_NAME,
                 parse_reenter_request as fn(&[u8]) -> _,
             ),
             (ENTER_RANDOM_MYROOM_REQUEST_NAME, parse_enter_random_request),
-            (FIRST_MYROOM_REQUEST_NAME, parse_first_request),
             (REQUEST_MYROOM_ITEMS_NAME, parse_request_items),
-            (SECEDE_MYROOM_REQUEST_NAME, parse_secede_request),
             (REQUEST_EMBLEMS_NAME, parse_request_emblems),
         ] {
             let packet = PacketWriter::named(name).into_inner();
             assert!(parser(&packet).is_ok());
             let mut trailing = packet;
-            trailing.push(1);
+            trailing.extend_from_slice(&[0x00, 0xff, 0x51]);
             assert!(matches!(
                 parser(&trailing),
-                Err(MyRoomProtocolError::TrailingBytes { count: 1, .. })
+                Err(MyRoomProtocolError::TrailingBytes {
+                    name: actual_name,
+                    count: 3,
+                }) if actual_name == name
             ));
         }
+    }
 
+    #[test]
+    fn first_and_secede_require_the_exact_hash_but_ignore_the_remaining_body() {
+        for (name, parser) in [
+            (
+                FIRST_MYROOM_REQUEST_NAME,
+                parse_first_request as fn(&[u8]) -> _,
+            ),
+            (SECEDE_MYROOM_REQUEST_NAME, parse_secede_request),
+        ] {
+            let expected_hash = adler32::packet_hash(name);
+            let packet = expected_hash.to_le_bytes();
+            assert!(parser(&packet).is_ok());
+
+            let mut trailing = packet.to_vec();
+            trailing.extend_from_slice(&[0x00, 0xff, 0x51, 0x36, 0xaa, 0x7e]);
+            assert!(parser(&trailing).is_ok());
+
+            let wrong_hash = expected_hash ^ 1;
+            let mut wrong_packet = wrong_hash.to_le_bytes().to_vec();
+            wrong_packet.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+            assert!(matches!(
+                parser(&wrong_packet),
+                Err(MyRoomProtocolError::UnexpectedPacketHash {
+                    name: actual_name,
+                    expected,
+                    actual,
+                }) if actual_name == name && expected == expected_hash && actual == wrong_hash
+            ));
+
+            for truncated_len in 0..packet.len() {
+                assert!(matches!(
+                    parser(&packet[..truncated_len]),
+                    Err(MyRoomProtocolError::Packet(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn parses_enter_requests_with_and_without_the_reserved_dword() {
         let mut packet = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
         packet.write_utf16("owner").unwrap();
         packet.write_i32(123);
@@ -1505,6 +1554,10 @@ mod tests {
             );
             assert_eq!(packet[start + MYROOM_EMPTY_SLOT_WIRE_LENGTH - 1], 0xff);
         }
+        assert_eq!(
+            format!("{:X}", Sha256::digest(&packet)),
+            "EF8EAF66F641F993E41C5D24F94B2E0660141025E143DC205FD95FDF00C66F9B"
+        );
     }
 
     #[test]

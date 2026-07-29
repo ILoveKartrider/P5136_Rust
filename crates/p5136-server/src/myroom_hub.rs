@@ -182,6 +182,211 @@ pub(crate) struct RoomPublication {
     pub(crate) audience: Vec<IdentityBinding>,
 }
 
+/// Actor-minted, bounded room topology used to load fresh wire presentation.
+///
+/// Slot zero deliberately retains the owner's exact identity after the owner
+/// leaves while visitors remain. The cached [`MyRoomPlayerSlot`] values held by
+/// the hub are not part of this capability and therefore cannot accidentally
+/// become the source of a freshly requested wire snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomWirePlan {
+    requester: IdentityBinding,
+    owner: OwnerKey,
+    slots: [Option<IdentityBinding>; MYROOM_SLOT_COUNT],
+}
+
+impl MyRoomWirePlan {
+    #[must_use]
+    pub(crate) fn requester(&self) -> &IdentityBinding {
+        &self.requester
+    }
+
+    #[must_use]
+    pub(crate) const fn owner(&self) -> UserNo {
+        self.owner.user_no()
+    }
+
+    /// Exact identities in protocol slot order, including empty slots.
+    pub(crate) fn slot_identities(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Option<&IdentityBinding>> + DoubleEndedIterator {
+        self.slots.iter().map(Option::as_ref)
+    }
+
+    /// Validates profile-derived presentation against this actor-minted
+    /// topology and seals it into an opaque projection.
+    pub(crate) fn project(
+        &self,
+        slots: [Option<MyRoomPlayerSlot>; MYROOM_SLOT_COUNT],
+    ) -> Result<MyRoomWireProjection, MyRoomWireProjectionError> {
+        for (index, (identity, player)) in self.slots.iter().zip(&slots).enumerate() {
+            validate_projected_slot(index, identity.as_ref(), player.as_ref())?;
+        }
+        Ok(MyRoomWireProjection {
+            plan: self.clone(),
+            slots,
+        })
+    }
+}
+
+/// Profile-fresh player presentation sealed to one actor-minted topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomWireProjection {
+    plan: MyRoomWirePlan,
+    slots: [Option<MyRoomPlayerSlot>; MYROOM_SLOT_COUNT],
+}
+
+impl MyRoomWireProjection {
+    #[must_use]
+    pub(crate) const fn plan(&self) -> &MyRoomWirePlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> MyRoomSnapshot {
+        MyRoomSnapshot {
+            owner: self.plan.owner(),
+            slots: std::array::from_fn(|index| {
+                self.slots[index]
+                    .as_ref()
+                    .map_or(MyRoomSlot::Empty, |player| {
+                        MyRoomSlot::Player(player.clone())
+                    })
+            }),
+        }
+    }
+
+    /// Applies fresh presentation to an actor-produced publication while using
+    /// that publication only as post-transition topology and audience proof.
+    ///
+    /// This is used after `Secede`: a departed visitor becomes empty, whereas
+    /// a departed owner remains projected in slot zero as the legacy owner
+    /// tombstone while visitors are still mapped.
+    pub(crate) fn overlay_publication(
+        &self,
+        publication: &RoomPublication,
+    ) -> Result<RoomPublication, MyRoomWireProjectionError> {
+        validate_publication_owner(&self.plan, publication)?;
+
+        let mut slots = std::array::from_fn(|_| MyRoomSlot::Empty);
+        for (index, published) in publication.snapshot.slots.iter().enumerate() {
+            let MyRoomSlot::Player(cached) = published else {
+                continue;
+            };
+            let identity = self.plan.slots[index].as_ref().ok_or(
+                MyRoomWireProjectionError::PublicationUnexpectedPlayer {
+                    slot: slot_number(index),
+                    actual: cached.user_no,
+                },
+            )?;
+            validate_publication_player(index, identity, cached)?;
+            let projected = self.slots[index].as_ref().ok_or(
+                MyRoomWireProjectionError::PublicationMissingProjection {
+                    slot: slot_number(index),
+                    expected: identity.user_no,
+                },
+            )?;
+            slots[index] = MyRoomSlot::Player(projected.clone());
+        }
+        validate_publication_audience(&self.plan, publication)?;
+
+        Ok(RoomPublication {
+            owner: publication.owner,
+            snapshot: MyRoomSnapshot {
+                owner: publication.snapshot.owner,
+                slots,
+            },
+            audience: publication.audience.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum MyRoomWireProjectionError {
+    #[error("MyRoom wire plan slot {slot} expects {expected:?}, but no player was projected")]
+    MissingPlayer { slot: u8, expected: UserNo },
+
+    #[error("MyRoom wire plan slot {slot} is empty, but player {actual} was projected")]
+    UnexpectedPlayer { slot: u8, actual: u32 },
+
+    #[error("projected MyRoom player in slot {slot} is wire-invalid")]
+    InvalidPlayer {
+        slot: u8,
+        #[source]
+        source: MyRoomProtocolError,
+    },
+
+    #[error(
+        "projected MyRoom player in slot {slot} has user number {actual}; expected {expected:?}"
+    )]
+    PlayerUserNoMismatch {
+        slot: u8,
+        expected: UserNo,
+        actual: u32,
+    },
+
+    #[error(
+        "projected MyRoom player in slot {slot} has nickname {actual:?}; expected {expected:?}"
+    )]
+    PlayerNicknameMismatch {
+        slot: u8,
+        expected: String,
+        actual: String,
+    },
+
+    #[error(
+        "projected MyRoom player in slot {slot} has source address {actual}; expected {expected}"
+    )]
+    PlayerAddressMismatch {
+        slot: u8,
+        expected: Ipv4Addr,
+        actual: Ipv4Addr,
+    },
+
+    #[error("MyRoom publication owner {actual:?} does not match wire plan owner {expected:?}")]
+    PublicationOwnerMismatch { expected: UserNo, actual: UserNo },
+
+    #[error("MyRoom publication for {owner:?} lost its owner tombstone")]
+    PublicationMissingOwner { owner: UserNo },
+
+    #[error("MyRoom publication slot {slot} contains unplanned player {actual}")]
+    PublicationUnexpectedPlayer { slot: u8, actual: u32 },
+
+    #[error(
+        "MyRoom publication slot {slot} player {actual} does not match planned identity {expected:?}"
+    )]
+    PublicationPlayerMismatch {
+        slot: u8,
+        expected: UserNo,
+        actual: u32,
+    },
+
+    #[error(
+        "MyRoom publication slot {slot} nickname {actual:?} does not match planned identity {expected:?}"
+    )]
+    PublicationNicknameMismatch {
+        slot: u8,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("MyRoom publication slot {slot} lacks projected player {expected:?}")]
+    PublicationMissingProjection { slot: u8, expected: UserNo },
+
+    #[error(
+        "MyRoom publication audience identity {user_no:?} generation {generation} is not in its topology"
+    )]
+    PublicationAudienceMismatch { user_no: UserNo, generation: u64 },
+
+    #[error(
+        "MyRoom publication audience is not in slot order: slot {slot} follows slot {previous}"
+    )]
+    PublicationAudienceOrder { previous: u8, slot: u8 },
+
+    #[error("MyRoom publication slot {slot} player {user_no:?} is absent from its audience")]
+    PublicationMissingAudience { slot: u8, user_no: UserNo },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RoomEffect {
     Updated(Box<RoomPublication>),
@@ -397,6 +602,19 @@ pub(crate) enum MyRoomHubError {
     #[error("identity {user_no:?} generation {generation} does not match its canonical binding")]
     IdentityBindingMismatch { user_no: UserNo, generation: u64 },
 
+    #[error(
+        "MyRoom wire plan requester {planned_user_no:?} generation {planned_generation} does not match supplied requester {supplied_user_no:?} generation {supplied_generation}"
+    )]
+    WirePlanRequesterMismatch {
+        planned_user_no: UserNo,
+        planned_generation: u64,
+        supplied_user_no: UserNo,
+        supplied_generation: u64,
+    },
+
+    #[error("MyRoom wire plan for room {owner:?} is stale")]
+    StaleWirePlan { owner: UserNo },
+
     #[error("identity advance changes user number from {previous:?} to {replacement:?}")]
     IdentityAdvanceUserMismatch {
         previous: UserNo,
@@ -441,6 +659,16 @@ pub(crate) enum MyRoomHubError {
 
     #[error("MyRoom internal invariant failed: {0}")]
     Invariant(#[from] MyRoomInvariantViolation),
+}
+
+impl MyRoomHubError {
+    #[must_use]
+    pub(crate) const fn is_wire_plan_stale(&self) -> bool {
+        matches!(
+            self,
+            Self::WirePlanRequesterMismatch { .. } | Self::StaleWirePlan { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -1015,6 +1243,68 @@ impl MyRoomHub {
         Ok(self.room(membership.owner)?.snapshot(membership.owner))
     }
 
+    /// Returns the first-room snapshot only when the supplied full binding is
+    /// a current member. An untracked identity or an absent room owner is a
+    /// normal `None`; stale and forged bindings remain errors.
+    pub(crate) fn first_snapshot_if_member(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomSnapshot>, MyRoomHubError> {
+        let Some(membership) = self.membership_if_member(identity)? else {
+            return Ok(None);
+        };
+        let owner = OwnerKey(membership.owner);
+        Ok(Some(self.room(owner)?.snapshot(owner)))
+    }
+
+    /// Mints an identity-only room topology for loading profile-fresh wire
+    /// presentation outside the actor.
+    pub(crate) fn wire_plan_if_member(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomWirePlan>, MyRoomHubError> {
+        let Some(membership) = self.membership_if_member(identity)? else {
+            return Ok(None);
+        };
+        let owner = OwnerKey(membership.owner);
+        Ok(Some(self.wire_plan(identity, owner)?))
+    }
+
+    /// Revalidates a returned wire plan after profile I/O. Expected requester
+    /// or room-topology churn is reported as a request-scoped stale plan;
+    /// unrelated hub invariant failures retain their original typed errors.
+    pub(crate) fn revalidate_wire_plan(
+        &self,
+        requester: &IdentityBinding,
+        plan: &MyRoomWirePlan,
+    ) -> Result<(), MyRoomHubError> {
+        if requester != plan.requester() {
+            return Err(MyRoomHubError::WirePlanRequesterMismatch {
+                planned_user_no: plan.requester.user_no,
+                planned_generation: plan.requester.generation.get(),
+                supplied_user_no: requester.user_no,
+                supplied_generation: requester.generation.get(),
+            });
+        }
+
+        let current = match self.wire_plan_if_member(requester) {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                return Err(MyRoomHubError::StaleWirePlan {
+                    owner: plan.owner(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if current == *plan {
+            Ok(())
+        } else {
+            Err(MyRoomHubError::StaleWirePlan {
+                owner: plan.owner(),
+            })
+        }
+    }
+
     pub(crate) fn peer_audience(
         &self,
         identity: &IdentityBinding,
@@ -1500,6 +1790,64 @@ impl MyRoomHub {
         Ok((changes, publications))
     }
 
+    fn wire_plan(
+        &self,
+        requester: &IdentityBinding,
+        owner: OwnerKey,
+    ) -> Result<MyRoomWirePlan, MyRoomHubError> {
+        let room = self.room(owner)?;
+        if room.owner.identity.user_no != owner.user_no() {
+            return Err(MyRoomInvariantViolation::WrongOwnerPresentation {
+                owner: owner.user_no(),
+                actual: room.owner.identity.user_no,
+            }
+            .into());
+        }
+
+        let slots = std::array::from_fn(|index| {
+            if index == 0 {
+                Some(room.owner.identity.clone())
+            } else {
+                room.visitors[index - 1]
+                    .as_ref()
+                    .map(|participant| participant.identity.clone())
+            }
+        });
+        for (index, identity) in slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, identity)| identity.as_ref().map(|identity| (index, identity)))
+        {
+            self.require_canonical_identity(identity)?;
+            if index == 0 && !room.owner_present {
+                continue;
+            }
+            let expected_slot =
+                MyRoomSlotIndex(u8::try_from(index).expect("MyRoom slot count always fits in u8"));
+            let membership = self.memberships.get(&identity.user_no).ok_or(
+                MyRoomInvariantViolation::MissingReverseMembership {
+                    owner: owner.user_no(),
+                    slot: expected_slot.get(),
+                    member: identity.user_no,
+                },
+            )?;
+            if membership.owner != owner || membership.slot != expected_slot {
+                return Err(MyRoomInvariantViolation::MissingReverseMembership {
+                    owner: owner.user_no(),
+                    slot: expected_slot.get(),
+                    member: identity.user_no,
+                }
+                .into());
+            }
+        }
+
+        Ok(MyRoomWirePlan {
+            requester: requester.clone(),
+            owner,
+            slots,
+        })
+    }
+
     fn membership_exact(&self, identity: &IdentityBinding) -> Result<Membership, MyRoomHubError> {
         self.require_canonical_identity(identity)?;
         let membership =
@@ -1799,6 +2147,159 @@ impl MyRoomHub {
     }
 }
 
+fn validate_projected_slot(
+    index: usize,
+    identity: Option<&IdentityBinding>,
+    player: Option<&MyRoomPlayerSlot>,
+) -> Result<(), MyRoomWireProjectionError> {
+    let (identity, player) = match (identity, player) {
+        (None, None) => return Ok(()),
+        (Some(identity), None) => {
+            return Err(MyRoomWireProjectionError::MissingPlayer {
+                slot: slot_number(index),
+                expected: identity.user_no,
+            });
+        }
+        (None, Some(player)) => {
+            return Err(MyRoomWireProjectionError::UnexpectedPlayer {
+                slot: slot_number(index),
+                actual: player.user_no,
+            });
+        }
+        (Some(identity), Some(player)) => (identity, player),
+    };
+    validate_myroom_player_slot(player).map_err(|source| {
+        MyRoomWireProjectionError::InvalidPlayer {
+            slot: slot_number(index),
+            source,
+        }
+    })?;
+    if player.user_no != identity.user_no.get() {
+        return Err(MyRoomWireProjectionError::PlayerUserNoMismatch {
+            slot: slot_number(index),
+            expected: identity.user_no,
+            actual: player.user_no,
+        });
+    }
+    if canonical_nickname_key(&player.nickname) != canonical_nickname_key(&identity.nickname) {
+        return Err(MyRoomWireProjectionError::PlayerNicknameMismatch {
+            slot: slot_number(index),
+            expected: identity.nickname.clone(),
+            actual: player.nickname.clone(),
+        });
+    }
+    let expected_address = identity_wire_address(identity);
+    if player.p2p_address != expected_address {
+        return Err(MyRoomWireProjectionError::PlayerAddressMismatch {
+            slot: slot_number(index),
+            expected: expected_address,
+            actual: player.p2p_address,
+        });
+    }
+    Ok(())
+}
+
+fn validate_publication_owner(
+    plan: &MyRoomWirePlan,
+    publication: &RoomPublication,
+) -> Result<(), MyRoomWireProjectionError> {
+    let expected = plan.owner();
+    for actual in [publication.owner, publication.snapshot.owner] {
+        if actual != expected {
+            return Err(MyRoomWireProjectionError::PublicationOwnerMismatch { expected, actual });
+        }
+    }
+    if matches!(publication.snapshot.slots[0], MyRoomSlot::Empty) {
+        return Err(MyRoomWireProjectionError::PublicationMissingOwner { owner: expected });
+    }
+    Ok(())
+}
+
+fn validate_publication_player(
+    index: usize,
+    identity: &IdentityBinding,
+    player: &MyRoomPlayerSlot,
+) -> Result<(), MyRoomWireProjectionError> {
+    if player.user_no != identity.user_no.get() {
+        return Err(MyRoomWireProjectionError::PublicationPlayerMismatch {
+            slot: slot_number(index),
+            expected: identity.user_no,
+            actual: player.user_no,
+        });
+    }
+    if canonical_nickname_key(&player.nickname) != canonical_nickname_key(&identity.nickname) {
+        return Err(MyRoomWireProjectionError::PublicationNicknameMismatch {
+            slot: slot_number(index),
+            expected: identity.nickname.clone(),
+            actual: player.nickname.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_publication_audience(
+    plan: &MyRoomWirePlan,
+    publication: &RoomPublication,
+) -> Result<(), MyRoomWireProjectionError> {
+    let mut previous = None;
+    let mut seen = [false; MYROOM_SLOT_COUNT];
+    for identity in &publication.audience {
+        let Some(index) = plan
+            .slots
+            .iter()
+            .position(|planned| planned.as_ref() == Some(identity))
+            .filter(|index| matches!(publication.snapshot.slots[*index], MyRoomSlot::Player(_)))
+        else {
+            return Err(MyRoomWireProjectionError::PublicationAudienceMismatch {
+                user_no: identity.user_no,
+                generation: identity.generation.get(),
+            });
+        };
+        if let Some(previous) = previous
+            && previous >= index
+        {
+            return Err(MyRoomWireProjectionError::PublicationAudienceOrder {
+                previous: slot_number(previous),
+                slot: slot_number(index),
+            });
+        }
+        seen[index] = true;
+        previous = Some(index);
+    }
+
+    for (index, published) in publication.snapshot.slots.iter().enumerate().skip(1) {
+        if let MyRoomSlot::Player(player) = published
+            && !seen[index]
+        {
+            let user_no = plan.slots[index].as_ref().map_or_else(
+                || {
+                    Err(MyRoomWireProjectionError::PublicationUnexpectedPlayer {
+                        slot: slot_number(index),
+                        actual: player.user_no,
+                    })
+                },
+                |identity| Ok(identity.user_no),
+            )?;
+            return Err(MyRoomWireProjectionError::PublicationMissingAudience {
+                slot: slot_number(index),
+                user_no,
+            });
+        }
+    }
+    Ok(())
+}
+
+const fn identity_wire_address(identity: &IdentityBinding) -> Ipv4Addr {
+    match identity.source_ip {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+    }
+}
+
+fn slot_number(index: usize) -> u8 {
+    u8::try_from(index).expect("the fixed MyRoom slot count fits in u8")
+}
+
 fn publication(owner: OwnerKey, room: &RoomState) -> RoomPublication {
     RoomPublication {
         owner: owner.user_no(),
@@ -1992,8 +2493,8 @@ mod tests {
         MAX_TRANSITION_GENERATIONS, MAX_TRANSITION_MEMBERSHIPS, MAX_TRANSITION_ROOMS,
         MembershipChange, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
         MyRoomInvariantViolation, MyRoomOwner, MyRoomParticipant, MyRoomRevision, MyRoomSlotIndex,
-        MyRoomTransition, OwnerKey, ParticipantRefreshEffects, RoomChange, RoomEffect, RoomState,
-        VISITOR_CAPACITY,
+        MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError,
+        OwnerKey, ParticipantRefreshEffects, RoomChange, RoomEffect, RoomState, VISITOR_CAPACITY,
     };
     use crate::{IdentityBinding, IdentityRegistry, ReleasedIdentity, SessionId};
 
@@ -2049,6 +2550,29 @@ mod tests {
         let mut player = participant(identity).player().clone();
         player.rp = rp;
         MyRoomParticipant::new(identity.clone(), player).unwrap()
+    }
+
+    fn projected_player(identity: &IdentityBinding, rp: u32) -> MyRoomPlayerSlot {
+        let mut player = participant_with_rp(identity, rp).player().clone();
+        player.p2p_address = match identity.source_ip {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+        };
+        player
+    }
+
+    fn projected_players(plan: &MyRoomWirePlan) -> [Option<MyRoomPlayerSlot>; MYROOM_SLOT_COUNT] {
+        let mut players = std::array::from_fn(|_| None);
+        for (index, identity) in plan.slot_identities().enumerate() {
+            players[index] = identity
+                .map(|identity| projected_player(identity, 10_000 + u32::try_from(index).unwrap()));
+        }
+        players
+    }
+
+    fn project_with_fresh_rp(plan: &MyRoomWirePlan) -> MyRoomWireProjection {
+        let players = projected_players(plan);
+        plan.project(players).unwrap()
     }
 
     fn owner(identity: &IdentityBinding) -> MyRoomOwner {
@@ -2640,6 +3164,356 @@ mod tests {
                 MyRoomInvariantViolation::OrphanCanonicalGeneration { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn optional_first_snapshot_hides_untracked_nonmember() {
+        let mut registry = IdentityRegistry::new();
+        let identity = claim(&mut registry, 1, "Untracked");
+        let hub = MyRoomHub::new();
+
+        assert_eq!(hub.first_snapshot_if_member(&identity).unwrap(), None);
+    }
+
+    #[test]
+    fn optional_first_snapshot_is_shared_by_owner_and_visitor() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let visitor = claim(&mut registry, 2, "Visitor");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&visitor), owner(&owner_id)).unwrap();
+
+        let owner_snapshot = hub.first_snapshot_if_member(&owner_id).unwrap().unwrap();
+        let visitor_snapshot = hub.first_snapshot_if_member(&visitor).unwrap().unwrap();
+        assert_eq!(owner_snapshot, visitor_snapshot);
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn optional_first_snapshot_hides_absent_owner_but_retains_owner_tombstone() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let visitor = claim(&mut registry, 2, "Visitor");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&visitor), owner(&owner_id)).unwrap();
+
+        leave(&mut hub, &owner_id).unwrap();
+
+        assert_eq!(hub.first_snapshot_if_member(&owner_id).unwrap(), None);
+        let visitor_snapshot = hub.first_snapshot_if_member(&visitor).unwrap().unwrap();
+        assert!(matches!(
+            &visitor_snapshot.slots[0],
+            MyRoomSlot::Player(player)
+                if player.user_no == owner_id.user_no.get()
+                    && player.nickname == owner_id.nickname
+        ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn optional_first_snapshot_rejects_stale_and_forged_bindings() {
+        let mut registry = IdentityRegistry::new();
+        let owner_g1 = claim(&mut registry, 1, "Owner");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_g1), owner(&owner_g1)).unwrap();
+        let owner_g2 = replacement_identity(&mut registry, 1, 2, "Owner");
+        let transition = hub
+            .advance_identity(&owner_g1, participant(&owner_g2))
+            .unwrap();
+        let _ = transition.commit(&mut hub).unwrap();
+
+        assert!(matches!(
+            hub.first_snapshot_if_member(&owner_g1),
+            Err(MyRoomHubError::StaleGeneration { .. })
+        ));
+
+        let mut forged = owner_g2.clone();
+        forged.source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+        assert!(matches!(
+            hub.first_snapshot_if_member(&forged),
+            Err(MyRoomHubError::IdentityBindingMismatch { .. })
+        ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn wire_plan_hides_untracked_nonmember() {
+        let mut registry = IdentityRegistry::new();
+        let identity = claim(&mut registry, 1, "Untracked");
+        let hub = MyRoomHub::new();
+
+        assert_eq!(hub.wire_plan_if_member(&identity).unwrap(), None);
+    }
+
+    #[test]
+    fn owner_and_visitor_wire_plans_share_exact_room_topology() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let visitor = claim(&mut registry, 2, "Visitor");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&visitor), owner(&owner_id)).unwrap();
+
+        let owner_plan = hub.wire_plan_if_member(&owner_id).unwrap().unwrap();
+        let visitor_plan = hub.wire_plan_if_member(&visitor).unwrap().unwrap();
+        assert_eq!(owner_plan.requester(), &owner_id);
+        assert_eq!(visitor_plan.requester(), &visitor);
+        assert_eq!(owner_plan.owner(), owner_id.user_no);
+        assert_eq!(visitor_plan.owner(), owner_id.user_no);
+        assert_eq!(
+            owner_plan
+                .slot_identities()
+                .map(Option::<&IdentityBinding>::cloned)
+                .collect::<Vec<_>>(),
+            visitor_plan
+                .slot_identities()
+                .map(Option::<&IdentityBinding>::cloned)
+                .collect::<Vec<_>>()
+        );
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn visitor_wire_plan_retains_absent_owner_tombstone() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let visitor = claim(&mut registry, 2, "Visitor");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&visitor), owner(&owner_id)).unwrap();
+        leave(&mut hub, &owner_id).unwrap();
+
+        assert_eq!(hub.wire_plan_if_member(&owner_id).unwrap(), None);
+        let visitor_plan = hub.wire_plan_if_member(&visitor).unwrap().unwrap();
+        assert_eq!(
+            visitor_plan.slot_identities().next().flatten(),
+            Some(&owner_id)
+        );
+        assert_eq!(
+            visitor_plan.slot_identities().nth(1).flatten(),
+            Some(&visitor)
+        );
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn wire_plan_rejects_stale_and_forged_requesters() {
+        let mut registry = IdentityRegistry::new();
+        let owner_g1 = claim(&mut registry, 1, "Owner");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_g1), owner(&owner_g1)).unwrap();
+
+        let mut forged = owner_g1.clone();
+        forged.source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+        assert!(matches!(
+            hub.wire_plan_if_member(&forged),
+            Err(MyRoomHubError::IdentityBindingMismatch { .. })
+        ));
+
+        let owner_g2 = replacement_identity(&mut registry, 1, 2, "Owner");
+        let transition = hub
+            .advance_identity(&owner_g1, participant(&owner_g2))
+            .unwrap();
+        let _ = transition.commit(&mut hub).unwrap();
+        assert!(matches!(
+            hub.wire_plan_if_member(&owner_g1),
+            Err(MyRoomHubError::StaleGeneration { .. })
+        ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn wire_projection_rejects_shape_and_identity_mismatches() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let visitor = claim(&mut registry, 2, "Visitor");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&visitor), owner(&owner_id)).unwrap();
+        let plan = hub.wire_plan_if_member(&owner_id).unwrap().unwrap();
+
+        let mut missing = projected_players(&plan);
+        missing[1] = None;
+        assert!(matches!(
+            plan.project(missing),
+            Err(MyRoomWireProjectionError::MissingPlayer {
+                slot: 1,
+                expected,
+            }) if expected == visitor.user_no
+        ));
+
+        let mut unexpected = projected_players(&plan);
+        unexpected[7] = Some(projected_player(&visitor, 7));
+        assert!(matches!(
+            plan.project(unexpected),
+            Err(MyRoomWireProjectionError::UnexpectedPlayer {
+                slot: 7,
+                actual,
+            }) if actual == visitor.user_no.get()
+        ));
+
+        let mut wrong_user = projected_players(&plan);
+        wrong_user[1].as_mut().unwrap().user_no = owner_id.user_no.get();
+        assert!(matches!(
+            plan.project(wrong_user),
+            Err(MyRoomWireProjectionError::PlayerUserNoMismatch {
+                slot: 1,
+                expected,
+                actual,
+            }) if expected == visitor.user_no && actual == owner_id.user_no.get()
+        ));
+
+        let mut wrong_address = projected_players(&plan);
+        wrong_address[1].as_mut().unwrap().p2p_address = Ipv4Addr::new(203, 0, 113, 77);
+        assert!(matches!(
+            plan.project(wrong_address),
+            Err(MyRoomWireProjectionError::PlayerAddressMismatch { slot: 1, .. })
+        ));
+
+        let projection = project_with_fresh_rp(&plan);
+        let snapshot = projection.snapshot();
+        assert!(matches!(
+            &snapshot.slots[0],
+            MyRoomSlot::Player(player)
+                if player.rp == 10_000 && player.p2p_address == Ipv4Addr::LOCALHOST
+        ));
+        assert!(matches!(
+            &snapshot.slots[1],
+            MyRoomSlot::Player(player)
+                if player.rp == 10_001 && player.p2p_address == Ipv4Addr::LOCALHOST
+        ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn wire_plan_revalidation_rejects_requester_and_topology_churn() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let first = claim(&mut registry, 2, "First");
+        let second = claim(&mut registry, 3, "Second");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&first), owner(&owner_id)).unwrap();
+        let plan = hub.wire_plan_if_member(&first).unwrap().unwrap();
+
+        let requester_error = hub.revalidate_wire_plan(&owner_id, &plan).unwrap_err();
+        assert!(matches!(
+            requester_error,
+            MyRoomHubError::WirePlanRequesterMismatch { .. }
+        ));
+        assert!(requester_error.is_wire_plan_stale());
+
+        enter(&mut hub, participant(&second), owner(&owner_id)).unwrap();
+        let topology_error = hub.revalidate_wire_plan(&first, &plan).unwrap_err();
+        assert!(matches!(
+            topology_error,
+            MyRoomHubError::StaleWirePlan { owner } if owner == owner_id.user_no
+        ));
+        assert!(topology_error.is_wire_plan_stale());
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn wire_plan_revalidation_preserves_hub_generation_and_binding_errors() {
+        let mut registry = IdentityRegistry::new();
+        let owner_g1 = claim(&mut registry, 1, "Owner");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_g1), owner(&owner_g1)).unwrap();
+        let plan = hub.wire_plan_if_member(&owner_g1).unwrap().unwrap();
+
+        let mut forged = owner_g1.clone();
+        forged.source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+        hub.generations.insert(owner_g1.user_no, forged);
+        let binding_error = hub.revalidate_wire_plan(&owner_g1, &plan).unwrap_err();
+        assert!(matches!(
+            binding_error,
+            MyRoomHubError::IdentityBindingMismatch { .. }
+        ));
+        assert!(!binding_error.is_wire_plan_stale());
+
+        let owner_g2 = replacement_identity(&mut registry, 1, 2, "Owner");
+        hub.generations.insert(owner_g1.user_no, owner_g2);
+        let generation_error = hub.revalidate_wire_plan(&owner_g1, &plan).unwrap_err();
+        assert!(matches!(
+            generation_error,
+            MyRoomHubError::StaleGeneration { .. }
+        ));
+        assert!(!generation_error.is_wire_plan_stale());
+    }
+
+    #[test]
+    fn wire_projection_overlays_post_leave_topology_with_fresh_players() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let departing = claim(&mut registry, 2, "Departing");
+        let remaining = claim(&mut registry, 3, "Remaining");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&departing), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&remaining), owner(&owner_id)).unwrap();
+
+        let visitor_plan = hub.wire_plan_if_member(&departing).unwrap().unwrap();
+        let visitor_projection = project_with_fresh_rp(&visitor_plan);
+        let visitor_transition = hub.leave(&departing).unwrap();
+        let RoomEffect::Updated(visitor_publication) = &visitor_transition.outcome().room else {
+            panic!("two members must remain after visitor leave");
+        };
+        let visitor_overlay = visitor_projection
+            .overlay_publication(visitor_publication)
+            .unwrap();
+        assert!(matches!(
+            &visitor_overlay.snapshot.slots[0],
+            MyRoomSlot::Player(player) if player.rp == 10_000
+        ));
+        assert_eq!(visitor_overlay.snapshot.slots[1], MyRoomSlot::Empty);
+        assert!(matches!(
+            &visitor_overlay.snapshot.slots[2],
+            MyRoomSlot::Player(player) if player.rp == 10_002
+        ));
+        assert_eq!(
+            user_numbers(&visitor_overlay.audience),
+            vec![owner_id.user_no.get(), remaining.user_no.get()]
+        );
+
+        let mut mismatched = (**visitor_publication).clone();
+        let MyRoomSlot::Player(player) = &mut mismatched.snapshot.slots[2] else {
+            panic!("remaining visitor must occupy slot two");
+        };
+        player.nickname = "WrongNickname".to_owned();
+        assert!(matches!(
+            visitor_projection.overlay_publication(&mismatched),
+            Err(MyRoomWireProjectionError::PublicationNicknameMismatch { slot: 2, .. })
+        ));
+
+        let _ = visitor_transition.commit(&mut hub).unwrap();
+        let owner_plan = hub.wire_plan_if_member(&owner_id).unwrap().unwrap();
+        let owner_projection = project_with_fresh_rp(&owner_plan);
+        let owner_transition = hub.leave(&owner_id).unwrap();
+        let RoomEffect::Updated(owner_publication) = &owner_transition.outcome().room else {
+            panic!("remaining visitor must preserve the owner tombstone");
+        };
+        let owner_overlay = owner_projection
+            .overlay_publication(owner_publication)
+            .unwrap();
+        assert!(matches!(
+            &owner_overlay.snapshot.slots[0],
+            MyRoomSlot::Player(player)
+                if player.user_no == owner_id.user_no.get() && player.rp == 10_000
+        ));
+        assert_eq!(
+            user_numbers(&owner_overlay.audience),
+            vec![remaining.user_no.get()]
+        );
+        assert_eq!(owner_overlay.snapshot.slots[1], MyRoomSlot::Empty);
+        assert!(matches!(
+            &owner_overlay.snapshot.slots[2],
+            MyRoomSlot::Player(player) if player.rp == 10_002
+        ));
+
+        let _ = owner_transition.commit(&mut hub).unwrap();
+        hub.audit_invariants().unwrap();
     }
 
     #[test]

@@ -16,8 +16,11 @@ which work should resume.
 - Do not copy old analysis artifacts or `PhysicsSim` into this repository.
 - The C# reference repository was not modified.
 - Current branch: `main`
-- Previous checkpoint: `4008740 Integrate actor-owned MyRoom lifecycle`
-- The durable MyRoom owner-info checkpoint is the commit containing this file.
+- Previous committed checkpoint:
+  `ec6d544 Persist MyRoom owner info through actor completion`
+- The FirstState/Secede live-profile tranche described below has passed its
+  independent reviews and full validation. Its implementation checkpoint and
+  the final pause-handoff checkpoint are recorded in the repository history.
 
 ## Implemented in the paused tranche
 
@@ -116,6 +119,43 @@ that the durable completion retires before World exits.
   then proves force waits for the disk job to finish and the durable profile
   value survives.
 
+### Live-profile FirstState and Secede
+
+- `RmFirstRequestPacket` and `ChRqSecedeMyRoomPacket` validate the exact
+  request hash and intentionally ignore every trailing byte, matching the C#
+  handlers.
+- A nonmember FirstState receives the exact 988-byte all-empty slot packet
+  without profile I/O.
+- A nonmember Secede receives the exact success reply without changing the Hub
+  revision or publishing to peers.
+- A member command uses a two-phase, actor-owned capability:
+
+  1. World authorizes the requester and mints an opaque, bounded
+     `MyRoomWirePlan` containing the exact requester and eight slot bindings.
+  2. The session profile runtime reloads each occupied slot from disk, one
+     canonical nickname lane at a time.
+  3. `MyRoomWireProjection` validates occupancy, user number, nickname, source
+     IP, UTF-16/wire bounds, and plan ownership.
+  4. World reauthorizes the requester and compares the exact room topology
+     before serializing or mutating.
+
+- Topology churn during profile I/O is a typed request-scoped stale-plan result.
+  The session retries at most three actor-minted plans; it never publishes a
+  mixed roster.
+- Wire presentation comes from the latest profile values for P2P port, the
+  65-byte rider-item snapshot, RP, and club name. User number, nickname, and
+  source IP remain World-owned identity fields.
+- Owner and visitor FirstState packets use the same fresh room projection.
+- Secede overlays the fresh projection onto the actor-planned post-leave
+  topology. A visitor disappears, while an explicitly departed owner remains
+  as the fresh slot-zero tombstone while visitors remain.
+- Secede serializes and reserves every peer publication first, then the
+  requester success reply. All permits are acquired before Hub commit; failure
+  drops prior permits and leaves state unchanged.
+- The TCP session returns no direct FirstState/Secede packet. Actor outbound is
+  the only publication path, including when the request acknowledgement is
+  cancelled.
+
 ## Non-negotiable invariants
 
 - Keep `unsafe_code = "forbid"`; syntactic Rust `unsafe` is currently zero.
@@ -135,6 +175,17 @@ that the durable completion retires before World exits.
 - Keep one pending MyRoom write per user and validate both the ticket map and
   user index on removal.
 - Do not put full profiles into the completion mailbox.
+- Do not serialize a member FirstState or Secede publication from the Hub's
+  entry-time `MyRoomPlayerSlot` cache. Mint an identity-only wire plan, reload
+  every occupied profile outside the actor, and revalidate the exact plan in
+  the actor.
+- Keep profile loads sequential across MyRoom slots. Holding several nickname
+  lanes together can deadlock when two owners visit each other's rooms.
+- Treat cached publication slots only as post-transition topology evidence.
+  Every emitted player value must come from the sealed live projection.
+- A stale wire plan is an expected request race, not a terminal World/sidecar
+  failure. Projection invariant failures and unrelated Hub invariant failures
+  must keep their typed sources.
 
 ## Verification completed at the pause
 
@@ -153,12 +204,15 @@ cargo test -p p5136-server myroom_info_dispatch_is_silent_for_nonmember_and_skip
 cargo test -p p5136-server graceful_supervisor_keeps_world_alive_until_myroom_profile_completion_drains -- --nocapture
 cargo test -p p5136-server force_shutdown_reports_abandoned_myroom_ticket_and_user_index -- --nocapture
 cargo test -p p5136-server forced_supervisor_drains_disk_after_abandoning_myroom_publication -- --nocapture
+cargo test -p p5136-server myroom_first_dispatch_ignores_body_and_uses_actor_outbound_for_all_roles -- --nocapture
+cargo test -p p5136-server myroom_owner_secede_broadcast_reloads_live_tombstone_profile -- --nocapture
+cargo test -p p5136-server stale_myroom_wire_projection_is_retryable_and_side_effect_free -- --nocapture
 
 cargo test -p p5136-server --all-features
-# 246 unit tests and 8 integration tests
+# 267 unit tests and 8 integration tests
 
 cargo test --workspace --all-features
-# 509 tests after the force-shutdown regressions
+# 532 tests across the workspace
 
 cargo clippy -p p5136-server --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -168,42 +222,74 @@ git diff --check
 
 The focused actor tests cover disk-to-Hub-to-echo ordering, requester result
 cancellation, registration reply cancellation, profile-lane recovery,
-outbound backpressure, and the pending-ticket shutdown guard.
+outbound backpressure, the pending-ticket shutdown guard, live disk projection,
+owner tombstones, stale topology rejection, and acknowledgement cancellation.
 
-The final independent read-only review found no P0, P1, or new P2 issue. It
-confirmed the RAII/capability abstractions, typed error sources, cancellation
-coverage, zero syntactic Rust `unsafe`, and graceful shutdown ordering.
+The durable owner-info review found no P0, P1, or new P2 issue. The initial
+First/Secede review correctly rejected the cached presentation path as a P1
+C#-fidelity mismatch. That path was replaced with the opaque, two-phase live
+wire plan described above.
 
-The full workspace tests, full server suite, focused tests, workspace-wide
-strict Clippy, formatting, and diff checks all passed after the force-shutdown
-regressions were added.
+Three independent final reviews approved the replacement with no remaining
+P0, P1, or P2 findings:
+
+- fidelity review: C# live-profile reads, exact packet behavior, owner
+  tombstone, and publication ordering verified;
+- safety review: topology and generation fencing, typed error preservation,
+  cancellation behavior, permit-before-commit ordering, and zero Rust
+  `unsafe` verified;
+- test review: no blocking defect; optional future stress coverage is listed
+  in the resume plan below.
+
+The full server suite, focused live-wire tests, workspace-wide tests,
+workspace-wide strict Clippy, formatting, and diff checks pass for the current
+checkpoint.
 
 ## Known gaps and decisions still required
 
 1. **Remaining MyRoom requests**
 
-   Only `UpdateInfo` is connected to TCP dispatch. The other eleven classified
-   requests are identity-fenced no-ops:
+   `UpdateInfo`, `FirstState`, and `Secede` are connected to TCP dispatch. The
+   other nine classified requests are identity-fenced no-ops:
 
    - re-enter;
    - random enter;
    - direct enter;
-   - first-state snapshot;
    - owner items;
    - character position;
-   - secede;
    - rider talk;
    - password check;
    - emblem list;
    - main-emblem update.
 
-2. **Expected rejection policy**
+2. **Fresh presentation beyond request-driven First/Secede**
+
+   The live wire plan now makes FirstState and Secede faithful to C# disk
+   reads. Before enabling Enter, the same freshness invariant must cover every
+   publication source:
+
+   - direct/random/re-enter must load fresh owner and entrant presentation as
+     part of the entry transition;
+   - channel migration must advance generation, source IP, and fresh
+     presentation in one transition and one fanout;
+   - equipment writes and fresh `GetRider` reloads need a silent Hub
+     presentation refresh while the nickname profile lane remains held;
+   - durable race reward completion must refresh RP without allowing an older
+     receipt to overwrite a newer presentation;
+   - disconnect/owner-close publications need an explicit policy because they
+     cannot perform blocking profile I/O in the World actor.
+
+   Rust still lacks the C# `ChClientP2pAddrPacket` profile-port write and club
+   create/rename profile writes. Port those before claiming complete MyRoom
+   presentation compatibility.
+
+3. **Expected rejection policy**
 
    Recheck which owner-info registration races should be soft protocol drops
    instead of terminating the login session. Persistence/infrastructure
    failures must retain their typed source.
 
-3. **Intentional owner-disconnect difference**
+4. **Intentional owner-disconnect difference**
 
    The Rust Hub closes an owner's room and ejects visitors when the exact owner
    is released. The C# server leaves an offline owner rendered in slot zero
@@ -211,7 +297,7 @@ regressions were added.
    but it must be called out in compatibility documentation or changed
    deliberately.
 
-4. **Force architecture follow-up**
+5. **Force architecture follow-up**
 
    A stronger design would replace the boolean force flag with a monotonic
    `Running -> Graceful -> Force` shutdown state and let force break reward
@@ -219,14 +305,14 @@ regressions were added.
    remove the current direct World force request: a reward dead-letter can
    otherwise deadlock shutdown.
 
-5. **Cross-platform and end-to-end gates**
+6. **Cross-platform and end-to-end gates**
 
    Windows, macOS, and Linux CI, Wine/CrossOver client launch, differential
    C#/Rust captures, and a two-client race remain later completion gates.
 
 ## Exact resume plan
 
-1. Inspect the checkpoint before editing:
+1. Inspect the clean checkpoint before editing:
 
    ```text
    git status --short
@@ -234,7 +320,7 @@ regressions were added.
    git diff --stat
    ```
 
-2. Run the final validation for this tranche:
+2. Establish the baseline before the next tranche:
 
    ```text
    cargo fmt --all -- --check
@@ -253,25 +339,31 @@ regressions were added.
    Text in error names or comments is not Rust unsafe syntax; any actual
    `unsafe` block is a stop-and-review condition.
 
-4. If code changed after this checkpoint, obtain another independent read-only
-   review of:
+4. Resume the remaining MyRoom requests in small commits:
 
-   - `crates/p5136-server/src/myroom_persistence.rs`
-   - `crates/p5136-profile/src/store.rs`
-   - `crates/p5136-server/src/world.rs`
-   - `crates/p5136-server/src/session.rs`
-   - `crates/p5136-server/src/runtime.rs`
-
-5. Resume the remaining MyRoom requests in small commits:
-
-   - membership query plus first-state and secede;
-   - direct/random/re-enter with exact status codes;
+   - identity-free profile presentation plus silent refresh hooks for
+     equipment, `GetRider`, reward RP, and migration;
+   - direct/random/re-enter with exact status codes and fresh entry
+     presentation;
    - owner-item profile reads and C# empty-kart quirk;
    - position and chat peer fanout;
    - password and emblem flows;
    - main-emblem durable write and session refresh.
 
-6. For every request, preserve C# wire behavior with a malformed-input test,
+5. Add the test reviewer's recommended stress coverage while touching the
+   relevant paths:
+
+   - exercise the actual session retry loop and its three-attempt cap;
+   - cancel or fail a profile load between plan and projection;
+   - prove nonmember FirstState performs zero profile loads with an explicit
+     counter;
+   - cover later rider-snapshot bytes, reciprocal-room loading, and a
+     three-or-more-peer middle backpressure failure.
+
+6. Port `ChClientP2pAddrPacket` and the club-name mutation paths before
+   declaring MyRoom presentation complete.
+
+7. For every request, preserve C# wire behavior with a malformed-input test,
    exact-generation test, backpressure/cancellation test where relevant, and
    exact packet fixture.
 
