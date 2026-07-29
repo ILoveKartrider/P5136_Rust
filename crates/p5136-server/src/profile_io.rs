@@ -16,9 +16,9 @@ use std::{
 
 use p5136_core::nickname::{NicknameError, canonical_nickname_key, normalize_nickname};
 use p5136_profile::{
-    AppliedTimeReward, PersistedRaceRewardReceipt, ProfileStore, ProfileStoreError, RaceRewardKey,
-    RaceRewardKeyError, RaceRewardPersistenceError, RaceRewardRecipientError, RaceRunLease,
-    apply_race_reward_once,
+    AppliedTimeReward, PersistedRaceRewardReceipt, Profile, ProfileStore, ProfileStoreError,
+    RaceRewardKey, RaceRewardKeyError, RaceRewardPersistenceError, RaceRewardRecipientError,
+    RaceRunLease, apply_race_reward_once, rider_item_snapshot,
 };
 use thiserror::Error;
 use tokio::{
@@ -26,10 +26,20 @@ use tokio::{
     task::{JoinError, JoinHandle, JoinSet},
 };
 
-use crate::world::RewardSettlementTask;
+use crate::{myroom_hub::MyRoomProfilePresentation, world::RewardSettlementTask};
 
 const MAX_BLOCKING_PROFILE_JOBS: usize = 32;
 const REWARD_PERSISTENCE_OPERATION: &str = "persist race reward";
+
+#[must_use]
+pub(crate) fn myroom_profile_presentation(profile: &Profile) -> MyRoomProfilePresentation {
+    MyRoomProfilePresentation::new(
+        u16::try_from(profile.rider.p2p_port).unwrap_or_default(),
+        rider_item_snapshot(&profile.rider_item),
+        profile.rider.rp,
+        profile.rider.club_name.clone(),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProfileIoLimits {
@@ -158,11 +168,20 @@ pub(crate) enum ProfileRewardJobError {
 pub(crate) struct DurableRewardReceipt {
     task: RewardSettlementTask,
     persisted: PersistedRaceRewardReceipt,
+    profile: Option<MyRoomProfileLease>,
 }
 
 impl DurableRewardReceipt {
-    fn new(task: RewardSettlementTask, persisted: PersistedRaceRewardReceipt) -> Self {
-        Self { task, persisted }
+    fn new(
+        task: RewardSettlementTask,
+        persisted: PersistedRaceRewardReceipt,
+        profile: MyRoomProfileLease,
+    ) -> Self {
+        Self {
+            task,
+            persisted,
+            profile: Some(profile),
+        }
     }
 
     pub(crate) fn task(&self) -> &RewardSettlementTask {
@@ -177,13 +196,36 @@ impl DurableRewardReceipt {
         self.persisted.applied
     }
 
+    pub(crate) fn profile(&self) -> Option<&MyRoomProfileLease> {
+        self.profile.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         task: RewardSettlementTask,
         key: RaceRewardKey,
         applied: AppliedTimeReward,
     ) -> Self {
-        Self::new(task, PersistedRaceRewardReceipt { key, applied })
+        Self {
+            task,
+            persisted: PersistedRaceRewardReceipt { key, applied },
+            profile: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_profile(
+        task: RewardSettlementTask,
+        key: RaceRewardKey,
+        applied: AppliedTimeReward,
+        presentation: MyRoomProfilePresentation,
+        nickname: &str,
+    ) -> Self {
+        Self {
+            task,
+            persisted: PersistedRaceRewardReceipt { key, applied },
+            profile: Some(MyRoomProfileLease::for_test(presentation, nickname)),
+        }
     }
 }
 
@@ -442,6 +484,44 @@ impl ProfileLanePermit {
     }
 }
 
+/// Profile-owned `MyRoom` fields paired with the canonical lane that produced
+/// them. Moving this lease into a World command prevents a queued older
+/// presentation from racing past a newer same-profile operation.
+#[derive(Debug)]
+pub(crate) struct MyRoomProfileLease {
+    presentation: MyRoomProfilePresentation,
+    subject: ProfileSubject,
+    #[expect(dead_code, reason = "drop retains the canonical profile lane")]
+    lane: Option<ProfileLanePermit>,
+}
+
+impl MyRoomProfileLease {
+    pub(crate) fn new(presentation: MyRoomProfilePresentation, lane: ProfileLanePermit) -> Self {
+        Self {
+            presentation,
+            subject: lane.subject().clone(),
+            lane: Some(lane),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(presentation: MyRoomProfilePresentation, nickname: &str) -> Self {
+        Self {
+            presentation,
+            subject: ProfileSubject::new(nickname).unwrap(),
+            lane: None,
+        }
+    }
+
+    pub(crate) fn presentation(&self) -> &MyRoomProfilePresentation {
+        &self.presentation
+    }
+
+    pub(crate) fn subject(&self) -> &ProfileSubject {
+        &self.subject
+    }
+}
+
 #[derive(Debug)]
 struct ProfileResources {
     store: Arc<ProfileStore>,
@@ -570,9 +650,11 @@ impl ProfileIoHandle {
                     let key = RaceRewardKey::new(&recipient, lease, room_id, race_epoch)?;
                     let transaction =
                         apply_race_reward_once(store, lease, &recipient, &key, proposed_reward)?;
-                    let persisted = match transaction {
-                        p5136_profile::ProfileTransaction::Unchanged { value, .. }
-                        | p5136_profile::ProfileTransaction::Committed { value, .. } => value,
+                    let (persisted, profile) = match transaction {
+                        p5136_profile::ProfileTransaction::Unchanged { value, profile, .. }
+                        | p5136_profile::ProfileTransaction::Committed { value, profile, .. } => {
+                            (value, profile)
+                        }
                         p5136_profile::ProfileTransaction::CommittedButDurabilityUncertain {
                             error,
                             ..
@@ -582,7 +664,7 @@ impl ProfileIoHandle {
                             ));
                         }
                     };
-                    Ok(persisted)
+                    Ok((persisted, myroom_profile_presentation(&profile)))
                 },
             )
             .await;
@@ -591,10 +673,16 @@ impl ProfileIoHandle {
             Err(error) => return Err(RewardPersistenceFailure::profile_io(task, error)),
         };
         let (result, lane) = completed.into_parts();
-        drop(lane);
         match result {
-            Ok(persisted) => Ok(DurableRewardReceipt::new(task, persisted)),
-            Err(error) => Err(RewardPersistenceFailure::reward(task, error)),
+            Ok((persisted, presentation)) => Ok(DurableRewardReceipt::new(
+                task,
+                persisted,
+                MyRoomProfileLease::new(presentation, lane),
+            )),
+            Err(error) => {
+                drop(lane);
+                Err(RewardPersistenceFailure::reward(task, error))
+            }
         }
     }
 
@@ -1160,6 +1248,30 @@ mod tests {
         assert_eq!(first.key().race_epoch(), epoch);
         assert_eq!(first.key().user_no(), 7);
         assert_eq!(first.key().canonical_nickname(), Some("rewardrider"));
+        let first_applied = first.applied();
+        let first_key = first.key().clone();
+
+        let waiting_handle = handle.clone();
+        let mut waiting = tokio::spawn(async move {
+            waiting_handle
+                .admit("rewardrider", "wait behind durable reward receipt")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "durable reward receipt released its profile lane before World acknowledgement"
+        );
+        drop(first);
+        drop(waiting.await.unwrap().unwrap());
+
+        let mut externally_updated = store.load_or_create("RewardRider").unwrap().profile;
+        externally_updated.rider.p2p_port = 45_136;
+        externally_updated.rider.rp = 515_136;
+        externally_updated.rider.club_name = "NewerProfile".to_owned();
+        externally_updated.rider_item.character = 321;
+        store.save("RewardRider", &externally_updated).unwrap();
 
         let retry_task = RewardSettlementTask::for_test(
             RoomId(11),
@@ -1170,12 +1282,15 @@ mod tests {
             TimeReward::new(1, 1).unwrap(),
         );
         let retry = handle.persist_reward(retry_task).await.unwrap();
-        assert_eq!(retry.applied(), first.applied());
-        assert_eq!(retry.key(), first.key());
+        assert_eq!(retry.applied(), first_applied);
+        assert_eq!(retry.key(), &first_key);
+        let presentation = retry.profile().unwrap().presentation();
+        assert_eq!(presentation.rp(), 515_136);
 
         let persisted = store.load_or_create("RewardRider").unwrap();
-        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(persisted.revision, Some(3));
         assert_eq!(persisted.profile.rider.lucci, initial_lucci + 7);
+        drop(retry);
         runtime.shutdown().await.unwrap();
     }
 

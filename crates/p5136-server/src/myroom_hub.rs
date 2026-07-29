@@ -18,6 +18,7 @@ use p5136_core::{
         validate_myroom_info, validate_myroom_player_slot,
     },
     nickname::canonical_nickname_key,
+    startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
 };
 use thiserror::Error;
 
@@ -82,6 +83,67 @@ impl MyRoomRevision {
     #[must_use]
     pub(crate) const fn get(self) -> u64 {
         self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomProfilePresentation {
+    p2p_port: u16,
+    rider_item_snapshot: [u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+    rp: u32,
+    club_name: String,
+}
+
+impl MyRoomProfilePresentation {
+    #[must_use]
+    pub(crate) fn new(
+        p2p_port: u16,
+        rider_item_snapshot: [u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+        rp: u32,
+        club_name: String,
+    ) -> Self {
+        Self {
+            p2p_port,
+            rider_item_snapshot,
+            rp,
+            club_name,
+        }
+    }
+
+    /// Binds profile-owned presentation to one actor-authoritative identity.
+    ///
+    /// The source address, user number, and nickname can never be supplied by
+    /// profile I/O. Wire validation occurs when the resulting participant or
+    /// projection is sealed.
+    #[must_use]
+    pub(crate) fn player_for(&self, identity: &IdentityBinding) -> MyRoomPlayerSlot {
+        MyRoomPlayerSlot {
+            user_no: identity.user_no.get(),
+            p2p_address: identity_wire_address(identity),
+            p2p_port: self.p2p_port,
+            nickname: identity.nickname.clone(),
+            rider_item_snapshot: self.rider_item_snapshot,
+            rp: self.rp,
+            club_name: self.club_name.clone(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn rp(&self) -> u32 {
+        self.rp
+    }
+
+    #[must_use]
+    pub(crate) const fn rider_item_snapshot(&self) -> &[u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH] {
+        &self.rider_item_snapshot
+    }
+
+    pub(crate) fn bind(
+        &self,
+        identity: IdentityBinding,
+    ) -> Result<MyRoomParticipant, MyRoomHubError> {
+        let player = self.player_for(&identity);
+        MyRoomParticipant::new(identity, player)
     }
 }
 
@@ -490,6 +552,12 @@ pub(crate) struct ParticipantRefreshEffects {
     /// Membership room first, then a distinct owned room.
     pub(crate) publications: Vec<RoomPublication>,
 }
+
+/// Marker outcome for a cache-only profile write-through. It intentionally
+/// exposes no publications, preventing a profile mutation from accidentally
+/// becoming an `RmSlotData` broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MyRoomSilentRefresh;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityAdvanceEffects {
@@ -1400,6 +1468,46 @@ impl MyRoomHub {
         )
     }
 
+    /// Silently refreshes every cached role held by one exact generation.
+    ///
+    /// A profile mutation alone does not cause a C# `RmSlotData` fan-out, so
+    /// the opaque outcome deliberately exposes no publication payload.
+    pub(crate) fn refresh_profile_if_tracked(
+        &self,
+        identity: &IdentityBinding,
+        presentation: &MyRoomProfilePresentation,
+    ) -> Result<Option<MyRoomTransition<MyRoomSilentRefresh>>, MyRoomHubError> {
+        if !self.has_role(identity.user_no)? {
+            return Ok(None);
+        }
+        let participant = presentation.bind(identity.clone())?;
+        self.require_canonical_identity(identity)?;
+        let next_revision = self.next_revision()?;
+        let (rooms, _) = self.replacement_rooms(identity.user_no, &participant)?;
+        self.transition(
+            next_revision,
+            rooms,
+            Vec::new(),
+            Vec::new(),
+            MyRoomSilentRefresh,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn canonical_identity_if_tracked(
+        &self,
+        user_no: UserNo,
+    ) -> Result<Option<IdentityBinding>, MyRoomHubError> {
+        if !self.has_role(user_no)? {
+            return Ok(None);
+        }
+        self.generations
+            .get(&user_no)
+            .cloned()
+            .ok_or_else(|| MyRoomInvariantViolation::MissingCanonicalGeneration { user_no }.into())
+            .map(Some)
+    }
+
     /// Atomically advances all roles for one migrated identity generation.
     pub(crate) fn advance_identity(
         &self,
@@ -1424,6 +1532,21 @@ impl MyRoomHub {
                 publications,
             },
         )
+    }
+
+    /// Atomically advances an exact migrated generation and installs the
+    /// profile snapshot loaded under the migration's canonical profile lane.
+    pub(crate) fn advance_profiled_identity_if_tracked(
+        &self,
+        previous: &IdentityBinding,
+        replacement: &IdentityBinding,
+        presentation: &MyRoomProfilePresentation,
+    ) -> Result<Option<MyRoomTransition<IdentityAdvanceEffects>>, MyRoomHubError> {
+        if !self.has_role(previous.user_no)? {
+            return Ok(None);
+        }
+        let participant = presentation.bind(replacement.clone())?;
+        self.advance_identity(previous, participant).map(Some)
     }
 
     /// Advances a migrated generation without requiring profile I/O.
@@ -1917,6 +2040,15 @@ impl MyRoomHub {
             },
         )?;
         require_same_binding(canonical, identity)
+    }
+
+    fn has_role(&self, user_no: UserNo) -> Result<bool, MyRoomHubError> {
+        let has_role =
+            self.memberships.contains_key(&user_no) || self.rooms.contains_key(&OwnerKey(user_no));
+        if !has_role && self.generations.contains_key(&user_no) {
+            return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration { user_no }.into());
+        }
+        Ok(has_role)
     }
 
     fn enter_prunes_old_owner_generation(
@@ -2492,9 +2624,10 @@ mod tests {
         EnterOutcome, GenerationChange, IdentityAdvanceEffects, MAX_MYROOM_IDENTITIES,
         MAX_TRANSITION_GENERATIONS, MAX_TRANSITION_MEMBERSHIPS, MAX_TRANSITION_ROOMS,
         MembershipChange, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
-        MyRoomInvariantViolation, MyRoomOwner, MyRoomParticipant, MyRoomRevision, MyRoomSlotIndex,
-        MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError,
-        OwnerKey, ParticipantRefreshEffects, RoomChange, RoomEffect, RoomState, VISITOR_CAPACITY,
+        MyRoomInvariantViolation, MyRoomOwner, MyRoomParticipant, MyRoomProfilePresentation,
+        MyRoomRevision, MyRoomSlotIndex, MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection,
+        MyRoomWireProjectionError, OwnerKey, ParticipantRefreshEffects, RoomChange, RoomEffect,
+        RoomState, VISITOR_CAPACITY,
     };
     use crate::{IdentityBinding, IdentityRegistry, ReleasedIdentity, SessionId};
 
@@ -2871,6 +3004,95 @@ mod tests {
             &owned.slots[0],
             MyRoomSlot::Player(player) if player.rp == 777
         ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn identity_free_profile_refresh_updates_owned_tombstone_and_visited_role_silently() {
+        let mut registry = IdentityRegistry::new();
+        let profiled = claim(&mut registry, 1, "Profiled");
+        let owned_visitor = claim(&mut registry, 2, "OwnedVisitor");
+        let visited_owner = claim(&mut registry, 3, "VisitedOwner");
+        let outsider = claim(&mut registry, 4, "Outsider");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&profiled), owner(&profiled)).unwrap();
+        enter(&mut hub, participant(&owned_visitor), owner(&profiled)).unwrap();
+        enter(&mut hub, participant(&visited_owner), owner(&visited_owner)).unwrap();
+        enter(&mut hub, participant(&profiled), owner(&visited_owner)).unwrap();
+
+        let revision = hub.revision();
+        let owned_before =
+            hub.rooms[&OwnerKey(profiled.user_no)].snapshot(OwnerKey(profiled.user_no));
+        let visited_before =
+            hub.rooms[&OwnerKey(visited_owner.user_no)].snapshot(OwnerKey(visited_owner.user_no));
+        let invalid = MyRoomProfilePresentation::new(
+            45_136,
+            [0xA5; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+            515_136,
+            "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1),
+        );
+        assert!(matches!(
+            hub.refresh_profile_if_tracked(&profiled, &invalid),
+            Err(MyRoomHubError::Wire(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom club name",
+                ..
+            }))
+        ));
+        assert_eq!(hub.revision(), revision);
+        assert_eq!(
+            hub.rooms[&OwnerKey(profiled.user_no)].snapshot(OwnerKey(profiled.user_no)),
+            owned_before
+        );
+        assert_eq!(
+            hub.rooms[&OwnerKey(visited_owner.user_no)].snapshot(OwnerKey(visited_owner.user_no)),
+            visited_before
+        );
+
+        let items = [0xD5; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH];
+        let presentation =
+            MyRoomProfilePresentation::new(45_137, items, 515_137, "FreshProfile".to_owned());
+        let transition = hub
+            .refresh_profile_if_tracked(&profiled, &presentation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transition.rooms.len(), 2);
+        assert!(transition.memberships.is_empty());
+        assert!(transition.generations.is_empty());
+        let _silent = transition.commit(&mut hub).unwrap();
+
+        let expected = presentation.player_for(&profiled);
+        let owned = &hub.rooms[&OwnerKey(profiled.user_no)];
+        assert!(!owned.owner_present);
+        assert_eq!(owned.owner.player, expected);
+        let visited = &hub.rooms[&OwnerKey(visited_owner.user_no)];
+        let visited_profile = visited
+            .visitors
+            .iter()
+            .flatten()
+            .find(|participant| participant.identity.user_no == profiled.user_no)
+            .unwrap();
+        assert_eq!(visited_profile.player, expected);
+        assert_eq!(expected.user_no, profiled.user_no.get());
+        assert_eq!(expected.nickname, profiled.nickname);
+        assert_eq!(expected.p2p_address, Ipv4Addr::LOCALHOST);
+        assert_eq!(expected.p2p_port, 45_137);
+        assert_eq!(expected.rider_item_snapshot, items);
+        assert_eq!(expected.rp, 515_137);
+        assert_eq!(expected.club_name, "FreshProfile");
+
+        let refreshed_revision = hub.revision();
+        assert!(
+            hub.refresh_profile_if_tracked(&outsider, &presentation)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(hub.revision(), refreshed_revision);
+        let profiled_g2 = replacement_identity(&mut registry, 1, 5, "Profiled");
+        assert!(matches!(
+            hub.refresh_profile_if_tracked(&profiled_g2, &presentation),
+            Err(MyRoomHubError::StaleGeneration { .. })
+        ));
+        assert_eq!(hub.revision(), refreshed_revision);
         hub.audit_invariants().unwrap();
     }
 

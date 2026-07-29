@@ -2,6 +2,7 @@ use std::{
     array,
     future::Future,
     io,
+    mem::size_of,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
@@ -53,16 +54,15 @@ use p5136_core::{
         parse_ch_leave_room_request, parse_gr_first_request,
     },
     startup::{
-        self, PrGetRiderFields, StartupError, StartupRequest, classify_startup_request,
-        is_startup_noop, parse_pq_update_game_option,
+        self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
+        classify_startup_request, is_startup_noop, parse_pq_update_game_option,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
 use p5136_profile::{
     CatalogInventory, EquipmentExceptions, EquipmentStateError, InventoryBuildError,
-    MAX_MYROOM_ITEM_RECORDS, MyRoomItemStateError, MyRoomOwnerInventory, Profile, ProfileMutation,
-    ProfileStoreError, ProfileTransaction, apply_rider_item_selection,
-    build_inventory_snapshot_with_equipment, is_grant_item, rider_item_snapshot,
+    MAX_MYROOM_ITEM_RECORDS, MyRoomItemStateError, MyRoomOwnerInventory, Profile,
+    ProfileStoreError, build_inventory_snapshot_with_equipment, rider_item_snapshot,
 };
 use rand::Rng;
 use thiserror::Error;
@@ -76,11 +76,19 @@ use tokio::{
 use crate::{
     ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ServerConfig, SessionId,
     UserNo, WorldError, WorldHandle,
+    equipment_persistence::{
+        PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
+        RiderEquipmentWriteError, catalog_grants, kart_is_owned,
+    },
     myroom_hub::{MyRoomWirePlan, MyRoomWireProjection},
     myroom_persistence::{
-        MYROOM_INFO_WRITE_OPERATION, MyRoomInfoWriteError, MyRoomInfoWriteReceipt,
+        MYROOM_INFO_WRITE_OPERATION, MyRoomCompletionSlot, MyRoomInfoWriteError,
+        MyRoomInfoWriteReceipt,
     },
-    profile_io::{ProfileIoError, ProfileIoHandle, ProfileJobAdmission, ProfileLanePermit},
+    profile_io::{
+        MyRoomProfileLease, ProfileIoError, ProfileIoHandle, ProfileJobAdmission,
+        ProfileLanePermit, myroom_profile_presentation,
+    },
     world::{
         LobbyCommandPayload, LobbyError, MyRoomCommandPayload, MyRoomSessionRole, OutboundBatch,
         RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
@@ -199,6 +207,21 @@ pub enum LoginSessionError {
     #[error(transparent)]
     ProfileIo(#[from] ProfileIoError),
 
+    #[error("rider-equipment persistence or publication failed")]
+    RiderEquipmentWrite {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    #[error(
+        "rider-equipment reload for {nickname:?} returned revision {actual:?} behind durable revision {durable}"
+    )]
+    RiderEquipmentReloadBehind {
+        nickname: String,
+        durable: u64,
+        actual: Option<u64>,
+    },
+
     #[error(transparent)]
     World(#[from] WorldError),
 
@@ -256,9 +279,6 @@ pub enum LoginSessionError {
         "profile admission for {admitted:?} cannot authorize operation on profile {requested:?}"
     )]
     ProfileSubjectMismatch { admitted: String, requested: String },
-
-    #[error("an unconditional profile mutation unexpectedly produced no revision")]
-    ProfileMutationUnchanged,
 
     #[error("MyRoom owner-item response has {actual} packets; operational maximum is {maximum}")]
     MyRoomOwnerItemPacketLimit { actual: usize, maximum: usize },
@@ -514,7 +534,8 @@ impl ProfileCoordinator {
             let (profile, lane) = self
                 .load(identity.nickname.clone(), false, admission)
                 .await?;
-            players[slot] = Some(myroom_player_slot_from_profile(&identity, &profile.profile));
+            players[slot] =
+                Some(myroom_profile_presentation(&profile.profile).player_for(&identity));
             drop(lane);
         }
         plan.project(players)
@@ -630,64 +651,27 @@ impl ProfileCoordinator {
         ))
     }
 
-    async fn update_rider_items(
+    fn prepare_rider_equipment_write(
         &self,
-        nickname: String,
         selection: RiderItemSelection,
         admission: ProfileJobAdmission,
-    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
-        Self::ensure_admitted_subject(&admission, &nickname)?;
+        completion: MyRoomCompletionSlot,
+    ) -> Result<PreparedRiderEquipmentWrite, LoginSessionError> {
         let catalog = self
             .catalog
             .clone()
             .ok_or(LoginSessionError::CatalogUnavailable)?;
+        let prepared = PreparedRiderEquipmentWrite::new(admission, selection, catalog, completion);
         #[cfg(test)]
-        let blocking_update_hook = self.blocking_update_hook.clone();
-        let completed = admission
-            .run("update rider equipment", move |store, _, subject| {
-                #[cfg(test)]
-                if let Some(hook) = blocking_update_hook {
-                    hook.entered.wait();
-                    hook.release.wait();
-                }
-                let transaction = store.transaction(subject.nickname(), |profile| {
-                    if let Err(error) = validate_rider_item_selection(&catalog, profile, selection)
-                    {
-                        return ProfileMutation::Unchanged(Err(error));
-                    }
-                    let mut next = profile.clone();
-                    apply_rider_item_selection(&mut next.rider_item, selection);
-                    ProfileMutation::changed(Ok(()), next)
-                })?;
-                match transaction {
-                    ProfileTransaction::Committed {
-                        value,
-                        profile,
-                        saved,
-                    } => {
-                        value?;
-                        Ok::<_, LoginSessionError>((saved, profile))
-                    }
-                    ProfileTransaction::CommittedButDurabilityUncertain { error, .. } => {
-                        Err(error.into())
-                    }
-                    ProfileTransaction::Unchanged { value, .. } => match value {
-                        Err(error) => Err(error),
-                        Ok(()) => Err(LoginSessionError::ProfileMutationUnchanged),
-                    },
-                }
-            })
-            .await?;
-        let (updated, lane) = completed.into_parts();
-        let (saved, profile) = updated?;
-        Ok((
-            ProfileSnapshot {
-                profile,
-                revision: Some(saved.revision),
-                source_path: saved.path,
-            },
-            lane,
-        ))
+        let prepared = if let Some(hook) = self.blocking_update_hook.clone() {
+            prepared.with_test_hook(Arc::new(move || {
+                hook.entered.wait();
+                hook.release.wait();
+            }))
+        } else {
+            prepared
+        };
+        Ok(prepared)
     }
 
     async fn equip_plant_part(
@@ -734,7 +718,18 @@ impl ProfileCoordinator {
             .ok_or(LoginSessionError::CatalogUnavailable)?;
         let completed = admission
             .run("load fresh rider inventory", move |store, _, subject| {
-                let loaded = store.load_or_create(subject.nickname())?;
+                let mut loaded = store.load_or_create(subject.nickname())?;
+                if loaded.profile.rider_item.kart != 0 && loaded.profile.rider_item.kart_serial == 0
+                {
+                    let (saved, profile) = store.update(subject.nickname(), |profile| {
+                        if profile.rider_item.kart != 0 && profile.rider_item.kart_serial == 0 {
+                            profile.rider_item.kart_serial = 1;
+                        }
+                    })?;
+                    loaded.profile = profile;
+                    loaded.revision = Some(saved.revision);
+                    loaded.source_path = saved.path;
+                }
                 let rider_directory = loaded
                     .source_path
                     .parent()
@@ -789,84 +784,6 @@ fn plant_part_is_owned(
             .ok()
             .zip(u16::try_from(request.item_id).ok())
             .is_some_and(|(category, item_id)| catalog_grants(catalog, category, item_id))
-}
-
-fn catalog_grants(catalog: &CatalogInventory, category: u16, item_id: u16) -> bool {
-    catalog
-        .category(category)
-        .any(|item| item.id == item_id && is_grant_item(item))
-}
-
-fn kart_is_owned(catalog: &CatalogInventory, profile: &Profile, kart_id: u16, serial: u16) -> bool {
-    catalog_grants(catalog, 3, kart_id)
-        && (serial == 1
-            || profile
-                .granted_karts
-                .iter()
-                .any(|kart| kart.kart_id == kart_id && kart.serial == serial))
-}
-
-fn normalized_kart_serial(kart_id: u16, serial: u16) -> u16 {
-    if kart_id != 0 && serial == 0 {
-        1
-    } else {
-        serial
-    }
-}
-
-fn validate_rider_item_selection(
-    catalog: &CatalogInventory,
-    profile: &Profile,
-    selection: RiderItemSelection,
-) -> Result<(), LoginSessionError> {
-    let current = &profile.rider_item;
-    let selected_items = [
-        (1, current.character, selection.character),
-        (2, current.paint, selection.paint),
-        (4, current.plate, selection.plate),
-        (8, current.goggle, selection.goggle),
-        (9, current.balloon, selection.balloon),
-        (11, current.head_band, selection.head_band),
-        (12, current.head_phone, selection.head_phone),
-        (16, current.hand_gear_left, selection.hand_gear_left),
-        (18, current.uniform, selection.uniform),
-        (20, current.decal, selection.decal),
-        (21, current.pet, selection.pet),
-        (52, current.flying_pet, selection.flying_pet),
-        (26, current.aura, selection.aura),
-        (27, current.skid_mark, selection.skid_mark),
-        (30, current.special_kit, selection.special_kit),
-        (31, current.rider_color, selection.rider_color),
-        (32, current.bonus_card, selection.bonus_card),
-        (36, current.boss_mode_card, selection.boss_mode_card),
-        (43, current.kart_plant1, selection.kart_plant1),
-        (44, current.kart_plant2, selection.kart_plant2),
-        (45, current.kart_plant3, selection.kart_plant3),
-        (46, current.kart_plant4, selection.kart_plant4),
-        (59, current.fishing_pole, selection.fishing_pole),
-        (61, current.tachometer, selection.tachometer),
-        (70, current.dye, selection.dye),
-        (68, current.kart_coating, selection.kart_coating),
-        (69, current.kart_tail_lamp, selection.kart_tail_lamp),
-    ];
-    for (category, previous, item_id) in selected_items {
-        if item_id != 0 && item_id != previous && !catalog_grants(catalog, category, item_id) {
-            return Err(LoginSessionError::RiderItemNotGranted { category, item_id });
-        }
-    }
-
-    let serial = normalized_kart_serial(selection.kart, selection.kart_serial);
-    let current_serial = normalized_kart_serial(current.kart, current.kart_serial);
-    if selection.kart != 0
-        && (selection.kart != current.kart || serial != current_serial)
-        && !kart_is_owned(catalog, profile, selection.kart, serial)
-    {
-        return Err(LoginSessionError::KartNotGranted {
-            kart_id: selection.kart,
-            serial,
-        });
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -956,6 +873,20 @@ fn ensure_identity_fence(
         actual_user_no: actual.user_no,
         actual_generation: actual.generation,
     })
+}
+
+fn rider_equipment_write_error(source: RiderEquipmentWriteError) -> LoginSessionError {
+    match source {
+        RiderEquipmentWriteError::Persistence(RiderEquipmentPersistError::Validation(
+            RiderEquipmentValidationError::RiderItemNotGranted { category, item_id },
+        )) => LoginSessionError::RiderItemNotGranted { category, item_id },
+        RiderEquipmentWriteError::Persistence(RiderEquipmentPersistError::Validation(
+            RiderEquipmentValidationError::KartNotGranted { kart_id, serial },
+        )) => LoginSessionError::KartNotGranted { kart_id, serial },
+        source => LoginSessionError::RiderEquipmentWrite {
+            source: Box::new(source),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -1436,13 +1367,14 @@ async fn handle_channel_move_in(
             admission,
         )
         .await?;
+    let presentation = myroom_profile_presentation(&profile.profile);
+    let profile_lease = MyRoomProfileLease::new(presentation, lane);
     let completion = world
-        .complete_preflighted_migration(preflight, Instant::now())
+        .complete_preflighted_migration(preflight, profile_lease)
         .await?;
     let identity = world.authorize_identity(session_id).await?;
     ensure_identity_fence(&completion.binding, &identity)?;
     context.bind_profile(identity, profile);
-    drop(lane);
 
     Ok(vec![serialize_pr_channel_move_in(
         config.ports.game_udp(),
@@ -1709,6 +1641,16 @@ async fn handle_equipment_request(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     match request {
         EquipmentRequest::SetRiderItems => {
+            if packet.len() < size_of::<u32>() + RIDER_ITEM_SNAPSHOT_WIRE_LENGTH {
+                let identity = world.authorize_identity(session_id).await?;
+                let _ = context.profile_for(&identity)?;
+                tracing::debug!(
+                    body_length = packet.len().saturating_sub(size_of::<u32>()),
+                    required = RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
+                    "ignored truncated P5136 rider-equipment request"
+                );
+                return Ok(Vec::new());
+            }
             let selection = parse_set_rider_items(packet)?;
             update_rider_equipment(world, profiles, session_id, selection, context).await?;
             Ok(Vec::new())
@@ -1735,21 +1677,47 @@ async fn update_rider_equipment(
     selection: RiderItemSelection,
     context: &mut SessionContext,
 ) -> Result<(), LoginSessionError> {
-    let nickname = context.bound_identity()?.nickname.clone();
-    let admission = profiles.admit(&nickname, "update rider equipment").await?;
     let before = world.authorize_identity(session_id).await?;
     let _ = context.profile_for(&before)?;
-    let (profile, lane) = profiles
-        .update_rider_items(before.nickname.clone(), selection, admission)
+    let admission = profiles
+        .admit(&before.nickname, "update rider equipment")
         .await?;
-    let after_write = world.authorize_identity(session_id).await?;
-    ensure_identity_fence(&before, &after_write)?;
-    let _ = context.profile_for(&after_write)?;
-    let snapshot = rider_item_snapshot(&profile.profile.rider_item);
-    world.publish_room_equipment(session_id, snapshot).await?;
-    let after_publish = world.authorize_identity(session_id).await?;
-    ensure_identity_fence(&before, &after_publish)?;
-    context.bind_profile(after_publish, profile);
+    let completion = world
+        .reserve_rider_equipment_completion()
+        .await
+        .map_err(rider_equipment_write_error)?;
+    let prepared = profiles.prepare_rider_equipment_write(selection, admission, completion)?;
+    let receipt = world
+        .persist_rider_equipment(session_id, prepared)
+        .await
+        .map_err(rider_equipment_write_error)?;
+    tracing::trace!(
+        nickname = %before.nickname,
+        revision = receipt.revision(),
+        publication = ?receipt.publication(),
+        "reloading the full bound profile after a durable rider-equipment write"
+    );
+    let reload_admission = profiles
+        .admit(&before.nickname, "reload profile after rider equipment")
+        .await?;
+    let (profile, lane) = profiles
+        .load(before.nickname.clone(), false, reload_admission)
+        .await?;
+    if profile
+        .revision
+        .is_none_or(|revision| revision < receipt.revision())
+    {
+        let actual = profile.revision;
+        drop(lane);
+        return Err(LoginSessionError::RiderEquipmentReloadBehind {
+            nickname: before.nickname,
+            durable: receipt.revision(),
+            actual,
+        });
+    }
+    let after = world.authorize_identity(session_id).await?;
+    ensure_identity_fence(&before, &after)?;
+    context.bind_profile(after, profile);
     drop(lane);
     Ok(())
 }
@@ -1935,20 +1903,12 @@ fn profile_p2p_endpoint(source_ip: IpAddr, profile: &Profile) -> (Ipv4Addr, u16)
 /// Callers must still reauthorize that binding in the World actor after any
 /// profile I/O. The actor may overwrite `user_no` and `nickname` from its
 /// authoritative binding before committing a hub transition.
+#[cfg(test)]
 fn myroom_player_slot_from_profile(
     identity: &IdentityBinding,
     profile: &Profile,
 ) -> MyRoomPlayerSlot {
-    let (p2p_address, p2p_port) = profile_p2p_endpoint(identity.source_ip, profile);
-    MyRoomPlayerSlot {
-        user_no: identity.user_no.get(),
-        p2p_address,
-        p2p_port,
-        nickname: identity.nickname.clone(),
-        rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
-        rp: profile.rider.rp,
-        club_name: profile.rider.club_name.clone(),
-    }
+    myroom_profile_presentation(profile).player_for(identity)
 }
 
 async fn handle_startup_request(
@@ -1990,8 +1950,14 @@ async fn handle_get_rider(
     let after = world.authorize_identity(session_id).await?;
     ensure_identity_fence(&before, &after)?;
     let _ = context.profile_for(&after)?;
+    world
+        .refresh_myroom_presentation(
+            session_id,
+            after.clone(),
+            MyRoomProfileLease::new(myroom_profile_presentation(&profile.profile), lane),
+        )
+        .await?;
     context.bind_profile(after, profile);
-    drop(lane);
     Ok(responses)
 }
 
@@ -2170,6 +2136,7 @@ fn trace_packet(peer: Option<SocketAddr>, packet: &[u8]) -> Result<(), LoginSess
 #[cfg(test)]
 mod tests {
     use std::{
+        array,
         fmt::Write as _,
         fs,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -2178,6 +2145,7 @@ mod tests {
     };
 
     use p5136_core::{
+        adler32,
         equipment_protocol::{
             EquipmentRequest, PlantPartEquipRequest, RiderItemSelection,
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
@@ -2190,15 +2158,16 @@ mod tests {
             MyRoomSlot, OWNER_ITEM_NAME, plan_owner_item_packets, serialize_myroom_info,
             serialize_secede_reply, serialize_slot_data,
         },
-        packet::PacketWriter,
+        packet::{PacketReader, PacketWriter},
         race_protocol::{
             GameControlRequest, RaceProtocolError, RaceRequest, parse_game_control_request,
         },
         room_protocol::{
-            ChCreateRoomRequest, ChJoinRoomRequest, ROOM_CONNECTION_CONTEXT_LENGTH,
-            ROOM_DATA_LENGTH, RoomProtocolError, RoomProtocolRequest,
+            ChCreateRoomRequest, ChJoinRoomRequest, MAX_CLUB_NAME_UTF16_UNITS,
+            ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomProtocolError,
+            RoomProtocolRequest,
         },
-        startup::GameOptions,
+        startup::{GameOptions, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH},
     };
     use p5136_profile::{
         CatalogInventory, EquipmentExceptions, GrantedKart, MyRoomItemStateError, Profile,
@@ -2211,14 +2180,16 @@ mod tests {
     use super::{
         BlockingUpdateHook, LoginSessionError, MAX_MYROOM_ITEM_RECORDS,
         MAX_MYROOM_OWNER_ITEM_BYTES, MAX_MYROOM_OWNER_ITEM_PACKETS, MAX_OUTBOUND_BATCH_BURST,
-        MyRoomOwnerItemPacketBatch, ProfileCoordinator, RoomKartBaseResolution,
-        RoomPhysicsFallbackReason, SessionContext, SessionReadEvent, SessionServices,
-        dispatch_packet, handle_channel_move_in, handle_equipment_request, handle_get_rider,
-        handle_lobby_request, handle_race_request, handle_room_request,
-        myroom_player_slot_from_profile, read_encrypted_frame, read_session_frame,
-        room_participant_from_profile, room_physics_metadata, select_session_read_event,
-        update_game_options, validate_rider_item_selection, write_session_bytes,
+        MyRoomOwnerItemPacketBatch, ProfileCoordinator, RiderEquipmentValidationError,
+        RoomKartBaseResolution, RoomPhysicsFallbackReason, SessionContext, SessionReadEvent,
+        SessionServices, dispatch_packet, handle_channel_move_in, handle_equipment_request,
+        handle_get_rider, handle_lobby_request, handle_race_request, handle_room_request,
+        myroom_player_slot_from_profile, myroom_profile_presentation, read_encrypted_frame,
+        read_session_frame, room_participant_from_profile, room_physics_metadata,
+        select_session_read_event, update_game_options, write_session_bytes,
     };
+    use crate::equipment_persistence::validate_rider_item_selection;
+    use crate::profile_io::MyRoomProfileLease;
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
         WorldError, WorldHandle,
@@ -4147,7 +4118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_rider_request_updates_revision_and_bound_context_snapshot() {
+    async fn rider_request_silently_ignores_short_body_and_ignores_trailing_bytes() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
@@ -4168,15 +4139,44 @@ mod tests {
         let mut context = SessionContext::default();
         context.bind_profile(identity, profile);
         drop(lane);
+        ProfileStore::new(profile_root.path())
+            .update("RiderOwner", |profile| {
+                profile.rider.premium = 42;
+                profile.rider.rp = 51_360;
+                profile.rider.club_name = "FreshEquipmentContext".to_owned();
+                profile.game_option.screen = 7;
+            })
+            .unwrap();
         let selection = rider_selection();
         let packet = rider_selection_packet(selection);
+        let truncated = &packet[..packet.len() - 1];
 
         let responses = handle_equipment_request(
             &world,
             &profiles,
             session,
             EquipmentRequest::SetRiderItems,
-            &packet,
+            truncated,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert!(responses.is_empty());
+        let unchanged = ProfileStore::new(profile_root.path())
+            .load_or_create("RiderOwner")
+            .unwrap();
+        assert_eq!(unchanged.revision, Some(2));
+        assert_eq!(unchanged.profile.rider_item, Profile::default().rider_item);
+
+        let mut trailing = packet.clone();
+        trailing.extend_from_slice(&[0x51, 0x36]);
+
+        let responses = handle_equipment_request(
+            &world,
+            &profiles,
+            session,
+            EquipmentRequest::SetRiderItems,
+            &trailing,
             &mut context,
         )
         .await
@@ -4186,6 +4186,18 @@ mod tests {
         let current_profile = context.profile_for(&current_identity).unwrap();
         assert_eq!(current_profile.rider_item.character, selection.character);
         assert_eq!(current_profile.rider_item.kart, selection.kart);
+        assert_eq!(current_profile.rider.premium, 42);
+        assert_eq!(current_profile.rider.rp, 51_360);
+        assert_eq!(current_profile.rider.club_name, "FreshEquipmentContext");
+        assert_eq!(current_profile.game_option.screen, 7);
+        assert_eq!(
+            context
+                .bound_profile_for(&current_identity)
+                .unwrap()
+                .profile
+                .revision,
+            Some(3)
+        );
         let expected_snapshot: [u8; 65] = packet[4..].try_into().unwrap();
         assert_eq!(
             rider_item_snapshot(&current_profile.rider_item),
@@ -4194,7 +4206,7 @@ mod tests {
         let persisted = ProfileStore::new(profile_root.path())
             .load_or_create("RiderOwner")
             .unwrap();
-        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(persisted.revision, Some(3));
         assert_eq!(persisted.profile.rider_item.character, selection.character);
 
         world.session_closed(session).await.unwrap();
@@ -4203,32 +4215,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_rider_reloads_disk_and_replaces_the_bound_context_snapshot() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end test covers both valid and wire-invalid GetRider refreshes against one tracked MyRoom"
+    )]
+    async fn get_rider_reloads_disk_and_silently_refreshes_the_myroom_cache() {
         let profile_root = tempfile::tempdir().unwrap();
-        let (profiles, _profile_runtime) =
+        let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
-        let (world, world_task) = WorldHandle::spawn(8);
-        let session = world
-            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_950))
-            .await
-            .unwrap();
-        let identity = world.claim_identity(session, "FreshRider").await.unwrap();
-        let admission = profiles
-            .admit(&identity.nickname, "test initial profile load")
-            .await
-            .unwrap();
-        let (profile, lane) = profiles
-            .load(identity.nickname.clone(), true, admission)
-            .await
-            .unwrap();
-        let mut context = SessionContext::default();
-        context.bind_profile(identity.clone(), profile);
-        drop(lane);
-
+        let myroom = spawn_myroom_world(MyRoomInfo::default());
+        let world = myroom.handle;
+        let actor = myroom.actor;
+        let mut owner = myroom.owner;
+        let mut visitor = myroom.visitor;
+        let session = owner.session;
+        let identity = owner.identity.clone();
+        let mut context = bind_test_profile(&profiles, &identity).await;
         let stale_premium = context.profile_for(&identity).unwrap().rider.premium;
         assert_ne!(stale_premium, 42);
         ProfileStore::new(profile_root.path())
-            .update("FreshRider", |profile| profile.rider.premium = 42)
+            .update(&identity.nickname, |profile| {
+                profile.rider.premium = 42;
+                profile.rider.p2p_port = 45_137;
+                profile.rider.rp = 515_137;
+                profile.rider.club_name = "FreshGetRider".to_owned();
+                profile.rider_item.character = 1_000;
+                profile.rider_item.kart = 1;
+                profile.rider_item.kart_serial = 0;
+                profile.rider_item.unknown4 = 0xD5;
+                profile.rider_item.kart_coating = 0xD6D7;
+                profile.rider_item.kart_tail_lamp = 0xD8D9;
+            })
             .unwrap();
         assert_eq!(
             context.profile_for(&identity).unwrap().rider.premium,
@@ -4241,11 +4258,78 @@ mod tests {
             .unwrap();
         assert!(!responses.is_empty());
         let current = world.authorize_identity(session).await.unwrap();
-        assert_eq!(context.profile_for(&current).unwrap().rider.premium, 42);
+        let current_profile = context.profile_for(&current).unwrap();
+        assert_eq!(current_profile.rider.premium, 42);
+        assert_eq!(current_profile.rider.p2p_port, 45_137);
+        assert_eq!(current_profile.rider.rp, 515_137);
+        assert_eq!(current_profile.rider.club_name, "FreshGetRider");
+        assert_eq!(current_profile.rider_item.kart, 1);
+        assert_eq!(current_profile.rider_item.kart_serial, 1);
+        assert_eq!(current_profile.rider_item.unknown4, 0xD5);
+        assert_eq!(current_profile.rider_item.kart_tail_lamp, 0xD8D9);
+        let mut rider_reader = PacketReader::new(responses.last().unwrap());
+        assert_eq!(
+            rider_reader.read_u32().unwrap(),
+            adler32::packet_hash("PrGetRider")
+        );
+        assert_eq!(rider_reader.read_u8().unwrap(), 1);
+        assert_eq!(rider_reader.read_u8().unwrap(), 0);
+        assert_eq!(rider_reader.read_utf16().unwrap(), identity.nickname);
+        for _ in 0..5 {
+            rider_reader.read_u16().unwrap();
+        }
+        assert_eq!(
+            rider_reader
+                .read_bytes(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH)
+                .unwrap(),
+            rider_item_snapshot(&current_profile.rider_item)
+        );
+        assert!(
+            owner.outbound.try_recv().is_err(),
+            "GetRider must not immediately publish a MyRoom snapshot to its requester"
+        );
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "GetRider must not immediately publish a MyRoom snapshot to a visitor"
+        );
+        let cached_owner = myroom_profile_presentation(current_profile).player_for(&identity);
 
-        world.session_closed(session).await.unwrap();
-        world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        let invalid_club_name = "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1);
+        ProfileStore::new(profile_root.path())
+            .update(&identity.nickname, |profile| {
+                profile.rider.premium = 43;
+                profile.rider.club_name.clone_from(&invalid_club_name);
+            })
+            .unwrap();
+        let invalid_responses = handle_get_rider(&world, &profiles, session, &mut context)
+            .await
+            .unwrap();
+        assert!(!invalid_responses.is_empty());
+        let current = world.authorize_identity(session).await.unwrap();
+        let invalid_profile = context.profile_for(&current).unwrap();
+        assert_eq!(invalid_profile.rider.premium, 43);
+        assert_eq!(invalid_profile.rider.club_name, invalid_club_name);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        world.session_closed(visitor.session).await.unwrap();
+        let persisted = ProfileStore::new(profile_root.path())
+            .load_or_create(&identity.nickname)
+            .unwrap();
+        assert_eq!(persisted.revision, Some(4));
+        assert_eq!(persisted.profile.rider_item.kart_serial, 1);
+        let expected_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] = array::from_fn(|slot| {
+            if slot == 0 {
+                MyRoomSlot::Player(cached_owner.clone())
+            } else {
+                MyRoomSlot::Empty
+            }
+        });
+        let packet = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packet, vec![serialize_slot_data(&expected_slots).unwrap()]);
+        assert!(owner.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[tokio::test]
@@ -4293,7 +4377,7 @@ mod tests {
         invalid.character = 999;
         assert!(matches!(
             validate_rider_item_selection(&catalog, &profile, invalid),
-            Err(LoginSessionError::RiderItemNotGranted {
+            Err(RiderEquipmentValidationError::RiderItemNotGranted {
                 category: 1,
                 item_id: 999
             })
@@ -4311,48 +4395,11 @@ mod tests {
         duplicate_kart.kart_serial = 3;
         assert!(matches!(
             validate_rider_item_selection(&catalog, &profile, duplicate_kart),
-            Err(LoginSessionError::KartNotGranted {
+            Err(RiderEquipmentValidationError::KartNotGranted {
                 kart_id: 1,
                 serial: 3
             })
         ));
-    }
-
-    #[tokio::test]
-    async fn rejected_rider_selection_does_not_publish_a_profile_revision() {
-        let profile_root = tempfile::tempdir().unwrap();
-        let (profiles, _profile_runtime) =
-            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
-        let admission = profiles
-            .admit("Rider", "test initial profile load")
-            .await
-            .unwrap();
-        let (_, lane) = profiles
-            .load("Rider".to_owned(), true, admission)
-            .await
-            .unwrap();
-        drop(lane);
-        let mut invalid = rider_selection();
-        invalid.character = 999;
-        let admission = profiles
-            .admit("Rider", "test rejected rider update")
-            .await
-            .unwrap();
-        assert!(matches!(
-            profiles
-                .update_rider_items("Rider".to_owned(), invalid, admission)
-                .await,
-            Err(LoginSessionError::RiderItemNotGranted {
-                category: 1,
-                item_id: 999
-            })
-        ));
-
-        let persisted = ProfileStore::new(profile_root.path())
-            .load_or_create("Rider")
-            .unwrap();
-        assert_eq!(persisted.revision, Some(1));
-        assert_eq!(persisted.profile.rider_item.character, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4413,16 +4460,16 @@ mod tests {
                 .admit(preflight.nickname(), "load migrated profile")
                 .await
                 .unwrap();
-            let (_, lane) = migration_profiles
+            let (profile, lane) = migration_profiles
                 .load(preflight.nickname().to_owned(), false, admission)
                 .await
                 .unwrap();
-            let completion = migration_world
-                .complete_preflighted_migration(preflight, Instant::now())
+            let presentation = myroom_profile_presentation(&profile.profile);
+            let profile_lease = MyRoomProfileLease::new(presentation, lane);
+            migration_world
+                .complete_preflighted_migration(preflight, profile_lease)
                 .await
-                .unwrap();
-            drop(lane);
-            completion
+                .unwrap()
         });
 
         assert!(
@@ -4442,6 +4489,134 @@ mod tests {
             Some(67)
         );
 
+        world.session_closed(destination).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cancellation test exercises the complete handler, lane wait, exact abort, and successful retry lifecycle"
+    )]
+    async fn cancelled_channel_move_in_handler_releases_its_exact_migration_freeze() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let (world, world_task) = WorldHandle::spawn(32);
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(address, 49_902))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(address, 49_903))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(source, "CancelledMigrationRider")
+            .await
+            .unwrap();
+        let admission = profiles
+            .admit(&identity.nickname, "test initial profile load")
+            .await
+            .unwrap();
+        let (_, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        drop(lane);
+
+        let token = MigrationToken::new(0x5137).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 12,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let held_admission = profiles
+            .admit(&identity.nickname, "hold cancelled migration profile lane")
+            .await
+            .unwrap();
+        let mut packet = PacketWriter::named("PqChannelMovein");
+        packet.write_u32(identity.user_no.get());
+        packet.write_u16(12);
+        packet.write_u16(token.get());
+        let packet = packet.into_inner();
+
+        let cancelled_world = world.clone();
+        let cancelled_profiles = profiles.clone();
+        let cancelled_packet = packet.clone();
+        let mut handler = tokio::spawn(async move {
+            let mut context = SessionContext::default();
+            handle_channel_move_in(
+                &ServerConfig::default(),
+                &cancelled_world,
+                &cancelled_profiles,
+                destination,
+                &cancelled_packet,
+                &mut context,
+            )
+            .await
+        });
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    world.authorize_identity(source).await,
+                    Err(WorldError::Identity(
+                        IdentityError::TransferInProgress { .. }
+                    ))
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the channel-move handler never installed its source freeze");
+        assert!(
+            time::timeout(Duration::from_millis(20), &mut handler)
+                .await
+                .is_err(),
+            "the migration handler did not remain blocked on the held profile lane"
+        );
+
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled());
+        world.drain_myroom_completions().await.unwrap();
+        assert_eq!(world.authorize_identity(source).await.unwrap(), identity);
+        assert!(matches!(
+            world.authorize_identity(destination).await,
+            Err(WorldError::Identity(
+                IdentityError::UnauthenticatedSession(session)
+            )) if session == destination
+        ));
+
+        drop(held_admission);
+        let mut retry_context = SessionContext::default();
+        let responses = handle_channel_move_in(
+            &ServerConfig::default(),
+            &world,
+            &profiles,
+            destination,
+            &packet,
+            &mut retry_context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.len(), 1);
+        let migrated = world.authorize_identity(destination).await.unwrap();
+        assert_eq!(migrated.user_no, identity.user_no);
+        assert!(migrated.generation.get() > identity.generation.get());
+        assert!(retry_context.bound_profile_for(&migrated).is_ok());
+
+        world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap();
@@ -4517,6 +4692,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retry.source_generation(), identity.generation);
+        assert!(matches!(
+            world.authorize_identity(source).await,
+            Err(WorldError::Identity(IdentityError::TransferInProgress {
+                ref nickname,
+            })) if nickname == "MissingMigrationProfile"
+        ));
+        drop(retry);
+        world.drain_myroom_completions().await.unwrap();
+        assert_eq!(world.authorize_identity(source).await.unwrap(), identity);
 
         world.session_closed(destination).await.unwrap();
         world.session_closed(source).await.unwrap();
@@ -4628,107 +4812,6 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.revision, Some(2));
         assert_eq!(persisted.profile.game_option.video_quality, 77);
-
-        world.session_closed(source).await.unwrap();
-        world.session_closed(destination).await.unwrap();
-        world.shutdown().await.unwrap();
-        world_task.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_rider_update_keeps_gate_until_save_precedes_migration() {
-        let profile_root = tempfile::tempdir().unwrap();
-        let hook = BlockingUpdateHook::new();
-        let (profiles, _profile_runtime) =
-            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
-        let profiles = profiles.with_blocking_update_hook(Arc::clone(&hook));
-        let (world, world_task) = WorldHandle::spawn(32);
-        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let source = world
-            .register_session(SocketAddr::new(address, 50_100))
-            .await
-            .unwrap();
-        let destination = world
-            .register_session(SocketAddr::new(address, 50_101))
-            .await
-            .unwrap();
-        let identity = world
-            .claim_identity(source, "EquipmentRider")
-            .await
-            .unwrap();
-        let admission = profiles
-            .admit(&identity.nickname, "test initial profile load")
-            .await
-            .unwrap();
-        let (_, lane) = profiles
-            .load(identity.nickname.clone(), true, admission)
-            .await
-            .unwrap();
-        drop(lane);
-        let token = MigrationToken::new(0x5137).unwrap();
-        world
-            .begin_migration(
-                source,
-                ChannelBinding {
-                    channel_id: 12,
-                    game_type: 67,
-                },
-                token,
-                Instant::now(),
-            )
-            .await
-            .unwrap();
-
-        let update_profiles = profiles.clone();
-        let nickname = identity.nickname.clone();
-        let update = tokio::spawn(async move {
-            let admission = update_profiles
-                .admit(&nickname, "test blocked rider update")
-                .await?;
-            update_profiles
-                .update_rider_items(nickname, rider_selection(), admission)
-                .await
-        });
-        let entered_hook = Arc::clone(&hook);
-        tokio::task::spawn_blocking(move || entered_hook.entered.wait())
-            .await
-            .unwrap();
-        update.abort();
-        assert!(update.await.unwrap_err().is_cancelled());
-
-        let migration_profiles = profiles.clone();
-        let migration_world = world.clone();
-        let user_no = identity.user_no;
-        let migration_nickname = identity.nickname.clone();
-        let mut migration = tokio::spawn(async move {
-            let admission = migration_profiles
-                .admit(&migration_nickname, "test migration handoff")
-                .await
-                .unwrap();
-            let completion = migration_world
-                .complete_migration(destination, user_no, 12, token, Instant::now())
-                .await;
-            drop(admission);
-            completion
-        });
-        assert!(
-            time::timeout(Duration::from_millis(50), &mut migration)
-                .await
-                .is_err(),
-            "migration acquired the equipment gate while the cancelled save still ran"
-        );
-
-        let release_hook = Arc::clone(&hook);
-        tokio::task::spawn_blocking(move || release_hook.release.wait())
-            .await
-            .unwrap();
-        migration.await.unwrap().unwrap();
-        let persisted = ProfileStore::new(profile_root.path())
-            .load_or_create("EquipmentRider")
-            .unwrap();
-        assert_eq!(persisted.revision, Some(2));
-        assert_eq!(persisted.profile.rider_item.character, 1_000);
-        assert_eq!(persisted.profile.rider_item.kart, 1);
 
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();

@@ -3,6 +3,7 @@
 use std::{
     array,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU64, NonZeroUsize},
     time::{Duration, Instant},
@@ -55,6 +56,11 @@ use tokio::{
     time::MissedTickBehavior,
 };
 
+use crate::equipment_persistence::{
+    DurableRiderEquipment, PreparedRiderEquipmentWrite, RegisteredRiderEquipmentWrite,
+    RiderEquipmentProfileCompletion, RiderEquipmentProfileJobResult, RiderEquipmentPublication,
+    RiderEquipmentPublicationInvariantError, RiderEquipmentWriteError, RiderEquipmentWriteReceipt,
+};
 use crate::identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
     IdentityRegistry, MigrationCompletion, MigrationPermit, MigrationPreflight, MigrationToken,
@@ -63,17 +69,17 @@ use crate::identity::{
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 use crate::myroom_hub::{
-    IdentityAdvanceEffects, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
-    MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError,
-    RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
+    MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
+    MyRoomProfilePresentation, MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection,
+    MyRoomWireProjectionError, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
 };
 use crate::myroom_persistence::{
-    MyRoomCompletionBridge, MyRoomCompletionDrainError, MyRoomInfoPublication,
-    MyRoomInfoWriteError, MyRoomInfoWriteReceipt, MyRoomPersistenceInvariantError,
-    MyRoomProfileCompletion, MyRoomProfileJobResult, MyRoomProfileTicketId,
-    PreparedMyRoomInfoWrite, RegisteredMyRoomInfoWrite,
+    MigrationProfileCompletion, MyRoomCompletionBridge, MyRoomCompletionDrainError,
+    MyRoomCompletionSlot, MyRoomInfoPublication, MyRoomInfoWriteError, MyRoomInfoWriteReceipt,
+    MyRoomPersistenceInvariantError, MyRoomProfileCompletion, MyRoomProfileJobResult,
+    MyRoomProfileTicketId, PreparedMyRoomInfoWrite, RegisteredMyRoomInfoWrite,
 };
-use crate::profile_io::{DurableRewardReceipt, ProfileJobAdmission};
+use crate::profile_io::{DurableRewardReceipt, MyRoomProfileLease, ProfileJobAdmission};
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
     UdpIngressBody, UdpService, UdpServiceError,
@@ -280,7 +286,7 @@ impl RewardSettlementTask {
 // integration tranche; tests exercise every variant in the meantime.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum RewardPersistenceCompletion {
-    Durable(DurableRewardReceipt),
+    Durable(Box<DurableRewardReceipt>),
     RetryableFailure(RewardSettlementTask),
     FatalFailure(RewardSettlementTask),
 }
@@ -474,20 +480,30 @@ impl RewardDrainStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorldForceShutdownReport {
-    pending_myroom_tickets: usize,
-    pending_myroom_user_indexes: usize,
+    myroom_tickets: usize,
+    myroom_user_indexes: usize,
+    rider_equipment_tickets: usize,
+    rider_equipment_user_indexes: usize,
+    migration_transfers: usize,
 }
 
 impl WorldForceShutdownReport {
     fn capture(world: &World) -> Self {
         Self {
-            pending_myroom_tickets: world.pending_myroom_writes.len(),
-            pending_myroom_user_indexes: world.pending_myroom_by_user.len(),
+            myroom_tickets: world.pending_myroom_writes.len(),
+            myroom_user_indexes: world.pending_myroom_by_user.len(),
+            rider_equipment_tickets: world.pending_rider_equipment_writes.len(),
+            rider_equipment_user_indexes: world.pending_rider_equipment_by_user.len(),
+            migration_transfers: world.identities.transfer_in_progress_count(),
         }
     }
 
-    fn has_abandoned_myroom_publications(self) -> bool {
-        self.pending_myroom_tickets != 0 || self.pending_myroom_user_indexes != 0
+    fn has_abandoned_completion_work(self) -> bool {
+        self.myroom_tickets != 0
+            || self.myroom_user_indexes != 0
+            || self.rider_equipment_tickets != 0
+            || self.rider_equipment_user_indexes != 0
+            || self.migration_transfers != 0
     }
 }
 
@@ -984,6 +1000,9 @@ pub enum WorldError {
     )]
     MyRoomWireProjectionMismatch { session: SessionId },
 
+    #[error("MyRoom profile lane for {actual:?} cannot refresh identity {expected:?}")]
+    MyRoomProfileSubjectMismatch { expected: String, actual: String },
+
     #[error(
         "reward attempt ID space exhausted for room {room_id}, epoch {race_epoch}, user {user_no}"
     )]
@@ -1068,6 +1087,9 @@ pub(crate) enum WorldSidecarError {
     #[error("world MyRoom persistence failed: {0}")]
     MyRoomPersistence(#[from] MyRoomPersistenceInvariantError),
 
+    #[error("world rider-equipment publication failed: {0}")]
+    RiderEquipment(#[from] RiderEquipmentPublicationInvariantError),
+
     #[error("world identity capacity must be nonzero")]
     InvalidIdentityCapacity,
 }
@@ -1083,6 +1105,22 @@ enum MyRoomInfoRegistrationError {
     Request(Box<MyRoomInfoWriteError>),
     MyRoom(Box<MyRoomLifecycleError>),
     Terminal(Box<MyRoomPersistenceInvariantError>),
+}
+
+#[derive(Debug)]
+enum RiderEquipmentRegistrationError {
+    Request(Box<RiderEquipmentWriteError>),
+    Terminal(Box<RiderEquipmentPublicationInvariantError>),
+}
+
+impl RiderEquipmentRegistrationError {
+    fn request(error: RiderEquipmentWriteError) -> Self {
+        Self::Request(Box::new(error))
+    }
+
+    fn terminal(error: RiderEquipmentPublicationInvariantError) -> Self {
+        Self::Terminal(Box::new(error))
+    }
 }
 
 impl MyRoomInfoRegistrationError {
@@ -1129,6 +1167,114 @@ impl From<MyRoomLifecycleError> for WorldOperationError {
     }
 }
 
+/// Cancellation-safe ownership of an identity migration freeze.
+///
+/// Dropping this capability before submission reports an abort through the
+/// pre-reserved completion channel. Once submitted, the World actor owns both
+/// the preflight and profile lease until it publishes one terminal result.
+pub(crate) struct RegisteredMigrationPreflight {
+    preflight: Option<Box<MigrationPreflight>>,
+    completion: Option<MyRoomCompletionSlot>,
+}
+
+impl fmt::Debug for RegisteredMigrationPreflight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredMigrationPreflight")
+            .field(
+                "nickname",
+                &self.preflight.as_deref().map(MigrationPreflight::nickname),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RegisteredMigrationPreflight {
+    fn new(preflight: MigrationPreflight, completion: MyRoomCompletionSlot) -> Self {
+        Self {
+            preflight: Some(Box::new(preflight)),
+            completion: Some(completion),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn nickname(&self) -> &str {
+        self.preflight
+            .as_deref()
+            .expect("a registered migration retains its preflight until submission")
+            .nickname()
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn canonical_nickname(&self) -> &str {
+        self.preflight
+            .as_deref()
+            .expect("a registered migration retains its preflight until submission")
+            .canonical_nickname()
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn user_no(&self) -> UserNo {
+        self.preflight
+            .as_deref()
+            .expect("a registered migration retains its preflight until submission")
+            .user_no()
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn source_generation(&self) -> IdentityGeneration {
+        self.preflight
+            .as_deref()
+            .expect("a registered migration retains its preflight until submission")
+            .source_generation()
+    }
+
+    #[must_use]
+    pub(crate) fn destination_ip(&self) -> IpAddr {
+        self.preflight
+            .as_deref()
+            .expect("a registered migration retains its preflight until submission")
+            .destination_ip()
+    }
+
+    fn submit(
+        mut self,
+        profile: MyRoomProfileLease,
+        reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
+    ) {
+        let preflight = self
+            .preflight
+            .take()
+            .expect("a registered migration submits its preflight exactly once");
+        let completion = self
+            .completion
+            .take()
+            .expect("a registered migration submits its completion capability exactly once");
+        completion.send(MyRoomProfileCompletion::Migration(
+            MigrationProfileCompletion::Ready {
+                preflight,
+                profile: Box::new(profile),
+                reply,
+            },
+        ));
+    }
+}
+
+impl Drop for RegisteredMigrationPreflight {
+    fn drop(&mut self) {
+        let (Some(preflight), Some(completion)) = (self.preflight.take(), self.completion.take())
+        else {
+            return;
+        };
+        completion.send(MyRoomProfileCompletion::Migration(
+            MigrationProfileCompletion::Aborted { preflight },
+        ));
+    }
+}
+
 #[derive(Debug)]
 enum WorldCommand {
     RegisterSession {
@@ -1172,23 +1318,25 @@ enum WorldCommand {
         channel_id: u16,
         token: MigrationToken,
         now: Instant,
-        reply: oneshot::Sender<Result<MigrationPreflight, WorldError>>,
-    },
-    #[cfg_attr(not(test), allow(dead_code))]
-    CompletePreflightedMigration {
-        preflight: MigrationPreflight,
-        now: Instant,
-        reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
+        completion: MyRoomCompletionSlot,
+        reply: oneshot::Sender<Result<RegisteredMigrationPreflight, WorldError>>,
     },
     RoomProtocol {
         session: SessionId,
         payload: Box<RoomCommandPayload>,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
     PublishRoomEquipment {
         session: SessionId,
         snapshot: Box<[u8; 65]>,
         reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    RefreshMyRoomPresentation {
+        session: SessionId,
+        expected: IdentityBinding,
+        profile: Box<MyRoomProfileLease>,
+        reply: oneshot::Sender<Result<bool, WorldError>>,
     },
     Lobby {
         session: SessionId,
@@ -1257,6 +1405,13 @@ enum WorldCommand {
         prepared: PreparedMyRoomInfoWrite,
         request_reply: oneshot::Sender<Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError>>,
         reply: oneshot::Sender<Result<RegisteredMyRoomInfoWrite, MyRoomInfoWriteError>>,
+    },
+    RegisterRiderEquipmentWrite {
+        session: SessionId,
+        prepared: PreparedRiderEquipmentWrite,
+        request_reply:
+            oneshot::Sender<Result<RiderEquipmentWriteReceipt, RiderEquipmentWriteError>>,
+        reply: oneshot::Sender<Result<RegisteredRiderEquipmentWrite, RiderEquipmentWriteError>>,
     },
     MyRoomSessionView {
         session: SessionId,
@@ -1369,6 +1524,7 @@ impl WorldHandle {
                 Err(
                     WorldSidecarError::MyRoom(_)
                     | WorldSidecarError::MyRoomPersistence(_)
+                    | WorldSidecarError::RiderEquipment(_)
                     | WorldSidecarError::InvalidIdentityCapacity,
                 ) => {
                     unreachable!("messenger-only test world has no MyRoom mutation commands")
@@ -1578,7 +1734,12 @@ impl WorldHandle {
         channel_id: u16,
         token: MigrationToken,
         now: Instant,
-    ) -> Result<MigrationPreflight, WorldError> {
+    ) -> Result<RegisteredMigrationPreflight, WorldError> {
+        let completion = self
+            .myroom_completions
+            .reserve()
+            .await
+            .map_err(|_| WorldError::Stopped)?;
         let (reply, response) = oneshot::channel();
         self.sender
             .send(WorldCommand::PreflightMigration {
@@ -1587,6 +1748,7 @@ impl WorldHandle {
                 channel_id,
                 token,
                 now,
+                completion,
                 reply,
             })
             .await
@@ -1597,18 +1759,11 @@ impl WorldHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn complete_preflighted_migration(
         &self,
-        preflight: MigrationPreflight,
-        now: Instant,
+        preflight: RegisteredMigrationPreflight,
+        profile: MyRoomProfileLease,
     ) -> Result<MigrationCompletion, WorldError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WorldCommand::CompletePreflightedMigration {
-                preflight,
-                now,
-                reply,
-            })
-            .await
-            .map_err(|_| WorldError::Stopped)?;
+        preflight.submit(profile, reply);
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
@@ -1629,6 +1784,7 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn publish_room_equipment(
         &self,
         session: SessionId,
@@ -1639,6 +1795,28 @@ impl WorldHandle {
             .send(WorldCommand::PublishRoomEquipment {
                 session,
                 snapshot: Box::new(snapshot),
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    /// Updates the actor-owned `MyRoom` cache from one profile snapshot without
+    /// emitting `RmSlotData`. C# exposes the change only through a later
+    /// topology publication or an explicit First request.
+    pub(crate) async fn refresh_myroom_presentation(
+        &self,
+        session: SessionId,
+        expected: IdentityBinding,
+        profile: MyRoomProfileLease,
+    ) -> Result<bool, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::RefreshMyRoomPresentation {
+                session,
+                expected,
+                profile: Box::new(profile),
                 reply,
             })
             .await
@@ -1866,6 +2044,42 @@ impl WorldHandle {
             .await
     }
 
+    pub(crate) async fn reserve_rider_equipment_completion(
+        &self,
+    ) -> Result<crate::myroom_persistence::MyRoomCompletionSlot, RiderEquipmentWriteError> {
+        self.myroom_completions
+            .reserve()
+            .await
+            .map_err(|_| RiderEquipmentWriteError::CompletionMailboxClosed)
+    }
+
+    pub(crate) async fn persist_rider_equipment(
+        &self,
+        session: SessionId,
+        prepared: PreparedRiderEquipmentWrite,
+    ) -> Result<RiderEquipmentWriteReceipt, RiderEquipmentWriteError> {
+        let (request_reply, request_response) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::RegisterRiderEquipmentWrite {
+                session,
+                prepared,
+                request_reply,
+                reply,
+            })
+            .await
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)?;
+        let registered = response
+            .await
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)??;
+        // The actor-minted ticket, profile lane, and pre-reserved completion
+        // capability are transferred without an intervening await.
+        registered.submit();
+        request_response
+            .await
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)?
+    }
+
     #[cfg(test)]
     pub(crate) async fn persist_myroom_owner_info_with_test_hook(
         &self,
@@ -1991,6 +2205,8 @@ struct World {
     next_reward_attempt_id: Option<NonZeroU64>,
     pending_myroom_writes: HashMap<MyRoomProfileTicketId, PendingMyRoomInfoWrite>,
     pending_myroom_by_user: HashMap<UserNo, MyRoomProfileTicketId>,
+    pending_rider_equipment_writes: HashMap<MyRoomProfileTicketId, PendingRiderEquipmentWrite>,
+    pending_rider_equipment_by_user: HashMap<UserNo, MyRoomProfileTicketId>,
     next_myroom_ticket: Option<MyRoomProfileTicketId>,
     quiescing: bool,
 }
@@ -2018,6 +2234,24 @@ struct PendingMyRoomInfoWrite {
     proposed: MyRoomInfo,
     echo: ReservedOutbound,
     reply: oneshot::Sender<Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError>>,
+}
+
+#[derive(Debug)]
+struct PendingRiderEquipmentWrite {
+    expected: IdentityBinding,
+    requested: p5136_core::equipment_protocol::RiderItemSelection,
+    reply: Option<oneshot::Sender<Result<RiderEquipmentWriteReceipt, RiderEquipmentWriteError>>>,
+    close_requested: bool,
+    deferred_close_replies: Vec<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct RoomEquipmentPlan {
+    room_id: RoomId,
+    user_no: UserNo,
+    snapshot: [u8; 65],
+    packet: Vec<u8>,
+    recipients: Vec<UserNo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2570,7 +2804,7 @@ impl ProtocolRoomState {
     }
 
     fn set_equipment_snapshot(&mut self, user_no: UserNo, snapshot: [u8; 65]) -> bool {
-        if let Some(member) = self
+        let updated = if let Some(member) = self
             .members_by_id
             .iter_mut()
             .chain(&mut self.observers)
@@ -2581,7 +2815,31 @@ impl ProtocolRoomState {
             true
         } else {
             false
+        };
+        if updated
+            && let Some(result) = self
+                .frozen_race
+                .as_mut()
+                .and_then(|frozen| {
+                    frozen
+                        .participants
+                        .iter_mut()
+                        .find(|participant| participant.identity.user_no == user_no)
+                })
+                .and_then(|participant| participant.result.as_mut())
+        {
+            result.character_id = u16::from_le_bytes(
+                snapshot[..2]
+                    .try_into()
+                    .expect("the character field is a fixed two-byte slice"),
+            );
+            result.kart_id = u16::from_le_bytes(
+                snapshot[4..6]
+                    .try_into()
+                    .expect("the kart field is a fixed two-byte slice"),
+            );
         }
+        updated
     }
 
     fn list_entry(&self) -> RoomListEntry {
@@ -2723,6 +2981,8 @@ impl Default for World {
             next_reward_attempt_id: Some(NonZeroU64::MIN),
             pending_myroom_writes: HashMap::new(),
             pending_myroom_by_user: HashMap::new(),
+            pending_rider_equipment_writes: HashMap::new(),
+            pending_rider_equipment_by_user: HashMap::new(),
             next_myroom_ticket: Some(MyRoomProfileTicketId::FIRST),
             quiescing: false,
         }
@@ -3197,7 +3457,11 @@ impl World {
                 },
             ));
         }
-        if self.pending_myroom_by_user.contains_key(&identity.user_no) {
+        if self.pending_myroom_by_user.contains_key(&identity.user_no)
+            || self
+                .pending_rider_equipment_by_user
+                .contains_key(&identity.user_no)
+        {
             return Err(MyRoomInfoRegistrationError::request(
                 MyRoomInfoWriteError::AlreadyPending {
                     user_no: identity.user_no,
@@ -3246,6 +3510,73 @@ impl World {
             "one user cannot own two pending MyRoom profile tickets"
         );
         self.debug_assert_myroom_persistence();
+        Ok(prepared.register(ticket))
+    }
+
+    fn register_rider_equipment_write(
+        &mut self,
+        session: SessionId,
+        prepared: PreparedRiderEquipmentWrite,
+        reply: oneshot::Sender<Result<RiderEquipmentWriteReceipt, RiderEquipmentWriteError>>,
+    ) -> Result<RegisteredRiderEquipmentWrite, RiderEquipmentRegistrationError> {
+        if self.quiescing {
+            return Err(RiderEquipmentRegistrationError::request(
+                RiderEquipmentWriteError::WorldQuiescing,
+            ));
+        }
+        let identity = self.identities.authorize(session).map_err(|_| {
+            RiderEquipmentRegistrationError::request(
+                RiderEquipmentWriteError::UnauthenticatedSession { session },
+            )
+        })?;
+        if canonical_nickname_key(prepared.admitted_nickname())
+            != canonical_nickname_key(&identity.nickname)
+        {
+            return Err(RiderEquipmentRegistrationError::request(
+                RiderEquipmentWriteError::ProfileSubjectMismatch {
+                    admitted: prepared.admitted_nickname().to_owned(),
+                    active: identity.nickname,
+                },
+            ));
+        }
+        if self
+            .pending_rider_equipment_by_user
+            .contains_key(&identity.user_no)
+            || self.pending_myroom_by_user.contains_key(&identity.user_no)
+        {
+            return Err(RiderEquipmentRegistrationError::request(
+                RiderEquipmentWriteError::AlreadyPending {
+                    user_no: identity.user_no,
+                },
+            ));
+        }
+
+        let ticket = self.next_myroom_ticket.ok_or_else(|| {
+            RiderEquipmentRegistrationError::terminal(
+                RiderEquipmentPublicationInvariantError::TicketIdExhausted,
+            )
+        })?;
+        self.next_myroom_ticket = ticket.successor();
+        let pending = PendingRiderEquipmentWrite {
+            expected: identity.clone(),
+            requested: prepared.selection(),
+            reply: Some(reply),
+            close_requested: false,
+            deferred_close_replies: Vec::new(),
+        };
+        let replaced = self.pending_rider_equipment_writes.insert(ticket, pending);
+        debug_assert!(
+            replaced.is_none(),
+            "profile completion ticket IDs are never reused"
+        );
+        let replaced = self
+            .pending_rider_equipment_by_user
+            .insert(identity.user_no, ticket);
+        debug_assert!(
+            replaced.is_none(),
+            "one user cannot own two pending rider-equipment tickets"
+        );
+        self.debug_assert_rider_equipment_persistence();
         Ok(prepared.register(ticket))
     }
 
@@ -3303,9 +3634,22 @@ impl World {
             MyRoomProfileCompletion::Finished { ticket, result } => {
                 self.finish_myroom_profile_write(ticket, *result)
             }
+            MyRoomProfileCompletion::RiderEquipment(_) => {
+                unreachable!("rider-equipment completions use their dedicated dispatcher")
+            }
+            MyRoomProfileCompletion::Migration(_) => {
+                unreachable!("migration completions use their dedicated dispatcher")
+            }
             MyRoomProfileCompletion::DrainBarrier { reply } => {
-                let pending = self.pending_myroom_writes.len();
-                let indexed = self.pending_myroom_by_user.len();
+                let pending = self
+                    .pending_myroom_writes
+                    .len()
+                    .saturating_add(self.pending_rider_equipment_writes.len())
+                    .saturating_add(self.identities.transfer_in_progress_count());
+                let indexed = self
+                    .pending_myroom_by_user
+                    .len()
+                    .saturating_add(self.pending_rider_equipment_by_user.len());
                 if pending == 0 && indexed == 0 {
                     let _ = reply.send(Ok(()));
                     Ok(())
@@ -3377,6 +3721,203 @@ impl World {
         drop(lane);
         self.debug_assert_myroom_persistence();
         Ok(())
+    }
+
+    fn handle_rider_equipment_profile_completion(
+        &mut self,
+        completion: RiderEquipmentProfileCompletion,
+    ) -> Result<Vec<oneshot::Sender<()>>, RiderEquipmentPublicationInvariantError> {
+        match completion {
+            RiderEquipmentProfileCompletion::AbortedBeforeSubmission { ticket } => {
+                let mut pending = self.take_pending_rider_equipment_write(ticket)?;
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(Err(RiderEquipmentWriteError::AbortedBeforeSubmission));
+                }
+                self.finish_deferred_equipment_close(ticket, pending)
+            }
+            RiderEquipmentProfileCompletion::AcceptedOutcomeLost { ticket } => {
+                drop(self.take_pending_rider_equipment_write(ticket)?);
+                Err(
+                    RiderEquipmentPublicationInvariantError::AcceptedOutcomeLost {
+                        ticket: ticket.get(),
+                    },
+                )
+            }
+            RiderEquipmentProfileCompletion::Finished { ticket, result } => {
+                self.finish_rider_equipment_profile_write(ticket, *result)
+            }
+        }
+    }
+
+    fn finish_rider_equipment_profile_write(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+        result: RiderEquipmentProfileJobResult,
+    ) -> Result<Vec<oneshot::Sender<()>>, RiderEquipmentPublicationInvariantError> {
+        let mut pending = self.take_pending_rider_equipment_write(ticket)?;
+        let completion = result.map_err(|source| {
+            RiderEquipmentPublicationInvariantError::ProfileInfrastructure {
+                ticket: ticket.get(),
+                source,
+            }
+        })?;
+        let (result, lane) = completion.into_parts();
+        let subject_matches = lane
+            .subject()
+            .matches_nickname(&pending.expected.nickname)
+            .map_err(crate::profile_io::ProfileIoError::from)
+            .map_err(
+                |source| RiderEquipmentPublicationInvariantError::ProfileInfrastructure {
+                    ticket: ticket.get(),
+                    source,
+                },
+            )?;
+        if !subject_matches {
+            return Err(
+                RiderEquipmentPublicationInvariantError::CompletionSubjectMismatch {
+                    ticket: ticket.get(),
+                    expected: pending.expected.nickname,
+                    actual: lane.subject().nickname().to_owned(),
+                },
+            );
+        }
+        let durable = match result {
+            Ok(durable) => durable,
+            Err(error) => {
+                drop(lane);
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(Err(RiderEquipmentWriteError::Persistence(error)));
+                }
+                return self.finish_deferred_equipment_close(ticket, pending);
+            }
+        };
+        if durable.selection() != pending.requested
+            || durable.snapshot() != durable.presentation().rider_item_snapshot()
+        {
+            return Err(
+                RiderEquipmentPublicationInvariantError::DurableValueMismatch {
+                    ticket: ticket.get(),
+                },
+            );
+        }
+
+        let publication =
+            self.publish_durable_rider_equipment(ticket, &pending.expected, &durable)?;
+        let receipt = durable.into_receipt(publication);
+        if let Some(reply) = pending.reply.take() {
+            let _ = reply.send(Ok(receipt));
+        }
+        drop(lane);
+        let close_replies = self.finish_deferred_equipment_close(ticket, pending)?;
+        self.debug_assert_rider_equipment_persistence();
+        Ok(close_replies)
+    }
+
+    fn publish_durable_rider_equipment(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+        expected: &IdentityBinding,
+        durable: &DurableRiderEquipment,
+    ) -> Result<RiderEquipmentPublication, RiderEquipmentPublicationInvariantError> {
+        let active = self.identities.active_identity_by_user_no(expected.user_no);
+        let identity_state = if active.as_ref() == Some(expected) {
+            MyRoomCompletionIdentityState::Active
+        } else if active.is_none() && self.identities.is_current_ownerless_binding(expected) {
+            MyRoomCompletionIdentityState::Ownerless
+        } else if active.is_some() {
+            MyRoomCompletionIdentityState::Superseded
+        } else {
+            MyRoomCompletionIdentityState::Released
+        };
+        if identity_state == MyRoomCompletionIdentityState::Superseded {
+            return Ok(RiderEquipmentPublication::PersistedAfterSupersession);
+        }
+        if identity_state == MyRoomCompletionIdentityState::Released {
+            return Ok(RiderEquipmentPublication::PersistedAfterRelease);
+        }
+
+        let protocol_plan = if identity_state == MyRoomCompletionIdentityState::Active {
+            let mapped_room = self.protocol_room_by_user.get(&expected.user_no).copied();
+            let plan = self
+                .plan_room_equipment(expected.user_no, *durable.snapshot())
+                .map_err(|source| RiderEquipmentPublicationInvariantError::Protocol {
+                    ticket: ticket.get(),
+                    source,
+                })?;
+            if let Some(room_id) = mapped_room
+                && plan.is_none()
+            {
+                return Err(
+                    RiderEquipmentPublicationInvariantError::ProtocolMembership {
+                        ticket: ticket.get(),
+                        room_id: room_id.0,
+                        user_no: expected.user_no,
+                    },
+                );
+            }
+            plan
+        } else {
+            None
+        };
+        let transition = match self
+            .myroom
+            .refresh_profile_if_tracked(expected, durable.presentation())
+        {
+            Ok(transition) => transition,
+            Err(MyRoomHubError::Wire(source)) => {
+                tracing::warn!(
+                    ticket = ticket.get(),
+                    nickname = %expected.nickname,
+                    %source,
+                    "skipped invalid MyRoom presentation after durable rider-equipment write"
+                );
+                None
+            }
+            Err(source) => {
+                return Err(RiderEquipmentPublicationInvariantError::Hub {
+                    ticket: ticket.get(),
+                    source,
+                });
+            }
+        };
+
+        if let Some(transition) = transition {
+            transition.commit(&mut self.myroom).map_err(|source| {
+                RiderEquipmentPublicationInvariantError::Commit {
+                    ticket: ticket.get(),
+                    source,
+                }
+            })?;
+        }
+        if let Some(plan) = protocol_plan {
+            self.commit_room_equipment(plan).map_err(|source| {
+                RiderEquipmentPublicationInvariantError::Delivery {
+                    ticket: ticket.get(),
+                    source: Box::new(source),
+                }
+            })?;
+        }
+        self.debug_assert_invariants();
+        Ok(if identity_state == MyRoomCompletionIdentityState::Active {
+            RiderEquipmentPublication::ActiveCachesUpdated
+        } else {
+            RiderEquipmentPublication::OwnerlessCachesUpdated
+        })
+    }
+
+    fn finish_deferred_equipment_close(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+        pending: PendingRiderEquipmentWrite,
+    ) -> Result<Vec<oneshot::Sender<()>>, RiderEquipmentPublicationInvariantError> {
+        if pending.close_requested {
+            self.close_session(pending.expected.owner, Instant::now())
+                .map_err(|source| RiderEquipmentPublicationInvariantError::Delivery {
+                    ticket: ticket.get(),
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(pending.deferred_close_replies)
     }
 
     fn publish_durable_myroom_info(
@@ -3477,6 +4018,71 @@ impl World {
         debug_assert!(self.pending_myroom_writes.iter().all(|(ticket, pending)| {
             self.pending_myroom_by_user.get(&pending.expected.user_no) == Some(ticket)
         }));
+    }
+
+    fn take_pending_rider_equipment_write(
+        &mut self,
+        ticket: MyRoomProfileTicketId,
+    ) -> Result<PendingRiderEquipmentWrite, RiderEquipmentPublicationInvariantError> {
+        let pending = self.pending_rider_equipment_writes.remove(&ticket).ok_or(
+            RiderEquipmentPublicationInvariantError::UnknownTicket {
+                ticket: ticket.get(),
+            },
+        )?;
+        let actual = self
+            .pending_rider_equipment_by_user
+            .remove(&pending.expected.user_no);
+        if actual != Some(ticket) {
+            return Err(
+                RiderEquipmentPublicationInvariantError::PendingIndexMismatch {
+                    user_no: pending.expected.user_no,
+                    expected: ticket.get(),
+                    actual: actual.map(MyRoomProfileTicketId::get),
+                },
+            );
+        }
+        self.debug_assert_rider_equipment_persistence();
+        Ok(pending)
+    }
+
+    fn debug_assert_rider_equipment_persistence(&self) {
+        debug_assert_eq!(
+            self.pending_rider_equipment_writes.len(),
+            self.pending_rider_equipment_by_user.len()
+        );
+        debug_assert!(
+            self.pending_rider_equipment_writes
+                .iter()
+                .all(|(ticket, pending)| {
+                    self.pending_rider_equipment_by_user
+                        .get(&pending.expected.user_no)
+                        == Some(ticket)
+                })
+        );
+    }
+
+    fn defer_session_close_for_rider_equipment(
+        &mut self,
+        session: SessionId,
+        reply: &mut Option<oneshot::Sender<()>>,
+    ) -> bool {
+        let Some(pending) = self
+            .pending_rider_equipment_writes
+            .values_mut()
+            .find(|pending| pending.expected.owner == session)
+        else {
+            return false;
+        };
+        pending.close_requested = true;
+        if let Some(reply) = reply.take() {
+            pending.deferred_close_replies.push(reply);
+        }
+        if let Some(mut state) = self.sessions.remove(&session)
+            && let Some(cancellation) = state.cancellation.take()
+        {
+            let _ = cancellation.send(());
+        }
+        true
     }
 
     fn drain_sessions_for_shutdown(&mut self) -> Result<(), WorldOperationError> {
@@ -4390,7 +4996,7 @@ impl World {
         &mut self,
         completion: RewardPersistenceCompletion,
         now: Instant,
-    ) -> Result<RewardCompletionDisposition, WorldError> {
+    ) -> Result<RewardCompletionDisposition, WorldOperationError> {
         let task = completion.task().clone();
         match self.expire_reward_attempt(&task, now) {
             Ok(RewardLeaseExpiry::Active) => {}
@@ -4402,7 +5008,7 @@ impl World {
                 | WorldError::RewardAttemptLeaseDeadlineOverflow { .. }
                 | WorldError::RewardRetryDeadlineOverflow { .. },
             ) => return Ok(RewardCompletionDisposition::TerminalFailure),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
         let Some((failure_count, _)) = self.current_reward_attempt(&task) else {
             return Ok(RewardCompletionDisposition::IgnoredStale);
@@ -4485,6 +5091,65 @@ impl World {
                     )?;
                     return Ok(RewardCompletionDisposition::TerminalFailure);
                 }
+                let (live_rp, myroom_refresh) = match receipt.profile() {
+                    Some(profile) => {
+                        if !profile
+                            .subject()
+                            .matches_nickname(&task.nickname)
+                            .map_err(IdentityError::from)?
+                        {
+                            return Err(WorldError::MyRoomProfileSubjectMismatch {
+                                expected: task.nickname.clone(),
+                                actual: profile.subject().nickname().to_owned(),
+                            }
+                            .into());
+                        }
+                        let identity = self
+                            .myroom
+                            .canonical_identity_if_tracked(task.user_no)
+                            .map_err(|source| {
+                                myroom_hub_error("durable reward profile refresh", source)
+                            })?;
+                        let refresh = match identity {
+                            Some(identity)
+                                if canonical_nickname_key(&identity.nickname)
+                                    == task.canonical_nickname =>
+                            {
+                                match self
+                                    .myroom
+                                    .refresh_profile_if_tracked(&identity, profile.presentation())
+                                {
+                                    Ok(refresh) => refresh,
+                                    Err(MyRoomHubError::Wire(source)) => {
+                                        tracing::warn!(
+                                            nickname = %task.nickname,
+                                            %source,
+                                            "skipped invalid MyRoom presentation after durable reward"
+                                        );
+                                        None
+                                    }
+                                    Err(source) => {
+                                        return Err(myroom_hub_error(
+                                            "durable reward profile refresh",
+                                            source,
+                                        )
+                                        .into());
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                return Err(WorldError::RewardSchedulerInvariant {
+                                    room_id: task.fence.room_id.0,
+                                    user_no: task.user_no.get(),
+                                }
+                                .into());
+                            }
+                            None => None,
+                        };
+                        (profile.presentation().rp(), refresh)
+                    }
+                    None => (applied.current_rp, None),
+                };
                 let Some(room) = self.protocol_rooms.get_mut(&task.fence.room_id) else {
                     return Ok(RewardCompletionDisposition::IgnoredStale);
                 };
@@ -4523,7 +5188,10 @@ impl World {
                 };
                 result.economy = FrozenResultEconomy::Applied(applied);
 
-                self.update_live_room_rp(task.user_no, applied.current_rp);
+                self.update_live_room_rp(task.user_no, live_rp);
+                if let Some(transition) = myroom_refresh {
+                    self.commit_silent_myroom_transition(transition)?;
+                }
                 match self.prepare_ready_settlement(task.fence.room_id) {
                     Ok(()) => Ok(RewardCompletionDisposition::Applied),
                     Err(RewardTerminalReason::ResultSerialization) => {
@@ -4532,7 +5200,8 @@ impl World {
                     Err(_) => Err(WorldError::RewardSchedulerInvariant {
                         room_id: task.fence.room_id.0,
                         user_no: task.user_no.get(),
-                    }),
+                    }
+                    .into()),
                 }
             }
         }
@@ -4919,11 +5588,11 @@ impl World {
         now: Instant,
     ) -> Result<MigrationCompletion, WorldOperationError> {
         let preflight = self.preflight_migration(destination, user_no, channel_id, token, now)?;
-        self.complete_preflighted_migration(preflight, now)
+        self.complete_preflighted_migration(preflight, None, now)
     }
 
     fn preflight_migration(
-        &self,
+        &mut self,
         destination: SessionId,
         user_no: UserNo,
         channel_id: u16,
@@ -4944,11 +5613,36 @@ impl World {
     fn complete_preflighted_migration(
         &mut self,
         preflight: MigrationPreflight,
+        profile: Option<&MyRoomProfileLease>,
         now: Instant,
     ) -> Result<MigrationCompletion, WorldOperationError> {
+        if let Some(profile) = profile {
+            let matches = match profile.subject().matches_nickname(preflight.nickname()) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    self.identities.abort_preflighted_migration(&preflight);
+                    return Err(IdentityError::from(error).into());
+                }
+            };
+            if !matches {
+                self.identities.abort_preflighted_migration(&preflight);
+                return Err(WorldError::MyRoomProfileSubjectMismatch {
+                    expected: preflight.nickname().to_owned(),
+                    actual: profile.subject().nickname().to_owned(),
+                }
+                .into());
+            }
+        }
         let destination = preflight.destination_session();
-        let current_ip = self.session_ip(destination)?;
+        let current_ip = match self.session_ip(destination) {
+            Ok(current_ip) => current_ip,
+            Err(error) => {
+                self.identities.abort_preflighted_migration(&preflight);
+                return Err(error.into());
+            }
+        };
         if current_ip != preflight.destination_ip() {
+            self.identities.abort_preflighted_migration(&preflight);
             return Err(IdentityError::SourceIpMismatch {
                 expected: preflight.destination_ip(),
                 received: current_ip,
@@ -4958,25 +5652,54 @@ impl World {
         let completion = self
             .identities
             .complete_preflighted_migration(preflight, now)?;
-        Ok(self.commit_migration_completion(completion, now)?)
+        Ok(self.commit_migration_completion(
+            completion,
+            profile.map(MyRoomProfileLease::presentation),
+            now,
+        )?)
     }
 
     fn commit_migration_completion(
         &mut self,
         completion: MigrationCompletion,
+        presentation: Option<&MyRoomProfilePresentation>,
         now: Instant,
     ) -> Result<MigrationCompletion, MyRoomLifecycleError> {
-        if let Some(transition) = self
-            .myroom
-            .advance_migrated_identity_if_tracked(&completion.previous_binding, &completion.binding)
-            .map_err(|error| myroom_hub_error("identity migration", error))?
-        {
-            self.commit_myroom_transition(
-                transition,
-                |world, effects: &IdentityAdvanceEffects| {
-                    world.myroom_publication_deliveries(&effects.publications)
-                },
-            )?;
+        let transition = match presentation {
+            Some(presentation) => match self.myroom.advance_profiled_identity_if_tracked(
+                &completion.previous_binding,
+                &completion.binding,
+                presentation,
+            ) {
+                Ok(transition) => transition,
+                Err(MyRoomHubError::Wire(source)) => {
+                    tracing::warn!(
+                        nickname = %completion.binding.nickname,
+                        %source,
+                        "retained the previous MyRoom presentation during identity migration"
+                    );
+                    self.myroom
+                        .advance_migrated_identity_if_tracked(
+                            &completion.previous_binding,
+                            &completion.binding,
+                        )
+                        .map_err(|error| myroom_hub_error("identity migration fallback", error))?
+                }
+                Err(error) => return Err(myroom_hub_error("identity migration", error)),
+            },
+            None => self
+                .myroom
+                .advance_migrated_identity_if_tracked(
+                    &completion.previous_binding,
+                    &completion.binding,
+                )
+                .map_err(|error| myroom_hub_error("identity migration", error))?,
+        };
+        if let Some(transition) = transition {
+            // C# advances the internal channel/session binding without sending
+            // an `RmSlotData` snapshot. A later First or topology operation
+            // observes the replacement generation and fresh presentation.
+            self.commit_silent_myroom_transition(transition)?;
         }
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Advance {
@@ -5029,29 +5752,110 @@ impl World {
         snapshot: [u8; 65],
     ) -> Result<(), WorldOperationError> {
         let identity = self.identities.authorize(session)?;
-        let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
+        let has_membership = self.protocol_room_by_user.contains_key(&identity.user_no);
+        let Some(plan) = self.plan_room_equipment(identity.user_no, snapshot)? else {
+            debug_assert!(
+                !has_membership,
+                "protocol membership map and room state diverged"
+            );
             return Ok(());
         };
-        let room = self
-            .protocol_rooms
-            .get_mut(&room_id)
-            .expect("protocol membership always references an existing room");
-        let Some(player_id) = room.equipment_player_id(identity.user_no) else {
-            debug_assert!(false, "protocol membership map and room state diverged");
-            return Ok(());
+        self.commit_room_equipment(plan)?;
+        self.debug_assert_invariants();
+        Ok(())
+    }
+
+    fn plan_room_equipment(
+        &self,
+        user_no: UserNo,
+        snapshot: [u8; 65],
+    ) -> Result<Option<RoomEquipmentPlan>, EquipmentProtocolError> {
+        let Some(room_id) = self.protocol_room_by_user.get(&user_no).copied() else {
+            return Ok(None);
+        };
+        let Some(room) = self.protocol_rooms.get(&room_id) else {
+            return Ok(None);
+        };
+        let Some(player_id) = room.equipment_player_id(user_no) else {
+            return Ok(None);
         };
         let packet = serialize_room_slot_items(player_id, &snapshot)?;
         let recipients = room
             .user_nos()
             .into_iter()
-            .filter(|user_no| *user_no != identity.user_no)
+            .filter(|recipient| *recipient != user_no)
             .collect();
-        let updated = room.set_equipment_snapshot(identity.user_no, snapshot);
-        debug_assert!(updated, "protocol membership map and room state diverged");
-        let deliveries = self.deliveries_for_users(recipients, &OutboundBatch::single(packet));
-        self.deliver(deliveries, Instant::now())?;
+        Ok(Some(RoomEquipmentPlan {
+            room_id,
+            user_no,
+            snapshot,
+            packet,
+            recipients,
+        }))
+    }
+
+    fn commit_room_equipment(
+        &mut self,
+        plan: RoomEquipmentPlan,
+    ) -> Result<(), MyRoomLifecycleError> {
+        let room = self
+            .protocol_rooms
+            .get_mut(&plan.room_id)
+            .expect("a preplanned protocol equipment room remains actor-owned");
+        let updated = room.set_equipment_snapshot(plan.user_no, plan.snapshot);
+        debug_assert!(
+            updated,
+            "a preplanned protocol equipment member remains in its room"
+        );
+        let deliveries =
+            self.deliveries_for_users(plan.recipients, &OutboundBatch::single(plan.packet));
+        self.deliver(deliveries, Instant::now())
+    }
+
+    fn refresh_myroom_presentation(
+        &mut self,
+        session: SessionId,
+        expected: &IdentityBinding,
+        profile: &MyRoomProfileLease,
+    ) -> Result<bool, WorldOperationError> {
+        let identity = self.identities.authorize(session)?;
+        if &identity != expected {
+            return Err(IdentityError::StaleSession(session).into());
+        }
+        if !profile
+            .subject()
+            .matches_nickname(&expected.nickname)
+            .map_err(IdentityError::from)?
+        {
+            return Err(WorldError::MyRoomProfileSubjectMismatch {
+                expected: expected.nickname.clone(),
+                actual: profile.subject().nickname().to_owned(),
+            }
+            .into());
+        }
+        let transition = match self
+            .myroom
+            .refresh_profile_if_tracked(&identity, profile.presentation())
+        {
+            Ok(transition) => transition,
+            Err(MyRoomHubError::Wire(source)) => {
+                tracing::warn!(
+                    nickname = %identity.nickname,
+                    %source,
+                    "skipped invalid MyRoom presentation during profile refresh"
+                );
+                None
+            }
+            Err(source) => {
+                return Err(myroom_hub_error("profile presentation refresh", source).into());
+            }
+        };
+        let Some(transition) = transition else {
+            return Ok(false);
+        };
+        self.commit_silent_myroom_transition(transition)?;
         self.debug_assert_invariants();
-        Ok(())
+        Ok(true)
     }
 
     fn lobby_command(
@@ -6239,6 +7043,15 @@ impl World {
         Ok(outcome)
     }
 
+    fn commit_silent_myroom_transition<T>(
+        &mut self,
+        transition: MyRoomTransition<T>,
+    ) -> Result<T, MyRoomLifecycleError> {
+        let outcome = transition.commit(&mut self.myroom)?;
+        debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
+        Ok(outcome)
+    }
+
     fn commit_myroom_command_transition<T>(
         &mut self,
         transition: MyRoomTransition<T>,
@@ -6413,7 +7226,10 @@ impl World {
                 None => self.sessions.contains_key(&session),
             };
             if failed && failed_sessions.insert(session) {
-                pending.extend(self.close_session_state(session, now)?);
+                let mut no_reply = None;
+                if !self.defer_session_close_for_rider_equipment(session, &mut no_reply) {
+                    pending.extend(self.close_session_state(session, now)?);
+                }
             }
         }
         Ok(())
@@ -7079,6 +7895,10 @@ impl WorldActorTimers {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the biased actor select loop keeps timer, completion, command, and UDP precedence auditable in one place"
+)]
 async fn run_world_actor_with_timers(
     mut world: World,
     mut receiver: mpsc::Receiver<WorldCommand>,
@@ -7107,6 +7927,9 @@ async fn run_world_actor_with_timers(
                 let Some(completion) = completion else {
                     if !world.pending_myroom_writes.is_empty()
                         || !world.pending_myroom_by_user.is_empty()
+                        || !world.pending_rider_equipment_writes.is_empty()
+                        || !world.pending_rider_equipment_by_user.is_empty()
+                        || world.identities.transfer_in_progress_count() != 0
                     {
                         return Err(
                             MyRoomPersistenceInvariantError::CompletionMailboxClosed.into()
@@ -7116,7 +7939,50 @@ async fn run_world_actor_with_timers(
                     continue;
                 };
                 world.advance_loading(Instant::now(), &clock);
-                world.handle_myroom_profile_completion(completion)?;
+                let mut migration_reply = None;
+                let deferred_close_replies = match completion {
+                    MyRoomProfileCompletion::RiderEquipment(completion) => {
+                        world.handle_rider_equipment_profile_completion(completion)?
+                    }
+                    MyRoomProfileCompletion::Migration(
+                        MigrationProfileCompletion::Aborted { preflight },
+                    ) => {
+                        world
+                            .identities
+                            .abort_preflighted_migration(preflight.as_ref());
+                        Vec::new()
+                    }
+                    MyRoomProfileCompletion::Migration(
+                        MigrationProfileCompletion::Ready {
+                            preflight,
+                            profile,
+                            reply,
+                        },
+                    ) => {
+                        let result = match world.complete_preflighted_migration(
+                            *preflight,
+                            Some(profile.as_ref()),
+                            Instant::now(),
+                        ) {
+                            Ok(completion) => Ok(completion),
+                            Err(WorldOperationError::Command(error)) => Err(error),
+                            Err(WorldOperationError::MyRoom(error)) => return Err(error.into()),
+                        };
+                        migration_reply = Some((reply, result));
+                        Vec::new()
+                    }
+                    completion => {
+                        world.handle_myroom_profile_completion(completion)?;
+                        Vec::new()
+                    }
+                };
+                flush_identity_lifecycle(&mut world, &sidecars).await?;
+                for reply in deferred_close_replies {
+                    let _ = reply.send(());
+                }
+                if let Some((reply, result)) = migration_reply {
+                    let _ = reply.send(result);
+                }
                 world.advance_loading(Instant::now(), &clock);
             }
             command = receiver.recv() => {
@@ -7154,6 +8020,10 @@ async fn run_world_actor_with_timers(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive actor command dispatcher must visibly own every reply path"
+)]
 async fn dispatch_command(
     world: &mut World,
     command: WorldCommand,
@@ -7224,6 +8094,15 @@ async fn dispatch_command(
             let result = world.publish_room_equipment(session, *snapshot);
             reply_after_world_operation(world, sidecars, reply, result).await?;
         }
+        WorldCommand::RefreshMyRoomPresentation {
+            session,
+            expected,
+            profile,
+            reply,
+        } => {
+            let result = world.refresh_myroom_presentation(session, &expected, &profile);
+            reply_after_world_operation(world, sidecars, reply, result).await?;
+        }
         WorldCommand::Lobby {
             session,
             payload,
@@ -7246,6 +8125,12 @@ async fn dispatch_command(
             request_reply,
             reply,
         } => dispatch_myroom_info_registration(world, session, prepared, request_reply, reply)?,
+        WorldCommand::RegisterRiderEquipmentWrite {
+            session,
+            prepared,
+            request_reply,
+            reply,
+        } => dispatch_rider_equipment_registration(world, session, prepared, request_reply, reply)?,
         command @ (WorldCommand::MyRoomSessionView { .. }
         | WorldCommand::PrepareMyRoom { .. }
         | WorldCommand::MyRoom { .. }
@@ -7261,8 +8146,11 @@ async fn dispatch_session_closed(
     world: &mut World,
     sidecars: &WorldSidecars,
     session: SessionId,
-    reply: Option<oneshot::Sender<()>>,
+    mut reply: Option<oneshot::Sender<()>>,
 ) -> Result<(), WorldSidecarError> {
+    if world.defer_session_close_for_rider_equipment(session, &mut reply) {
+        return Ok(());
+    }
     world.close_session(session, Instant::now())?;
     flush_identity_lifecycle(world, sidecars).await?;
     if let Some(reply) = reply {
@@ -7338,6 +8226,28 @@ fn dispatch_myroom_info_registration(
     }
 }
 
+fn dispatch_rider_equipment_registration(
+    world: &mut World,
+    session: SessionId,
+    prepared: PreparedRiderEquipmentWrite,
+    request_reply: oneshot::Sender<Result<RiderEquipmentWriteReceipt, RiderEquipmentWriteError>>,
+    reply: oneshot::Sender<Result<RegisteredRiderEquipmentWrite, RiderEquipmentWriteError>>,
+) -> Result<(), WorldSidecarError> {
+    match world.register_rider_equipment_write(session, prepared, request_reply) {
+        Ok(registered) => {
+            let _ = reply.send(Ok(registered));
+            Ok(())
+        }
+        Err(RiderEquipmentRegistrationError::Request(error)) => {
+            let _ = reply.send(Err(*error));
+            Ok(())
+        }
+        Err(RiderEquipmentRegistrationError::Terminal(error)) => {
+            Err(WorldSidecarError::RiderEquipment(*error))
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the actor utility command dispatcher exhaustively owns every reply path"
@@ -7354,18 +8264,13 @@ async fn dispatch_utility_command(
             channel_id,
             token,
             now,
+            completion,
             reply,
         } => {
-            let result = world.preflight_migration(destination, user_no, channel_id, token, now);
+            let result = world
+                .preflight_migration(destination, user_no, channel_id, token, now)
+                .map(|preflight| RegisteredMigrationPreflight::new(preflight, completion));
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
-        }
-        WorldCommand::CompletePreflightedMigration {
-            preflight,
-            now,
-            reply,
-        } => {
-            let result = world.complete_preflighted_migration(preflight, now);
-            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::CreateRoom { reply } => {
             let result = world.create_room();
@@ -7413,7 +8318,7 @@ async fn dispatch_utility_command(
             reply,
         } => {
             let result = world.complete_reward_task(completion, now);
-            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::Quiesce { reply } => {
             world.quiesce();
@@ -7431,7 +8336,10 @@ async fn dispatch_utility_command(
             Ok(status)
                 if status.is_drained()
                     && world.pending_myroom_writes.is_empty()
-                    && world.pending_myroom_by_user.is_empty() =>
+                    && world.pending_myroom_by_user.is_empty()
+                    && world.pending_rider_equipment_writes.is_empty()
+                    && world.pending_rider_equipment_by_user.is_empty()
+                    && world.identities.transfer_in_progress_count() == 0 =>
             {
                 let lifecycle = flush_identity_lifecycle(world, sidecars).await;
                 world.cancel_all_sessions();
@@ -7441,8 +8349,15 @@ async fn dispatch_utility_command(
             }
             Ok(status) if status.is_drained() => {
                 let _ = reply.send(Err(WorldError::MyRoomPersistenceShutdownBlocked {
-                    pending: world.pending_myroom_writes.len(),
-                    indexed: world.pending_myroom_by_user.len(),
+                    pending: world
+                        .pending_myroom_writes
+                        .len()
+                        .saturating_add(world.pending_rider_equipment_writes.len())
+                        .saturating_add(world.identities.transfer_in_progress_count()),
+                    indexed: world
+                        .pending_myroom_by_user
+                        .len()
+                        .saturating_add(world.pending_rider_equipment_by_user.len()),
                 }));
             }
             Ok(status) => {
@@ -7457,11 +8372,14 @@ async fn dispatch_utility_command(
         },
         WorldCommand::ForceShutdown { reply } => {
             let report = WorldForceShutdownReport::capture(world);
-            if report.has_abandoned_myroom_publications() {
+            if report.has_abandoned_completion_work() {
                 tracing::warn!(
-                    pending_myroom_tickets = report.pending_myroom_tickets,
-                    pending_myroom_user_indexes = report.pending_myroom_user_indexes,
-                    "force shutdown is abandoning durable MyRoom outcomes before Hub publication, owner echo, and final request reply"
+                    pending_myroom_tickets = report.myroom_tickets,
+                    pending_myroom_user_indexes = report.myroom_user_indexes,
+                    pending_rider_equipment_tickets = report.rider_equipment_tickets,
+                    pending_rider_equipment_user_indexes = report.rider_equipment_user_indexes,
+                    pending_migration_transfers = report.migration_transfers,
+                    "force shutdown is abandoning profile publication or migration completion work before actor reconciliation and final request reply"
                 );
             }
             let lifecycle = flush_identity_lifecycle(world, sidecars).await;
@@ -7478,11 +8396,13 @@ async fn dispatch_utility_command(
         | WorldCommand::CompleteMigration { .. }
         | WorldCommand::RoomProtocol { .. }
         | WorldCommand::PublishRoomEquipment { .. }
+        | WorldCommand::RefreshMyRoomPresentation { .. }
         | WorldCommand::Lobby { .. }
         | WorldCommand::Race { .. }
         | WorldCommand::PrepareMyRoom { .. }
         | WorldCommand::MyRoom { .. }
         | WorldCommand::RegisterMyRoomInfoWrite { .. }
+        | WorldCommand::RegisterRiderEquipmentWrite { .. }
         | WorldCommand::MyRoomSessionView { .. }
         | WorldCommand::DrainSessions { .. } => {
             unreachable!("identity-affecting commands are dispatched by dispatch_command")
@@ -7810,11 +8730,13 @@ mod tests {
         collections::HashSet,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroU64,
+        sync::{Arc, Barrier},
         time::{Duration, Instant},
     };
 
     use p5136_core::{
         adler32,
+        equipment_protocol::serialize_room_slot_items,
         lobby_protocol::{
             CHANGE_TEAM_REPLY_NAME, PlayerSlotState, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
@@ -7835,30 +8757,37 @@ mod tests {
         },
         room_protocol::{
             ChCreateRoomRequest, ChGetRoomListRequest, ChJoinRoomRequest,
-            ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomPlayer, RoomProtocolError,
+            MAX_CLUB_NAME_UTF16_UNITS, ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH,
+            RoomPlayer, RoomProtocolError,
         },
         startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
     };
-    use p5136_profile::{Profile, ProfileStore};
+    use p5136_profile::{Profile, ProfileStore, rider_item_snapshot};
     use tokio::{
         net::UdpSocket,
         sync::{mpsc, oneshot},
+        time,
     };
 
     use super::{
         GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
         LobbyCommandPayload, LobbyError, MyRoomCommandPayload, MyRoomLifecycleError,
         MyRoomPreparedCommand, MyRoomWireProjection, OutboundBatch, ROOM_CAPACITY,
-        RaceCommandOutcome, RaceCommandPayload, RaceError, RoomCommandPayload, RoomError, RoomId,
-        RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError,
-        WorldHandle, WorldOperationError, WorldSidecarError, WorldSidecars, dispatch_command,
-        source_ipv4,
+        RaceCommandOutcome, RaceCommandPayload, RaceError, RegisteredMigrationPreflight,
+        RoomCommandPayload, RoomError, RoomId, RoomParticipant, RoomPhase, SessionId,
+        StartRoomPlan, World, WorldCommand, WorldError, WorldHandle, WorldOperationError,
+        WorldSidecarError, WorldSidecars, dispatch_command, source_ipv4,
     };
-    use crate::myroom_hub::{MyRoomOwner, MyRoomParticipant};
+    use crate::equipment_persistence::{
+        PreparedRiderEquipmentWrite, RiderEquipmentWriteError,
+        tests::{catalog as test_equipment_catalog, selection as test_equipment_selection},
+    };
+    use crate::myroom_hub::{MyRoomOwner, MyRoomParticipant, MyRoomProfilePresentation};
     use crate::myroom_persistence::{
-        MyRoomInfoPublication, MyRoomInfoWriteError, PreparedMyRoomInfoWrite,
+        MyRoomCompletionBridge, MyRoomInfoPublication, MyRoomInfoWriteError,
+        PreparedMyRoomInfoWrite,
     };
-    use crate::profile_io::{ProfileIoBootstrap, ProfileIoLimits};
+    use crate::profile_io::{MyRoomProfileLease, ProfileIoBootstrap, ProfileIoLimits};
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
         MessengerServiceError, MessengerServiceHandle, MigrationToken, ServerClock,
@@ -7917,6 +8846,140 @@ mod tests {
         ProfileIoBootstrap::acquire(root.to_owned(), ProfileIoLimits::for_tests(8, 8))
             .unwrap()
             .spawn()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the shared end-to-end harness keeps both durable success and rejection close-barrier paths identical"
+    )]
+    async fn exercise_rider_equipment_close_barrier(expect_success: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let nickname = if expect_success {
+            "EquipmentCloseSuccess"
+        } else {
+            "EquipmentCloseFailure"
+        };
+        let initial = store.save(nickname, &Profile::default()).unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+
+        let mut prepared_world = World::default();
+        let mut owner = register_channel_session(&mut prepared_world, nickname, 67, 56_070, 16);
+        let mut peer =
+            register_channel_session(&mut prepared_world, "EquipmentClosePeer", 67, 56_072, 16);
+        let room_id = create_protocol_room(&mut prepared_world, &owner, 1);
+        join_protocol_room(&mut prepared_world, &peer, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut peer.outbound);
+
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+        let completion = world.reserve_rider_equipment_completion().await.unwrap();
+        let admission = profiles
+            .admit(nickname, "test deferred equipment close")
+            .await
+            .unwrap();
+        let mut selection = test_equipment_selection();
+        if !expect_success {
+            selection.character = u16::MAX;
+        }
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        let prepared = PreparedRiderEquipmentWrite::new(
+            admission,
+            selection,
+            Arc::new(test_equipment_catalog()),
+            completion,
+        )
+        .with_test_hook(Arc::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        }));
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        world
+            .sender
+            .send(WorldCommand::RegisterRiderEquipmentWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        registration_result.await.unwrap().unwrap().submit();
+        let entered_wait = Arc::clone(&entered);
+        tokio::task::spawn_blocking(move || entered_wait.wait())
+            .await
+            .unwrap();
+
+        let close_world = world.clone();
+        let mut close = tokio::spawn(async move { close_world.session_closed(session).await });
+        assert!(
+            time::timeout(Duration::from_millis(20), &mut close)
+                .await
+                .is_err(),
+            "session close acknowledged before the durable equipment outcome"
+        );
+        let release_wait = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_wait.wait())
+            .await
+            .unwrap();
+
+        let request = time::timeout(Duration::from_secs(1), request_result)
+            .await
+            .expect("equipment request did not reach a terminal outcome")
+            .unwrap();
+        time::timeout(Duration::from_secs(1), &mut close)
+            .await
+            .expect("deferred equipment close was not released")
+            .unwrap()
+            .unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+
+        match (expect_success, request) {
+            (true, Ok(_)) | (false, Err(RiderEquipmentWriteError::Persistence(_))) => {}
+            (expected, actual) => {
+                panic!("unexpected equipment close outcome for success={expected}: {actual:?}")
+            }
+        }
+        let loaded = store.load_or_create(nickname).unwrap();
+        assert_eq!(
+            loaded.revision,
+            Some(if expect_success {
+                initial.revision + 1
+            } else {
+                initial.revision
+            })
+        );
+
+        let mut peer_hashes = Vec::new();
+        while let Ok(batch) = peer.outbound.try_recv() {
+            peer_hashes.extend(
+                batch
+                    .into_packets()
+                    .iter()
+                    .map(|packet| logical_packet_hash(packet)),
+            );
+        }
+        let equipment_hash = adler32::packet_hash("GrSlotItemOnPacket");
+        if expect_success {
+            assert_eq!(peer_hashes.first(), Some(&equipment_hash));
+        } else {
+            assert!(!peer_hashes.contains(&equipment_hash));
+        }
+        assert!(matches!(
+            world.authorize_identity(session).await,
+            Err(WorldError::Identity(
+                IdentityError::UnauthenticatedSession(actual)
+            )) if actual == session
+        ));
+
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
     }
 
     fn prepare_myroom_owner(
@@ -8063,6 +9126,15 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn test_myroom_profile_presentation() -> MyRoomProfilePresentation {
+        MyRoomProfilePresentation::new(
+            39_312,
+            [0; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+            100,
+            "migration-profile".to_owned(),
+        )
     }
 
     fn myroom_owner(identity: &IdentityBinding, presented_ip: Ipv4Addr) -> MyRoomOwner {
@@ -8416,7 +9488,37 @@ mod tests {
             key,
             applied_reward(task, current_lucci),
         );
-        super::RewardPersistenceCompletion::Durable(receipt)
+        super::RewardPersistenceCompletion::Durable(Box::new(receipt))
+    }
+
+    fn durable_completion_with_profile(
+        task: &super::RewardSettlementTask,
+        current_lucci: u32,
+        presentation: MyRoomProfilePresentation,
+    ) -> super::RewardPersistenceCompletion {
+        let root = tempfile::tempdir().unwrap();
+        let store = p5136_profile::ProfileStore::new(root.path());
+        store.load_or_create(task.nickname()).unwrap();
+        let lease = store.acquire_race_run_lease().unwrap();
+        let recipient = store
+            .bind_race_reward_recipient(&lease, task.nickname(), task.user_no().get())
+            .unwrap();
+        let fence = task.fence();
+        let key = p5136_profile::RaceRewardKey::new(
+            &recipient,
+            &lease,
+            fence.room_id().0,
+            fence.race_epoch(),
+        )
+        .unwrap();
+        let receipt = crate::profile_io::DurableRewardReceipt::for_test_with_profile(
+            task.clone(),
+            key,
+            applied_reward(task, current_lucci),
+            presentation,
+            task.nickname(),
+        );
+        super::RewardPersistenceCompletion::Durable(Box::new(receipt))
     }
 
     fn set_result_admission(
@@ -10400,6 +11502,105 @@ mod tests {
     }
 
     #[test]
+    fn durable_reward_uses_current_profile_for_live_myroom_and_protocol_caches() {
+        let (mut world, mut owner, room_id, deadline, _clock) =
+            prepare_single_reward_persistence("RewardPresentation", 42_329);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 90),
+            Ipv4Addr::new(192, 0, 2, 90),
+        );
+        let revision = world.myroom.revision();
+        let task = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let items = [0xD5; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH];
+        let presentation =
+            MyRoomProfilePresentation::new(45_137, items, 515_137, "RewardFresh".to_owned());
+
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    durable_completion_with_profile(&task, 70_000, presentation),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+
+        let protocol_member = world.protocol_rooms[&room_id]
+            .members_by_id
+            .iter()
+            .flatten()
+            .find(|member| member.user_no == owner.identity.user_no)
+            .unwrap();
+        assert_eq!(protocol_member.player.rp, 515_137);
+        let snapshot = world.myroom.first_snapshot(&owner.identity).unwrap();
+        let MyRoomSlot::Player(player) = &snapshot.slots[0] else {
+            panic!("reward recipient must remain the MyRoom owner");
+        };
+        assert_eq!(player.p2p_port, 45_137);
+        assert_eq!(player.rider_item_snapshot, items);
+        assert_eq!(player.rp, 515_137);
+        assert_eq!(player.club_name, "RewardFresh");
+        assert_eq!(world.myroom.revision().get(), revision.get() + 1);
+        assert!(owner.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalid_myroom_presentation_does_not_reject_a_durable_reward() {
+        let (mut world, mut owner, room_id, deadline, _clock) =
+            prepare_single_reward_persistence("InvalidRewardPresentation", 42_330);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 91),
+            Ipv4Addr::new(192, 0, 2, 91),
+        );
+        let revision = world.myroom.revision();
+        let cached = world.myroom.first_snapshot(&owner.identity).unwrap();
+        let task = world
+            .take_due_reward_tasks(deadline, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let invalid = MyRoomProfilePresentation::new(
+            45_138,
+            [0xD6; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+            515_138,
+            "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1),
+        );
+
+        assert_eq!(
+            world
+                .complete_reward_task(
+                    durable_completion_with_profile(&task, 70_001, invalid),
+                    deadline,
+                )
+                .unwrap(),
+            super::RewardCompletionDisposition::Applied
+        );
+        let protocol_member = world.protocol_rooms[&room_id]
+            .members_by_id
+            .iter()
+            .flatten()
+            .find(|member| member.user_no == owner.identity.user_no)
+            .unwrap();
+        assert_eq!(protocol_member.player.rp, 515_138);
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(
+            world.myroom.first_snapshot(&owner.identity).unwrap(),
+            cached
+        );
+        assert!(owner.outbound.try_recv().is_err());
+    }
+
+    #[test]
     fn reward_completions_are_fenced_by_room_epoch_user_and_attempt() {
         let mut world = World::default();
         let mut owner = register_channel_session(&mut world, "FenceReward", 67, 42_331, 64);
@@ -10693,7 +11894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_preflight_handle_is_read_only_and_rechecks_destination_liveness() {
+    async fn migration_preflight_handle_freezes_source_and_rechecks_destination_liveness() {
         let (handle, actor) = WorldHandle::spawn(16);
         let source = handle
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_350))
@@ -10730,18 +11931,30 @@ mod tests {
         assert_eq!(preflight.canonical_nickname(), "preflightrider");
         assert_eq!(preflight.user_no(), source_identity.user_no);
         assert_eq!(preflight.source_generation(), source_identity.generation);
-        assert_eq!(
-            handle.authorize_identity(source).await.unwrap(),
-            source_identity
-        );
+        assert!(matches!(
+            handle.authorize_identity(source).await,
+            Err(WorldError::Identity(IdentityError::TransferInProgress {
+                ref nickname,
+            })) if nickname == "PreflightRider"
+        ));
 
         handle.session_closed(first_destination).await.unwrap();
         assert!(matches!(
             handle
-                .complete_preflighted_migration(preflight, Instant::now())
+                .complete_preflighted_migration(
+                    preflight,
+                    MyRoomProfileLease::for_test(
+                        test_myroom_profile_presentation(),
+                        "PreflightRider",
+                    ),
+                )
                 .await,
             Err(WorldError::UnknownSession(session)) if session == first_destination
         ));
+        assert_eq!(
+            handle.authorize_identity(source).await.unwrap(),
+            source_identity
+        );
 
         let second_destination = handle
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_352))
@@ -10758,7 +11971,10 @@ mod tests {
             .await
             .unwrap();
         let completion = handle
-            .complete_preflighted_migration(preflight, Instant::now())
+            .complete_preflighted_migration(
+                preflight,
+                MyRoomProfileLease::for_test(test_myroom_profile_presentation(), "PreflightRider"),
+            )
             .await
             .unwrap();
         assert_eq!(completion.binding.owner, second_destination);
@@ -10766,6 +11982,90 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_ready_waiter_cannot_cancel_actor_owned_migration_commit() {
+        let mut state = World::default();
+        let (source_cancellation, source_cancelled) = oneshot::channel();
+        let source = state
+            .register_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_353),
+                Some(source_cancellation),
+                None,
+            )
+            .unwrap();
+        let identity = state
+            .claim_identity(source, "ReadyCancellationRider")
+            .unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(778).unwrap();
+        state
+            .identities
+            .begin_migration(source, channel, token, Instant::now())
+            .unwrap();
+        let destination = state
+            .register_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_354),
+                None,
+                None,
+            )
+            .unwrap();
+        let raw_preflight = state
+            .preflight_migration(
+                destination,
+                identity.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel(8);
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(state.identity_capacity);
+        let completion = myroom_completions.reserve().await.unwrap();
+        let preflight = RegisteredMigrationPreflight::new(raw_preflight, completion);
+        let (reply, response) = oneshot::channel();
+        preflight.submit(
+            MyRoomProfileLease::for_test(
+                test_myroom_profile_presentation(),
+                "ReadyCancellationRider",
+            ),
+            reply,
+        );
+        drop(response);
+
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+            myroom_completions,
+        };
+        let actor = tokio::spawn(async move {
+            super::run_world_actor(
+                state,
+                receiver,
+                completion_receiver,
+                None,
+                WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await
+        });
+
+        let migrated = handle.authorize_identity(destination).await.unwrap();
+        assert_eq!(migrated.user_no, identity.user_no);
+        assert!(migrated.generation.get() > identity.generation.get());
+        time::timeout(Duration::from_secs(1), source_cancelled)
+            .await
+            .expect("migration did not cancel the previous owner")
+            .unwrap();
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[test]
@@ -12084,6 +13384,88 @@ mod tests {
     }
 
     #[test]
+    fn live_race_equipment_change_updates_the_serialized_game_result() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "LiveRaceEquipment", 67, 47_140, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        force_running(&mut world, room_id);
+
+        let character_id: u16 = 0x1234;
+        let kart_id: u16 = 0x2345;
+        let mut snapshot = [0u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH];
+        snapshot[..2].copy_from_slice(&character_id.to_le_bytes());
+        snapshot[4..6].copy_from_slice(&kart_id.to_le_bytes());
+        world
+            .publish_room_equipment(owner.session, snapshot)
+            .unwrap();
+        let admission = world.protocol_rooms[&room_id]
+            .frozen_race
+            .as_ref()
+            .unwrap()
+            .participants[0]
+            .result
+            .unwrap();
+        assert_eq!(admission.character_id, character_id);
+        assert_eq!(admission.kart_id, kart_id);
+        assert!(owner.outbound.try_recv().is_err());
+
+        let now = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 456),
+                now,
+                &clock,
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        assert_eq!(complete_all_due_rewards(&mut world, deadline).len(), 1);
+        world.advance_loading(deadline + Duration::from_millis(1), &clock);
+
+        let packets = take_packets(&mut owner.outbound);
+        let result = packets
+            .iter()
+            .find(|packet| {
+                logical_packet_hash(packet) == adler32::packet_hash(GAME_RESULT_PACKET_NAME)
+            })
+            .expect("settlement must include GameResultPacket");
+        assert_eq!(i32::from_le_bytes(result[5..9].try_into().unwrap()), 1);
+        let human_record = 9;
+        assert_eq!(
+            u16::from_le_bytes(
+                result[human_record + 9..human_record + 11]
+                    .try_into()
+                    .unwrap()
+            ),
+            kart_id
+        );
+        assert_eq!(
+            u16::from_le_bytes(
+                result[human_record + 85..human_record + 87]
+                    .try_into()
+                    .unwrap()
+            ),
+            character_id
+        );
+    }
+
+    #[test]
     fn cross_channel_migration_removes_room_membership_and_fans_out_slots() {
         let mut world = World::default();
         let mut owner = register_channel_session(&mut world, "Switching", 67, 47_200, 16);
@@ -13021,6 +14403,376 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this end-to-end cancellation test covers disk durability and both actor publication planes"
+    )]
+    async fn accepted_rider_equipment_write_survives_request_cancellation_and_publishes_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let mut initial_profile = Profile::default();
+        initial_profile.rider.p2p_port = 45_136;
+        initial_profile.rider.rp = 515_136;
+        initial_profile.rider.club_name = "DurableEquipment".to_owned();
+        let initial = store
+            .save("CancelledEquipmentOwner", &initial_profile)
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+
+        let mut prepared_world = World::default();
+        let mut owner = register_channel_session(
+            &mut prepared_world,
+            "CancelledEquipmentOwner",
+            67,
+            56_062,
+            16,
+        );
+        let mut visitor = register_channel_session(
+            &mut prepared_world,
+            "EquipmentMyRoomVisitor",
+            67,
+            56_064,
+            16,
+        );
+        let mut peer =
+            register_channel_session(&mut prepared_world, "EquipmentProtocolPeer", 67, 56_066, 16);
+        enter_myroom(
+            &mut prepared_world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut prepared_world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let room_id = create_protocol_room(&mut prepared_world, &owner, 1);
+        join_protocol_room(&mut prepared_world, &peer, room_id, false);
+        let owner_player_id = prepared_world.protocol_rooms[&room_id]
+            .equipment_player_id(owner.identity.user_no)
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut visitor.outbound);
+        drain_batches(&mut peer.outbound);
+
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+        let completion = world.reserve_rider_equipment_completion().await.unwrap();
+        let admission = profiles
+            .admit(
+                "cancelledequipmentowner",
+                "test cancelled rider-equipment request",
+            )
+            .await
+            .unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        let prepared = PreparedRiderEquipmentWrite::new(
+            admission,
+            test_equipment_selection(),
+            Arc::new(test_equipment_catalog()),
+            completion,
+        )
+        .with_test_hook(Arc::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        }));
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        world
+            .sender
+            .send(WorldCommand::RegisterRiderEquipmentWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        let registered = registration_result.await.unwrap().unwrap();
+        registered.submit();
+        let entered_wait = Arc::clone(&entered);
+        tokio::task::spawn_blocking(move || entered_wait.wait())
+            .await
+            .unwrap();
+        drop(request_result);
+        let release_wait = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_wait.wait())
+            .await
+            .unwrap();
+
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        let loaded = store.load_or_create("CancelledEquipmentOwner").unwrap();
+        assert_eq!(loaded.revision, Some(initial.revision + 1));
+        let snapshot = rider_item_snapshot(&loaded.profile.rider_item);
+        assert_eq!(
+            take_single_packet(&mut peer.outbound),
+            serialize_room_slot_items(owner_player_id, &snapshot).unwrap()
+        );
+        assert!(peer.outbound.try_recv().is_err());
+        assert!(
+            owner.outbound.try_recv().is_err(),
+            "the equipment sender must not receive its game-room publication"
+        );
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "a profile refresh must not emit an immediate MyRoom snapshot"
+        );
+
+        world.session_closed(visitor.session).await.unwrap();
+        let expected_owner = crate::profile_io::myroom_profile_presentation(&loaded.profile)
+            .player_for(&owner.identity);
+        let expected_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] = array::from_fn(|slot| {
+            if slot == 0 {
+                MyRoomSlot::Player(expected_owner.clone())
+            } else {
+                MyRoomSlot::Empty
+            }
+        });
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_slot_data(&expected_slots).unwrap()
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_myroom_presentation_does_not_kill_durable_equipment_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let mut initial_profile = Profile::default();
+        initial_profile.rider.club_name = "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1);
+        let initial = store
+            .save("InvalidEquipmentPresentation", &initial_profile)
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+
+        let mut prepared_world = World::default();
+        let mut owner = register_channel_session(
+            &mut prepared_world,
+            "InvalidEquipmentPresentation",
+            67,
+            56_067,
+            16,
+        );
+        let mut peer =
+            register_channel_session(&mut prepared_world, "InvalidEquipmentPeer", 67, 56_069, 16);
+        enter_myroom(
+            &mut prepared_world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let room_id = create_protocol_room(&mut prepared_world, &owner, 1);
+        join_protocol_room(&mut prepared_world, &peer, room_id, false);
+        let owner_player_id = prepared_world.protocol_rooms[&room_id]
+            .equipment_player_id(owner.identity.user_no)
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut peer.outbound);
+
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+        let completion = world.reserve_rider_equipment_completion().await.unwrap();
+        let admission = profiles
+            .admit(
+                "invalidequipmentpresentation",
+                "test invalid-presentation rider equipment",
+            )
+            .await
+            .unwrap();
+        let prepared = PreparedRiderEquipmentWrite::new(
+            admission,
+            test_equipment_selection(),
+            Arc::new(test_equipment_catalog()),
+            completion,
+        );
+        world
+            .persist_rider_equipment(session, prepared)
+            .await
+            .unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+
+        let loaded = store
+            .load_or_create("InvalidEquipmentPresentation")
+            .unwrap();
+        assert_eq!(loaded.revision, Some(initial.revision + 1));
+        let equipment = rider_item_snapshot(&loaded.profile.rider_item);
+        assert_eq!(
+            take_single_packet(&mut peer.outbound),
+            serialize_room_slot_items(owner_player_id, &equipment).unwrap()
+        );
+        assert_eq!(
+            world.authorize_identity(session).await.unwrap(),
+            owner.identity
+        );
+        let view = world.myroom_session_view(session).await.unwrap().unwrap();
+        assert_eq!(view.info().room_id, 1);
+        assert!(owner.outbound.try_recv().is_err());
+
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_equipment_write_defers_close_until_publication_finishes() {
+        exercise_rider_equipment_close_barrier(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_equipment_write_still_releases_the_deferred_close() {
+        exercise_rider_equipment_close_barrier(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_rider_equipment_registration_reply_aborts_ticket_and_releases_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let initial = store
+            .save("DroppedEquipmentCapability", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let mut prepared_world = World::default();
+        let owner = register_channel_session(
+            &mut prepared_world,
+            "DroppedEquipmentCapability",
+            67,
+            56_068,
+            8,
+        );
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+
+        let completion = world.reserve_rider_equipment_completion().await.unwrap();
+        let admission = profiles
+            .admit(
+                "droppedequipmentcapability",
+                "test dropped rider-equipment registration reply",
+            )
+            .await
+            .unwrap();
+        let prepared = PreparedRiderEquipmentWrite::new(
+            admission,
+            test_equipment_selection(),
+            Arc::new(test_equipment_catalog()),
+            completion,
+        );
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        drop(registration_result);
+        world
+            .sender
+            .send(WorldCommand::RegisterRiderEquipmentWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            request_result.await,
+            Ok(Err(RiderEquipmentWriteError::AbortedBeforeSubmission))
+        ));
+        world.drain_myroom_completions().await.unwrap();
+        let replacement = profiles
+            .admit(
+                "droppedequipmentcapability",
+                "test released rider-equipment profile lane",
+            )
+            .await
+            .unwrap();
+        drop(replacement);
+        assert_eq!(
+            store
+                .load_or_create("DroppedEquipmentCapability")
+                .unwrap()
+                .revision,
+            Some(initial.revision)
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_shutdown_waits_for_registered_rider_equipment_ticket_to_abort() {
+        let root = tempfile::tempdir().unwrap();
+        ProfileStore::new(root.path())
+            .save("PendingEquipmentShutdown", &Profile::default())
+            .unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let mut prepared_world = World::default();
+        let owner = register_channel_session(
+            &mut prepared_world,
+            "PendingEquipmentShutdown",
+            67,
+            56_069,
+            8,
+        );
+        let session = owner.session;
+        let (world, actor) = spawn_prepared_world(prepared_world, 16);
+
+        let completion = world.reserve_rider_equipment_completion().await.unwrap();
+        let admission = profiles
+            .admit(
+                "pendingequipmentshutdown",
+                "test pending rider-equipment shutdown",
+            )
+            .await
+            .unwrap();
+        let prepared = PreparedRiderEquipmentWrite::new(
+            admission,
+            test_equipment_selection(),
+            Arc::new(test_equipment_catalog()),
+            completion,
+        );
+        let (request_reply, request_result) = oneshot::channel();
+        let (registration_reply, registration_result) = oneshot::channel();
+        world
+            .sender
+            .send(WorldCommand::RegisterRiderEquipmentWrite {
+                session,
+                prepared,
+                request_reply,
+                reply: registration_reply,
+            })
+            .await
+            .unwrap();
+        let registered = registration_result.await.unwrap().unwrap();
+        assert!(matches!(
+            world.shutdown().await,
+            Err(WorldError::MyRoomPersistenceShutdownBlocked {
+                pending: 1,
+                indexed: 1,
+            })
+        ));
+        drop(registered);
+        assert!(matches!(
+            request_result.await,
+            Ok(Err(RiderEquipmentWriteError::AbortedBeforeSubmission))
+        ));
+        world.drain_myroom_completions().await.unwrap();
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_registration_reply_aborts_ticket_and_releases_profile_lane() {
         let root = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(root.path());
@@ -13209,8 +14961,8 @@ mod tests {
             })
         ));
         let report = world.force_shutdown().await.unwrap();
-        assert_eq!(report.pending_myroom_tickets, 1);
-        assert_eq!(report.pending_myroom_user_indexes, 1);
+        assert_eq!(report.myroom_tickets, 1);
+        assert_eq!(report.myroom_user_indexes, 1);
 
         actor.await.unwrap();
         assert!(
@@ -13224,6 +14976,59 @@ mod tests {
         );
         drop(registered);
         profile_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_barriers_report_an_outstanding_migration_freeze() {
+        let (world, actor) = WorldHandle::spawn(8);
+        let source = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 56_096))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(source, "FrozenMigrationOwner")
+            .await
+            .unwrap();
+        let channel = ChannelBinding {
+            channel_id: 12,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(56_096).unwrap();
+        world
+            .begin_migration(source, channel, token, Instant::now())
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 56_097))
+            .await
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                identity.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            world.shutdown().await,
+            Err(WorldError::MyRoomPersistenceShutdownBlocked {
+                pending: 1,
+                indexed: 0,
+            })
+        ));
+        let report = world.force_shutdown().await.unwrap();
+        assert_eq!(report.myroom_tickets, 0);
+        assert_eq!(report.myroom_user_indexes, 0);
+        assert_eq!(report.rider_equipment_tickets, 0);
+        assert_eq!(report.rider_equipment_user_indexes, 0);
+        assert_eq!(report.migration_transfers, 1);
+
+        actor.await.unwrap();
+        drop(preflight);
     }
 
     #[test]
@@ -13328,9 +15133,9 @@ mod tests {
     }
 
     #[test]
-    fn myroom_migration_preserves_role_snapshot_and_advances_exact_generation() {
+    fn myroom_migration_installs_fresh_profile_silently_and_advances_exact_generation() {
         let mut world = World::default();
-        let owner = register_channel_session(&mut world, "MoveOwner", 67, 56_300, 8);
+        let mut owner = register_channel_session(&mut world, "MoveOwner", 67, 56_300, 8);
         let mut guest = register_channel_session(&mut world, "MoveGuest", 67, 56_310, 8);
         let stale_presented_ip = Ipv4Addr::new(192, 0, 2, 30);
         enter_myroom(
@@ -13348,7 +15153,47 @@ mod tests {
             stale_presented_ip,
         );
 
-        let mut migrated = migrate_channel_session(&mut world, &owner, 56_320, 8);
+        let channel = owner.identity.channel.unwrap();
+        let token = MigrationToken::new(56_320).unwrap();
+        world
+            .identities
+            .begin_migration(owner.session, channel, token, Instant::now())
+            .unwrap();
+        let (outbound, receiver) = mpsc::channel(8);
+        let destination = world
+            .register_session(
+                SocketAddr::new(owner.identity.source_ip, 56_320),
+                None,
+                Some(outbound),
+            )
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                owner.identity.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .unwrap();
+        let fresh_items = [0xAB; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH];
+        let profile = MyRoomProfileLease::for_test(
+            MyRoomProfilePresentation::new(
+                45_136,
+                fresh_items,
+                515_136,
+                "FreshMigration".to_owned(),
+            ),
+            &owner.identity.nickname,
+        );
+        let completion = world
+            .complete_preflighted_migration(preflight, Some(&profile), Instant::now())
+            .unwrap();
+        let mut migrated = TestChannelSession {
+            session: destination,
+            identity: completion.binding,
+            outbound: receiver,
+        };
         assert!(migrated.identity.generation.get() > owner.identity.generation.get());
         assert!(matches!(
             world.myroom_udp_targets(&owner.identity),
@@ -13364,11 +15209,104 @@ mod tests {
             panic!("migrated owner must remain in slot zero");
         };
         assert_eq!(presentation.p2p_address, Ipv4Addr::LOCALHOST);
-        assert_eq!(presentation.p2p_port, 39_312);
-        assert_eq!(presentation.rp, 100);
-        let packet = serialize_slot_data(&snapshot.slots).unwrap();
-        assert_eq!(take_single_packet(&mut migrated.outbound), packet);
-        assert_eq!(take_single_packet(&mut guest.outbound), packet);
+        assert_eq!(presentation.p2p_port, 45_136);
+        assert_eq!(presentation.rider_item_snapshot, fresh_items);
+        assert_eq!(presentation.rp, 515_136);
+        assert_eq!(presentation.club_name, "FreshMigration");
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(migrated.outbound.try_recv().is_err());
+        assert!(guest.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn invalid_migration_presentation_is_skipped_without_rejecting_identity_transfer() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "InvalidMoveOwner", 67, 56_330, 8);
+        let mut guest = register_channel_session(&mut world, "InvalidMoveGuest", 67, 56_340, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let revision = world.myroom.revision();
+        let snapshot = world.myroom.first_snapshot(&owner.identity).unwrap();
+
+        let channel = owner.identity.channel.unwrap();
+        let token = MigrationToken::new(56_350).unwrap();
+        world
+            .identities
+            .begin_migration(owner.session, channel, token, Instant::now())
+            .unwrap();
+        let (outbound, _receiver) = mpsc::channel(8);
+        let destination = world
+            .register_session(
+                SocketAddr::new(owner.identity.source_ip, 56_350),
+                None,
+                Some(outbound),
+            )
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                owner.identity.user_no,
+                channel.channel_id,
+                token,
+                Instant::now(),
+            )
+            .unwrap();
+        let profile = MyRoomProfileLease::for_test(
+            MyRoomProfilePresentation::new(
+                45_136,
+                [0xCD; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+                515_136,
+                "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1),
+            ),
+            &owner.identity.nickname,
+        );
+
+        let completion = world
+            .complete_preflighted_migration(preflight, Some(&profile), Instant::now())
+            .unwrap();
+        assert!(matches!(
+            world.identities.authorize(owner.session),
+            Err(IdentityError::StaleSession(actual)) if actual == owner.session
+        ));
+        assert_eq!(
+            world.identities.authorize(destination).unwrap(),
+            completion.binding
+        );
+        assert_eq!(
+            completion.binding.generation.get(),
+            owner
+                .identity
+                .generation
+                .get()
+                .max(guest.identity.generation.get())
+                + 1
+        );
+        assert_eq!(
+            world
+                .identities
+                .active_identity_by_user_no(owner.identity.user_no),
+            Some(completion.binding.clone())
+        );
+        assert_eq!(world.myroom.revision().get(), revision.get() + 1);
+        assert_eq!(
+            world.myroom.first_snapshot(&completion.binding).unwrap(),
+            snapshot
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(guest.outbound.try_recv().is_err());
         world.myroom.audit_invariants().unwrap();
     }
 

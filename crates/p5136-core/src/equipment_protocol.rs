@@ -142,7 +142,8 @@ pub fn parse_set_rider_items(packet: &[u8]) -> Result<RiderItemSelection, Equipm
         kart_coating: reader.read_u16()?,
         kart_tail_lamp: reader.read_u16()?,
     };
-    ensure_exhausted(&reader, SET_RIDER_ITEMS_REQUEST_NAME)?;
+    // The P5136 C# handler reads exactly one 65-byte rider snapshot from the
+    // request body and ignores any bytes that follow it.
     Ok(RiderItemSelection {
         kart_serial: normalize_kart_serial(selection.kart, selection.kart_serial),
         ..selection
@@ -264,9 +265,9 @@ const _: () = assert!(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH == 65);
 mod tests {
     use super::{
         EQUIP_PLANT_PART_REQUEST_NAME, EquipmentProtocolError, EquipmentRequest,
-        PlantPartEquipRequest, SET_RIDER_ITEMS_REQUEST_NAME, classify_equipment_request,
-        parse_equip_plant_part, parse_set_rider_items, serialize_equip_tuning_failure,
-        serialize_equip_tuning_success, serialize_room_slot_items,
+        PlantPartEquipRequest, RiderItemSelection, SET_RIDER_ITEMS_REQUEST_NAME,
+        classify_equipment_request, parse_equip_plant_part, parse_set_rider_items,
+        serialize_equip_tuning_failure, serialize_equip_tuning_success, serialize_room_slot_items,
     };
     use crate::{adler32, packet::PacketWriter};
 
@@ -354,15 +355,49 @@ mod tests {
     }
 
     #[test]
-    fn equipment_parsers_reject_truncation_trailing_bytes_and_invalid_fields() {
+    fn equipment_parsers_match_csharp_rider_length_and_reject_invalid_plant_fields() {
         assert!(parse_set_rider_items(&[0; 4]).is_err());
 
         let mut trailing = PacketWriter::named(SET_RIDER_ITEMS_REQUEST_NAME);
         trailing.write_bytes(&[0; 66]);
-        assert!(matches!(
-            parse_set_rider_items(&trailing.into_inner()),
-            Err(EquipmentProtocolError::TrailingBytes { count: 1, .. })
-        ));
+        assert_eq!(
+            parse_set_rider_items(&trailing.into_inner()).unwrap(),
+            RiderItemSelection {
+                character: 0,
+                paint: 0,
+                kart: 0,
+                plate: 0,
+                goggle: 0,
+                balloon: 0,
+                unknown1: 0,
+                head_band: 0,
+                head_phone: 0,
+                hand_gear_left: 0,
+                unknown2: 0,
+                uniform: 0,
+                decal: 0,
+                pet: 0,
+                flying_pet: 0,
+                aura: 0,
+                skid_mark: 0,
+                special_kit: 0,
+                rider_color: 0,
+                bonus_card: 0,
+                boss_mode_card: 0,
+                kart_plant1: 0,
+                kart_plant2: 0,
+                kart_plant3: 0,
+                kart_plant4: 0,
+                unknown3: 0,
+                fishing_pole: 0,
+                tachometer: 0,
+                dye: 0,
+                kart_serial: 0,
+                unknown4: 0,
+                kart_coating: 0,
+                kart_tail_lamp: 0,
+            }
+        );
 
         let invalid = decode_hex("4F08B95A2A000500030079050100");
         assert!(matches!(

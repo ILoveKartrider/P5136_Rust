@@ -18,10 +18,11 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    SessionId,
-    identity::UserNo,
+    SessionId, WorldError,
+    equipment_persistence::RiderEquipmentProfileCompletion,
+    identity::{MigrationCompletion, MigrationPreflight, UserNo},
     myroom_hub::{MyRoomCommitError, MyRoomHubError},
-    profile_io::{ProfileIoCompletion, ProfileIoError, ProfileJobAdmission},
+    profile_io::{MyRoomProfileLease, ProfileIoCompletion, ProfileIoError, ProfileJobAdmission},
 };
 
 pub(crate) const MYROOM_INFO_WRITE_OPERATION: &str = "persist MyRoom owner info";
@@ -266,6 +267,18 @@ pub(crate) type MyRoomProfileJobResult =
     Result<ProfileIoCompletion<Result<DurableMyRoomInfo, MyRoomPersistError>>, ProfileIoError>;
 
 #[derive(Debug)]
+pub(crate) enum MigrationProfileCompletion {
+    Aborted {
+        preflight: Box<MigrationPreflight>,
+    },
+    Ready {
+        preflight: Box<MigrationPreflight>,
+        profile: Box<MyRoomProfileLease>,
+        reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) enum MyRoomProfileCompletion {
     AbortedBeforeSubmission {
         ticket: MyRoomProfileTicketId,
@@ -277,6 +290,8 @@ pub(crate) enum MyRoomProfileCompletion {
         ticket: MyRoomProfileTicketId,
         result: Box<MyRoomProfileJobResult>,
     },
+    RiderEquipment(RiderEquipmentProfileCompletion),
+    Migration(MigrationProfileCompletion),
     DrainBarrier {
         reply: oneshot::Sender<Result<(), MyRoomCompletionDrainError>>,
     },
@@ -339,7 +354,7 @@ impl fmt::Debug for MyRoomCompletionSlot {
 }
 
 impl MyRoomCompletionSlot {
-    fn send(self, completion: MyRoomProfileCompletion) {
+    pub(crate) fn send(self, completion: MyRoomProfileCompletion) {
         let _sender = self.permit.send(completion);
     }
 }

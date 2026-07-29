@@ -1,31 +1,194 @@
-# Rust port pause handoff
+# Rust port status and resumable handoff
 
 Last updated: 2026-07-29
 
 This file is the resumable checkpoint for the independent Rust port. It records
-what is implemented, which invariants must not regress, and the exact order in
-which work should resume.
+what is implemented, which invariants must not regress, and the order in which
+work should continue.
 
 ## Scope and repositories
 
 - Rust repository:
   `C:\Users\drash\Documents\kartrider\kartrider_p5136_rust`
-- Read-only C# reference:
+- C# source and behavioral reference:
   `C:\Users\drash\Documents\kartrider\KartRider-P5136`
+- C# stability findings:
+  `C:\Users\drash\Documents\kartrider\KartRider-P5136\P5136_STABILITY_AUDIT.md`
 - `PhysicsSim` is a separate project and is out of scope.
 - Do not copy old analysis artifacts or `PhysicsSim` into this repository.
-- The C# reference repository was not modified.
+- The user has explicitly placed confirmed C# source defects in scope for
+  repair. Keep C# and Rust edits, validation, history, and commits in their own
+  repositories; never copy either repository's dirty tree over the other.
+- The C# repository already has valuable unrelated dirty work. Inspect and
+  preserve it before adding stability fixes.
 - Current branch: `main`
-- Previous committed checkpoint:
-  `ec6d544 Persist MyRoom owner info through actor completion`
+- Current committed checkpoint:
+  `4bd09cd Document resumable Rust port checkpoint`
 - The FirstState/Secede live-profile tranche described below has passed its
   independent reviews and full validation.
-- Current implementation checkpoint:
-  `d768c18 Implement live-profile MyRoom first and secede`
-- Pause state: no implementation tranche is in progress. Start with the
-  identity-free presentation/silent-refresh foundation in resume-plan step 4.
+- The working tree contains the validated live-presentation, equipment, and
+  migration-safety tranche described below. It is awaiting its final independent
+  reviews and checkpoint commit. Do not discard, overwrite, or stash over it.
 
-## Implemented in the paused tranche
+## Compatibility policy
+
+The C# server is a protocol and product-intent reference, not a specification
+whose bugs must be cloned.
+
+- Preserve packet identifiers, field layout, status values needed by the stock
+  client, and externally meaningful success ordering.
+- Prefer a documented Rust correction when the C# behavior loses accepted work,
+  races disconnect or migration, partially mutates identity, trusts invalid
+  persisted state, or turns a request-scoped error into server failure.
+- Fence every intentional difference with a deterministic test and record why
+  it is a hardening or correctness fix rather than an accidental compatibility
+  regression.
+- Grant and ownership validation for rider equipment is an intentional Rust
+  hardening. Revisit it only if a real client capture proves that valid stock
+  behavior depends on equipping ungranted items.
+- Invalid MyRoom presentation data must not undo an otherwise valid durable
+  equipment/reward write or identity migration. Rust retains the last valid
+  cached presentation and continues the independent operation.
+
+## Current uncommitted checkpoint
+
+The dirty tree is based on `4bd09cd` and contains changes in:
+
+```text
+PORTING_STATUS.md
+crates/p5136-core/src/equipment_protocol.rs
+crates/p5136-server/src/identity.rs
+crates/p5136-server/src/lib.rs
+crates/p5136-server/src/myroom_hub.rs
+crates/p5136-server/src/myroom_persistence.rs
+crates/p5136-server/src/profile_io.rs
+crates/p5136-server/src/runtime.rs
+crates/p5136-server/src/session.rs
+crates/p5136-server/src/world.rs
+crates/p5136-server/src/equipment_persistence.rs  # new, untracked
+```
+
+Do not run a destructive Git command against this tree.
+
+### Work implemented but not committed
+
+- Added identity-free `MyRoomProfilePresentation` projection and silent Hub
+  refresh. One refresh updates every matching owner/visitor role without an
+  immediate wire packet.
+- Made `GetRider`, channel migration, and durable reward completion carry fresh
+  full presentation data rather than reconstructing it from a historical or
+  partial cache.
+- Added cancellation-independent rider-equipment persistence:
+
+  - World reserves a bounded completion slot and mints an opaque ticket;
+  - a registered capability owns the admitted profile lane;
+  - RAII guards report abort-before-submit and accepted-outcome-loss paths;
+  - the durable transaction validates grants, saves the exact equipment
+    selection, and normalizes a nonzero kart with serial zero to serial one;
+  - World revalidates the ticket, identity generation, durable value, and full
+    presentation before publication;
+  - an active exact session silently refreshes MyRoom, refreshes the game-room
+    cache, and fans out to peers except the sender;
+  - disconnect cleanup is deferred while that source owns a pending equipment
+    write;
+  - graceful and forced shutdown accounting includes equipment tickets and
+    per-user indexes.
+
+- Made the equipment session continuation reload the full canonical profile
+  while it still owns the profile lane. The bound session can no longer retain
+  unrelated stale profile fields after an equipment write.
+- Matched the useful C# `SetRiderItems` framing behavior: an authenticated short
+  body is silently ignored, while trailing bytes after the first 65 are ignored.
+  The Rust path still identity-fences both cases.
+- Made `GetRider` normalize `kart != 0 && serial == 0` to serial one, durably
+  save it, and reply from the exact immutable receipt.
+- Made live race equipment changes update the frozen participant's GameResult
+  character and kart fields. Historical reward calculation remains sealed to
+  the completed result.
+- Reworked migration around an actor-minted exact transfer ID:
+
+  - preflight freezes that exact source identity generation;
+  - a linear RAII registration owns a pre-reserved completion slot;
+  - dropping the request reports abort independently of request cancellation;
+  - stale aborts cannot ABA-release a newer transfer using the same permit;
+  - completion revalidates source, destination, permit, and transfer ID;
+  - TTL is checked at actor dequeue time;
+  - graceful and forced shutdown account for admitted migration transfers.
+
+- Separated optional MyRoom presentation publication from durable reward,
+  equipment, migration, and GetRider correctness. Invalid presentation retains
+  the last valid Hub snapshot without killing World or rejecting the independent
+  operation.
+- Added focused tests for durability uncertainty, exact kart normalization,
+  malformed/trailing equipment packets, dropped response waiters, explicit
+  deferred close, silent MyRoom refresh, game result serialization, profile-lane
+  recovery, migration cancellation/ABA/TTL, and shutdown blocking/accounting.
+
+### Validation snapshot for the dirty tree
+
+Passed:
+
+```text
+cargo test -p p5136-server --lib
+# 282 passed, 0 failed
+
+cargo check --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+# 547 passed, 0 failed
+
+cargo fmt --all -- --check
+git diff --check
+```
+
+The 2026-07-29 source scan found no production Rust `unsafe` syntax, and the
+workspace forbids unsafe code.
+
+Three final read-only reviews examined this diff:
+
+- protocol/state review found no P0/P1 regression in equipment, GetRider,
+  live-race equipment, invalid-presentation isolation, exact-ID migration, or
+  deferred close;
+- Rust safety review found no P0 and confirmed zero unsafe code, but identified
+  the pre-existing graceful-shutdown operation-drain P1 recorded below;
+- test review found no blocking false positive and confirmed that the central
+  tests reach production handler, persistence, actor, serializer, and shutdown
+  paths.
+
+The remaining P2 coverage gaps are an outbound-queue-triggered deferred close,
+preflight reply cancellation before capability receipt, TTL expiry while the
+profile lane is blocked, and exact final GameResult batch ordering in the
+live-equipment test. The durable reward receipt mismatch is also a P2 typed
+terminal-invariant problem rather than a direct actor crash.
+
+### Highest-priority follow-up
+
+Migration freeze currently rejects new identity authorization immediately but
+does not yet track and drain source packet operations that were authorized
+before the freeze. C# attempts this with `ActiveOperations`; the next Rust
+tranche should implement the intended property with exact actor-owned operation
+leases rather than copy the C# mechanics:
+
+1. every admitted authenticated operation owns a linear, generation-bound
+   operation guard;
+2. beginning migration prevents new operation admission;
+3. preflight completion waits for all already-admitted guards to retire;
+4. cancellation or error releases exactly its own guard;
+5. timeout/abort cannot release another migration or leak a frozen identity;
+6. accepted durable work retains its normal publication/reply semantics.
+
+The same lease must also fix an existing graceful-shutdown P1: normal shutdown
+currently quiesces World and aborts session tasks before every already-admitted
+wire operation reaches its socket reply and session-context update. A profile
+save can therefore commit durably while the client receives no result. Graceful
+shutdown must close new packet admission, wait for operation leases to reach
+zero while World/profile/sidecars stay alive, and only then retire sessions.
+Forced shutdown may bypass the wait, but must report the exact abandoned
+operation count.
+
+This is a correctness fix and may intentionally differ internally from C#.
+
+## Earlier implemented architecture
 
 ### Exact profile receipts
 
@@ -190,7 +353,7 @@ that the durable completion retires before World exits.
   failure. Projection invariant failures and unrelated Hub invariant failures
   must keep their typed sources.
 
-## Verification completed at the pause
+## Verification completed at the previous clean checkpoint
 
 Passed:
 
@@ -245,12 +408,27 @@ P0, P1, or P2 findings:
   in the resume plan below.
 
 The full server suite, focused live-wire tests, workspace-wide tests,
-workspace-wide strict Clippy, formatting, and diff checks pass for the current
-checkpoint.
+workspace-wide strict Clippy, formatting, and diff checks passed for committed
+checkpoint `4bd09cd`. See "Validation snapshot for the dirty tree" above for
+the newer, uncommitted tranche.
 
 ## Known gaps and decisions still required
 
-1. **Remaining MyRoom requests**
+1. **Migration active-operation drain**
+
+   Implement the exact operation-lease property described in
+   "Highest-priority follow-up," including the graceful-shutdown ordering fix.
+   This is the next correctness tranche after the current checkpoint commit.
+
+2. **Reward completion terminal invariant**
+
+   Recheck whether a durable reward receipt whose canonical subject does not
+   match its ticket can escape as an ordinary command error and terminate
+   World. Impossible actor-owned completion contradictions should be explicit
+   terminal invariant failures with diagnostic context; expected request or
+   stale-generation races should remain typed, nonterminal outcomes.
+
+3. **Remaining MyRoom requests**
 
    `UpdateInfo`, `FirstState`, and `Secede` are connected to TCP dispatch. The
    other nine classified requests are identity-fenced no-ops:
@@ -265,20 +443,14 @@ checkpoint.
    - emblem list;
    - main-emblem update.
 
-2. **Fresh presentation beyond request-driven First/Secede**
+4. **Fresh presentation beyond request-driven First/Secede**
 
    The live wire plan now makes FirstState and Secede faithful to C# disk
-   reads. Before enabling Enter, the same freshness invariant must cover every
-   publication source:
+   reads. The dirty tranche adds silent refresh for migration, equipment,
+   `GetRider`, and reward completion. Freshness still must cover:
 
    - direct/random/re-enter must load fresh owner and entrant presentation as
      part of the entry transition;
-   - channel migration must advance generation, source IP, and fresh
-     presentation in one transition and one fanout;
-   - equipment writes and fresh `GetRider` reloads need a silent Hub
-     presentation refresh while the nickname profile lane remains held;
-   - durable race reward completion must refresh RP without allowing an older
-     receipt to overwrite a newer presentation;
    - disconnect/owner-close publications need an explicit policy because they
      cannot perform blocking profile I/O in the World actor.
 
@@ -286,21 +458,22 @@ checkpoint.
    create/rename profile writes. Port those before claiming complete MyRoom
    presentation compatibility.
 
-3. **Expected rejection policy**
+5. **Expected rejection policy**
 
    Recheck which owner-info registration races should be soft protocol drops
    instead of terminating the login session. Persistence/infrastructure
    failures must retain their typed source.
 
-4. **Intentional owner-disconnect difference**
+6. **Intentional owner-disconnect difference**
 
    The Rust Hub closes an owner's room and ejects visitors when the exact owner
    is released. The C# server leaves an offline owner rendered in slot zero
-   while visitors remain. This is an intentional deterministic policy for now,
-   but it must be called out in compatibility documentation or changed
-   deliberately.
+   while visitors remain. Rust's deterministic cleanup may be the safer product
+   behavior. Decide from client-observable requirements and captures, not solely
+   from C# implementation shape, then keep the chosen behavior explicit in
+   tests and compatibility notes.
 
-5. **Force architecture follow-up**
+7. **Force architecture follow-up**
 
    A stronger design would replace the boolean force flag with a monotonic
    `Running -> Graceful -> Force` shutdown state and let force break reward
@@ -308,32 +481,109 @@ checkpoint.
    remove the current direct World force request: a reward dead-letter can
    otherwise deadlock shutdown.
 
-6. **Cross-platform and end-to-end gates**
+8. **Cross-platform and end-to-end gates**
 
    Windows, macOS, and Linux CI, Wine/CrossOver client launch, differential
    C#/Rust captures, and a two-client race remain later completion gates.
 
+9. **C# stability audit parity**
+
+   `P5136_STABILITY_AUDIT.md` identifies confirmed missing reconnect restore
+   for per-user `PartsData.json` and `LevelData.json`, an incomplete-kart grant
+   risk, insufficient `GameSlotPacket` framing checks, missing movement relay
+   fallback, and possible finish/ceremony state divergence. Repair confirmed
+   defects in C# with codec fixtures, and independently check the Rust port for
+   the intended safety property. Do not mechanically port the faulty C# path.
+
 ## Exact resume plan
 
-1. Inspect the clean checkpoint before editing:
+1. Finish the three read-only reviews of the current dirty diff:
 
-   ```text
-   git status --short
-   git diff --check
-   git diff --stat
-   ```
+   - protocol and intended-state compatibility, separating required behavior
+     from C# defects;
+   - Rust abstraction, cancellation, typed-error, terminal-invariant, and
+     `unsafe` audit;
+   - production-path and missing-interleaving test audit.
 
-2. Establish the baseline before the next tranche:
+   Resolve every P0/P1. Resolve or explicitly record P2 findings, rerun the
+   stabilization gate, and commit this tranche as one coherent checkpoint.
+
+2. Implement migration operation drain in a separate small commit:
+
+   - actor-minted, generation-bound, linear operation leases;
+   - freeze-before-drain so no new source work enters;
+   - cancellation-independent exact lease retirement;
+   - pending preflight release only after the active set becomes empty;
+   - deterministic timeout, abort, stale-generation, shutdown, and request-
+     cancellation tests;
+   - an accepted durable equipment/profile operation must still publish and
+     receive its normal result before migration commits.
+
+3. In the C# repository, convert the stability audit into tested fixes without
+   disturbing its pre-existing dirty work:
+
+   - restore per-user X-parts and level exception data during P5136 login;
+   - evaluate Tune/Level12/Parts12 sibling restore streams from captured client
+     requirements;
+   - quarantine or completeness-filter invalid kart grant candidates;
+   - validate `GameSlotPacket` framing before every typed read and log bounded
+     diagnostic metadata;
+   - add generation-fenced observed-endpoint movement relay fallback;
+   - define finish/result/ceremony admission from coherent race state.
+
+4. Harden remaining Rust completion paths:
+
+   - make impossible durable reward receipt mismatches actor-terminal and
+     diagnostic if the final review confirms the gap;
+   - add an outbound-queue-triggered deferred-close regression in addition to
+     the existing explicit-close tests;
+   - prove equipment completion cannot publish through a superseded identity;
+   - keep invalid optional presentation isolated from durable operation success.
+
+5. Apply the same intended stability properties to Rust where applicable:
+
+   - reconnect restore for every supported equipment enhancement generation;
+   - catalog completeness filtering;
+   - bounded typed item parsing and diagnostic summaries;
+   - movement relay fallback using actor-owned generation-fenced UDP routes;
+   - coherent race-result and ceremony participation.
+
+6. Resume the remaining MyRoom requests in small commits:
+
+   - direct/random/re-enter with intentional status codes and fresh entry
+     presentation;
+   - owner-item profile reads, deciding whether the C# empty-kart quirk is
+     required client behavior or a defect;
+   - position and chat peer fanout;
+   - password and emblem flows;
+   - main-emblem durable write and session refresh.
+
+7. Port `ChClientP2pAddrPacket` and club-name mutation paths before declaring
+   MyRoom presentation complete.
+
+8. Resolve owner-disconnect semantics using stock-client captures and explicit
+   tests. Do not copy the C# tombstone behavior unless it is externally useful.
+
+9. Add Windows, macOS, and Linux CI, then validate the connector through
+   Wine/CrossOver and run a two-client login/channel/room/race/persistence flow.
+
+10. For every request, preserve required wire behavior with a malformed-input
+   test, exact-generation test, backpressure/cancellation test where relevant,
+   and exact packet fixture.
+
+11. Run this stabilization gate before every Rust checkpoint:
 
    ```text
    cargo fmt --all -- --check
    cargo test -p p5136-profile
+   cargo test -p p5136-server --lib
    cargo test -p p5136-server --all-features
    cargo clippy --workspace --all-targets --all-features -- -D warnings
    cargo test --workspace --all-features
+   git diff --check
    ```
 
-3. Search for accidental unsafe code:
+12. Search for accidental unsafe code:
 
    ```text
    rg -n "\bunsafe\b" crates -g "*.rs"
@@ -341,34 +591,6 @@ checkpoint.
 
    Text in error names or comments is not Rust unsafe syntax; any actual
    `unsafe` block is a stop-and-review condition.
-
-4. Resume the remaining MyRoom requests in small commits:
-
-   - identity-free profile presentation plus silent refresh hooks for
-     equipment, `GetRider`, reward RP, and migration;
-   - direct/random/re-enter with exact status codes and fresh entry
-     presentation;
-   - owner-item profile reads and C# empty-kart quirk;
-   - position and chat peer fanout;
-   - password and emblem flows;
-   - main-emblem durable write and session refresh.
-
-5. Add the test reviewer's recommended stress coverage while touching the
-   relevant paths:
-
-   - exercise the actual session retry loop and its three-attempt cap;
-   - cancel or fail a profile load between plan and projection;
-   - prove nonmember FirstState performs zero profile loads with an explicit
-     counter;
-   - cover later rider-snapshot bytes, reciprocal-room loading, and a
-     three-or-more-peer middle backpressure failure.
-
-6. Port `ChClientP2pAddrPacket` and the club-name mutation paths before
-   declaring MyRoom presentation complete.
-
-7. For every request, preserve C# wire behavior with a malformed-input test,
-   exact-generation test, backpressure/cancellation test where relevant, and
-   exact packet fixture.
 
 ## Port completion goal
 

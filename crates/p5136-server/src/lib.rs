@@ -1,6 +1,7 @@
 //! Cross-platform P5136 server runtime.
 
 mod config;
+mod equipment_persistence;
 mod identity;
 mod messenger_hub;
 mod messenger_runtime;

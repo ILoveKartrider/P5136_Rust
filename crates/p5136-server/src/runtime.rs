@@ -915,7 +915,7 @@ async fn publish_reward_completion(
     let (context, completion, diagnostic) = match result {
         Ok(receipt) => (
             RewardTaskContext::from_task(receipt.task()),
-            RewardPersistenceCompletion::Durable(receipt),
+            RewardPersistenceCompletion::Durable(Box::new(receipt)),
             RewardCompletionDiagnostic::DurableReceipt,
         ),
         Err(failure) => {
@@ -1556,6 +1556,9 @@ fn world_sidecar_error(error: WorldSidecarError) -> ServerError {
             source: Box::new(source),
         },
         WorldSidecarError::MyRoomPersistence(source) => ServerError::WorldActorMyRoom {
+            source: Box::new(source),
+        },
+        WorldSidecarError::RiderEquipment(source) => ServerError::WorldActorMyRoom {
             source: Box::new(source),
         },
         WorldSidecarError::InvalidIdentityCapacity => {
