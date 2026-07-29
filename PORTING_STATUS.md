@@ -19,8 +19,11 @@ which work should resume.
 - Previous committed checkpoint:
   `ec6d544 Persist MyRoom owner info through actor completion`
 - The FirstState/Secede live-profile tranche described below has passed its
-  independent reviews and full validation. Its implementation checkpoint and
-  the final pause-handoff checkpoint are recorded in the repository history.
+  independent reviews and full validation.
+- Current implementation checkpoint:
+  `d768c18 Implement live-profile MyRoom first and secede`
+- Pause state: no implementation tranche is in progress. Start with the
+  identity-free presentation/silent-refresh foundation in resume-plan step 4.
 
 ## Implemented in the paused tranche
 
