@@ -27,13 +27,58 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Committed baseline before the current tranche:
-`a013945 Port bounded MyRoom RequestItems flow`
+`917fe2f Port exact MyRoom character position fanout`
 
 ## Current Rust checkpoint
 
-The current worktree builds on the bounded `RequestItems` checkpoint and closes
-the MyRoom `CharacterPosition` vertical slice identified by the C# stability
-review.
+The current worktree builds on the `CharacterPosition` checkpoint and closes
+the first direct MyRoom entry vertical slice: self bootstrap/re-entry and entry
+into an already actor-tracked, owner-present public room.
+
+### MyRoom direct public entry
+
+- `ChRqEnterMyRoomPacket` is now an explicit session path. The owner nickname is
+  parsed with the existing bounded UTF-16 codec; only the protocol's optional
+  reserved dword is accepted, and it is not reinterpreted as a password or
+  authority token.
+- No extra profile job or profile lane is introduced. The session projects its
+  already generation-bound in-memory profile into an opaque
+  `MyRoomEntryInput`; malformed presentation or self-room info fails before the
+  World command is queued.
+- The World actor reauthorizes the exact requester binding, resolves the target
+  through the active identity registry, and validates the target against Hub
+  owner topology in one actor turn. This removes the need for an async
+  prepare/retry plan and leaves no target-generation or room-policy race between
+  authorization and commit.
+- Self entry creates the requester's room from its bound profile when no owned
+  room exists. Re-entry into an existing owned room preserves the actor's
+  authoritative owner presentation and info rather than overwriting them with
+  a stale session copy.
+- Visitor entry is deliberately narrower and safer than C#: the exact target
+  must already own an actor-tracked room, occupy its slot zero, remain the
+  active generation, and have `use_room_password == 0`. Inactive, untracked,
+  owner-absent, or protected targets all return `OwnerUnavailable`; only an
+  otherwise admissible public room can reveal `Full`.
+- Successful self replies contain the owner's full room info. Visitor replies
+  preserve BGM, policy flags, `TalkLock`, and kart fields but clear both raw
+  password strings. The reply always uses the canonical actor-resolved owner
+  nickname.
+- A move is one Hub transition containing old-room removal and destination
+  admission. The requester response, old-room update, and destination snapshot
+  are serialized and every exact-generation recipient queue permit is reserved
+  before the transition commits. A full queue publishes nothing and changes no
+  membership or revision. Backpressure remains a typed request error and is
+  propagated to fail the session explicitly rather than leaving a stock client
+  waiting forever for an entry reply; the actor operation itself is retryable
+  from unchanged state after queues drain.
+- The requester's destination batch is ordered as entry reply then current slot
+  snapshot. Destination peers receive only that snapshot; remaining old-room
+  members receive only the post-move old-room snapshot. A dropped ACK receiver
+  cannot cancel accepted actor work, while quiesce rejects the command before
+  publication.
+- Random entry, `Reenter`, protected-room password proof, and `CheckPassword`
+  remain separate unported slices. Rust does not copy the C# bug that ignores
+  room passwords or leaks both stored plaintext passwords to visitors.
 
 ### MyRoom CharacterPosition
 
@@ -167,9 +212,9 @@ review.
   by run/user/attempt identity.
 - MyRoom actor state includes bounded entry topology and generation-aware
   migration/disconnect cleanup. Production dispatch currently integrates
-  fresh FirstState projection, owner-info durability, bounded RequestItems,
-  exact-generation character-position fanout, and Secede;
-  direct/random/re-enter are still missing.
+  direct self/public entry, fresh FirstState projection, owner-info durability,
+  bounded RequestItems, exact-generation character-position fanout, and
+  Secede; random/re-enter and protected password entry are still missing.
 - Rider equipment/plant persistence is cancellation-independent and refreshes
   the actor caches only after durable confirmation.
 - Graceful shutdown drains wire admission, accepted durable work, completion
@@ -209,6 +254,11 @@ these areas:
 - Visitor-facing integrated MyRoom info does not disclose stored room/item
   passwords. Protected owner-item reads are denied without disk access until a
   real password capability is implemented.
+- Direct MyRoom entry does not ignore the room-password flag or serialize
+  stored plaintext passwords to visitors. Only an exact, present, actor-tracked
+  public owner can admit a visitor; all queue reservations precede the combined
+  old/new topology commit, so the C# reply-then-best-effort fanout window is not
+  reproduced.
 - Character-position input cannot spoof another member's slot or forward
   non-finite transforms. Rust resolves and revalidates the current-generation
   audience inside the actor and reserves every bounded peer queue before
@@ -253,11 +303,11 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 606 passed, 0 failed
+# 617 passed, 0 failed
 git diff --check
 ```
 
-The 606 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 340 server
+The 617 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 351 server
 unit, and 8 server integration tests. Doc-tests also passed.
 
 Focused regressions cover:
@@ -279,6 +329,11 @@ Focused regressions cover:
   cancellation, dropped ACK, and atomic queue backpressure;
 - aggregate multi-packet write timeout, guard drain, exact packet order, and
   IV progression;
+- direct-entry self bootstrap/re-entry, public visitor redaction,
+  protected/untracked/owner-absent denial, public-room full mapping, canonical
+  nickname lookup, old/new move audiences, atomic backpressure rollback and
+  typed session propagation, stale requester generation, dropped ACK, and
+  quiesce rejection;
 - strict character-position input, canonical sender slots, nonmember and
   self-echo suppression, stale-source migration fencing, exact peer packets,
   atomic multi-peer backpressure/retry, dropped ACK, and quiesce rejection;
@@ -306,11 +361,11 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Finish direct/random/re-enter and chat fanout, the actor-minted password
-   capability and emblem flows, main-emblem persistence, P2P-port profile
-   writes, club create/rename refresh, and any request still intentionally
-   classified as a no-op. Finish kart tuning/upgrades and the remaining
-   quest/attendance/progression surface.
+   Finish random/re-enter, protected-room entry, and chat fanout; add the
+   actor-minted password capability and emblem flows, main-emblem persistence,
+   P2P-port profile writes, club create/rename refresh, and any request still
+   intentionally classified as a no-op. Finish kart tuning/upgrades and the
+   remaining quest/attendance/progression surface.
 
 4. **Evidence-dependent packet behavior**
 

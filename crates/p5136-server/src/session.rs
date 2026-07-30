@@ -37,11 +37,13 @@ use p5136_core::{
         serialize_pr_login,
     },
     myroom_protocol::{
-        MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest,
-        classify_myroom_request, parse_character_position, parse_first_request,
-        parse_request_items, parse_secede_request, parse_update_info, plan_owner_item_packets,
-        serialize_myroom_info, serialize_owner_item_enchants, serialize_owner_items,
+        EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
+        MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
+        parse_enter_request, parse_first_request, parse_request_items, parse_secede_request,
+        parse_update_info, plan_owner_item_packets, serialize_myroom_info,
+        serialize_owner_item_enchants, serialize_owner_items,
     },
+    nickname::canonical_nickname_key,
     packet::PacketError,
     race_protocol::{
         RaceProtocolError, RaceRequest, classify_race_request, parse_ai_goal_in_request,
@@ -93,8 +95,8 @@ use crate::{
     },
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
-        MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole, OutboundBatch,
-        RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
+        MyRoomEntryInput, MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole,
+        OutboundBatch, RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -217,6 +219,12 @@ pub enum LoginSessionError {
 
     #[error("live MyRoom wire projection failed")]
     MyRoomWireProjection {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    #[error("MyRoom entry profile projection failed")]
+    MyRoomEntryPreparation {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
@@ -1666,6 +1674,10 @@ async fn handle_myroom_request(
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     match request {
+        MyRoomRequest::Enter => {
+            execute_myroom_entry(world, parse_enter_request(packet)?, context).await?;
+            return Ok(Vec::new());
+        }
         MyRoomRequest::FirstState => {
             parse_first_request(packet)?;
             execute_live_myroom_command(
@@ -1742,6 +1754,33 @@ async fn handle_myroom_request(
         "applied durable MyRoom owner info to the bound session profile"
     );
     Ok(Vec::new())
+}
+
+async fn execute_myroom_entry(
+    world: &AdmittedWorldHandle<'_>,
+    request: EnterMyRoomRequest,
+    context: &SessionContext,
+) -> Result<(), LoginSessionError> {
+    let identity = world.authorize_identity().await?;
+    let profile = context.profile_for(&identity)?;
+    let self_info = if canonical_nickname_key(&request.owner_nickname)
+        == canonical_nickname_key(&identity.nickname)
+    {
+        Some(profile.my_room.try_to_protocol_info()?)
+    } else {
+        None
+    };
+    let input = MyRoomEntryInput::new(
+        identity,
+        request.owner_nickname,
+        &myroom_profile_presentation(profile),
+        self_info,
+    )
+    .map_err(|source| LoginSessionError::MyRoomEntryPreparation {
+        source: Box::new(source),
+    })?;
+    world.myroom_enter(input).await?;
+    Ok(())
 }
 
 async fn execute_myroom_owner_items(
@@ -2530,11 +2569,13 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            CHAR_POSITION_NAME, MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo,
-            MyRoomKart, MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
+            CHAR_POSITION_NAME, ENTER_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart,
+            MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
             REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_character_position,
-            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
-            serialize_owner_items, serialize_secede_reply, serialize_slot_data,
+            serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
+            serialize_owner_item_enchants, serialize_owner_items, serialize_secede_reply,
+            serialize_slot_data,
         },
         packet::{PacketReader, PacketWriter},
         race_protocol::{
@@ -3569,6 +3610,288 @@ mod tests {
 
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one dispatch fixture proves self bootstrap, optional reserved dword, public visitor entry, password redaction, and actor-owned packet ordering"
+    )]
+    async fn myroom_direct_entry_dispatch_bootstraps_self_and_redacts_visitor_secrets() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (direct_owner_session, _direct_owner_cancelled, mut direct_owner_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_730),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let direct_owner = world
+            .claim_identity(direct_owner_session, "DispatchDirectOwner")
+            .await
+            .unwrap();
+        let (direct_visitor_session, _direct_visitor_cancelled, mut direct_visitor_outbound) =
+            world
+                .register_login_session(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_731),
+                    WireOperationGate::new(),
+                )
+                .await
+                .unwrap();
+        let direct_visitor = world
+            .claim_identity(direct_visitor_session, "DispatchDirectVisitor")
+            .await
+            .unwrap();
+
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let mut owner_profile = Profile::default();
+        owner_profile.rider.p2p_port = 41_360;
+        owner_profile.rider.rp = 51_360;
+        owner_profile.rider.club_name = "DirectEntryClub".to_owned();
+        owner_profile.my_room.my_room = 36;
+        owner_profile.my_room.my_room_bgm = 8;
+        owner_profile.my_room.use_room_pwd = 0;
+        owner_profile.my_room.use_item_pwd = 1;
+        owner_profile.my_room.talk_lock = 0;
+        owner_profile.my_room.room_pwd = "room-dispatch-secret".to_owned();
+        owner_profile.my_room.item_pwd = "item-dispatch-secret".to_owned();
+        store.save(&direct_owner.nickname, &owner_profile).unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut direct_owner_context = bind_test_profile(&profiles, &direct_owner).await;
+        let mut direct_visitor_context = bind_test_profile(&profiles, &direct_visitor).await;
+        let visitor_profile = store
+            .load_or_create(&direct_visitor.nickname)
+            .unwrap()
+            .profile;
+        let config = ServerConfig::default();
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: direct_owner_session,
+        };
+        let visitor_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: direct_visitor_session,
+        };
+
+        let mut self_entry = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        self_entry.write_utf16("dispatchdirectowner").unwrap();
+        self_entry.write_i32(0x5136);
+        assert!(
+            dispatch_packet(
+                &owner_services,
+                &self_entry.into_inner(),
+                &mut direct_owner_context,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let owner_info = owner_profile.my_room.try_to_protocol_info().unwrap();
+        let mut owner_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] =
+            array::from_fn(|_| MyRoomSlot::Empty);
+        owner_slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(
+            &direct_owner,
+            &owner_profile,
+        ));
+        assert_eq!(
+            direct_owner_outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &direct_owner.nickname,
+                    EnterMyRoomStatus::Success,
+                    &owner_info,
+                )
+                .unwrap(),
+                serialize_slot_data(&owner_slots).unwrap(),
+            ]
+        );
+
+        let mut visitor_entry = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        visitor_entry.write_utf16("DISPATCHDIRECTOWNER").unwrap();
+        assert!(
+            dispatch_packet(
+                &visitor_services,
+                &visitor_entry.into_inner(),
+                &mut direct_visitor_context,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let mut redacted = owner_info.clone();
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        let mut current_slots = owner_slots;
+        current_slots[1] = MyRoomSlot::Player(myroom_player_slot_from_profile(
+            &direct_visitor,
+            &visitor_profile,
+        ));
+        assert_eq!(
+            direct_visitor_outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &direct_owner.nickname,
+                    EnterMyRoomStatus::Success,
+                    &redacted,
+                )
+                .unwrap(),
+                serialize_slot_data(&current_slots).unwrap(),
+            ]
+        );
+        assert_eq!(
+            direct_owner_outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_slot_data(&current_slots).unwrap()]
+        );
+        assert_eq!(redacted.use_item_password, owner_info.use_item_password);
+        assert_eq!(redacted.talk_lock, owner_info.talk_lock);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_myroom_direct_entry_stops_before_actor_publication() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_732),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "MalformedDirectEntry")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+        let mut malformed = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        malformed.write_utf16(&owner.identity.nickname).unwrap();
+        let mut malformed = malformed.into_inner();
+        malformed.push(0x51);
+
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::TrailingBytes { .. }
+            ))
+        ));
+        assert!(outbound.try_recv().is_err());
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_direct_entry_backpressure_is_atomic_and_fails_session_explicitly() {
+        let fixture = spawn_myroom_world_with_outbound_capacity(MyRoomInfo::default(), 1);
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (outsider_session, _cancelled, mut outsider_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_733),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let outsider = world
+            .claim_identity(outsider_session, "DirectEntryBackpressure")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut outsider_context = bind_test_profile(&profiles, &outsider).await;
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let outsider_services = SessionServices {
+            session_id: outsider_session,
+            ..owner_services
+        };
+
+        let queued_position = serialize_character_position(0, [51.36; 6]).unwrap();
+        assert!(
+            dispatch_packet(&owner_services, &queued_position, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut enter = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        enter.write_utf16(&owner.identity.nickname).unwrap();
+        assert!(matches!(
+            dispatch_packet(
+                &outsider_services,
+                &enter.into_inner(),
+                &mut outsider_context,
+            )
+            .await,
+            Err(LoginSessionError::World(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == visitor.session
+        ));
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(outsider_outbound.try_recv().is_err());
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![queued_position]
+        );
+
+        let first = PacketWriter::named("RmFirstRequestPacket").into_inner();
+        assert!(
+            dispatch_packet(&outsider_services, &first, &mut outsider_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let empty: [MyRoomSlot; MYROOM_SLOT_COUNT] = array::from_fn(|_| MyRoomSlot::Empty);
+        assert_eq!(
+            outsider_outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_slot_data(&empty).unwrap()],
+            "entry backpressure must leave the requester outside every MyRoom"
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -197,25 +197,11 @@ impl MyRoomParticipant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the TCP MyRoom entry command consumes owner input"
-    )
-)]
 pub(crate) struct MyRoomOwner {
     participant: MyRoomParticipant,
     info: MyRoomInfo,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the TCP MyRoom entry command consumes owner input"
-    )
-)]
 impl MyRoomOwner {
     pub(crate) fn new(
         participant: MyRoomParticipant,
@@ -227,6 +213,16 @@ impl MyRoomOwner {
 
     fn key(&self) -> OwnerKey {
         OwnerKey(self.participant.identity.user_no)
+    }
+
+    #[must_use]
+    pub(crate) fn identity(&self) -> &IdentityBinding {
+        self.participant.identity()
+    }
+
+    #[must_use]
+    pub(crate) fn info(&self) -> &MyRoomInfo {
+        &self.info
     }
 }
 
@@ -1534,6 +1530,53 @@ impl MyRoomHub {
     #[must_use]
     pub(crate) fn room_info(&self, owner: UserNo) -> Option<&MyRoomInfo> {
         self.rooms.get(&OwnerKey(owner)).map(|room| &room.info)
+    }
+
+    /// Returns the exact cached owner input for an actor-tracked owned room.
+    ///
+    /// An active identity which has not created its own room is a normal
+    /// `None`. If the identity already has any tracked role, its full binding
+    /// must still match the hub's canonical generation.
+    pub(crate) fn tracked_owner_entry_input(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomOwner>, MyRoomHubError> {
+        let owner = OwnerKey(identity.user_no);
+        let Some(room) = self.rooms.get(&owner) else {
+            if self.has_role(identity.user_no)? {
+                self.require_canonical_identity(identity)?;
+            }
+            return Ok(None);
+        };
+        self.require_canonical_identity(identity)?;
+        require_same_binding(&room.owner.identity, identity)?;
+        Ok(Some(MyRoomOwner {
+            participant: room.owner.clone(),
+            info: room.info.clone(),
+        }))
+    }
+
+    /// Returns owner input only while the exact owner generation occupies slot
+    /// zero of its actor-tracked room.
+    pub(crate) fn present_owner_entry_input(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomOwner>, MyRoomHubError> {
+        let Some(owner) = self.tracked_owner_entry_input(identity)? else {
+            return Ok(None);
+        };
+        let key = OwnerKey(identity.user_no);
+        let room = self.room(key)?;
+        if !room.owner_present {
+            return Ok(None);
+        }
+        let membership = self.membership_exact(identity)?;
+        if membership.owner != key || membership.slot != MyRoomSlotIndex::OWNER {
+            return Err(MyRoomHubError::NotPresentOwner {
+                user_no: identity.user_no,
+            });
+        }
+        Ok(Some(owner))
     }
 
     pub(crate) fn update_owner_info(
@@ -2935,6 +2978,55 @@ mod tests {
                 .get(),
             1
         );
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn entry_owner_queries_require_exact_tracked_and_present_owner_roles() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "EntryOwner");
+        let visitor_id = claim(&mut registry, 2, "EntryVisitor");
+        let mut hub = MyRoomHub::new();
+
+        assert_eq!(hub.tracked_owner_entry_input(&owner_id).unwrap(), None);
+        assert_eq!(hub.present_owner_entry_input(&owner_id).unwrap(), None);
+
+        let owner_input = owner(&owner_id);
+        enter(&mut hub, participant(&owner_id), owner_input.clone()).unwrap();
+        assert_eq!(
+            hub.tracked_owner_entry_input(&owner_id).unwrap(),
+            Some(owner_input.clone())
+        );
+        assert_eq!(
+            hub.present_owner_entry_input(&owner_id).unwrap(),
+            Some(owner_input.clone())
+        );
+
+        enter(&mut hub, participant(&visitor_id), owner_input.clone()).unwrap();
+        assert_eq!(
+            hub.tracked_owner_entry_input(&visitor_id).unwrap(),
+            None,
+            "a tracked visitor must not become an entry owner"
+        );
+        leave(&mut hub, &owner_id).unwrap();
+        assert_eq!(
+            hub.tracked_owner_entry_input(&owner_id).unwrap(),
+            Some(owner_input),
+            "the owned-room tombstone remains available for owner self-entry"
+        );
+        assert_eq!(
+            hub.present_owner_entry_input(&owner_id).unwrap(),
+            None,
+            "visitors cannot enter while the owner is absent from slot zero"
+        );
+
+        let replacement =
+            replacement_identity(&mut registry, owner_id.owner.get(), 3, "EntryOwner");
+        assert!(matches!(
+            hub.tracked_owner_entry_input(&replacement),
+            Err(MyRoomHubError::StaleGeneration { .. }
+                | MyRoomHubError::IdentityBindingMismatch { .. })
+        ));
         hub.audit_invariants().unwrap();
     }
 
