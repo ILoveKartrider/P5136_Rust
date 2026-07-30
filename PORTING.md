@@ -79,12 +79,13 @@ been demonstrated.
 - [x] visitor MyRoom secret redaction and conservative protected-item denial
 - [x] exact-generation MyRoom character-position peer fanout
 - [x] direct MyRoom self-bootstrap and actor-tracked public-room entry
+- [x] current-membership Reenter and bounded random public-room entry
 - [x] race start/grid/readiness with deterministic fallback track
 - [ ] live track-pool/mode/random-track control surface
 - [x] finish, ranking, settlement, team booster, and DNF deadline
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
-- [ ] random/re-enter and password-capable protected MyRoom entry flows
+- [ ] password-capable protected MyRoom entry flow
 - [ ] MyRoom talk, password, emblem, and main-emblem flows
 - [ ] P2P-port and club-name profile mutation/refresh paths
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface

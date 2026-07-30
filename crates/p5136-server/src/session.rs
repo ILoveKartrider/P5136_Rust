@@ -39,9 +39,10 @@ use p5136_core::{
     myroom_protocol::{
         EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
         MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
-        parse_enter_request, parse_first_request, parse_request_items, parse_secede_request,
-        parse_update_info, plan_owner_item_packets, serialize_myroom_info,
-        serialize_owner_item_enchants, serialize_owner_items,
+        parse_enter_random_request, parse_enter_request, parse_first_request,
+        parse_reenter_request, parse_request_items, parse_secede_request, parse_update_info,
+        plan_owner_item_packets, serialize_myroom_info, serialize_owner_item_enchants,
+        serialize_owner_items,
     },
     nickname::canonical_nickname_key,
     packet::PacketError,
@@ -1675,7 +1676,22 @@ async fn handle_myroom_request(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     match request {
         MyRoomRequest::Enter => {
-            execute_myroom_entry(world, parse_enter_request(packet)?, context).await?;
+            execute_myroom_entry(
+                world,
+                SessionMyRoomEntryIntent::Direct(parse_enter_request(packet)?),
+                context,
+            )
+            .await?;
+            return Ok(Vec::new());
+        }
+        MyRoomRequest::Reenter => {
+            parse_reenter_request(packet)?;
+            execute_myroom_entry(world, SessionMyRoomEntryIntent::Reenter, context).await?;
+            return Ok(Vec::new());
+        }
+        MyRoomRequest::EnterRandom => {
+            parse_enter_random_request(packet)?;
+            execute_myroom_entry(world, SessionMyRoomEntryIntent::Random, context).await?;
             return Ok(Vec::new());
         }
         MyRoomRequest::FirstState => {
@@ -1756,26 +1772,38 @@ async fn handle_myroom_request(
     Ok(Vec::new())
 }
 
+enum SessionMyRoomEntryIntent {
+    Direct(EnterMyRoomRequest),
+    Reenter,
+    Random,
+}
+
 async fn execute_myroom_entry(
     world: &AdmittedWorldHandle<'_>,
-    request: EnterMyRoomRequest,
+    intent: SessionMyRoomEntryIntent,
     context: &SessionContext,
 ) -> Result<(), LoginSessionError> {
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
-    let self_info = if canonical_nickname_key(&request.owner_nickname)
-        == canonical_nickname_key(&identity.nickname)
-    {
-        Some(profile.my_room.try_to_protocol_info()?)
-    } else {
-        None
-    };
-    let input = MyRoomEntryInput::new(
-        identity,
-        request.owner_nickname,
-        &myroom_profile_presentation(profile),
-        self_info,
-    )
+    let presentation = myroom_profile_presentation(profile);
+    let input = match intent {
+        SessionMyRoomEntryIntent::Direct(request) => {
+            let self_info = if canonical_nickname_key(&request.owner_nickname)
+                == canonical_nickname_key(&identity.nickname)
+            {
+                Some(profile.my_room.try_to_protocol_info()?)
+            } else {
+                None
+            };
+            MyRoomEntryInput::direct(identity, request.owner_nickname, &presentation, self_info)
+        }
+        SessionMyRoomEntryIntent::Reenter => MyRoomEntryInput::reenter(
+            identity,
+            &presentation,
+            profile.my_room.try_to_protocol_info(),
+        ),
+        SessionMyRoomEntryIntent::Random => MyRoomEntryInput::random(identity, &presentation),
+    }
     .map_err(|source| LoginSessionError::MyRoomEntryPreparation {
         source: Box::new(source),
     })?;
@@ -2569,13 +2597,13 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            CHAR_POSITION_NAME, ENTER_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart,
-            MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
-            REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_character_position,
-            serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
-            serialize_owner_item_enchants, serialize_owner_items, serialize_secede_reply,
-            serialize_slot_data,
+            CHAR_POSITION_NAME, ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME,
+            EnterMyRoomStatus, MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo,
+            MyRoomKart, MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
+            REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets,
+            serialize_character_position, serialize_enter_error, serialize_enter_reply,
+            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
+            serialize_owner_items, serialize_secede_reply, serialize_slot_data,
         },
         packet::{PacketReader, PacketWriter},
         race_protocol::{
@@ -2736,6 +2764,19 @@ mod tests {
         world: &WorldHandle,
         profile_runtime: crate::profile_io::ProfileIoRuntime,
         actor: tokio::task::JoinHandle<Result<(), crate::world::WorldSidecarError>>,
+    ) {
+        world.quiesce().await.unwrap();
+        world.drain_sessions().await.unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    async fn shutdown_spawned_myroom_test(
+        world: &WorldHandle,
+        profile_runtime: crate::profile_io::ProfileIoRuntime,
+        actor: tokio::task::JoinHandle<Result<(), crate::world::WorldActorError>>,
     ) {
         world.quiesce().await.unwrap();
         world.drain_sessions().await.unwrap();
@@ -3760,6 +3801,332 @@ mod tests {
         assert!(visitor.outbound.try_recv().is_err());
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_reentry_dispatch_bootstraps_self_from_the_bound_profile() {
+        let (world, actor) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_740),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "DispatchReentrySelf")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let profile = store.load_or_create(&identity.nickname).unwrap().profile;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+        let request = PacketWriter::named(REENTER_MYROOM_REQUEST_NAME).into_inner();
+
+        assert!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let info = profile.my_room.try_to_protocol_info().unwrap();
+        let mut slots: [MyRoomSlot; MYROOM_SLOT_COUNT] = array::from_fn(|_| MyRoomSlot::Empty);
+        slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(&identity, &profile));
+        assert_eq!(
+            outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(&identity.nickname, EnterMyRoomStatus::Success, &info)
+                    .unwrap(),
+                serialize_slot_data(&slots).unwrap(),
+            ]
+        );
+
+        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_reentry_current_membership_ignores_invalid_self_fallback_info() {
+        let owner_info = MyRoomInfo {
+            room_id: 5136,
+            room_password: "owner-room-secret".to_owned(),
+            item_password: "owner-item-secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(owner_info.clone());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let mut profile = Profile::default();
+        profile.my_room.room_pwd = "x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1);
+        store.save(&visitor.identity.nickname, &profile).unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        let request = PacketWriter::named(REENTER_MYROOM_REQUEST_NAME).into_inner();
+
+        assert!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "current authoritative membership must not consume invalid self-bootstrap data"
+        );
+
+        let packets = visitor.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 2);
+        let mut redacted = owner_info;
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        assert_eq!(
+            packets[0],
+            serialize_enter_reply(
+                &owner.identity.nickname,
+                EnterMyRoomStatus::Success,
+                &redacted,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![packets[1].clone()]
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_reentry_invalid_self_fallback_is_typed_without_stopping_the_actor() {
+        let (world, actor) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_744),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "InvalidReentryFallback")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let mut profile = Profile::default();
+        profile.my_room.item_pwd = "x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1);
+        store.save(&identity.nickname, &profile).unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+        let request = PacketWriter::named(REENTER_MYROOM_REQUEST_NAME).into_inner();
+
+        assert!(matches!(
+            dispatch_packet(&services, &request, &mut context).await,
+            Err(LoginSessionError::World(
+                WorldError::MyRoomEntrySelfInfoInvalid {
+                    session: actual,
+                    source: MyRoomProtocolError::StringTooLong {
+                        field: "MyRoom item password",
+                        ..
+                    },
+                }
+            )) if actual == session
+        ));
+        assert!(outbound.try_recv().is_err());
+        assert_eq!(world.myroom_session_view(session).await.unwrap(), None);
+        assert_eq!(world.session_count().await.unwrap(), 1);
+
+        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_random_entry_dispatch_uses_the_only_eligible_public_room() {
+        let owner_info = MyRoomInfo {
+            room_id: 5136,
+            use_item_password: 1,
+            room_password: "public-room-raw-secret".to_owned(),
+            item_password: "public-item-raw-secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(owner_info.clone());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_741),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "DispatchRandomVisitor")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+        let request = PacketWriter::named(ENTER_RANDOM_MYROOM_REQUEST_NAME).into_inner();
+
+        assert!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let packets = outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 2);
+        let mut redacted = owner_info;
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        assert_eq!(
+            packets[0],
+            serialize_enter_reply(
+                &owner.identity.nickname,
+                EnterMyRoomStatus::Success,
+                &redacted,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![packets[1].clone()]
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![packets[1].clone()]
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_random_entry_dispatch_reports_no_available_room() {
+        let (world, actor) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_742),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "DispatchRandomAlone")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+        let request = PacketWriter::named(ENTER_RANDOM_MYROOM_REQUEST_NAME).into_inner();
+
+        assert!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_enter_error(EnterMyRoomStatus::NoAvailableRoom).unwrap()]
+        );
+        assert_eq!(world.myroom_session_view(session).await.unwrap(), None);
+
+        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_myroom_reentry_and_random_stop_before_actor_publication() {
+        let (world, actor) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_743),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "MalformedTypedEntry")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+
+        for name in [
+            REENTER_MYROOM_REQUEST_NAME,
+            ENTER_RANDOM_MYROOM_REQUEST_NAME,
+        ] {
+            let mut malformed = PacketWriter::named(name).into_inner();
+            malformed.push(0x51);
+            assert!(matches!(
+                dispatch_packet(&services, &malformed, &mut context).await,
+                Err(LoginSessionError::MyRoomProtocol(
+                    MyRoomProtocolError::TrailingBytes {
+                        name: actual,
+                        count: 1,
+                    }
+                )) if actual == name
+            ));
+            assert!(outbound.try_recv().is_err());
+            assert_eq!(world.myroom_session_view(session).await.unwrap(), None);
+        }
+
+        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

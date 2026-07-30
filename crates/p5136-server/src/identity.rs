@@ -1540,13 +1540,6 @@ impl IdentityRegistry {
     /// Iterates over exact bindings for identities that currently have an
     /// owning session. Ownerless migration generations are deliberately
     /// omitted until a destination completes the transfer.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the pending random MyRoom entry command consumes active identities"
-        )
-    )]
     pub(crate) fn active_identities(&self) -> impl Iterator<Item = IdentityBinding> + '_ {
         self.active_by_name
             .values()

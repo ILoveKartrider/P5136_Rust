@@ -501,6 +501,25 @@ pub(crate) enum EnterOutcome {
     },
 }
 
+/// Actor-authoritative eligibility for admitting a random visitor.
+///
+/// Only [`Self::Available`] carries entry authority. Callers cannot mistake a
+/// tracked-but-ineligible room for one whose authoritative owner input may be
+/// passed back to [`MyRoomHub::enter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the TCP random MyRoom entry command consumes this classification"
+    )
+)]
+pub(crate) enum MyRoomVisitorEntryAvailability {
+    Available(Box<MyRoomOwner>),
+    Full,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
@@ -1532,6 +1551,36 @@ impl MyRoomHub {
         self.rooms.get(&OwnerKey(owner)).map(|room| &room.info)
     }
 
+    /// Returns authoritative owner input for the requester's current room.
+    ///
+    /// Membership, rather than current public admission policy, is the
+    /// authority: an exact existing member may re-enter a protected room or a
+    /// room whose owner is temporarily absent. An identity with no current
+    /// membership is a normal `None`; a stale or forged tracked binding is an
+    /// error.
+    pub(crate) fn membership_owner_entry_input(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomOwner>, MyRoomHubError> {
+        let Some(membership) = self.membership_if_member(identity)? else {
+            return Ok(None);
+        };
+        let owner = OwnerKey(membership.owner);
+        let room = self.room(owner)?;
+        if room.owner.identity.user_no != owner.user_no() {
+            return Err(MyRoomInvariantViolation::WrongOwnerPresentation {
+                owner: owner.user_no(),
+                actual: room.owner.identity.user_no,
+            }
+            .into());
+        }
+        self.require_canonical_identity(&room.owner.identity)?;
+        Ok(Some(MyRoomOwner {
+            participant: room.owner.clone(),
+            info: room.info.clone(),
+        }))
+    }
+
     /// Returns the exact cached owner input for an actor-tracked owned room.
     ///
     /// An active identity which has not created its own room is a normal
@@ -1577,6 +1626,29 @@ impl MyRoomHub {
             });
         }
         Ok(Some(owner))
+    }
+
+    /// Classifies an exact active owner binding for random visitor admission.
+    ///
+    /// A candidate is available only when its actor-tracked owned room has the
+    /// same canonical owner in slot zero, remains public, and has a visitor
+    /// vacancy. Untracked, owner-absent, and protected rooms are intentionally
+    /// indistinguishable to callers.
+    pub(crate) fn public_owner_entry_availability(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<MyRoomVisitorEntryAvailability, MyRoomHubError> {
+        let Some(owner) = self.present_owner_entry_input(identity)? else {
+            return Ok(MyRoomVisitorEntryAvailability::Unavailable);
+        };
+        let room = self.room(OwnerKey(identity.user_no))?;
+        if room.info.use_room_password != 0 {
+            return Ok(MyRoomVisitorEntryAvailability::Unavailable);
+        }
+        if room.visitors.iter().all(Option::is_some) {
+            return Ok(MyRoomVisitorEntryAvailability::Full);
+        }
+        Ok(MyRoomVisitorEntryAvailability::Available(Box::new(owner)))
     }
 
     pub(crate) fn update_owner_info(
@@ -2787,9 +2859,9 @@ mod tests {
         MAX_TRANSITION_GENERATIONS, MAX_TRANSITION_MEMBERSHIPS, MAX_TRANSITION_ROOMS,
         MembershipChange, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
         MyRoomInvariantViolation, MyRoomOwner, MyRoomParticipant, MyRoomProfilePresentation,
-        MyRoomRevision, MyRoomSlotIndex, MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection,
-        MyRoomWireProjectionError, OwnerKey, ParticipantRefreshEffects, RoomChange, RoomEffect,
-        RoomState, VISITOR_CAPACITY,
+        MyRoomRevision, MyRoomSlotIndex, MyRoomTransition, MyRoomVisitorEntryAvailability,
+        MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError, OwnerKey,
+        ParticipantRefreshEffects, RoomChange, RoomEffect, RoomState, VISITOR_CAPACITY,
     };
     use crate::{IdentityBinding, IdentityRegistry, ReleasedIdentity, SessionId};
 
@@ -3024,6 +3096,117 @@ mod tests {
             replacement_identity(&mut registry, owner_id.owner.get(), 3, "EntryOwner");
         assert!(matches!(
             hub.tracked_owner_entry_input(&replacement),
+            Err(MyRoomHubError::StaleGeneration { .. }
+                | MyRoomHubError::IdentityBindingMismatch { .. })
+        ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn membership_owner_entry_input_uses_exact_membership_and_authoritative_room_state() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "ReenterOwner");
+        let visitor_id = claim(&mut registry, 2, "ReenterVisitor");
+        let outsider = claim(&mut registry, 3, "ReenterOutsider");
+        let mut hub = MyRoomHub::new();
+        let protected_owner = MyRoomOwner::new(
+            participant(&owner_id),
+            MyRoomInfo {
+                room_id: 77,
+                use_room_password: 1,
+                room_password: "secret".to_owned(),
+                ..MyRoomInfo::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            hub.membership_owner_entry_input(&outsider).unwrap(),
+            None,
+            "an untracked identity is not a re-entry candidate"
+        );
+        enter(&mut hub, participant(&owner_id), protected_owner.clone()).unwrap();
+        enter(&mut hub, participant(&visitor_id), protected_owner.clone()).unwrap();
+        assert_eq!(
+            hub.membership_owner_entry_input(&visitor_id).unwrap(),
+            Some(protected_owner.clone()),
+            "an existing member may re-enter a protected room"
+        );
+
+        leave(&mut hub, &owner_id).unwrap();
+        assert_eq!(
+            hub.membership_owner_entry_input(&visitor_id).unwrap(),
+            Some(protected_owner),
+            "owner absence must not revoke an existing member's re-entry input"
+        );
+
+        let visitor_g2 =
+            replacement_identity(&mut registry, visitor_id.owner.get(), 4, "ReenterVisitor");
+        assert!(matches!(
+            hub.membership_owner_entry_input(&visitor_g2),
+            Err(MyRoomHubError::StaleGeneration { .. }
+                | MyRoomHubError::IdentityBindingMismatch { .. })
+        ));
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn public_owner_entry_availability_classifies_policy_presence_and_capacity() {
+        let mut registry = IdentityRegistry::new();
+        let public_id = claim(&mut registry, 1, "RandomPublic");
+        let protected_id = claim(&mut registry, 2, "RandomProtected");
+        let untracked = claim(&mut registry, 3, "RandomUntracked");
+        let mut hub = MyRoomHub::new();
+        let public_owner = owner(&public_id);
+        let protected_owner = MyRoomOwner::new(
+            participant(&protected_id),
+            MyRoomInfo {
+                use_room_password: 1,
+                room_password: "secret".to_owned(),
+                ..MyRoomInfo::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            hub.public_owner_entry_availability(&untracked).unwrap(),
+            MyRoomVisitorEntryAvailability::Unavailable
+        );
+        enter(&mut hub, participant(&public_id), public_owner.clone()).unwrap();
+        enter(&mut hub, participant(&protected_id), protected_owner).unwrap();
+        assert_eq!(
+            hub.public_owner_entry_availability(&public_id).unwrap(),
+            MyRoomVisitorEntryAvailability::Available(Box::new(public_owner.clone()))
+        );
+        assert_eq!(
+            hub.public_owner_entry_availability(&protected_id).unwrap(),
+            MyRoomVisitorEntryAvailability::Unavailable
+        );
+
+        for index in 0..VISITOR_CAPACITY {
+            let visitor = claim(
+                &mut registry,
+                10 + u64::try_from(index).unwrap(),
+                &format!("RandomVisitor{index}"),
+            );
+            enter(&mut hub, participant(&visitor), public_owner.clone()).unwrap();
+        }
+        assert_eq!(
+            hub.public_owner_entry_availability(&public_id).unwrap(),
+            MyRoomVisitorEntryAvailability::Full
+        );
+
+        leave(&mut hub, &public_id).unwrap();
+        assert_eq!(
+            hub.public_owner_entry_availability(&public_id).unwrap(),
+            MyRoomVisitorEntryAvailability::Unavailable,
+            "owner absence takes precedence over otherwise full visitor slots"
+        );
+
+        let public_g2 =
+            replacement_identity(&mut registry, public_id.owner.get(), 30, "RandomPublic");
+        assert!(matches!(
+            hub.public_owner_entry_availability(&public_g2),
             Err(MyRoomHubError::StaleGeneration { .. }
                 | MyRoomHubError::IdentityBindingMismatch { .. })
         ));

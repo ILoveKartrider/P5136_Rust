@@ -74,8 +74,8 @@ use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 use crate::myroom_hub::{
     EnterOutcome as MyRoomEnterOutcome, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub,
     MyRoomHubError, MyRoomOwner, MyRoomOwnerItemPlan, MyRoomParticipant, MyRoomProfilePresentation,
-    MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError,
-    RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
+    MyRoomTransition, MyRoomVisitorEntryAvailability, MyRoomWirePlan, MyRoomWireProjection,
+    MyRoomWireProjectionError, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
 };
 use crate::myroom_persistence::{
     MigrationAcknowledgement, MigrationProfileCompletion, MyRoomCompletionBridge,
@@ -114,6 +114,18 @@ const MAX_DUE_REWARD_TASK_BATCH: usize = 64;
 trait RewardRollSource {
     fn draw_rp(&mut self) -> u8;
     fn draw_lucci(&mut self) -> u16;
+}
+
+trait MyRoomOwnerChoiceSource {
+    fn choose_index(&mut self, count: NonZeroUsize) -> usize;
+}
+
+struct RandomMyRoomOwnerChoiceSource;
+
+impl MyRoomOwnerChoiceSource for RandomMyRoomOwnerChoiceSource {
+    fn choose_index(&mut self, count: NonZeroUsize) -> usize {
+        rand::rng().random_range(0..count.get())
+    }
 }
 
 struct RandomRewardRollSource;
@@ -929,40 +941,85 @@ pub(crate) enum MyRoomPeerCommandPayload {
     CharacterPosition(CharacterPositionRequest),
 }
 
-/// Session-profile presentation fenced to one exact identity for a direct
+/// Session-profile presentation fenced to one exact identity for a typed
 /// `MyRoom` entry request.
 ///
 /// Construction seals profile presentation to the session-authorized identity.
-/// The World actor then revalidates that binding and resolves owner topology,
-/// password policy, bounded fan-out reservation, and commit in one actor turn.
+/// The World actor then revalidates that binding and resolves direct, reentry,
+/// or random-owner topology, password policy, bounded fan-out reservation, and
+/// commit in one actor turn.
 #[derive(Debug)]
 pub(crate) struct MyRoomEntryInput {
     expected: IdentityBinding,
-    requested_owner: String,
     member: MyRoomParticipant,
-    self_info: Option<MyRoomInfo>,
+    intent: MyRoomEntryIntent,
+}
+
+#[derive(Debug)]
+enum MyRoomEntryIntent {
+    Direct {
+        requested_owner: String,
+        self_info: Option<MyRoomInfo>,
+    },
+    Reenter {
+        self_info: Result<MyRoomInfo, MyRoomProtocolError>,
+    },
+    Random,
 }
 
 enum MyRoomEntryOwnerResolution {
-    Rejected,
+    Rejected(EnterMyRoomStatus),
     Tracked(MyRoomOwner),
     Bootstrap(MyRoomInfo),
 }
 
 impl MyRoomEntryInput {
-    pub(crate) fn new(
+    fn bind(
+        expected: IdentityBinding,
+        presentation: &MyRoomProfilePresentation,
+        intent: MyRoomEntryIntent,
+    ) -> Result<Self, MyRoomHubError> {
+        let member = presentation.bind(expected.clone())?;
+        Ok(Self {
+            expected,
+            member,
+            intent,
+        })
+    }
+
+    pub(crate) fn direct(
         expected: IdentityBinding,
         requested_owner: String,
         presentation: &MyRoomProfilePresentation,
         self_info: Option<MyRoomInfo>,
     ) -> Result<Self, MyRoomHubError> {
-        let member = presentation.bind(expected.clone())?;
-        Ok(Self {
+        Self::bind(
             expected,
-            requested_owner,
-            member,
-            self_info,
-        })
+            presentation,
+            MyRoomEntryIntent::Direct {
+                requested_owner,
+                self_info,
+            },
+        )
+    }
+
+    pub(crate) fn reenter(
+        expected: IdentityBinding,
+        presentation: &MyRoomProfilePresentation,
+        self_info: Result<MyRoomInfo, MyRoomProtocolError>,
+    ) -> Result<Self, MyRoomHubError> {
+        Self::bind(
+            expected,
+            presentation,
+            MyRoomEntryIntent::Reenter { self_info },
+        )
+    }
+
+    pub(crate) fn random(
+        expected: IdentityBinding,
+        presentation: &MyRoomProfilePresentation,
+    ) -> Result<Self, MyRoomHubError> {
+        Self::bind(expected, presentation, MyRoomEntryIntent::Random)
     }
 }
 
@@ -1171,6 +1228,16 @@ pub enum WorldError {
         expected: bool,
         actual: bool,
     },
+
+    #[error("MyRoom reentry fallback info for session {session:?} is not wire-safe")]
+    MyRoomEntrySelfInfoInvalid {
+        session: SessionId,
+        #[source]
+        source: MyRoomProtocolError,
+    },
+
+    #[error("MyRoom random owner choice {index} is outside candidate count {count}")]
+    MyRoomRandomChoiceOutOfRange { index: usize, count: usize },
 
     #[error("channel-move acknowledgement queue is unavailable for session {session:?}")]
     MigrationAcknowledgementUnavailable { session: SessionId },
@@ -4144,51 +4211,46 @@ impl World {
         session: SessionId,
         input: MyRoomEntryInput,
     ) -> Result<(), WorldOperationError> {
+        let mut choice_source = RandomMyRoomOwnerChoiceSource;
+        self.myroom_entry_with_choice_source(session, input, &mut choice_source)
+    }
+
+    fn myroom_entry_with_choice_source(
+        &mut self,
+        session: SessionId,
+        input: MyRoomEntryInput,
+        choice_source: &mut impl MyRoomOwnerChoiceSource,
+    ) -> Result<(), WorldOperationError> {
         let identity = self.authorize_session_operation(session)?;
         let MyRoomEntryInput {
             expected,
-            requested_owner,
             member,
-            self_info,
+            intent,
         } = input;
         if identity != expected || member.identity() != &expected {
             return Err(WorldError::MyRoomEntryIdentityStale { session }.into());
         }
 
-        let requested_self =
-            canonical_nickname_key(&requested_owner) == canonical_nickname_key(&identity.nickname);
-        if requested_self != self_info.is_some() {
-            return Err(WorldError::MyRoomEntrySelfInfoMismatch {
-                session,
-                expected: requested_self,
-                actual: self_info.is_some(),
-            }
-            .into());
-        }
-
-        let owner = match self.resolve_myroom_entry_owner(
-            session,
-            &identity,
-            &requested_owner,
-            self_info,
-        )? {
-            MyRoomEntryOwnerResolution::Rejected => {
-                return self
-                    .publish_myroom_entry_status(session, EnterMyRoomStatus::OwnerUnavailable);
-            }
-            MyRoomEntryOwnerResolution::Tracked(owner) => owner,
-            MyRoomEntryOwnerResolution::Bootstrap(info) => {
-                MyRoomOwner::new(member.clone(), info)
-                    .map_err(|source| myroom_hub_error("self-entry owner construction", source))?
-            }
-        };
+        let full_is_expected_rejection = matches!(&intent, MyRoomEntryIntent::Direct { .. });
+        let owner =
+            match self.resolve_myroom_entry_owner(session, &identity, intent, choice_source)? {
+                MyRoomEntryOwnerResolution::Rejected(status) => {
+                    return self.publish_myroom_entry_status(session, status);
+                }
+                MyRoomEntryOwnerResolution::Tracked(owner) => owner,
+                MyRoomEntryOwnerResolution::Bootstrap(info) => {
+                    MyRoomOwner::new(member.clone(), info).map_err(|source| {
+                        myroom_hub_error("self-entry owner construction", source)
+                    })?
+                }
+            };
 
         let transition = match self.myroom.enter(&member, &owner) {
             Ok(transition) => transition,
-            Err(MyRoomHubError::Full { .. }) => {
+            Err(MyRoomHubError::Full { .. }) if full_is_expected_rejection => {
                 return self.publish_myroom_entry_status(session, EnterMyRoomStatus::Full);
             }
-            Err(source) => return Err(myroom_hub_error("direct entry", source).into()),
+            Err(source) => return Err(myroom_hub_error("typed entry", source).into()),
         };
 
         let mut reply_info = owner.info().clone();
@@ -4212,9 +4274,46 @@ impl World {
         &self,
         session: SessionId,
         requester: &IdentityBinding,
+        intent: MyRoomEntryIntent,
+        choice_source: &mut impl MyRoomOwnerChoiceSource,
+    ) -> Result<MyRoomEntryOwnerResolution, WorldOperationError> {
+        match intent {
+            MyRoomEntryIntent::Direct {
+                requested_owner,
+                self_info,
+            } => self.resolve_direct_myroom_entry_owner(
+                session,
+                requester,
+                &requested_owner,
+                self_info,
+            ),
+            MyRoomEntryIntent::Reenter { self_info } => {
+                self.resolve_reenter_myroom_entry_owner(session, requester, self_info)
+            }
+            MyRoomEntryIntent::Random => {
+                self.resolve_random_myroom_entry_owner(requester, choice_source)
+            }
+        }
+    }
+
+    fn resolve_direct_myroom_entry_owner(
+        &self,
+        session: SessionId,
+        requester: &IdentityBinding,
         requested_owner: &str,
         self_info: Option<MyRoomInfo>,
     ) -> Result<MyRoomEntryOwnerResolution, WorldOperationError> {
+        let requested_self =
+            canonical_nickname_key(requested_owner) == canonical_nickname_key(&requester.nickname);
+        if requested_self != self_info.is_some() {
+            return Err(WorldError::MyRoomEntrySelfInfoMismatch {
+                session,
+                expected: requested_self,
+                actual: self_info.is_some(),
+            }
+            .into());
+        }
+
         match self.identities.active_identity(requested_owner) {
             Some(target) if &target == requester => {
                 let tracked = self
@@ -4241,11 +4340,83 @@ impl World {
                     Some(owner) if owner.info().use_room_password == 0 => {
                         MyRoomEntryOwnerResolution::Tracked(owner)
                     }
-                    Some(_) | None => MyRoomEntryOwnerResolution::Rejected,
+                    Some(_) | None => {
+                        MyRoomEntryOwnerResolution::Rejected(EnterMyRoomStatus::OwnerUnavailable)
+                    }
                 })
             }
-            None => Ok(MyRoomEntryOwnerResolution::Rejected),
+            None => Ok(MyRoomEntryOwnerResolution::Rejected(
+                EnterMyRoomStatus::OwnerUnavailable,
+            )),
         }
+    }
+
+    fn resolve_reenter_myroom_entry_owner(
+        &self,
+        session: SessionId,
+        requester: &IdentityBinding,
+        self_info: Result<MyRoomInfo, MyRoomProtocolError>,
+    ) -> Result<MyRoomEntryOwnerResolution, WorldOperationError> {
+        if let Some(owner) = self
+            .myroom
+            .membership_owner_entry_input(requester)
+            .map_err(|source| myroom_hub_error("reentry membership owner query", source))?
+        {
+            return Ok(MyRoomEntryOwnerResolution::Tracked(owner));
+        }
+        if let Some(owner) = self
+            .myroom
+            .tracked_owner_entry_input(requester)
+            .map_err(|source| myroom_hub_error("reentry owned-room query", source))?
+        {
+            return Ok(MyRoomEntryOwnerResolution::Tracked(owner));
+        }
+        let self_info = self_info
+            .map_err(|source| WorldError::MyRoomEntrySelfInfoInvalid { session, source })?;
+        Ok(MyRoomEntryOwnerResolution::Bootstrap(self_info))
+    }
+
+    fn resolve_random_myroom_entry_owner(
+        &self,
+        requester: &IdentityBinding,
+        choice_source: &mut impl MyRoomOwnerChoiceSource,
+    ) -> Result<MyRoomEntryOwnerResolution, WorldOperationError> {
+        let current_owner = self
+            .myroom
+            .membership_if_member(requester)
+            .map_err(|source| myroom_hub_error("random-entry requester membership query", source))?
+            .map(|membership| membership.owner);
+        let mut candidates = Vec::new();
+        for candidate in self.identities.active_identities() {
+            if candidate.user_no == requester.user_no || current_owner == Some(candidate.user_no) {
+                continue;
+            }
+            match self
+                .myroom
+                .public_owner_entry_availability(&candidate)
+                .map_err(|source| myroom_hub_error("random-entry owner query", source))?
+            {
+                MyRoomVisitorEntryAvailability::Available(owner) => candidates.push(*owner),
+                MyRoomVisitorEntryAvailability::Full
+                | MyRoomVisitorEntryAvailability::Unavailable => {}
+            }
+        }
+        candidates.sort_unstable_by_key(|owner| owner.identity().user_no.get());
+
+        let Some(count) = NonZeroUsize::new(candidates.len()) else {
+            return Ok(MyRoomEntryOwnerResolution::Rejected(
+                EnterMyRoomStatus::NoAvailableRoom,
+            ));
+        };
+        let index = choice_source.choose_index(count);
+        let Some(owner) = candidates.into_iter().nth(index) else {
+            return Err(WorldError::MyRoomRandomChoiceOutOfRange {
+                index,
+                count: count.get(),
+            }
+            .into());
+        };
+        Ok(MyRoomEntryOwnerResolution::Tracked(owner))
     }
 
     fn myroom_entry_deliveries(
@@ -10326,7 +10497,7 @@ mod tests {
         array,
         collections::HashSet,
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        num::NonZeroU64,
+        num::{NonZeroU64, NonZeroUsize},
         sync::{Arc, Barrier},
         time::{Duration, Instant},
     };
@@ -10372,12 +10543,12 @@ mod tests {
     use super::{
         GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
         LobbyCommandPayload, LobbyError, MigrationAcknowledgement, MyRoomCommandPayload,
-        MyRoomEntryInput, MyRoomLifecycleError, MyRoomPeerCommandPayload, MyRoomPreparedCommand,
-        MyRoomWireProjection, OutboundBatch, ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload,
-        RaceError, RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId,
-        RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError,
-        WorldHandle, WorldOperationError, WorldSidecarError, WorldSidecars, WorldSpawnError,
-        dispatch_command, source_ipv4,
+        MyRoomEntryInput, MyRoomLifecycleError, MyRoomOwnerChoiceSource, MyRoomPeerCommandPayload,
+        MyRoomPreparedCommand, MyRoomWireProjection, OutboundBatch, ROOM_CAPACITY,
+        RaceCommandOutcome, RaceCommandPayload, RaceError, RegisteredMigrationPreflight,
+        RoomCommandPayload, RoomError, RoomId, RoomParticipant, RoomPhase, SessionId,
+        StartRoomPlan, World, WorldCommand, WorldError, WorldHandle, WorldOperationError,
+        WorldSidecarError, WorldSidecars, WorldSpawnError, dispatch_command, source_ipv4,
     };
     use crate::equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentWriteError,
@@ -10746,13 +10917,50 @@ mod tests {
         requested_owner: &str,
         self_info: Option<MyRoomInfo>,
     ) -> MyRoomEntryInput {
-        MyRoomEntryInput::new(
+        MyRoomEntryInput::direct(
             identity.clone(),
             requested_owner.to_owned(),
             &test_myroom_profile_presentation(),
             self_info,
         )
         .unwrap()
+    }
+
+    fn test_myroom_reentry_input(
+        identity: &IdentityBinding,
+        self_info: MyRoomInfo,
+    ) -> MyRoomEntryInput {
+        MyRoomEntryInput::reenter(
+            identity.clone(),
+            &test_myroom_profile_presentation(),
+            Ok(self_info),
+        )
+        .unwrap()
+    }
+
+    fn test_myroom_random_entry_input(identity: &IdentityBinding) -> MyRoomEntryInput {
+        MyRoomEntryInput::random(identity.clone(), &test_myroom_profile_presentation()).unwrap()
+    }
+
+    struct FixedMyRoomOwnerChoiceSource {
+        index: usize,
+        calls: Vec<usize>,
+    }
+
+    impl FixedMyRoomOwnerChoiceSource {
+        fn new(index: usize) -> Self {
+            Self {
+                index,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl MyRoomOwnerChoiceSource for FixedMyRoomOwnerChoiceSource {
+        fn choose_index(&mut self, count: NonZeroUsize) -> usize {
+            self.calls.push(count.get());
+            self.index
+        }
     }
 
     fn myroom_owner(identity: &IdentityBinding, presented_ip: Ipv4Addr) -> MyRoomOwner {
@@ -10781,6 +10989,20 @@ mod tests {
             )
             .unwrap();
         transition.commit(&mut world.myroom).unwrap();
+    }
+
+    fn enter_myroom_with_owner(
+        world: &mut World,
+        member: &IdentityBinding,
+        owner: &MyRoomOwner,
+        member_ip: Ipv4Addr,
+    ) {
+        world
+            .myroom
+            .enter(&myroom_participant(member, member_ip, 200), owner)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
     }
 
     fn prepare_test_myroom_command(
@@ -17065,6 +17287,558 @@ mod tests {
             None
         );
         assert!(migrated.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one reentry fixture covers protected membership, owned-room precedence, owner absence, redaction, and idempotent publication"
+    )]
+    fn myroom_reentry_prefers_exact_protected_membership_and_redacts_visitor_secrets() {
+        let mut world = World::default();
+        let mut protected_owner =
+            register_channel_session(&mut world, "ReentryProtectedOwner", 67, 56_300, 8);
+        let mut visitor =
+            register_channel_session(&mut world, "ReentryProtectedVisitor", 67, 56_302, 8);
+        let mut own_room_guest =
+            register_channel_session(&mut world, "ReentryOwnRoomGuest", 67, 56_304, 8);
+        let visitor_owned_room = myroom_owner(&visitor.identity, Ipv4Addr::LOCALHOST);
+        enter_myroom_with_owner(
+            &mut world,
+            &visitor.identity,
+            &visitor_owned_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom_with_owner(
+            &mut world,
+            &own_room_guest.identity,
+            &visitor_owned_room,
+            Ipv4Addr::LOCALHOST,
+        );
+
+        let protected_info = MyRoomInfo {
+            room_id: 5136,
+            bgm: 7,
+            use_room_password: 1,
+            use_item_password: 1,
+            talk_lock: 1,
+            room_password: "protected-room-secret".to_owned(),
+            item_password: "protected-item-secret".to_owned(),
+            kart_1: 11,
+            kart_2: 12,
+        };
+        let protected_room = MyRoomOwner::new(
+            myroom_participant(&protected_owner.identity, Ipv4Addr::LOCALHOST, 100),
+            protected_info.clone(),
+        )
+        .unwrap();
+        enter_myroom_with_owner(
+            &mut world,
+            &protected_owner.identity,
+            &protected_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom_with_owner(
+            &mut world,
+            &visitor.identity,
+            &protected_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        let revision = world.myroom.revision();
+        let snapshot = world.myroom.first_snapshot(&visitor.identity).unwrap();
+        let mut choice = FixedMyRoomOwnerChoiceSource::new(usize::MAX);
+
+        world
+            .myroom_entry_with_choice_source(
+                visitor.session,
+                test_myroom_reentry_input(
+                    &visitor.identity,
+                    MyRoomInfo {
+                        room_password: "stale-self-copy".to_owned(),
+                        ..MyRoomInfo::default()
+                    },
+                ),
+                &mut choice,
+            )
+            .unwrap();
+
+        let mut redacted = protected_info;
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &protected_owner.identity.nickname,
+                    EnterMyRoomStatus::Success,
+                    &redacted,
+                )
+                .unwrap(),
+                serialize_slot_data(&snapshot.slots).unwrap(),
+            ]
+        );
+        assert_eq!(
+            take_single_packet(&mut protected_owner.outbound),
+            serialize_slot_data(&snapshot.slots).unwrap()
+        );
+        assert!(
+            own_room_guest.outbound.try_recv().is_err(),
+            "reentry must not move a current visitor back to their owned room"
+        );
+        assert_eq!(
+            world.myroom.membership_owner(&visitor.identity).unwrap(),
+            protected_owner.identity.user_no
+        );
+        assert_eq!(
+            world
+                .myroom
+                .membership_owner(&own_room_guest.identity)
+                .unwrap(),
+            visitor.identity.user_no
+        );
+        assert_eq!(world.myroom.revision(), revision);
+        assert!(
+            choice.calls.is_empty(),
+            "non-random reentry must not consume the random source"
+        );
+
+        world
+            .myroom
+            .leave(&protected_owner.identity)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
+        let owner_absent_revision = world.myroom.revision();
+        let owner_absent_snapshot = world.myroom.first_snapshot(&visitor.identity).unwrap();
+        world
+            .myroom_entry_with_choice_source(
+                visitor.session,
+                test_myroom_reentry_input(&visitor.identity, MyRoomInfo::default()),
+                &mut choice,
+            )
+            .unwrap();
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &protected_owner.identity.nickname,
+                    EnterMyRoomStatus::Success,
+                    &redacted,
+                )
+                .unwrap(),
+                serialize_slot_data(&owner_absent_snapshot.slots).unwrap(),
+            ],
+            "an exact existing member may reenter while the owner is temporarily absent"
+        );
+        assert!(protected_owner.outbound.try_recv().is_err());
+        assert_eq!(world.myroom.revision(), owner_absent_revision);
+        assert!(choice.calls.is_empty());
+
+        world
+            .myroom
+            .leave(&visitor.identity)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
+        world
+            .myroom_entry_with_choice_source(
+                visitor.session,
+                test_myroom_reentry_input(
+                    &visitor.identity,
+                    MyRoomInfo {
+                        room_id: -1,
+                        ..MyRoomInfo::default()
+                    },
+                ),
+                &mut choice,
+            )
+            .unwrap();
+        let returned_snapshot = world.myroom.first_snapshot(&visitor.identity).unwrap();
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &visitor.identity.nickname,
+                    EnterMyRoomStatus::Success,
+                    visitor_owned_room.info(),
+                )
+                .unwrap(),
+                serialize_slot_data(&returned_snapshot.slots).unwrap(),
+            ],
+            "membership loss must return to authoritative owned-room state before bootstrap"
+        );
+        assert_eq!(
+            take_single_packet(&mut own_room_guest.outbound),
+            serialize_slot_data(&returned_snapshot.slots).unwrap()
+        );
+        assert_eq!(
+            world.myroom.membership_owner(&visitor.identity).unwrap(),
+            visitor.identity.user_no
+        );
+        assert!(choice.calls.is_empty());
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn myroom_reentry_without_membership_bootstraps_the_requesters_own_room() {
+        let mut world = World::default();
+        let mut requester =
+            register_channel_session(&mut world, "ReentrySelfBootstrap", 67, 56_306, 8);
+        let info = MyRoomInfo {
+            room_id: 136,
+            bgm: 9,
+            use_room_password: 1,
+            room_password: "owner-private".to_owned(),
+            ..MyRoomInfo::default()
+        };
+
+        world
+            .myroom_entry(
+                requester.session,
+                test_myroom_reentry_input(&requester.identity, info.clone()),
+            )
+            .unwrap();
+
+        let snapshot = world.myroom.first_snapshot(&requester.identity).unwrap();
+        assert_eq!(
+            requester.outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &requester.identity.nickname,
+                    EnterMyRoomStatus::Success,
+                    &info,
+                )
+                .unwrap(),
+                serialize_slot_data(&snapshot.slots).unwrap(),
+            ]
+        );
+        assert_eq!(
+            world.myroom.membership_owner(&requester.identity).unwrap(),
+            requester.identity.user_no
+        );
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one random-entry fixture proves the complete eligibility intersection, stable choice, movement, and secret redaction"
+    )]
+    fn myroom_random_entry_selects_only_stable_eligible_public_rooms() {
+        let mut world = World::default();
+        let mut current_owner =
+            register_channel_session(&mut world, "RandomCurrentOwner", 67, 56_310, 8);
+        let mut requester = register_channel_session(&mut world, "RandomRequester", 67, 56_312, 8);
+        let mut eligible_a = register_channel_session(&mut world, "RandomEligibleA", 67, 56_314, 8);
+        let mut eligible_b = register_channel_session(&mut world, "RandomEligibleB", 67, 56_316, 8);
+        let mut protected = register_channel_session(&mut world, "RandomProtected", 67, 56_318, 8);
+        let mut full = register_channel_session(&mut world, "RandomFull", 67, 56_320, 8);
+        let mut absent = register_channel_session(&mut world, "RandomAbsent", 67, 56_322, 8);
+        let mut lingering =
+            register_channel_session(&mut world, "RandomAbsentVisitor", 67, 56_324, 8);
+        let mut untracked = register_channel_session(&mut world, "RandomUntracked", 67, 56_326, 8);
+
+        enter_myroom(
+            &mut world,
+            &current_owner.identity,
+            &current_owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &requester.identity,
+            &current_owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &eligible_a.identity,
+            &eligible_a.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let eligible_b_info = MyRoomInfo {
+            room_id: 777,
+            use_item_password: 1,
+            room_password: "unused-public-secret".to_owned(),
+            item_password: "random-item-secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let eligible_b_room = MyRoomOwner::new(
+            myroom_participant(&eligible_b.identity, Ipv4Addr::LOCALHOST, 100),
+            eligible_b_info.clone(),
+        )
+        .unwrap();
+        enter_myroom_with_owner(
+            &mut world,
+            &eligible_b.identity,
+            &eligible_b_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        let protected_room = MyRoomOwner::new(
+            myroom_participant(&protected.identity, Ipv4Addr::LOCALHOST, 100),
+            MyRoomInfo {
+                use_room_password: 1,
+                room_password: "must-not-enter".to_owned(),
+                ..MyRoomInfo::default()
+            },
+        )
+        .unwrap();
+        enter_myroom_with_owner(
+            &mut world,
+            &protected.identity,
+            &protected_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &full.identity,
+            &full.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let mut full_visitors = Vec::new();
+        for index in 0..7_u16 {
+            let filler = register_channel_session(
+                &mut world,
+                &format!("RandomFullVisitor{index}"),
+                67,
+                56_330 + index * 2,
+                8,
+            );
+            enter_myroom(
+                &mut world,
+                &filler.identity,
+                &full.identity,
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::LOCALHOST,
+            );
+            full_visitors.push(filler);
+        }
+        enter_myroom(
+            &mut world,
+            &absent.identity,
+            &absent.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &lingering.identity,
+            &absent.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        world
+            .myroom
+            .leave(&absent.identity)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
+
+        let mut choice = FixedMyRoomOwnerChoiceSource::new(1);
+        world
+            .myroom_entry_with_choice_source(
+                requester.session,
+                test_myroom_random_entry_input(&requester.identity),
+                &mut choice,
+            )
+            .unwrap();
+
+        assert_eq!(
+            choice.calls,
+            vec![2],
+            "only the two eligible owners may reach the random source"
+        );
+        assert_eq!(
+            world.myroom.membership_owner(&requester.identity).unwrap(),
+            eligible_b.identity.user_no,
+            "index one selects the second candidate after stable UserNo sorting"
+        );
+        let current_snapshot = world
+            .myroom
+            .first_snapshot(&current_owner.identity)
+            .unwrap();
+        let selected_snapshot = world.myroom.first_snapshot(&requester.identity).unwrap();
+        let mut redacted = eligible_b_info;
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        assert_eq!(
+            requester.outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(
+                    &eligible_b.identity.nickname,
+                    EnterMyRoomStatus::Success,
+                    &redacted,
+                )
+                .unwrap(),
+                serialize_slot_data(&selected_snapshot.slots).unwrap(),
+            ]
+        );
+        assert_eq!(
+            take_single_packet(&mut current_owner.outbound),
+            serialize_slot_data(&current_snapshot.slots).unwrap()
+        );
+        assert_eq!(
+            take_single_packet(&mut eligible_b.outbound),
+            serialize_slot_data(&selected_snapshot.slots).unwrap()
+        );
+        for receiver in [
+            &mut eligible_a.outbound,
+            &mut protected.outbound,
+            &mut full.outbound,
+            &mut absent.outbound,
+            &mut lingering.outbound,
+        ] {
+            assert!(receiver.try_recv().is_err());
+        }
+        assert!(untracked.outbound.try_recv().is_err());
+        assert!(
+            full_visitors
+                .iter_mut()
+                .all(|visitor| visitor.outbound.try_recv().is_err())
+        );
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn myroom_random_entry_reports_no_available_without_drawing_and_rejects_bad_sources() {
+        let mut world = World::default();
+        let mut requester =
+            register_channel_session(&mut world, "RandomNoAvailable", 67, 56_350, 8);
+        let _untracked =
+            register_channel_session(&mut world, "RandomNoAvailablePeer", 67, 56_352, 8);
+        let mut no_candidate_choice = FixedMyRoomOwnerChoiceSource::new(usize::MAX);
+
+        world
+            .myroom_entry_with_choice_source(
+                requester.session,
+                test_myroom_random_entry_input(&requester.identity),
+                &mut no_candidate_choice,
+            )
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut requester.outbound),
+            serialize_enter_error(EnterMyRoomStatus::NoAvailableRoom).unwrap()
+        );
+        assert!(no_candidate_choice.calls.is_empty());
+        assert_eq!(
+            world
+                .myroom
+                .first_snapshot_if_member(&requester.identity)
+                .unwrap(),
+            None
+        );
+
+        let mut eligible =
+            register_channel_session(&mut world, "RandomBadChoiceOwner", 67, 56_354, 8);
+        enter_myroom(
+            &mut world,
+            &eligible.identity,
+            &eligible.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let revision = world.myroom.revision();
+        let mut invalid_choice = FixedMyRoomOwnerChoiceSource::new(1);
+        assert!(matches!(
+            world.myroom_entry_with_choice_source(
+                requester.session,
+                test_myroom_random_entry_input(&requester.identity),
+                &mut invalid_choice,
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomRandomChoiceOutOfRange { index: 1, count: 1 }
+            ))
+        ));
+        assert_eq!(invalid_choice.calls, vec![1]);
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(
+            world
+                .myroom
+                .first_snapshot_if_member(&requester.identity)
+                .unwrap(),
+            None
+        );
+        assert!(requester.outbound.try_recv().is_err());
+        assert!(eligible.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn myroom_random_entry_backpressure_rolls_back_and_is_retryable() {
+        let mut world = World::default();
+        let mut owner =
+            register_channel_session(&mut world, "RandomBackpressureOwner", 67, 56_360, 1);
+        let mut requester =
+            register_channel_session(&mut world, "RandomBackpressureVisitor", 67, 56_362, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let sentinel = vec![0x51, 0x36];
+        world.sessions[&owner.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(sentinel.clone()))
+            .unwrap();
+        let revision = world.myroom.revision();
+        let mut choice = FixedMyRoomOwnerChoiceSource::new(0);
+
+        assert!(matches!(
+            world.myroom_entry_with_choice_source(
+                requester.session,
+                test_myroom_random_entry_input(&requester.identity),
+                &mut choice,
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == owner.session
+        ));
+        assert_eq!(world.myroom.revision(), revision);
+        assert_eq!(
+            world
+                .myroom
+                .first_snapshot_if_member(&requester.identity)
+                .unwrap(),
+            None
+        );
+        assert!(requester.outbound.try_recv().is_err());
+        assert_eq!(take_single_packet(&mut owner.outbound), sentinel);
+
+        world
+            .myroom_entry_with_choice_source(
+                requester.session,
+                test_myroom_random_entry_input(&requester.identity),
+                &mut choice,
+            )
+            .unwrap();
+        let snapshot = world.myroom.first_snapshot(&requester.identity).unwrap();
+        let info = world
+            .myroom
+            .room_info(owner.identity.user_no)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            requester.outbound.try_recv().unwrap().into_packets(),
+            vec![
+                serialize_enter_reply(&owner.identity.nickname, EnterMyRoomStatus::Success, &info,)
+                    .unwrap(),
+                serialize_slot_data(&snapshot.slots).unwrap(),
+            ]
+        );
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_slot_data(&snapshot.slots).unwrap()
+        );
+        assert_eq!(choice.calls, vec![1, 1]);
         world.myroom.audit_invariants().unwrap();
     }
 
