@@ -19,6 +19,10 @@ pub const RIDER_ITEM_SNAPSHOT_WIRE_LENGTH: usize = 65;
 pub const MAX_GAME_OPTION_TRAILING_BYTES: usize = 80;
 pub const LOCKED_ITEM_LIST_REQUEST_NAME: &str = "PqLockedItemGet";
 pub const LOCKED_ITEM_LIST_REPLY_NAME: &str = "PrLockedItemGet";
+pub const REQUEST_EXTRADATA_REQUEST_NAME: &str = "PqRequestExtradata";
+pub const REQUEST_EXTRADATA_REPLY_NAME: &str = "PrRequestExtradata";
+pub const WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME: &str = "PqWebEventCompleteCheckPacket";
+pub const WEB_EVENT_COMPLETE_CHECK_REPLY_NAME: &str = "PrWebEventCompleteCheckPacket";
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -93,6 +97,8 @@ pub enum StartupRequest {
     AddTimeEventInit,
     LockedItemList,
     ServerTime,
+    RequestExtradata,
+    WebEventCompleteCheck,
 }
 
 pub const STARTUP_REQUESTS: &[StartupRequest] = &[
@@ -121,6 +127,8 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::AddTimeEventInit,
     StartupRequest::LockedItemList,
     StartupRequest::ServerTime,
+    StartupRequest::RequestExtradata,
+    StartupRequest::WebEventCompleteCheck,
 ];
 
 impl StartupRequest {
@@ -152,6 +160,8 @@ impl StartupRequest {
             Self::AddTimeEventInit => "PqAddTimeEventInitPacket",
             Self::LockedItemList => LOCKED_ITEM_LIST_REQUEST_NAME,
             Self::ServerTime => "PqServerTime",
+            Self::RequestExtradata => REQUEST_EXTRADATA_REQUEST_NAME,
+            Self::WebEventCompleteCheck => WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         }
     }
 
@@ -183,6 +193,8 @@ impl StartupRequest {
             Self::AddTimeEventInit => Some("PrAddTimeEventInitPacket"),
             Self::LockedItemList => Some(LOCKED_ITEM_LIST_REPLY_NAME),
             Self::ServerTime => Some("PrServerTime"),
+            Self::RequestExtradata => Some(REQUEST_EXTRADATA_REPLY_NAME),
+            Self::WebEventCompleteCheck => Some(WEB_EVENT_COMPLETE_CHECK_REPLY_NAME),
         }
     }
 }
@@ -305,14 +317,35 @@ pub fn parse_pq_update_game_option(packet: &[u8]) -> Result<PqUpdateGameOption, 
 /// request as hash-only. Rust requires exact exhaustion before returning the
 /// terminal empty list.
 pub fn parse_pq_locked_item_get(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, LOCKED_ITEM_LIST_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact hash-only extra-data request.
+///
+/// The stock producer allocates only the base packet and writes no payload
+/// fields. Rust therefore rejects the trailing bytes that the C# handler
+/// ignored instead of widening the evidenced wire shape.
+pub fn parse_pq_request_extradata(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, REQUEST_EXTRADATA_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact hash-only web-event completion request.
+///
+/// The stock producer allocates only the base packet and writes no payload
+/// fields. Rust therefore requires complete consumption.
+pub fn parse_pq_web_event_complete_check(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME)
+}
+
+fn parse_hash_only_request(packet: &[u8], name: &'static str) -> Result<(), StartupError> {
     let mut reader = PacketReader::new(packet);
-    expect_hash(&mut reader, LOCKED_ITEM_LIST_REQUEST_NAME)?;
+    expect_hash(&mut reader, name)?;
     let trailing = reader.remaining().len();
     if trailing == 0 {
         Ok(())
     } else {
         Err(StartupError::TrailingBytes {
-            name: LOCKED_ITEM_LIST_REQUEST_NAME,
+            name,
             count: trailing,
         })
     }
@@ -555,6 +588,25 @@ pub fn serialize_pr_server_time(time: LegacyTime) -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the fail-closed stock extra-data reply: a zero code followed by
+/// an absent optional-value marker.
+///
+/// The business meaning of code zero is not established, so no speculative
+/// success code or optional value is exposed by this API.
+#[must_use]
+pub fn serialize_pr_request_extradata() -> Vec<u8> {
+    let mut packet = PacketWriter::named(REQUEST_EXTRADATA_REPLY_NAME);
+    packet.write_u8(0);
+    packet.write_u8(0);
+    packet.into_inner()
+}
+
+/// Serializes the empty stock web-event completion reply.
+#[must_use]
+pub fn serialize_pr_web_event_complete_check() -> Vec<u8> {
+    PacketWriter::named(WEB_EVENT_COMPLETE_CHECK_REPLY_NAME).into_inner()
+}
+
 fn expect_hash(reader: &mut PacketReader<'_>, name: &'static str) -> Result<(), StartupError> {
     let actual = reader.read_u32()?;
     let expected = adler32::packet_hash(name);
@@ -680,20 +732,23 @@ mod tests {
 
     use super::{
         GameOptions, LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME,
-        MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
-        StartupError, StartupRequest, channel_static_reply_body, classify_startup_request,
-        is_startup_noop, parse_pq_locked_item_get, parse_pq_update_game_option,
-        serialize_channel_static_reply, serialize_empty_locked_item_list,
-        serialize_lo_rp_add_racing_time, serialize_lo_rp_event_reward,
-        serialize_pr_add_time_event_init, serialize_pr_chapter_info,
+        MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields, REQUEST_EXTRADATA_REPLY_NAME,
+        REQUEST_EXTRADATA_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError,
+        StartupRequest, WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+        channel_static_reply_body, classify_startup_request, is_startup_noop,
+        parse_pq_locked_item_get, parse_pq_request_extradata, parse_pq_update_game_option,
+        parse_pq_web_event_complete_check, serialize_channel_static_reply,
+        serialize_empty_locked_item_list, serialize_lo_rp_add_racing_time,
+        serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
         serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_kart_pass_init,
         serialize_pr_kart_pass_reward, serialize_pr_login_vip_info, serialize_pr_public_command,
-        serialize_pr_quest_ux_second, serialize_pr_rider_school_data,
-        serialize_pr_rider_school_progress, serialize_pr_server_time,
-        serialize_pr_set_playtime_event_tick, serialize_pr_sync_dictionary_info,
+        serialize_pr_quest_ux_second, serialize_pr_request_extradata,
+        serialize_pr_rider_school_data, serialize_pr_rider_school_progress,
+        serialize_pr_server_time, serialize_pr_set_playtime_event_tick,
+        serialize_pr_sync_dictionary_info, serialize_pr_web_event_complete_check,
     };
     use crate::{
         adler32,
@@ -723,6 +778,60 @@ mod tests {
         )));
         assert!(!is_startup_noop(adler32::packet_hash("PqGetRider")));
         assert_eq!(classify_startup_request(0xdead_beef), None);
+    }
+
+    #[test]
+    fn strict_stock_hash_only_requests_preserve_exact_pairs_and_replies() {
+        assert_eq!(
+            adler32::packet_hash(REQUEST_EXTRADATA_REQUEST_NAME),
+            0x4466_0748
+        );
+        assert_eq!(
+            adler32::packet_hash(REQUEST_EXTRADATA_REPLY_NAME),
+            0x4477_0749
+        );
+        assert_eq!(
+            adler32::packet_hash(WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME),
+            0xA814_0B50
+        );
+        assert_eq!(
+            adler32::packet_hash(WEB_EVENT_COMPLETE_CHECK_REPLY_NAME),
+            0xA830_0B51
+        );
+
+        assert_eq!(
+            classify_startup_request(0x4466_0748),
+            Some(StartupRequest::RequestExtradata)
+        );
+        assert_eq!(
+            StartupRequest::RequestExtradata.reply_name(),
+            Some(REQUEST_EXTRADATA_REPLY_NAME)
+        );
+        assert_eq!(
+            classify_startup_request(0xA814_0B50),
+            Some(StartupRequest::WebEventCompleteCheck)
+        );
+        assert_eq!(
+            StartupRequest::WebEventCompleteCheck.reply_name(),
+            Some(WEB_EVENT_COMPLETE_CHECK_REPLY_NAME)
+        );
+        assert!(!is_startup_noop(0x4466_0748));
+        assert!(!is_startup_noop(0xA814_0B50));
+
+        assert_strict_hash_only_parser(parse_pq_request_extradata, REQUEST_EXTRADATA_REQUEST_NAME);
+        assert_strict_hash_only_parser(
+            parse_pq_web_event_complete_check,
+            WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+        );
+
+        assert_eq!(
+            serialize_pr_request_extradata(),
+            [0x49, 0x07, 0x77, 0x44, 0, 0]
+        );
+        assert_eq!(
+            serialize_pr_web_event_complete_check(),
+            [0x51, 0x0B, 0x30, 0xA8]
+        );
     }
 
     #[test]
@@ -1043,5 +1152,41 @@ mod tests {
             expected_hash
         );
         assert_eq!(&packet[4..], expected_body);
+    }
+
+    fn assert_strict_hash_only_parser(
+        parser: fn(&[u8]) -> Result<(), StartupError>,
+        request_name: &'static str,
+    ) {
+        let request = PacketWriter::named(request_name).into_inner();
+        assert_eq!(request.len(), 4);
+        assert!(parser(&request).is_ok());
+
+        for truncated_length in 0..4 {
+            assert!(matches!(
+                parser(&request[..truncated_length]),
+                Err(StartupError::Packet(_))
+            ));
+        }
+
+        match parser(&[0; 4]) {
+            Err(StartupError::UnexpectedPacketHash {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(name, request_name);
+                assert_eq!(expected, adler32::packet_hash(request_name));
+                assert_eq!(actual, 0);
+            }
+            other => panic!("wrong hash should be rejected, got {other:?}"),
+        }
+
+        let mut trailing = request;
+        trailing.push(0x51);
+        assert!(matches!(
+            parser(&trailing),
+            Err(StartupError::TrailingBytes { name, count: 1 }) if name == request_name
+        ));
     }
 }

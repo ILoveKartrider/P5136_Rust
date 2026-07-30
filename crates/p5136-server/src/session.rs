@@ -60,7 +60,7 @@ use p5136_core::{
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
         classify_startup_request, is_startup_noop, parse_pq_locked_item_get,
-        parse_pq_update_game_option,
+        parse_pq_request_extradata, parse_pq_update_game_option, parse_pq_web_event_complete_check,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
@@ -2802,8 +2802,11 @@ async fn handle_startup_request(
         update_game_options_admitted(world, profiles, session_id, packet, context).await?;
         return Ok(Vec::new());
     }
-    if request == StartupRequest::LockedItemList {
-        parse_pq_locked_item_get(packet)?;
+    match request {
+        StartupRequest::LockedItemList => parse_pq_locked_item_get(packet)?,
+        StartupRequest::RequestExtradata => parse_pq_request_extradata(packet)?,
+        StartupRequest::WebEventCompleteCheck => parse_pq_web_event_complete_check(packet)?,
+        _ => {}
     }
 
     let identity = world.authorize_identity().await?;
@@ -2903,6 +2906,8 @@ fn startup_response(request: StartupRequest, profile: &Profile) -> Option<Vec<u8
         StartupRequest::AddTimeEventInit => startup::serialize_pr_add_time_event_init(time),
         StartupRequest::ServerTime => startup::serialize_pr_server_time(time),
         StartupRequest::LockedItemList => startup::serialize_empty_locked_item_list(),
+        StartupRequest::RequestExtradata => startup::serialize_pr_request_extradata(),
+        StartupRequest::WebEventCompleteCheck => startup::serialize_pr_web_event_complete_check(),
         StartupRequest::GetRider | StartupRequest::UpdateGameOption => return None,
     })
 }
@@ -3190,8 +3195,10 @@ mod tests {
         },
         shop_protocol::{ShopBuyRequest, serialize_shop_buy_failure},
         startup::{
-            GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
-            StartupError, serialize_empty_locked_item_list,
+            GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
+            RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+            serialize_empty_locked_item_list, serialize_pr_request_extradata,
+            serialize_pr_web_event_complete_check,
         },
     };
     use p5136_profile::{
@@ -4314,6 +4321,223 @@ mod tests {
             identity
         );
 
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_stateless_compatibility_replies_are_direct_and_profile_read_only() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_712))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "StatelessCompat")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let cases = [
+            (
+                REQUEST_EXTRADATA_REQUEST_NAME,
+                serialize_pr_request_extradata(),
+            ),
+            (
+                WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+                serialize_pr_web_event_complete_check(),
+            ),
+        ];
+
+        let mut unbound_context = SessionContext::default();
+        for (request_name, _) in &cases {
+            let request = PacketWriter::named(request_name).into_inner();
+            assert!(matches!(
+                dispatch_packet(&services, &request, &mut unbound_context).await,
+                Err(LoginSessionError::ProfileNotBound)
+            ));
+
+            // For a live admitted identity, exact wire validation precedes
+            // packet-specific authorization and the bound-profile fence.
+            let mut malformed = request;
+            malformed.push(0x51);
+            assert!(matches!(
+                dispatch_packet(&services, &malformed, &mut unbound_context).await,
+                Err(LoginSessionError::StartupProtocol(
+                    StartupError::TrailingBytes {
+                        name,
+                        count: 1
+                    }
+                )) if name == *request_name
+            ));
+        }
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let store = ProfileStore::new(profile_root.path());
+        let before = store.reload(&identity.nickname).unwrap();
+        for (request_name, expected_response) in &cases {
+            let request = PacketWriter::named(request_name).into_inner();
+            assert_eq!(
+                dispatch_packet(&services, &request, &mut context)
+                    .await
+                    .unwrap(),
+                vec![expected_response.clone()]
+            );
+            assert_eq!(
+                world.authorize_identity(session_id).await.unwrap(),
+                identity
+            );
+
+            let server_time = PacketWriter::named("PqServerTime");
+            let follow_up = dispatch_packet(&services, server_time.as_slice(), &mut context)
+                .await
+                .unwrap();
+            assert_eq!(follow_up.len(), 1);
+            assert_eq!(
+                &follow_up[0][..4],
+                &adler32::packet_hash("PrServerTime").to_le_bytes()
+            );
+
+            let mut trailing = request;
+            trailing.push(0x51);
+            assert!(matches!(
+                dispatch_packet(&services, &trailing, &mut context).await,
+                Err(LoginSessionError::StartupProtocol(
+                    StartupError::TrailingBytes {
+                        name,
+                        count: 1
+                    }
+                )) if name == *request_name
+            ));
+        }
+
+        let after = store.reload(&identity.nickname).unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.profile, before.profile);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_stateless_compatibility_replies_obey_generation_and_quiesce_fences() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(peer_ip, 49_713))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(peer_ip, 49_714))
+            .await
+            .unwrap();
+        let source_identity = world
+            .claim_identity(source, "StatelessCompatFence")
+            .await
+            .unwrap();
+        let mut source_context = bind_test_profile(&profiles, &source_identity).await;
+        let source_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: source,
+        };
+
+        let token = MigrationToken::new(0x5A14).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 13,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let completion = world
+            .complete_migration(
+                destination,
+                source_identity.user_no,
+                13,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        let web_event = PacketWriter::named(WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME).into_inner();
+        let mut malformed_web_event = web_event.clone();
+        malformed_web_event.push(0x51);
+        // Global identity-operation admission rejects stale ownership before
+        // the packet-specific parser is reached.
+        assert!(matches!(
+            dispatch_packet(&source_services, &malformed_web_event, &mut source_context).await,
+            Err(LoginSessionError::World(WorldError::Identity(
+                IdentityError::StaleSession(id)
+            ))) if id == source
+        ));
+        assert!(matches!(
+            dispatch_packet(&source_services, &web_event, &mut source_context).await,
+            Err(LoginSessionError::World(WorldError::Identity(
+                IdentityError::StaleSession(id)
+            ))) if id == source
+        ));
+        assert_eq!(
+            world.authorize_identity(destination).await.unwrap(),
+            completion.binding
+        );
+
+        let destination_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: destination,
+        };
+        let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
+        let extradata = PacketWriter::named(REQUEST_EXTRADATA_REQUEST_NAME).into_inner();
+        world.quiesce().await.unwrap();
+        let mut malformed_extradata = extradata.clone();
+        malformed_extradata.push(0x51);
+        // The producer barrier likewise closes before packet-specific parsing.
+        assert!(matches!(
+            dispatch_packet(
+                &destination_services,
+                &malformed_extradata,
+                &mut destination_context
+            )
+            .await,
+            Err(LoginSessionError::World(
+                WorldError::OutboundProductionClosed
+            ))
+        ));
+        assert!(matches!(
+            dispatch_packet(&destination_services, &extradata, &mut destination_context).await,
+            Err(LoginSessionError::World(
+                WorldError::OutboundProductionClosed
+            ))
+        ));
+
+        world.drain_sessions().await.unwrap();
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
