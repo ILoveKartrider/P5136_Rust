@@ -26,21 +26,96 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
+State: paused at a clean, reviewed checkpoint. Resume with item 1 under
+**Exact resume plan**; do not start a new packet slice first.
+
 Current implementation checkpoint:
-`8f6fbe5 Port strict read-only club queries`
+`32ab427 Port safe item-state boundaries`
 
 ## Current Rust checkpoint
 
-The current checkpoint closes the five remaining read-only club queries:
-`PqCheckMyClubStatePacket`, `PqGetUserWaitingJoinClubPacket`,
-`PqCheckCreateClubConditionPacket`, `PqGetClubListCountPacket`, and
-`PqGetClubWaitingCrewCountPacket`. Rust accepts only the exact stock-producer
-layouts, preserves global generation/quiesce admission as the outermost fence,
-and then applies strict parsing before packet-specific identity/profile
-authorization. Because no authoritative club repository exists yet, every
-reply is an evidence-backed empty or unavailable state. The handlers perform
-no request-specific World command, profile I/O, persistence, mutation, retry,
-or peer fanout. The C# repository remains unchanged and is evidence only.
+The current checkpoint closes the direct-request disposition ledger at 40 of
+40 by adding strict item-state boundaries for `LoRqDeleteItemPacket`,
+`PqUnLockedItem`, `PqFavoriteItemGet`, and `PqFavoriteItemUpdate`.
+Delete and unlock are explicit, authenticated, read-only no-reply outcomes:
+Rust does not clone C# success acknowledgements that would claim deletion or
+unlock without an authoritative durable transition. Favorite Get/Update are
+fully implemented for profiles whose Rust migration marker is already
+`Some(...)`; an absent marker fails closed until the bounded C#
+`Favorite.json` importer is implemented. The C# repository remains unchanged
+and is evidence only.
+
+### Safe item-state checkpoint
+
+- Exact request hashes are `LoRqDeleteItemPacket` `0x4F4E07B8`,
+  `PqUnLockedItem` `0x27C00565`, `PqFavoriteItemGet` `0x3BAD06B0`, and
+  `PqFavoriteItemUpdate` `0x527807F3`. The evidenced reply hashes are
+  `LoRpDeleteItemPacket` `0x4F3D07B7`,
+  `PrUnLockedItem` `0x27CD0566`, and `PrFavoriteItemGet` `0x3BBD06B1`;
+  Favorite Update is one-way.
+- Delete and unlock share the observed
+  `auth_scalar:u32 | credential_count:u32` prefix. Rust accepts only the stock
+  producer's zero scalar and empty credential list before reading any
+  credential string. Delete then consumes four `u16` values; unlock consumes
+  one terminal zero byte. Every request requires exact exhaustion.
+- Rust exposes no delete/unlock success serializer. The stock client treats
+  either reply as a capability to perform a local transition, while the C#
+  server acknowledges deletion without durable server deletion and unlock
+  accepts a reply even when its authentication/state semantics are not
+  enforced. Valid requests therefore remain connected but unanswered; invalid
+  requests return typed protocol errors.
+- Favorite Update is exactly
+  `hash | scope:u8=1 | count:u32 | count * (category:u16 | item_id:u16 |
+  serial:u16 | operation:u8)`. One stock batch is capped at 200 records before
+  allocation. Operations 1/2 are Add/Remove. Repeated keys are legal and are
+  applied sequentially in wire order; stock evidence does not establish a
+  uniqueness invariant.
+- Favorite Get is exact hash-only. Its reply is
+  `hash | count:u32 | count * (category:u16 | item_id:u16 | serial:u16 |
+  state:u8=0)`. The aggregate collection cap is independent of the 200-record
+  update cap and is derived from the configured login payload. At the default
+  1 MiB payload it is 149,795 records.
+- `FavoriteItems` is a private-vector, stable-order, unique persisted
+  abstraction. Whole batches are applied purely in O(N+B), with idempotent
+  Add/Remove semantics, final-result cap validation, and no partial mutation.
+  Persistence uses one optimistic profile transaction and exact immutable
+  durability confirmation. A repeated successful request reuses its revision.
+- `ProfileStore::transaction_with_context` is an additive, read-only snapshot
+  abstraction that exposes only the optional source revision. It lets an
+  already-populated legacy `Launcher.json` be published as immutable revision
+  1 even when an idempotent update changes no fields. The original
+  `transaction` API and shared CAS loop remain intact.
+- The bound session cache now patches only the favorite projection and exact
+  revision after the post-write identity fence; unrelated cached projections
+  are preserved. Favorite persistence errors remain concrete and typed at the
+  public session boundary rather than being erased behind `dyn Error`.
+- `Profile.favorite_items: Option<FavoriteItems>` is the migration marker:
+  `None` means the external C# sidecar decision is unresolved, while
+  `Some(empty/list)` is canonical Rust state. Until import exists, both Get
+  (implemented as an empty durable batch) and Update return
+  `MigrationPending` for `None`, publish no revision, send no false success,
+  and never erase the future import decision.
+- Resume must implement the importer inside `p5136-profile`/`ProfileStore`, not
+  by joining a raw path in `session.rs`. It must use the lease-bound canonical
+  profile root, bounded handle-relative/no-follow access to
+  `<nickname>/Favorite.json`, strict canonical array parsing, and one profile
+  transaction that imports, applies an incoming batch, sets `Some(result)`,
+  and publishes the exact receipt. Invalid, duplicate, malformed, or oversized
+  sidecars must fail closed without a marker. Run C# and Rust servers
+  separately during this one-time migration; the C# process does not honor the
+  Rust lease.
+- After the importer, add a real encrypted-TCP regression:
+  login -> Update with no reply -> Get on the same connection ->
+  reconnect/relogin -> identical Get, plus malformed and persistence-failure
+  socket-closure cases. Current direct-dispatch tests prove codec, handler,
+  atomicity, cancellation/migration fencing, and cache refresh, but not that
+  full runtime path.
+- Checkpoint gates passed on Windows: 808 regular tests, both opt-in local-data
+  tests, workspace/all-target/all-feature Clippy with `-D warnings`, formatting,
+  and `git diff --check`. Workspace `unsafe_code = "forbid"` remains active;
+  the new production path has no `unsafe`, panic, `unwrap`, or `expect`.
+  Independent abstraction/error/durability reviews found no commit-blocking
+  P0/P1 issue after the fail-closed marker and cache fixes.
 
 ### Strict read-only club-query boundary
 
@@ -112,11 +187,12 @@ or peer fanout. The C# repository remains unchanged and is evidence only.
   request, stale migration ownership, and quiesce priority. Two independent
   read-only reviews found no P0-P3 issue in the protocol, abstraction,
   ordering, error propagation, or `unsafe` policy.
-- The direct P5136 request-disposition ledger is now 37 of 40 explicit, with
-  three remaining. The deliberate compatibility no-op table remains 25 of 25
-  explicit. Successful club membership, creation, join, search, and rename
-  remain deferred until an actor-owned repository and atomic namespace,
-  membership, authorization, and durability rules are designed.
+- The direct P5136 request-disposition ledger is now 40 of 40 explicit after
+  the later item-state checkpoint. The deliberate compatibility no-op table
+  remains 25 of 25 explicit. Successful club membership, creation, join,
+  search, and rename remain deferred until an actor-owned repository and
+  atomic namespace, membership, authorization, and durability rules are
+  designed.
 
 ### Fail-closed rider-info lookup
 
@@ -183,9 +259,10 @@ or peer fanout. The C# repository remains unchanged and is evidence only.
   fields/digest, unbound-profile ordering, authenticated direct dispatch,
   profile immutability, follow-up liveness, stale migration ownership, and
   quiesce.
-- The direct P5136 request-disposition ledger is now 37 of 40 explicit, with
-  three remaining. The deliberate compatibility no-op table remains 25 of 25
-  explicit. Stock-client school-start E2E remains an open validation gate.
+- The direct P5136 request-disposition ledger is now 40 of 40 explicit after
+  the later item-state checkpoint. The deliberate compatibility no-op table
+  remains 25 of 25 explicit. Stock-client school-start E2E remains an open
+  validation gate.
 
 ### Strict stateless compatibility replies
 
@@ -222,9 +299,9 @@ or peer fanout. The C# repository remains unchanged and is evidence only.
   the malformed/error-priority combinations.
 - These were tracked as additional shared startup-handler gaps rather than
   members of the 40 direct P5136 request-disposition set. That direct ledger
-  was therefore unchanged by this slice. After the later rider-info and
-  rider-school and club-query work, the current ledger is 37 of 40 explicit
-  with three missing; the deliberate no-op table remains 25 of 25 explicit.
+  was therefore unchanged by this slice. After the later rider-info,
+  rider-school, club-query, and item-state work, the current ledger is 40 of
+  40 explicit; the deliberate no-op table remains 25 of 25 explicit.
 - Stock analysis artifacts remain outside this repository. Stock-client E2E
   behavior and the successful extra-data value policy remain open evidence
   gaps.
@@ -263,15 +340,13 @@ or peer fanout. The C# repository remains unchanged and is evidence only.
   quiesce rejection. Stock-client purchase UI/E2E behavior and the meanings of
   the unknown fields remain open evidence gaps.
 - These two aliases contributed to the earlier 30-of-40 checkpoint. The
-  current direct P5136 request-disposition audit is 37 of 40 explicit after
-  rider-info, rider-school, and club-query integration. The separate deliberate
-  compatibility no-op table remains 25 of 25 explicit.
-- The remaining direct-request names are `LoRqDeleteItemPacket`,
-  `PqUnLockedItem`, and `PqFavoriteItemUpdate`.
-  `LoRqDeleteItemPacket` must not copy the C# success-without-deletion
-  behavior. A future `PqFavoriteItemUpdate` must fully parse and validate
-  before one atomic durable mutation instead of reproducing C# partial-update
-  exposure.
+  current direct P5136 request-disposition audit is 40 of 40 explicit after
+  rider-info, rider-school, club-query, and item-state integration. The
+  separate deliberate compatibility no-op table remains 25 of 25 explicit.
+- `LoRqDeleteItemPacket` and `PqUnLockedItem` are now explicit safe no-reply
+  boundaries, so Rust does not copy C# success-without-state-transition
+  behavior. `PqFavoriteItemUpdate` is strictly parsed and atomically persisted
+  for canonical profiles; unresolved C# sidecar migration fails closed.
 
 ### Authenticated legacy server time
 
@@ -1013,18 +1088,25 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 772 regular tests and 2 opt-in proprietary-fixture tests passed
+# 808 regular tests and 2 opt-in local-data tests passed
 git diff --check
 ```
 
-The 772 regular passing tests comprise 9 CLI, 35 connector, 192 core, 85
-profile, 13 RHO5, 430 server unit, and 8 server integration tests. The two
+The 808 regular passing tests comprise 9 CLI, 35 connector, 204 core, 100
+profile, 13 RHO5, 439 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
+- exact four-request item-state classification, hashes, stock-producer
+  goldens, every truncated prefix, strict auth/scope/op/exhaustion checks,
+  repeated-key wire order, independent batch/aggregate caps, exact Favorite
+  Get replies, pure stable/idempotent batch application, atomic durable
+  revision reuse, legacy immutable canonicalization, unresolved-sidecar
+  fail-closed behavior, cancellation/migration fencing, and selective bound
+  session favorite/revision refresh;
 - exact five-request club-query classification and producer shapes, complete
   reply layouts and digests, fail-closed consumer meanings, private
   parser-minted fields, pre-allocation UTF-16 bounds, complete consumption,
@@ -1236,23 +1318,21 @@ These items prevent a "port complete" claim.
 
 ## Exact resume plan
 
-1. Continue the packet-disposition ledger: every known request must be
-   implemented, an evidence-backed deliberate no-reply, explicitly
-   unsupported, or capture-blocked. `PqServerTime` and both fail-closed shop
-   aliases, strict fail-closed `PqGetRiderInfo`, and canonical
-   `PqStartRiderSchool` plus all five strict read-only club queries are now
-   explicit; 37 of 40 direct P5136 requests are classified, leaving
-   `LoRqDeleteItemPacket`, `PqUnLockedItem`, and `PqFavoriteItemUpdate`. The
-   additional shared `PqRequestExtradata` and
-   `PqWebEventCompleteCheckPacket` paths are also explicit and strict from
-   stock producer evidence. Next establish the producer, consumer, and
-   serializer boundaries for those three item requests. Do not copy C#
-   ACK-without-deletion behavior, and require a fully parsed, validated,
-   authorized, atomic durable transition before any deletion, unlock, or
-   favorite-item update. If safe client-visible failure/no-op semantics are
-   not evidenced, keep the request explicitly unsupported rather than
-   inventing success. The generic authenticated fallback returns
-   `UnsupportedIdentityPacket`; it never reports silent success.
+1. Finish the bounded one-time C# favorite-item migration before enabling
+   favorite state for unresolved profiles. Keep `favorite_items=None`
+   fail-closed until this is done. Add a lease-bound `ProfileStore` sidecar
+   capability for enum-selected `Favorite.json`; use handle-relative/no-follow
+   bounded access rather than joining `source_path` in `session.rs`. Strictly
+   parse the ordered `{ItemCatID, ItemID, ItemSN}` array, reject malformed,
+   duplicate, or oversized input without setting a marker, and atomically
+   combine import + incoming update + `Some(result)` in one immutable profile
+   revision. Preserve the sidecar as recovery evidence and document that the
+   C# server must be stopped during migration because it does not honor the
+   Rust lease. Then add the real encrypted-TCP
+   Update(no reply) -> Get -> reconnect/relogin -> Get regression and socket
+   failure cases. The direct disposition ledger is already 40 of 40 explicit;
+   do not reopen delete/unlock until authoritative state and safe success
+   semantics exist.
 2. Keep the completed bounded TCP GameSlot slice frozen at its current
    evidence boundary. Collect stock-client type-1/type-2 request/reply,
    type-9/type-10, and generic type-12 fixtures before implementing pickup

@@ -51,6 +51,7 @@ been demonstrated.
 - [x] strict fail-closed cross-profile `PqGetRiderInfo` boundary
 - [x] strict `PqStartRiderSchool` and canonical 240-byte physics reply
 - [x] strict read-only club state/join/create/list/capacity query boundaries
+- [x] strict item-state wire parsing and safe no-reply delete/unlock boundaries
 
 ## World, Messenger, and UDP
 
@@ -101,6 +102,8 @@ been demonstrated.
 - [x] generation-bound P2P-port report, persistence, and cache refresh
 - [x] strict terminal empty protected-item list
 - [x] exact normal/preset shop-buy parsing and fail-closed failure reply
+- [x] atomic durable canonical favorite-item Get/Update and session-cache refresh
+- [ ] bounded one-time C# `Favorite.json` import and real encrypted-TCP favorite E2E
 - [ ] authoritative type-1/type-2 item pickup award and synthesis
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
 - [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow
