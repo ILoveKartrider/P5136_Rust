@@ -26,12 +26,14 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
-State: clean, reviewed login-initialization checkpoint. The next live action is
-to rerun the stock client with the release named below and verify that traffic
-progresses beyond `SpRqGetMaxGiftIdPacket`; do not reopen the completed
-favorite-item migration without a new compatibility/security finding.
+State: clean, reviewed captured-initialization checkpoint. The next live action
+is to rerun the stock client with the `p5136-corpus-audit` release named below
+and verify that traffic progresses beyond `SpRqKoinBalance` through the
+already-supported channel switch. The wider retained gameplay corpus is
+inventoried but not falsely marked complete.
 
 Current implementation checkpoint:
+`406a9e9 Handle captured Koin queries and scenarios` +
 `1cdb3aa Complete login initialization query coverage` +
 `4c806af Complete post-rider startup query replies` +
 `533df45 Port lease-bound favorite sidecar migration` +
@@ -206,6 +208,70 @@ unchanged and is evidence only.
   `target\p5136-initialization\release\p5136.exe` (15,473,152 bytes, SHA-256
   `C01B47262FE5FC258EE7B1B063FD57EE6331A2D084E62647A5349A046E083745`).
   It was built in a distinct target directory so a running older executable
+  could not mask the new implementation.
+- The C# repository remains unmodified.
+
+### Captured Koin fix and retained-log coverage audit (2026-07-30)
+
+- The next Rust run,
+  `target\p5136-initialization\release\logs\p5136-1785436881093-30272.log`,
+  passed the gift, cash-inventory, and adjacent menu queries. It terminated on
+  a five-byte `SpRqKoinBalance` request:
+  `BD 05 4C 2D 01`. The old Rust parser incorrectly treated Koin as a
+  hash-only request and rejected the terminal `01` as one trailing byte.
+- All 56 Koin requests in 28 retained packet traces have that exact five-byte
+  form. Rust now requires the request hash, the observed mode byte `1`, and
+  exact exhaustion. Truncation, a different mode byte, or additional bytes
+  remain typed protocol errors. The response remains the profile-backed
+  `SpRpKoinBalance | koin:u32 | 0:u32`.
+- The common captured post-Koin sequence is `PqFavoriteItemGet`,
+  `PqLockedItemGet`, `PqFavoriteTrackMapGet`, `PqGetFavoriteChannel`,
+  `PqAddTimeEventTimerPacket`, `PqCheckMyClubStatePacket`,
+  `LoRqSetRiderItemOnPacket`, and `PqChannelSwitch`. Every one was already
+  owned by a Rust item-state/startup/club/equipment/channel domain. The new
+  crash was therefore one exact wire-shape error rather than evidence that the
+  remaining baseline initialization path was absent.
+- The entire external client log directory was audited to avoid another
+  one-packet-at-a-time search. The 49 packet-trace files contain 19,496
+  incoming records and 100 distinct incoming hashes. Seventy-two were already
+  classified by existing Rust transports/domains; the remaining 28 are all
+  TCP requests. Their request lengths, C# reply/state requirements, and Rust
+  status are recorded in
+  [CAPTURED_PACKET_COVERAGE.md](CAPTURED_PACKET_COVERAGE.md).
+- Five of the 28 are bounded read-only queries with complete capture/C#
+  evidence. Rust now implements exact terminal replies for current
+  competition, challenger info, four-ID event-buy counts, training missions,
+  and the empty new-career list. Unlike C#, the event-buy query uses no
+  mutable process-global request state. All five remain behind the exact
+  identity/profile fence and are proven not to change the profile revision.
+- `PqStartScenario` and `PqCompleteScenarioSingle` are also fully ported rather
+  than treated as compatibility no-ops. Start validates
+  `hash | scenario_type:i32`, acquires the identity-bound canonical profile
+  lane, durably stores `scenario_type`, reauthorizes the generation, refreshes
+  the session snapshot, and only then returns the exact nine-byte reply.
+  Completion consumes exactly the captured 22-byte opaque-body length (the C#
+  handler does not interpret its values) and returns the bound durable
+  `scenario_type` without mutation.
+- An early implementation attempt admitted all 28 request hashes and captured
+  lengths as successful no-reply compatibility packets. Independent review
+  rejected it: room track/AI/slot/chat, X-parts, kart physics, and time-attack
+  requests require replies, broadcasts, or durable state changes. That broad
+  fallback was removed before commit or release. The remaining 21 gaps
+  deliberately return `UnsupportedIdentityPacket`, with a regression test
+  pinning every hash, instead of letting client/server state diverge.
+- Independent final review found no P1 issue after that correction. Its P2
+  recommendations were applied: scenario identity/profile validation now
+  precedes profile-lane admission, opaque completion documentation says
+  length-only validation, malformed 21/23-byte and wrong-hash completion tests
+  were added, and all 21 pending hashes are asserted fail-closed.
+- Workspace all-feature validation passes with 839 regular tests and two local
+  opt-in tests ignored. Formatting, `git diff --check`, workspace
+  all-target/all-feature Clippy with `-D warnings`, and the workspace
+  `unsafe_code = "forbid"` policy also pass.
+- The fresh release is
+  `target\p5136-corpus-audit\release\p5136.exe` (15,488,000 bytes, SHA-256
+  `FAC9124B4C3640965FCF3BFCC15F1620A0CFA7DCA0A955D2CB322D5139ED3E36`).
+  It was built in a distinct target directory so an older running executable
   could not mask the new implementation.
 - The C# repository remains unmodified.
 

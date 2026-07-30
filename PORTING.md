@@ -30,6 +30,9 @@ been demonstrated.
   captured `SpRqGetMaxGiftIdPacket` failure
 - [x] strict read-only startup replies for gift sequence, KOIN, favorite-track
   projection, cash inventory, Cash, and TC Cash
+- [x] exact captured five-byte `SpRqKoinBalance` request shape
+- [x] retained client packet-trace RX inventory and explicit coverage ledger
+- [x] five capture-derived read-only menu/mode query replies
 - [x] workspace-wide `unsafe_code = "forbid"`
 
 ## Connector
@@ -122,8 +125,11 @@ been demonstrated.
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
 - [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow
 - [x] exact MyRoom Career empty-list reply and kind-2 grant consumption
+- [x] durable single-player scenario start and bound-revision completion reply
 - [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
 - [ ] evidence ledger for every deliberate no-reply/unsupported packet
+- [ ] implement the 21 stateful or unidentified TCP requests still marked
+  pending in `CAPTURED_PACKET_COVERAGE.md`
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface
 - [ ] race-wide multi-profile reward journal/recovery
 
@@ -140,3 +146,6 @@ been demonstrated.
 - [ ] Wine or CrossOver connector launches the same client
 - [ ] two clients login, migrate, join a room, race, persist, and shut down
 - [x] build, runtime, connector, and resume documentation exists
+
+Detailed retained-log coverage:
+[CAPTURED_PACKET_COVERAGE.md](CAPTURED_PACKET_COVERAGE.md)
