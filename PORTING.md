@@ -92,9 +92,10 @@ been demonstrated.
 - [x] bounded read-only native RHO5 emblem-definition extraction
 - [x] exhaustive MyRoom dispatch and explicit rejection of unclassified identity packets
 - [ ] stock-client RequestEmblems/main-emblem E2E
-- [ ] generation-bound P2P-port report, persistence, and cache refresh
+- [x] generation-bound P2P-port report, persistence, and cache refresh
 - [ ] club rename after global membership/namespace invariants are specified
-- [ ] capture-derived MyRoom Career request/reply codecs and kind-2 grant consumption
+- [ ] exact MyRoom Career empty-list reply and kind-2 grant consumption
+- [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
 - [ ] evidence ledger for every deliberate no-reply/unsupported packet
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface
 - [ ] race-wide multi-profile reward journal/recovery

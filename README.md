@@ -19,6 +19,8 @@ server. The implemented foundation provides:
 - bounded messenger TCP sessions with generation-fenced identity publication;
 - supervised game/P2P UDP sockets with exact Echo/TimeSync replies and
   generation-fenced room relay;
+- exact client P2P-port reporting with durable, generation-bound ordinary-room
+  and MyRoom cache refresh;
 - exact ready-stage, race-control, race-start, settlement, and 235-byte kart
   physics codecs used by the actor-integrated human race flow;
 - bounded login concurrency and opt-in remote profile creation;
@@ -54,6 +56,16 @@ owner, validate every nonzero ID against an immutable positive-ID catalog, and
 publish success only after a transactional profile write is durable. The
 ordinary room cache is refreshed silently; no unsupported MyRoom peer fanout
 is invented.
+Client endpoint reports are exact ten-byte packets. Rust discards the claimed
+IPv4 bytes, derives the advertised address from the authenticated TCP peer,
+persists only the reported P2P port, and publishes it only for the same active
+identity generation. Port zero is an absolute clear and every login or
+same-channel replacement starts unadvertised even if a historical profile
+value exists. IPv4-mapped peers retain their embedded IPv4 address; native
+IPv6 peers remain `(0.0.0.0, 0)` because the legacy room wire format cannot
+represent them. The sibling game-UDP report is validated but cannot replace
+the endpoint authority learned by the UDP ingress path. No speculative
+endpoint ACK or live peer-refresh packet is emitted without capture evidence.
 Character positions use actor-derived sender slots and exact-generation peer
 audiences with all-recipient atomic queue reservation. RiderTalk uses the same
 atomic peer path, bounds and redacts the message-bearing request, enforces the

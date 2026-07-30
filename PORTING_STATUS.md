@@ -1,6 +1,6 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
@@ -27,17 +27,68 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`f2f6143 Port RHO5 emblem catalog and durable main emblems`
+`d2fb318 Port generation-bound client P2P reports`
 
 ## Current Rust checkpoint
 
-The current checkpoint ports the bounded emblem catalog request, the
-three-slot main-emblem update, and a native read-only RHO5 source for the stock
-emblem definitions. It also corrects a source defect discovered by comparing
-the C# handler with the stock client: the stock request and every ordinary
-rider projection contain three `i16` emblem values, while C# reads only two
-and hard-codes the third projection to zero. C# remains unchanged; Rust
-persists and publishes all three.
+The current checkpoint ports exact client Game-UDP/P2P endpoint reports and
+the durable, generation-bound P2P presentation update. It deliberately fixes
+the C# trust and lifetime problems instead of cloning them: client-claimed
+address bytes never become endpoint authority, historical profile values
+never revive as a new connection's live port, and only the exact active
+generation may publish a durable port into actor caches. C# remains unchanged.
+
+### Generation-bound client P2P reports
+
+- `ChClientP2pAddrPacket` and `ChClientUdpAddrPacket` are exact ten-byte
+  packets: the four-byte packet-name hash, four client-claimed IPv4 bytes, and
+  a little-endian `u16` port. Truncation at every boundary, trailing data, an
+  unknown hash, or the other report kind's hash fails before profile admission
+  or actor mutation.
+- The codec consumes but does not expose the claimed IPv4 bytes. Rust derives
+  the wire address only from the authenticated TCP peer. Direct IPv4 and
+  IPv4-mapped IPv6 peers retain that IPv4 address; native IPv6 peers are
+  deliberately unadvertised as `(0.0.0.0, 0)` because P5136 room packets
+  cannot represent IPv6. A native IPv6 peer must never become the false
+  capability `0.0.0.0:<nonzero>`.
+- The Game-UDP report is strict validation-only and has no reply. Observed UDP
+  ingress remains the authority for the separate game transport table; a TCP
+  self-report is not proof of NAT reachability and cannot overwrite the first
+  UDP bind.
+- The P2P report persists only the `u16` port through the canonical profile
+  lane, `ProfileStore::transaction`, exact immutable-receipt confirmation, and
+  a pre-reserved actor completion slot. Once submitted, the write and terminal
+  publication survive requester cancellation. An identical value reuses the
+  existing revision; port zero is an absolute durable clear.
+- Runtime endpoint authority is separate from the historical profile field.
+  Every login generation and same-channel replacement starts with runtime port
+  zero, regardless of the value loaded from disk. Later profile/equipment,
+  reward, and `PqGetRider` refreshes preserve only the exact live generation's
+  runtime value and cannot resurrect a stored port.
+- After durability, World revalidates the exact identity binding. Only an
+  actively owned exact generation updates runtime state. Ownerless,
+  superseded, or released outcomes remain durable but do not revive a cache or
+  receive a stale success path.
+- In one actor turn, an accepted active report updates the ordinary protocol
+  room projection, including observers, and every current MyRoom owner/visitor
+  role for that identity. Other presentation fields remain role-specific.
+  An absent-owner tombstone stays unadvertised, and an exact duplicate causes
+  neither a topology change nor a MyRoom revision increment.
+- The report has no client ACK and emits no invented peer fanout. Publication
+  does not reserve an outbound queue, so saturation cannot prevent the durable
+  cache update. A peer that already received an older room snapshot may retain
+  it until a later normal snapshot; capture evidence is required before adding
+  a live endpoint-refresh packet.
+- Same-channel replacement retains lobby/MyRoom membership for the next
+  lobby, clears its advertised endpoint, and does not inherit a frozen
+  Loading/Running race generation or result authority. The old exact race
+  generation becomes inactive and follows the existing abort/DNF settlement
+  policy.
+- The C# direct-P2P/Game-UDP shortcut trusts client-reported endpoint data and
+  may skip relay without proving reachability. Rust does not reproduce that
+  behavior. Its reported presentation port and observed UDP routing authority
+  remain intentionally separate until stock-client/NAT captures justify a
+  stronger link.
 
 ### MyRoom emblem catalog and main selection
 
@@ -172,9 +223,9 @@ persists and publishes all three.
   actor-owned grant scoped to the exact requester binding, exact owner
   binding, protected resource, and the owner's room-info revision. Garage and
   Item Dictionary grants are consumed by the next `RequestItems` prepare;
-  The Emblem grant is consumed only by `RequestEmblems`; the Career grant
-  remains reserved for its still-unported matching request path. Neither can
-  authorize owner items.
+  the Emblem grant is consumed only by `RequestEmblems`; the Career grant
+  remains reserved for the next exact Career request path. Neither can
+  authorize another resource.
 - The uncached stock-client path sends at most one matching follow-up after a
   successful check, so grants are deliberately one-shot. An unused grant may
   remain until it is consumed or revoked; successful entry/reentry, room
@@ -185,6 +236,30 @@ persists and publishes all three.
 - The C# path parses only the kind, returns a kind-0-only placeholder, and
   serves owner items without checking the item password. Rust deliberately
   does not reproduce that bypass.
+
+### MyRoom Career static wire evidence (next slice)
+
+- The bundled C# server exposes the four Career packet-name hashes but has no
+  usable handler. It remains unchanged and cannot define the missing behavior.
+  Stock-client static analysis now supplies exact layouts, so a safe terminal
+  empty-list path no longer needs to wait for a capture.
+- `RmRequestCareerListPacket` (`0x801309EE`) is an exact hash-only request.
+  `RmOwnerCareerListPacket` (`0x6B740910`) starts with signed `i32 marker_b`,
+  `i32 marker_a`, and `i32 count`. Each nonempty entry is exactly 17 bytes:
+  `i32 field0`, `i32 field1`, `u8 field2`, `i32 field3`, `i16 field4`, and
+  `i16 field5`. The client treats `marker_a == marker_b` as terminal, making
+  `0,0,0` the conservative complete empty-list response.
+- The second request (`0xB7D40BE9`) is signed `i32 requester_no` plus a
+  bounded UTF-16 nickname. Its response (`0x6A500900`) begins with
+  `u8 present`; when present it continues with UTF-16 nickname, `i32 level`,
+  `u8 rank`, and `i32 career_points`.
+- The next implementation should strictly parse the hash-only list request,
+  reuse the exact owner/member/resource authorization policy, consume only a
+  matching kind-2 one-shot grant, reserve the requester queue before
+  publication while preserving the established queue-full one-shot semantics,
+  and return the terminal empty list. Nonempty entry ownership,
+  pagination/marker meaning beyond the terminal equality, and the owner-info
+  lookup policy remain evidence-limited and must not be invented.
 
 ### MyRoom Reenter and random public entry
 
@@ -544,13 +619,14 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 681 passed, 0 failed, 2 opt-in proprietary-fixture tests ignored
+cargo test --workspace --all-features -- --ignored
+# 699 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 681 passing tests comprise 9 CLI, 35 connector, 138 core, 85 profile,
-13 RHO5, 393 server unit, and 8 server integration tests. The two ignored tests
-exercise local proprietary RHO5 metadata and the full
+The 699 regular passing tests comprise 9 CLI, 35 connector, 140 core, 85
+profile, 13 RHO5, 409 server unit, and 8 server integration tests. The two
+opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
@@ -573,6 +649,15 @@ Focused regressions cover:
   cancellation, dropped ACK, and atomic queue backpressure;
 - aggregate multi-packet write timeout, guard drain, exact packet order, and
   IV progression;
+- exact ten-byte P2P/Game-UDP report parsing, cross-kind rejection, claimed-IP
+  discard, full `u16` port domain, and Game-UDP validation-only isolation;
+- P2P durability cancellation survival, immutable-receipt confirmation,
+  idempotent retry, and absolute port-zero clearing;
+- exact active-generation ordinary-member/observer and MyRoom cache refresh,
+  stale/ownerless/released publication suppression, same-channel endpoint
+  revocation, duplicate Hub-revision stability, absent-owner tombstone
+  preservation, no-ACK/no-fanout behavior, and IPv4/mapped/native-IPv6
+  projection;
 - direct-entry self bootstrap/re-entry, public visitor redaction, exact
   owner-plus-password parsing, protected empty prompt, status-4 mismatch,
   successful protected entry, untracked/owner-absent denial, room-full
@@ -640,13 +725,13 @@ These items prevent a "port complete" claim.
    handler is a compile error. Complete the evidence ledger for the existing
    deliberate no-reply list.
 
-   Add generation-bound P2P-port admission, durable persistence, and ordinary
-   room/MyRoom cache refresh. Do not trust the client-reported IP address and
-   do not advertise an old persisted port as a new connection's observed UDP
-   endpoint. Capture the exact MyRoom Career request/reply layouts before
-   consuming the remaining kind-2 Career grant: the bundled C# code contains
-   only the four packet-name hashes and silently drops the requests, so it
-   cannot specify their bodies. Club rename requires a global membership/name
+   Implement the exact terminal empty `RmOwnerCareerListPacket` and consume
+   only the matching kind-2 Career grant. Static client analysis establishes
+   the safe layouts and `marker_a == marker_b` terminal condition, but
+   nonempty ownership, marker/pagination semantics, and owner-info policy still
+   need stronger evidence. The bundled C# code contains only the four
+   packet-name hashes and silently drops the requests, so it is not a
+   behavioral specification. Club rename requires a global membership/name
    namespace; club creation is a separate system-design slice rather than a
    per-profile string write. Finish kart tuning/upgrades and the remaining
    quest/attendance/progression surface.
@@ -688,14 +773,15 @@ These items prevent a "port complete" claim.
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. The generic authenticated fallback now
    returns `UnsupportedIdentityPacket`; it no longer reports silent success.
-2. Port `ChClientP2pAddrPacket` as an exact-body, generation-bound report. Use
-   the authenticated TCP source IP, persist only the reported port through a
-   cancellation-safe profile completion, and refresh ordinary room/MyRoom
-   caches only for the exact live generation.
-3. Capture the two MyRoom Career request/reply pairs, including empty-list
-   behavior and request order, before consuming the exact kind-2 grant. Keep
-   the completed RHO5 reader narrowly scoped and read-only, and keep every
-   proprietary archive/XML fixture outside Git.
+2. Port the exact hash-only Career-list request and terminal `0,0,0` response.
+   Reuse the actor-owned owner/member/resource authorization, consume only an
+   exact kind-2 one-shot grant with the established queue-full one-shot
+   semantics, and add strict malformed/stale/backpressure/grant-separation
+   tests. Do not invent nonempty records or owner-info policy.
+3. Capture endpoint-report behavior with two stock clients and NAT-relevant
+   topologies before adding a live peer-refresh/fanout packet or coupling the
+   durable presentation port to observed UDP routing. Existing peers may
+   retain an earlier serialized endpoint until a normal room snapshot.
 4. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
 5. Capture and implement movement sequence/tick behavior per sender and exact
