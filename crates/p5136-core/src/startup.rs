@@ -92,6 +92,7 @@ pub enum StartupRequest {
     SyncDictionaryInfo,
     AddTimeEventInit,
     LockedItemList,
+    ServerTime,
 }
 
 pub const STARTUP_REQUESTS: &[StartupRequest] = &[
@@ -119,6 +120,7 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::SyncDictionaryInfo,
     StartupRequest::AddTimeEventInit,
     StartupRequest::LockedItemList,
+    StartupRequest::ServerTime,
 ];
 
 impl StartupRequest {
@@ -149,6 +151,7 @@ impl StartupRequest {
             Self::SyncDictionaryInfo => "PqSyncDictionaryInfoPacket",
             Self::AddTimeEventInit => "PqAddTimeEventInitPacket",
             Self::LockedItemList => LOCKED_ITEM_LIST_REQUEST_NAME,
+            Self::ServerTime => "PqServerTime",
         }
     }
 
@@ -179,6 +182,7 @@ impl StartupRequest {
             Self::SyncDictionaryInfo => Some("PrSyncDictionaryInfoPacket"),
             Self::AddTimeEventInit => Some("PrAddTimeEventInitPacket"),
             Self::LockedItemList => Some(LOCKED_ITEM_LIST_REPLY_NAME),
+            Self::ServerTime => Some("PrServerTime"),
         }
     }
 }
@@ -259,6 +263,11 @@ pub fn classify_startup_request(hash: u32) -> Option<StartupRequest> {
         .copied()
         .find(|request| adler32::packet_hash(request.request_name()) == hash)
 }
+
+// Evidence boundary: both inspected C# handlers dispatch `PqServerTime`
+// solely from the already-read packet hash and do not consume its body. No
+// capture or schema establishes a stricter request layout, so this module
+// intentionally classifies the hash without inventing a request parser.
 
 /// Returns whether the compatibility server deliberately consumes a request
 /// without replying. `LoRqGetRiderItemPacket` is included because the complete
@@ -538,6 +547,14 @@ pub fn serialize_empty_locked_item_list() -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the legacy four-byte server clock representation.
+#[must_use]
+pub fn serialize_pr_server_time(time: LegacyTime) -> Vec<u8> {
+    let mut packet = PacketWriter::named("PrServerTime");
+    write_legacy_time(&mut packet, time);
+    packet.into_inner()
+}
+
 fn expect_hash(reader: &mut PacketReader<'_>, name: &'static str) -> Result<(), StartupError> {
     let actual = reader.read_u32()?;
     let expected = adler32::packet_hash(name);
@@ -675,8 +692,8 @@ mod tests {
         serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_kart_pass_init,
         serialize_pr_kart_pass_reward, serialize_pr_login_vip_info, serialize_pr_public_command,
         serialize_pr_quest_ux_second, serialize_pr_rider_school_data,
-        serialize_pr_rider_school_progress, serialize_pr_set_playtime_event_tick,
-        serialize_pr_sync_dictionary_info,
+        serialize_pr_rider_school_progress, serialize_pr_server_time,
+        serialize_pr_set_playtime_event_tick, serialize_pr_sync_dictionary_info,
     };
     use crate::{
         adler32,
@@ -859,6 +876,30 @@ mod tests {
         assert_eq!(
             format!("{:X}", Sha256::digest(&add_time)),
             "4105DD09D53B9CC28AFF41C5F410FF0B6C92DC0B27BC6D4724684318CAADE834"
+        );
+    }
+
+    #[test]
+    fn server_time_classification_and_reply_match_the_exact_legacy_layout() {
+        assert_eq!(adler32::packet_hash("PqServerTime"), 0x1E92_04C7);
+        assert_eq!(adler32::packet_hash("PrServerTime"), 0x1E9D_04C8);
+        assert_eq!(
+            classify_startup_request(0x1E92_04C7),
+            Some(StartupRequest::ServerTime)
+        );
+        assert_eq!(StartupRequest::ServerTime.request_name(), "PqServerTime");
+        assert_eq!(
+            StartupRequest::ServerTime.reply_name(),
+            Some("PrServerTime")
+        );
+
+        assert_packet(
+            &serialize_pr_server_time(LegacyTime {
+                days_since_1900: 0x1234,
+                quarter_seconds: 0x5678,
+            }),
+            0x1E9D_04C8,
+            &[0x34, 0x12, 0x78, 0x56],
         );
     }
 

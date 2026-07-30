@@ -2856,6 +2856,7 @@ fn startup_response(request: StartupRequest, profile: &Profile) -> Option<Vec<u8
         StartupRequest::DisassembleFeeInfo => startup::serialize_pr_disassemble_fee_info(),
         StartupRequest::SyncDictionaryInfo => startup::serialize_pr_sync_dictionary_info(),
         StartupRequest::AddTimeEventInit => startup::serialize_pr_add_time_event_init(time),
+        StartupRequest::ServerTime => startup::serialize_pr_server_time(time),
         StartupRequest::LockedItemList => startup::serialize_empty_locked_item_list(),
         StartupRequest::GetRider | StartupRequest::UpdateGameOption => return None,
     })
@@ -4011,6 +4012,60 @@ mod tests {
                 .unwrap(),
             vec![serialize_empty_locked_item_list()]
         );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_time_dispatch_returns_one_bounded_legacy_clock() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_708))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ServerTimeClassifier")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        // The three corroborating C# handlers do not consume a request body,
+        // and no checked-in producer or capture proves hash-only exhaustion.
+        // Preserve that bounded compatibility contract instead of inventing a
+        // stricter layout.
+        for trailing in [&[][..], &[0x51, 0x36][..]] {
+            let mut request = PacketWriter::named("PqServerTime");
+            request.write_bytes(trailing);
+            let responses = dispatch_packet(&services, request.as_slice(), &mut context)
+                .await
+                .unwrap();
+            assert_eq!(responses.len(), 1);
+
+            let mut response = PacketReader::new(&responses[0]);
+            assert_eq!(
+                response.read_u32().unwrap(),
+                adler32::packet_hash("PrServerTime")
+            );
+            let _days_since_1900 = response.read_u16().unwrap();
+            assert!(response.read_u16().unwrap() < 24 * 60 * 15);
+            assert!(response.remaining().is_empty());
+        }
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),
             identity
