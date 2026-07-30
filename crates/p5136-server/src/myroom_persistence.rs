@@ -11,9 +11,7 @@ use std::{
 };
 
 use p5136_core::myroom_protocol::{MyRoomInfo, MyRoomProtocolError};
-use p5136_profile::{
-    ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction, SavedProfile,
-};
+use p5136_profile::{ProfileMutation, ProfileStore, ProfileStoreError, SavedProfile};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -23,6 +21,7 @@ use crate::{
     identity::{MigrationCompletion, MigrationPreflight, UserNo},
     main_emblem_persistence::MainEmblemProfileCompletion,
     myroom_hub::{MyRoomCommitError, MyRoomHubError},
+    profile_durability::{ExactDurabilityError, ExactProfileTransaction},
     profile_io::{MyRoomProfileLease, ProfileIoCompletion, ProfileIoError, ProfileJobAdmission},
 };
 
@@ -120,6 +119,27 @@ pub(crate) enum MyRoomPersistError {
 impl From<ProfileStoreError> for MyRoomPersistError {
     fn from(source: ProfileStoreError) -> Self {
         Self::Store(Box::new(source))
+    }
+}
+
+impl ExactDurabilityError for MyRoomPersistError {
+    fn durability_unconfirmed(
+        revision: u64,
+        initial: ProfileStoreError,
+        confirmation: ProfileStoreError,
+    ) -> Self {
+        Self::DurabilityUnconfirmed {
+            revision,
+            initial: Box::new(initial),
+            confirmation: Box::new(confirmation),
+        }
+    }
+
+    fn durability_receipt_changed(expected: SavedProfile, actual: Option<SavedProfile>) -> Self {
+        Self::DurabilityReceiptChanged {
+            expected: Box::new(expected),
+            actual: actual.map(Box::new),
+        }
     }
 }
 
@@ -548,15 +568,6 @@ impl Drop for AcceptedCompletionGuard {
     }
 }
 
-enum DurabilityEvidence {
-    Confirmed(SavedProfile),
-    NeedsConfirmation {
-        expected: SavedProfile,
-        initial: ProfileStoreError,
-    },
-    Missing,
-}
-
 fn persist_myroom_info(
     store: &ProfileStore,
     nickname: &str,
@@ -576,35 +587,7 @@ fn persist_myroom_info(
         }
     })?;
 
-    let (mutation, profile, durability) = match transaction {
-        ProfileTransaction::Unchanged {
-            value,
-            profile,
-            saved,
-        } => (
-            value,
-            profile,
-            saved.map_or(DurabilityEvidence::Missing, DurabilityEvidence::Confirmed),
-        ),
-        ProfileTransaction::Committed {
-            value,
-            profile,
-            saved,
-        } => (value, profile, DurabilityEvidence::Confirmed(saved)),
-        ProfileTransaction::CommittedButDurabilityUncertain {
-            value,
-            profile,
-            saved,
-            error,
-        } => (
-            value,
-            profile,
-            DurabilityEvidence::NeedsConfirmation {
-                expected: saved,
-                initial: error,
-            },
-        ),
-    };
+    let (mutation, profile, durability) = ExactProfileTransaction::from(transaction).into_parts();
     mutation?;
 
     let persisted = profile.my_room.try_to_protocol_info()?;
@@ -612,42 +595,14 @@ fn persist_myroom_info(
         return Err(MyRoomPersistError::PersistedValueMismatch);
     }
 
-    let confirmed = match durability {
-        DurabilityEvidence::Confirmed(saved) => saved,
-        DurabilityEvidence::NeedsConfirmation { expected, initial } => {
-            confirm_exact_revision(store, nickname, &expected, initial)?
-        }
-        DurabilityEvidence::Missing => {
-            return Err(MyRoomPersistError::MissingDurableRevision);
-        }
-    };
+    let confirmed = durability
+        .confirm_exact::<MyRoomPersistError>(store, nickname)?
+        .ok_or(MyRoomPersistError::MissingDurableRevision)?;
 
     Ok(DurableMyRoomInfo {
         info: persisted,
         revision: confirmed.revision,
     })
-}
-
-fn confirm_exact_revision(
-    store: &ProfileStore,
-    nickname: &str,
-    expected: &SavedProfile,
-    initial: ProfileStoreError,
-) -> Result<SavedProfile, MyRoomPersistError> {
-    let confirmed = store
-        .confirm_latest_revision_durable(nickname)
-        .map_err(|confirmation| MyRoomPersistError::DurabilityUnconfirmed {
-            revision: expected.revision,
-            initial: Box::new(initial),
-            confirmation: Box::new(confirmation),
-        })?;
-    match confirmed {
-        Some(actual) if &actual == expected => Ok(actual),
-        actual => Err(MyRoomPersistError::DurabilityReceiptChanged {
-            expected: Box::new(expected.clone()),
-            actual: actual.map(Box::new),
-        }),
-    }
 }
 
 #[cfg(test)]

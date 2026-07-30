@@ -12,9 +12,8 @@ use p5136_core::{
     startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
 };
 use p5136_profile::{
-    CatalogInventory, Profile, ProfileMutation, ProfileStore, ProfileStoreError,
-    ProfileTransaction, SavedProfile, apply_rider_item_selection, is_grant_item,
-    rider_item_snapshot,
+    CatalogInventory, Profile, ProfileMutation, ProfileStore, ProfileStoreError, SavedProfile,
+    apply_rider_item_selection, is_grant_item, rider_item_snapshot,
 };
 use thiserror::Error;
 
@@ -22,6 +21,7 @@ use crate::{
     myroom_hub::MyRoomProfilePresentation,
     myroom_hub::{MyRoomCommitError, MyRoomHubError},
     myroom_persistence::{MyRoomCompletionSlot, MyRoomProfileCompletion, MyRoomProfileTicketId},
+    profile_durability::{ExactDurabilityError, ExactProfileTransaction},
     profile_io::{
         ProfileIoCompletion, ProfileIoError, ProfileJobAdmission, myroom_profile_presentation,
     },
@@ -75,6 +75,27 @@ pub(crate) enum RiderEquipmentPersistError {
 impl From<ProfileStoreError> for RiderEquipmentPersistError {
     fn from(source: ProfileStoreError) -> Self {
         Self::Store(Box::new(source))
+    }
+}
+
+impl ExactDurabilityError for RiderEquipmentPersistError {
+    fn durability_unconfirmed(
+        revision: u64,
+        initial: ProfileStoreError,
+        confirmation: ProfileStoreError,
+    ) -> Self {
+        Self::DurabilityUnconfirmed {
+            revision,
+            initial: Box::new(initial),
+            confirmation: Box::new(confirmation),
+        }
+    }
+
+    fn durability_receipt_changed(expected: SavedProfile, actual: Option<SavedProfile>) -> Self {
+        Self::DurabilityReceiptChanged {
+            expected: Box::new(expected),
+            actual: actual.map(Box::new),
+        }
     }
 }
 
@@ -437,15 +458,6 @@ impl Drop for AcceptedCompletionGuard {
     }
 }
 
-enum DurabilityEvidence {
-    Confirmed(SavedProfile),
-    NeedsConfirmation {
-        expected: SavedProfile,
-        initial: ProfileStoreError,
-    },
-    Missing,
-}
-
 fn persist_rider_equipment(
     store: &ProfileStore,
     catalog: &CatalogInventory,
@@ -462,46 +474,12 @@ fn persist_rider_equipment(
         ProfileMutation::changed(Ok(()), next)
     })?;
 
-    let (validation, profile, durability) = match transaction {
-        ProfileTransaction::Unchanged {
-            value,
-            profile,
-            saved,
-        } => (
-            value,
-            profile,
-            saved.map_or(DurabilityEvidence::Missing, DurabilityEvidence::Confirmed),
-        ),
-        ProfileTransaction::Committed {
-            value,
-            profile,
-            saved,
-        } => (value, profile, DurabilityEvidence::Confirmed(saved)),
-        ProfileTransaction::CommittedButDurabilityUncertain {
-            value,
-            profile,
-            saved,
-            error,
-        } => (
-            value,
-            profile,
-            DurabilityEvidence::NeedsConfirmation {
-                expected: saved,
-                initial: error,
-            },
-        ),
-    };
+    let (validation, profile, durability) = ExactProfileTransaction::from(transaction).into_parts();
     validation?;
 
-    let saved = match durability {
-        DurabilityEvidence::Confirmed(saved) => saved,
-        DurabilityEvidence::NeedsConfirmation { expected, initial } => {
-            confirm_exact_revision(store, nickname, &expected, initial)?
-        }
-        DurabilityEvidence::Missing => {
-            return Err(RiderEquipmentPersistError::MissingDurableRevision);
-        }
-    };
+    let saved = durability
+        .confirm_exact::<RiderEquipmentPersistError>(store, nickname)?
+        .ok_or(RiderEquipmentPersistError::MissingDurableRevision)?;
     let snapshot = rider_item_snapshot(&profile.rider_item);
     let presentation = myroom_profile_presentation(&profile);
     Ok(DurableRiderEquipment {
@@ -510,30 +488,6 @@ fn persist_rider_equipment(
         presentation,
         saved,
     })
-}
-
-fn confirm_exact_revision(
-    store: &ProfileStore,
-    nickname: &str,
-    expected: &SavedProfile,
-    initial: ProfileStoreError,
-) -> Result<SavedProfile, RiderEquipmentPersistError> {
-    let confirmed = store
-        .confirm_latest_revision_durable(nickname)
-        .map_err(
-            |confirmation| RiderEquipmentPersistError::DurabilityUnconfirmed {
-                revision: expected.revision,
-                initial: Box::new(initial),
-                confirmation: Box::new(confirmation),
-            },
-        )?;
-    match confirmed {
-        Some(actual) if &actual == expected => Ok(actual),
-        actual => Err(RiderEquipmentPersistError::DurabilityReceiptChanged {
-            expected: Box::new(expected.clone()),
-            actual: actual.map(Box::new),
-        }),
-    }
 }
 
 pub(crate) fn catalog_grants(catalog: &CatalogInventory, category: u16, item_id: u16) -> bool {

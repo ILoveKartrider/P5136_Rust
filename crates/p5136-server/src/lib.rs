@@ -9,6 +9,7 @@ mod messenger_runtime;
 mod myroom_hub;
 mod myroom_persistence;
 mod operation_gate;
+mod profile_durability;
 mod profile_io;
 mod runtime;
 mod session;

@@ -9,14 +9,14 @@ use std::fmt;
 
 use p5136_core::myroom_protocol::UpdateMainEmblemRequest;
 use p5136_profile::{
-    EmblemCatalog, ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction,
-    SavedProfile,
+    EmblemCatalog, ProfileMutation, ProfileStore, ProfileStoreError, SavedProfile,
 };
 use thiserror::Error;
 
 use crate::{
     myroom_hub::MyRoomHubError,
     myroom_persistence::{MyRoomCompletionSlot, MyRoomProfileCompletion, MyRoomProfileTicketId},
+    profile_durability::{ExactDurabilityError, ExactProfileTransaction},
     profile_io::{ProfileIoCompletion, ProfileIoError, ProfileJobAdmission},
 };
 
@@ -99,6 +99,27 @@ pub(crate) enum MainEmblemPersistError {
 impl From<ProfileStoreError> for MainEmblemPersistError {
     fn from(source: ProfileStoreError) -> Self {
         Self::Store(Box::new(source))
+    }
+}
+
+impl ExactDurabilityError for MainEmblemPersistError {
+    fn durability_unconfirmed(
+        revision: u64,
+        initial: ProfileStoreError,
+        confirmation: ProfileStoreError,
+    ) -> Self {
+        Self::DurabilityUnconfirmed {
+            revision,
+            initial: Box::new(initial),
+            confirmation: Box::new(confirmation),
+        }
+    }
+
+    fn durability_receipt_changed(expected: SavedProfile, actual: Option<SavedProfile>) -> Self {
+        Self::DurabilityReceiptChanged {
+            expected: Box::new(expected),
+            actual: actual.map(Box::new),
+        }
     }
 }
 
@@ -456,14 +477,6 @@ impl Drop for AcceptedCompletionGuard {
     }
 }
 
-enum DurabilityEvidence {
-    Confirmed(Option<SavedProfile>),
-    NeedsConfirmation {
-        expected: SavedProfile,
-        initial: ProfileStoreError,
-    },
-}
-
 fn persist_main_emblems(
     store: &ProfileStore,
     nickname: &str,
@@ -484,50 +497,12 @@ fn persist_main_emblems(
         ProfileMutation::changed((), next)
     })?;
 
-    let durability = match transaction {
-        ProfileTransaction::Unchanged { saved, .. } => DurabilityEvidence::Confirmed(saved),
-        ProfileTransaction::Committed { saved, .. } => DurabilityEvidence::Confirmed(Some(saved)),
-        ProfileTransaction::CommittedButDurabilityUncertain { saved, error, .. } => {
-            DurabilityEvidence::NeedsConfirmation {
-                expected: saved,
-                initial: error,
-            }
-        }
-    };
-    let saved = match durability {
-        DurabilityEvidence::Confirmed(saved) => saved,
-        DurabilityEvidence::NeedsConfirmation { expected, initial } => {
-            Some(confirm_exact_revision(store, nickname, &expected, initial)?)
-        }
-    };
+    let ((), _, durability) = ExactProfileTransaction::from(transaction).into_parts();
+    let saved = durability.confirm_exact::<MainEmblemPersistError>(store, nickname)?;
     Ok(DurableMainEmblems {
         selection,
         revision: saved.map(|saved| saved.revision),
     })
-}
-
-fn confirm_exact_revision(
-    store: &ProfileStore,
-    nickname: &str,
-    expected: &SavedProfile,
-    initial: ProfileStoreError,
-) -> Result<SavedProfile, MainEmblemPersistError> {
-    let confirmed = store
-        .confirm_latest_revision_durable(nickname)
-        .map_err(
-            |confirmation| MainEmblemPersistError::DurabilityUnconfirmed {
-                revision: expected.revision,
-                initial: Box::new(initial),
-                confirmation: Box::new(confirmation),
-            },
-        )?;
-    match confirmed {
-        Some(actual) if &actual == expected => Ok(actual),
-        actual => Err(MainEmblemPersistError::DurabilityReceiptChanged {
-            expected: Box::new(expected.clone()),
-            actual: actual.map(Box::new),
-        }),
-    }
 }
 
 #[cfg(test)]
