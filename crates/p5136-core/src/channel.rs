@@ -10,6 +10,46 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_SWITCH_OPAQUE_LENGTH: usize = 1_048_576;
+pub const CLIENT_P2P_ADDRESS_PACKET_NAME: &str = "ChClientP2pAddrPacket";
+pub const CLIENT_UDP_ADDRESS_PACKET_NAME: &str = "ChClientUdpAddrPacket";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientEndpointReportKind {
+    P2p,
+    GameUdp,
+}
+
+impl ClientEndpointReportKind {
+    #[must_use]
+    pub const fn packet_name(self) -> &'static str {
+        match self {
+            Self::P2p => CLIENT_P2P_ADDRESS_PACKET_NAME,
+            Self::GameUdp => CLIENT_UDP_ADDRESS_PACKET_NAME,
+        }
+    }
+}
+
+pub const CLIENT_ENDPOINT_REPORTS: &[ClientEndpointReportKind] = &[
+    ClientEndpointReportKind::P2p,
+    ClientEndpointReportKind::GameUdp,
+];
+
+/// The only trusted value extracted from a client endpoint report.
+///
+/// The four reported address bytes are consumed for exact wire validation but
+/// deliberately discarded. Room advertisement remains bound to the
+/// authenticated TCP connection's source IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientEndpointPortReport {
+    port: u16,
+}
+
+impl ClientEndpointPortReport {
+    #[must_use]
+    pub const fn port(self) -> u16 {
+        self.port
+    }
+}
 
 /// Resolves P5136's mode-group value to a concrete record from the static
 /// channel table advertised by `ChRequestChStaticReplyPacket`.
@@ -75,6 +115,36 @@ pub enum ChannelError {
 
     #[error("PqChannelSwitch opaque length {length} exceeds configured maximum {maximum}")]
     OpaqueTooLarge { length: usize, maximum: usize },
+
+    #[error("{name} has {count} trailing bytes")]
+    TrailingBytes { name: &'static str, count: usize },
+}
+
+#[must_use]
+pub fn classify_client_endpoint_report(hash: u32) -> Option<ClientEndpointReportKind> {
+    CLIENT_ENDPOINT_REPORTS
+        .iter()
+        .copied()
+        .find(|kind| adler32::packet_hash(kind.packet_name()) == hash)
+}
+
+pub fn parse_client_endpoint_report(
+    kind: ClientEndpointReportKind,
+    packet: &[u8],
+) -> Result<ClientEndpointPortReport, ChannelError> {
+    let name = kind.packet_name();
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, name)?;
+    let _reported_address = reader.read_bytes(4)?;
+    let port = reader.read_u16()?;
+    let trailing = reader.remaining().len();
+    if trailing != 0 {
+        return Err(ChannelError::TrailingBytes {
+            name,
+            count: trailing,
+        });
+    }
+    Ok(ClientEndpointPortReport { port })
 }
 
 pub fn parse_pq_channel_switch(packet: &[u8]) -> Result<PqChannelSwitch, ChannelError> {
@@ -174,7 +244,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ChannelError, parse_pq_channel_movein, parse_pq_channel_switch,
+        CLIENT_ENDPOINT_REPORTS, CLIENT_P2P_ADDRESS_PACKET_NAME, CLIENT_UDP_ADDRESS_PACKET_NAME,
+        ChannelError, ClientEndpointReportKind, classify_client_endpoint_report,
+        parse_client_endpoint_report, parse_pq_channel_movein, parse_pq_channel_switch,
         parse_pq_channel_switch_with_limit, resolve_channel_id, serialize_pr_channel_move_in,
         serialize_pr_channel_switch,
     };
@@ -244,6 +316,67 @@ mod tests {
             format!("{:X}", Sha256::digest(&reply)),
             "787B77F735942EF6D57F07297FBD9E2B908023377DDD6089CA044A61E998F09C"
         );
+    }
+
+    #[test]
+    fn client_endpoint_reports_are_exact_and_discard_the_claimed_address() {
+        let p2p = [0xcf, 0x07, 0x97, 0x53, 203, 0, 113, 99, 0x34, 0x12];
+        assert_eq!(
+            classify_client_endpoint_report(u32::from_le_bytes([p2p[0], p2p[1], p2p[2], p2p[3]])),
+            Some(ClientEndpointReportKind::P2p)
+        );
+        assert_eq!(
+            parse_client_endpoint_report(ClientEndpointReportKind::P2p, &p2p)
+                .unwrap()
+                .port(),
+            0x1234
+        );
+
+        let udp = [0x06, 0x08, 0x30, 0x56, 198, 51, 100, 7, 0, 0];
+        assert_eq!(
+            classify_client_endpoint_report(u32::from_le_bytes([udp[0], udp[1], udp[2], udp[3]])),
+            Some(ClientEndpointReportKind::GameUdp)
+        );
+        assert_eq!(
+            parse_client_endpoint_report(ClientEndpointReportKind::GameUdp, &udp)
+                .unwrap()
+                .port(),
+            0
+        );
+
+        assert_eq!(
+            crate::adler32::packet_hash(CLIENT_P2P_ADDRESS_PACKET_NAME),
+            1_402_406_863
+        );
+        assert_eq!(
+            crate::adler32::packet_hash(CLIENT_UDP_ADDRESS_PACKET_NAME),
+            1_445_988_358
+        );
+        assert_eq!(CLIENT_ENDPOINT_REPORTS.len(), 2);
+        assert_eq!(classify_client_endpoint_report(0xDEAD_BEEF), None);
+    }
+
+    #[test]
+    fn client_endpoint_reports_reject_wrong_hash_truncation_and_trailing_bytes() {
+        let exact = [0xcf, 0x07, 0x97, 0x53, 127, 0, 0, 1, 0x90, 0x99];
+        assert!(matches!(
+            parse_client_endpoint_report(ClientEndpointReportKind::GameUdp, &exact),
+            Err(ChannelError::UnexpectedPacketHash {
+                name: CLIENT_UDP_ADDRESS_PACKET_NAME,
+                ..
+            })
+        ));
+        assert!(parse_client_endpoint_report(ClientEndpointReportKind::P2p, &exact[..9]).is_err());
+
+        let mut trailing = exact.to_vec();
+        trailing.push(0xff);
+        assert!(matches!(
+            parse_client_endpoint_report(ClientEndpointReportKind::P2p, &trailing),
+            Err(ChannelError::TrailingBytes {
+                name: CLIENT_P2P_ADDRESS_PACKET_NAME,
+                count: 1
+            })
+        ));
     }
 
     #[test]
