@@ -804,14 +804,23 @@ impl ProfileCoordinator {
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
         let completed = admission
-            .run(FAVORITE_ITEM_UPDATE_OPERATION, move |store, _, subject| {
-                #[cfg(test)]
-                if let Some(hook) = blocking_update_hook {
-                    hook.entered.wait();
-                    hook.release.wait();
-                }
-                persist_favorite_item_changes(store, subject.nickname(), &changes, maximum_records)
-            })
+            .run(
+                FAVORITE_ITEM_UPDATE_OPERATION,
+                move |store, lease, subject| {
+                    #[cfg(test)]
+                    if let Some(hook) = blocking_update_hook {
+                        hook.entered.wait();
+                        hook.release.wait();
+                    }
+                    persist_favorite_item_changes(
+                        store,
+                        lease,
+                        subject.nickname(),
+                        &changes,
+                        maximum_records,
+                    )
+                },
+            )
             .await?;
         let (updated, lane) = completed.into_parts();
         Ok((updated?, lane))

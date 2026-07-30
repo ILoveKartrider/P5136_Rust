@@ -11,15 +11,21 @@ use std::{
     },
 };
 
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions},
+};
 use fs2::FileExt;
 use p5136_core::nickname::{NicknameError, canonical_nickname_key, normalize_nickname};
 use rand::random;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
-use crate::Profile;
+use crate::{FavoriteItems, Profile};
 
 const LEGACY_FILENAME: &str = "Launcher.json";
+const LEGACY_FAVORITE_ITEMS_FILENAME: &str = "Favorite.json";
 const VERSION_PREFIX: &str = "Launcher.v";
 const VERSION_SUFFIX: &str = ".json";
 const RACE_RUN_GENERATION_PREFIX: &str = ".P5136RustRaceRun.v";
@@ -104,6 +110,7 @@ pub struct RaceRunLease {
     generation: RaceRunGeneration,
     store_id: ProfileStoreId,
     canonical_root: PathBuf,
+    root_capability: CapabilityDir,
     lock_file: File,
 }
 
@@ -260,6 +267,48 @@ pub enum ProfileStoreError {
     },
 }
 
+/// Failure while importing the C# favorite-item sidecar into a Rust profile.
+///
+/// The importer deliberately has a narrower, fail-closed contract than the
+/// legacy C# reader: only a regular `Favorite.json` containing the exact
+/// bounded `FavoriteItems` JSON representation is accepted. A missing file is
+/// the sole empty-state case.
+#[derive(Debug, Error)]
+pub enum FavoriteItemImportError {
+    #[error("favorite-item profile storage operation failed")]
+    Store {
+        #[source]
+        source: Box<ProfileStoreError>,
+    },
+
+    #[error("legacy favorite-item sidecar at {path} is not a regular non-symbolic-link file")]
+    InvalidStorageEntry { path: PathBuf },
+
+    #[error(
+        "legacy favorite-item sidecar at {path} has at least {length} bytes; configured maximum is {maximum}"
+    )]
+    TooLarge {
+        path: PathBuf,
+        length: u64,
+        maximum: u64,
+    },
+
+    #[error("legacy favorite-item JSON at {path} is invalid")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+impl From<ProfileStoreError> for FavoriteItemImportError {
+    fn from(source: ProfileStoreError) -> Self {
+        Self::Store {
+            source: Box::new(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedProfile {
     pub nickname: String,
@@ -296,6 +345,29 @@ impl ProfileTransactionContext {
     #[must_use]
     pub const fn has_immutable_revision(self) -> bool {
         self.revision.is_some()
+    }
+}
+
+/// The provenance of favorite-item state supplied to a legacy-aware
+/// transaction.
+///
+/// Imported state must satisfy every current reply-bound before Rust seals the
+/// migration marker. Canonical state may be temporarily over a newly lowered
+/// bound so a later operation can shrink it without making recovery
+/// impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FavoriteItemStateOrigin {
+    /// State already present in the loaded Rust profile; external import was
+    /// resolved by an earlier writer or legacy migration.
+    Canonical,
+    /// The one captured C# `Favorite.json` sidecar snapshot.
+    LegacySidecar,
+}
+
+impl FavoriteItemStateOrigin {
+    #[must_use]
+    pub const fn is_legacy_sidecar(self) -> bool {
+        matches!(self, Self::LegacySidecar)
     }
 }
 
@@ -450,10 +522,17 @@ impl ProfileStore {
         verify_atomic_publish_support(&canonical_root)?;
         let store_id = load_or_create_store_id(&canonical_root)?;
         let generation = self.allocate_race_run_generation_locked(&canonical_root, store_id)?;
+        let root_capability = CapabilityDir::open_ambient_dir(&canonical_root, ambient_authority())
+            .map_err(|source| ProfileStoreError::Io {
+                operation: "open profile-root capability",
+                path: canonical_root.clone(),
+                source,
+            })?;
         Ok(RaceRunLease {
             generation,
             store_id,
             canonical_root,
+            root_capability,
             lock_file,
         })
     }
@@ -728,17 +807,116 @@ impl ProfileStore {
     where
         F: FnMut(&Profile, ProfileTransactionContext) -> ProfileMutation<T>,
     {
+        self.transaction_with_snapshot(nickname, |snapshot, context| {
+            Ok(transaction(&snapshot.profile, context))
+        })
+    }
+
+    /// Runs a favorite-item transaction, importing an unresolved C# sidecar
+    /// only when the Rust migration marker is absent.
+    ///
+    /// The caller receives the resolved favorite state, its provenance, and
+    /// returns both its value and the next state. When the marker is absent,
+    /// the sidecar read, marker write, and requested state change are one
+    /// profile transaction.
+    /// Once a Rust marker exists, this method never reads `Favorite.json`
+    /// again. The closure can be retried after a cross-process CAS conflict,
+    /// so it must not have externally visible side effects and must use the
+    /// origin supplied on each invocation: a retry can change from a captured
+    /// sidecar to a competing writer's canonical Rust state.
+    pub fn transaction_with_legacy_favorite_items<T, E, F>(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        mut transaction: F,
+    ) -> Result<ProfileTransaction<Result<T, E>>, FavoriteItemImportError>
+    where
+        F: FnMut(&FavoriteItems, FavoriteItemStateOrigin) -> Result<(T, FavoriteItems), E>,
+    {
+        self.validate_race_run_lease(lease)?;
         let nickname = Self::normalize_storage_nickname(nickname)?;
         let profile_lock = self.profile_lock(&nickname)?;
         let _guard = lock(&profile_lock)?;
+        let initial_snapshot = self.load_or_default_from_disk(&nickname)?;
+        // Capture the sidecar exactly once while the in-process profile lane is
+        // held. A CAS retry may observe a newer Rust marker, but must not read
+        // mutable legacy state a second time.
+        let imported = initial_snapshot
+            .profile
+            .favorite_items
+            .is_none()
+            .then(|| self.read_legacy_favorite_items(lease, &initial_snapshot))
+            .transpose()?;
+        self.transaction_with_snapshot_locked(
+            &nickname,
+            Some(initial_snapshot),
+            |snapshot, context| {
+                let (current_items, origin) = match snapshot.profile.favorite_items.as_ref() {
+                    Some(items) => (items, FavoriteItemStateOrigin::Canonical),
+                    None => (
+                        imported.as_ref().ok_or_else(|| {
+                            FavoriteItemImportError::from(ProfileStoreError::InternalInvariant {
+                                message: "an unresolved favorite-item marker requires one captured import",
+                            })
+                        })?,
+                        FavoriteItemStateOrigin::LegacySidecar,
+                    ),
+                };
+
+                let (value, next_items) = match transaction(current_items, origin) {
+                    Ok(result) => result,
+                    Err(error) => return Ok(ProfileMutation::Unchanged(Err(error))),
+                };
+
+                if context.has_immutable_revision()
+                    && snapshot.profile.favorite_items.as_ref() == Some(&next_items)
+                {
+                    return Ok(ProfileMutation::Unchanged(Ok(value)));
+                }
+
+                let mut profile = snapshot.profile.clone();
+                profile.favorite_items = Some(next_items);
+                Ok(ProfileMutation::changed(Ok(value), profile))
+            },
+        )
+    }
+
+    fn transaction_with_snapshot<T, E, F>(
+        &self,
+        nickname: &str,
+        transaction: F,
+    ) -> Result<ProfileTransaction<T>, E>
+    where
+        E: From<ProfileStoreError>,
+        F: FnMut(&DiskProfileSnapshot, ProfileTransactionContext) -> Result<ProfileMutation<T>, E>,
+    {
+        let nickname = Self::normalize_storage_nickname(nickname).map_err(E::from)?;
+        let profile_lock = self.profile_lock(&nickname).map_err(E::from)?;
+        let _guard = lock(&profile_lock).map_err(E::from)?;
+        self.transaction_with_snapshot_locked(&nickname, None, transaction)
+    }
+
+    fn transaction_with_snapshot_locked<T, E, F>(
+        &self,
+        nickname: &str,
+        mut initial_snapshot: Option<DiskProfileSnapshot>,
+        mut transaction: F,
+    ) -> Result<ProfileTransaction<T>, E>
+    where
+        E: From<ProfileStoreError>,
+        F: FnMut(&DiskProfileSnapshot, ProfileTransactionContext) -> Result<ProfileMutation<T>, E>,
+    {
         for _ in 0..MAX_TRANSACTION_CAS_ATTEMPTS {
-            let snapshot = self.load_or_default_from_disk(&nickname)?;
+            let snapshot = match initial_snapshot.take() {
+                Some(snapshot) => snapshot,
+                None => self.load_or_default_from_disk(nickname).map_err(E::from)?,
+            };
             let context = ProfileTransactionContext {
                 revision: snapshot.revision,
             };
-            match transaction(&snapshot.profile, context) {
+            match transaction(&snapshot, context)? {
                 ProfileMutation::Unchanged(value) => {
-                    let durability = self.confirm_snapshot_durability(&nickname, &snapshot);
+                    let durability = self.confirm_snapshot_durability(nickname, &snapshot);
                     return match durability {
                         Ok(saved) => Ok(ProfileTransaction::Unchanged {
                             value,
@@ -746,11 +924,11 @@ impl ProfileStore {
                             saved,
                         }),
                         Err(error @ ProfileStoreError::CommittedButDurabilityUncertain { .. }) => {
-                            let Some(saved) = saved_profile_from_snapshot(&nickname, &snapshot)
+                            let Some(saved) = saved_profile_from_snapshot(nickname, &snapshot)
                             else {
-                                return Err(ProfileStoreError::InternalInvariant {
+                                return Err(E::from(ProfileStoreError::InternalInvariant {
                                     message: "a committed durability warning must reference a revision",
-                                });
+                                }));
                             };
                             Ok(ProfileTransaction::CommittedButDurabilityUncertain {
                                 value,
@@ -759,17 +937,20 @@ impl ProfileStore {
                                 error,
                             })
                         }
-                        Err(error) => Err(error),
+                        Err(error) => Err(E::from(error)),
                     };
                 }
                 ProfileMutation::Changed { value, profile } => {
                     let profile = *profile;
-                    match self.save_compare_and_swap_locked(
-                        &nickname,
-                        &profile,
-                        snapshot.head_revision,
-                        snapshot.revision,
-                    )? {
+                    match self
+                        .save_compare_and_swap_locked(
+                            nickname,
+                            &profile,
+                            snapshot.head_revision,
+                            snapshot.revision,
+                        )
+                        .map_err(E::from)?
+                    {
                         PreparedPublishOutcome::Published(SaveOutcome::Durable(saved)) => {
                             return Ok(ProfileTransaction::Committed {
                                 value,
@@ -793,10 +974,10 @@ impl ProfileStore {
                 }
             }
         }
-        Err(ProfileStoreError::TransactionContention {
-            nickname,
+        Err(E::from(ProfileStoreError::TransactionContention {
+            nickname: nickname.to_owned(),
             attempts: MAX_TRANSACTION_CAS_ATTEMPTS,
-        })
+        }))
     }
 
     fn profile_lock(&self, nickname: &str) -> Result<Arc<Mutex<()>>, ProfileStoreError> {
@@ -923,6 +1104,111 @@ impl ProfileStore {
             source_path: legacy,
             recovered_revisions,
             directory,
+        })
+    }
+
+    fn read_legacy_favorite_items(
+        &self,
+        lease: &RaceRunLease,
+        snapshot: &DiskProfileSnapshot,
+    ) -> Result<FavoriteItems, FavoriteItemImportError> {
+        let Some(directory_name) = snapshot.directory.file_name() else {
+            return Err(ProfileStoreError::InternalInvariant {
+                message: "profile directory must have one terminal component",
+            }
+            .into());
+        };
+        let sidecar_path = lease
+            .root()
+            .join(directory_name)
+            .join(LEGACY_FAVORITE_ITEMS_FILENAME);
+        let profile_directory = lease
+            .root_capability
+            .open_dir_nofollow(directory_name)
+            .map_err(|source| {
+                favorite_item_import_io(
+                    "open legacy favorite-item profile directory without following links",
+                    sidecar_path.clone(),
+                    source,
+                )
+            })?;
+        // This precheck avoids opening a known FIFO/device at all. It is not
+        // trusted for authorization: the later no-follow nonblocking open and
+        // opened-handle metadata check close the replacement race.
+        let metadata = match profile_directory.symlink_metadata(LEGACY_FAVORITE_ITEMS_FILENAME) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(FavoriteItems::default());
+            }
+            Err(source) => {
+                return Err(favorite_item_import_io(
+                    "inspect legacy favorite-item sidecar without following links",
+                    sidecar_path,
+                    source,
+                ));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(FavoriteItemImportError::InvalidStorageEntry { path: sidecar_path });
+        }
+
+        let mut options = CapabilityOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
+        let file = match profile_directory.open_with(LEGACY_FAVORITE_ITEMS_FILENAME, &options) {
+            Ok(file) => file,
+            Err(source) => {
+                return Err(favorite_item_import_io(
+                    "open legacy favorite-item sidecar without following links",
+                    sidecar_path,
+                    source,
+                ));
+            }
+        };
+        let opened_metadata = file.metadata().map_err(|source| {
+            favorite_item_import_io(
+                "inspect opened legacy favorite-item sidecar",
+                sidecar_path.clone(),
+                source,
+            )
+        })?;
+        if !opened_metadata.file_type().is_file() {
+            return Err(FavoriteItemImportError::InvalidStorageEntry { path: sidecar_path });
+        }
+        if opened_metadata.len() > self.maximum_bytes {
+            return Err(FavoriteItemImportError::TooLarge {
+                path: sidecar_path,
+                length: opened_metadata.len(),
+                maximum: self.maximum_bytes,
+            });
+        }
+
+        let read_limit = self.maximum_bytes.saturating_add(1);
+        let initial_capacity = usize::try_from(opened_metadata.len().min(64 * 1024))
+            .expect("64 KiB capacity is representable on every supported platform");
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        file.take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|source| {
+                favorite_item_import_io(
+                    "read legacy favorite-item sidecar",
+                    sidecar_path.clone(),
+                    source,
+                )
+            })?;
+        let length = u64::try_from(bytes.len()).expect("Vec length is representable as u64");
+        if length > self.maximum_bytes {
+            return Err(FavoriteItemImportError::TooLarge {
+                path: sidecar_path,
+                length,
+                maximum: self.maximum_bytes,
+            });
+        }
+        // C# sidecar readers accept an optional UTF-8 BOM; preserve that
+        // migration compatibility while keeping the JSON record schema strict.
+        let json = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+        serde_json::from_slice(json).map_err(|source| FavoriteItemImportError::Json {
+            path: sidecar_path,
+            source,
         })
     }
 
@@ -1236,6 +1522,19 @@ fn regular_profile_file_exists(path: &Path) -> Result<bool, ProfileStoreError> {
             source,
         }),
     }
+}
+
+fn favorite_item_import_io(
+    operation: &'static str,
+    path: PathBuf,
+    source: io::Error,
+) -> FavoriteItemImportError {
+    ProfileStoreError::Io {
+        operation,
+        path,
+        source,
+    }
+    .into()
 }
 
 fn create_dir_all_durable(path: &Path) -> Result<(), ProfileStoreError> {

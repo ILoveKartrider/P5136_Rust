@@ -7,6 +7,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 fs2.workspace = true
 p5136-core = { path = "../p5136-core" }
 quick-xml.workspace = true

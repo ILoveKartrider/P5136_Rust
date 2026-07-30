@@ -2119,6 +2119,7 @@ mod tests {
             PlantPartEquipRequest, serialize_equip_tuning_failure, serialize_equip_tuning_success,
         },
         frame, handshake,
+        item_state_protocol::FavoriteItemKey,
         login::{LegacyTime, serialize_pr_cn_authen_login},
         messenger::{encode_frame as encode_messenger_frame, serialize_guild_chat},
         myroom_protocol::MyRoomInfo,
@@ -3726,6 +3727,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_favorite_update_get_and_reconnect_preserve_imported_state() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let nickname = "FavoriteTcpRider";
+        let directory = profile_root.path().join(nickname);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("Launcher.json"), b"{}").unwrap();
+        fs::write(
+            directory.join("Favorite.json"),
+            b"\xef\xbb\xbf[{\"ItemCatID\":3,\"ItemID\":1450,\"ItemSN\":1}]",
+        )
+        .unwrap();
+        let imported = FavoriteItemKey::new(3, 1_450, 1);
+        let added = FavoriteItemKey::new(3, 1_453, 2);
+        let expected = [imported, added];
+
+        let (server, maximum) = start_test_server(profile_root.path(), None).await;
+        let endpoint = server.endpoints().login_tcp;
+        let mut client = authenticate_and_login(endpoint, maximum, nickname).await;
+        assert_no_login_data(&mut client.stream).await;
+
+        let update = build_favorite_item_update(&[(added, 1)]);
+        send_packet(&mut client.stream, &update, &mut client.send_iv, maximum).await;
+        assert_no_login_data(&mut client.stream).await;
+
+        let get = PacketWriter::named("PqFavoriteItemGet").into_inner();
+        send_packet(&mut client.stream, &get, &mut client.send_iv, maximum).await;
+        assert_favorite_item_reply(&read_login_packet(&mut client, maximum).await, &expected);
+
+        drop(client);
+        wait_for_session_count(&server.world(), 0).await;
+
+        let mut reconnected = authenticate_and_login(endpoint, maximum, nickname).await;
+        assert_no_login_data(&mut reconnected.stream).await;
+        let get = PacketWriter::named("PqFavoriteItemGet").into_inner();
+        send_packet(
+            &mut reconnected.stream,
+            &get,
+            &mut reconnected.send_iv,
+            maximum,
+        )
+        .await;
+        assert_favorite_item_reply(
+            &read_login_packet(&mut reconnected, maximum).await,
+            &expected,
+        );
+
+        drop(reconnected);
+        wait_for_session_count(&server.world(), 0).await;
+        server.shutdown().await.unwrap();
+
+        let persisted = ProfileStore::new(profile_root.path())
+            .reload(nickname)
+            .unwrap();
+        assert_eq!(persisted.revision, Some(1));
+        assert_eq!(
+            persisted
+                .profile
+                .favorite_items
+                .expect("first favorite update must write the Rust marker")
+                .as_slice(),
+            expected
+        );
+    }
+
+    #[tokio::test]
     async fn catalog_inventory_precedes_get_rider_and_late_request_is_a_noop() {
         let profile_root = tempfile::tempdir().unwrap();
         let catalog_path = profile_root.path().join("KartCatalog.xml");
@@ -4293,6 +4359,43 @@ mod tests {
         packet.write_u16(0);
         packet.write_u16(0);
         packet.into_inner()
+    }
+
+    fn build_favorite_item_update(items: &[(FavoriteItemKey, u8)]) -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqFavoriteItemUpdate");
+        packet.write_u8(1);
+        packet.write_u32(u32::try_from(items.len()).expect("test record count fits u32"));
+        for &(item, operation) in items {
+            packet.write_u16(item.category());
+            packet.write_u16(item.item_id());
+            packet.write_u16(item.serial());
+            packet.write_u8(operation);
+        }
+        packet.into_inner()
+    }
+
+    fn assert_favorite_item_reply(packet: &[u8], expected: &[FavoriteItemKey]) {
+        let mut reader = PacketReader::new(packet);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrFavoriteItemGet")
+        );
+        assert_eq!(
+            usize::try_from(reader.read_u32().unwrap()).unwrap(),
+            expected.len()
+        );
+        for &item in expected {
+            assert_eq!(
+                FavoriteItemKey::new(
+                    reader.read_u16().unwrap(),
+                    reader.read_u16().unwrap(),
+                    reader.read_u16().unwrap(),
+                ),
+                item
+            );
+            assert_eq!(reader.read_u8().unwrap(), 0);
+        }
+        assert!(reader.remaining().is_empty());
     }
 
     fn build_plant_part_request(request: PlantPartEquipRequest, trailing: bool) -> Vec<u8> {

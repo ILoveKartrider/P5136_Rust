@@ -41,6 +41,7 @@ pub use progression::{
     apply_race_reward_once, apply_time_reward, finish_reward, time_reward_from_rolls,
 };
 pub use store::{
-    LoadedProfile, ProfileMutation, ProfileStore, ProfileStoreError, ProfileStoreId,
-    ProfileTransaction, ProfileTransactionContext, RaceRunGeneration, RaceRunLease, SavedProfile,
+    FavoriteItemImportError, FavoriteItemStateOrigin, LoadedProfile, ProfileMutation, ProfileStore,
+    ProfileStoreError, ProfileStoreId, ProfileTransaction, ProfileTransactionContext,
+    RaceRunGeneration, RaceRunLease, SavedProfile,
 };
