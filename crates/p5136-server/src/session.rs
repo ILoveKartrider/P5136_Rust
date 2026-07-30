@@ -53,6 +53,10 @@ use p5136_core::{
         parse_ch_create_room_request, parse_ch_get_room_list_request, parse_ch_join_room_request,
         parse_ch_leave_room_request, parse_gr_first_request,
     },
+    shop_protocol::{
+        ShopProtocolError, classify_shop_buy_request, parse_shop_buy_request,
+        serialize_shop_buy_failure,
+    },
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
         classify_startup_request, is_startup_noop, parse_pq_locked_item_get,
@@ -222,6 +226,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     MyRoomProtocol(#[from] MyRoomProtocolError),
+
+    #[error(transparent)]
+    ShopProtocol(#[from] ShopProtocolError),
 
     #[error(transparent)]
     MyRoomItemState(#[from] MyRoomItemStateError),
@@ -1531,6 +1538,10 @@ async fn dispatch_packet_admitted(
     };
     let world = services.world.admitted(operation);
 
+    if classify_shop_buy_request(hash).is_some() {
+        return handle_shop_buy_failure(&world, packet, context).await;
+    }
+
     if hash == adler32::packet_hash("PqChannelSwitch") {
         return handle_channel_switch(services.config, &world, packet).await;
     }
@@ -1602,6 +1613,40 @@ async fn dispatch_packet_admitted(
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
     Err(LoginSessionError::UnsupportedIdentityPacket { hash })
+}
+
+async fn handle_shop_buy_failure(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+
+    let request = match parse_shop_buy_request(packet) {
+        Ok(parsed) => parsed,
+        Err(error) => match &error {
+            ShopProtocolError::Packet(_) | ShopProtocolError::TrailingBytes { .. } => {
+                tracing::debug!(
+                    packet_length = packet.len(),
+                    %error,
+                    "dropping malformed P5136 shop-buy request"
+                );
+                return Ok(Vec::new());
+            }
+            ShopProtocolError::UnsupportedPacketHash { .. } => return Err(error.into()),
+        },
+    };
+
+    // Fail closed without logging request fields or forwarding the purchase
+    // into a World domain command. Only bounded, non-sensitive metadata is
+    // retained for diagnostics.
+    tracing::debug!(
+        request_kind = request.kind().request_name(),
+        packet_length = packet.len(),
+        "rejecting P5136 shop-buy request fail-closed"
+    );
+    Ok(vec![serialize_shop_buy_failure()])
 }
 
 async fn handle_channel_switch(
@@ -3143,6 +3188,7 @@ mod tests {
             ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomProtocolError,
             RoomProtocolRequest,
         },
+        shop_protocol::{ShopBuyRequest, serialize_shop_buy_failure},
         startup::{
             GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
             StartupError, serialize_empty_locked_item_list,
@@ -3277,6 +3323,17 @@ mod tests {
             </KartCatalog>"#
         );
         Arc::new(CatalogInventory::from_xml(xml.as_bytes()).unwrap())
+    }
+
+    fn exact_shop_buy_request(kind: ShopBuyRequest) -> Vec<u8> {
+        let mut packet = PacketWriter::named(kind.request_name());
+        packet.write_i32(-12_345);
+        packet.write_i32(i32::MIN);
+        packet.write_u8(0xFF);
+        if kind == ShopBuyRequest::ItemPreset {
+            packet.write_u16(0xBEEF);
+        }
+        packet.into_inner()
     }
 
     async fn bind_test_profile(
@@ -3964,6 +4021,192 @@ mod tests {
             identity
         );
 
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shop_buy_aliases_fail_closed_without_ending_the_authenticated_session() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_709))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ShopFailClosed")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+
+        let valid_normal = exact_shop_buy_request(ShopBuyRequest::Normal);
+        assert_eq!(valid_normal.len(), 13);
+        let mut unbound_context = SessionContext::default();
+        assert!(matches!(
+            dispatch_packet(&services, &valid_normal, &mut unbound_context).await,
+            Err(LoginSessionError::ProfileNotBound)
+        ));
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        let expected_failure = serialize_shop_buy_failure();
+        assert_eq!(expected_failure.len(), 29);
+        assert_eq!(&expected_failure[..5], &[0x01, 0x07, 0x5B, 0x41, 0x01]);
+        assert!(expected_failure[5..].iter().all(|byte| *byte == 0));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        for request in [ShopBuyRequest::Normal, ShopBuyRequest::ItemPreset] {
+            let valid = exact_shop_buy_request(request);
+            assert_eq!(
+                valid.len(),
+                match request {
+                    ShopBuyRequest::Normal => 13,
+                    ShopBuyRequest::ItemPreset => 15,
+                }
+            );
+            let hash_only = valid[..4].to_vec();
+            let truncated = valid[..valid.len() - 1].to_vec();
+            let mut trailing = valid.clone();
+            trailing.push(0xA5);
+
+            for (packet, should_reply) in [
+                (hash_only, false),
+                (truncated, false),
+                (valid, true),
+                (trailing, false),
+            ] {
+                let expected = if should_reply {
+                    vec![expected_failure.clone()]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    dispatch_packet(&services, &packet, &mut context)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    world.authorize_identity(session_id).await.unwrap(),
+                    identity
+                );
+
+                let server_time = PacketWriter::named("PqServerTime");
+                let responses = dispatch_packet(&services, server_time.as_slice(), &mut context)
+                    .await
+                    .unwrap();
+                assert_eq!(responses.len(), 1);
+                let mut response = PacketReader::new(&responses[0]);
+                assert_eq!(
+                    response.read_u32().unwrap(),
+                    adler32::packet_hash("PrServerTime")
+                );
+                let _days_since_1900 = response.read_u16().unwrap();
+                assert!(response.read_u16().unwrap() < 24 * 60 * 15);
+                assert!(response.remaining().is_empty());
+                assert_eq!(
+                    world.authorize_identity(session_id).await.unwrap(),
+                    identity
+                );
+            }
+        }
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shop_buy_failure_obeys_stale_generation_and_quiesce_fences() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(peer_ip, 49_710))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(peer_ip, 49_711))
+            .await
+            .unwrap();
+        let source_identity = world
+            .claim_identity(source, "ShopIdentityFence")
+            .await
+            .unwrap();
+        let mut source_context = bind_test_profile(&profiles, &source_identity).await;
+        let source_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: source,
+        };
+        let request = exact_shop_buy_request(ShopBuyRequest::Normal);
+
+        let token = MigrationToken::new(0x5A13).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 12,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let completion = world
+            .complete_migration(
+                destination,
+                source_identity.user_no,
+                12,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            dispatch_packet(&source_services, &request, &mut source_context).await,
+            Err(LoginSessionError::World(WorldError::Identity(
+                IdentityError::StaleSession(id)
+            ))) if id == source
+        ));
+        assert_eq!(
+            world.authorize_identity(destination).await.unwrap(),
+            completion.binding
+        );
+
+        let destination_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: destination,
+        };
+        let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
+        world.quiesce().await.unwrap();
+        assert!(matches!(
+            dispatch_packet(&destination_services, &request, &mut destination_context).await,
+            Err(LoginSessionError::World(
+                WorldError::OutboundProductionClosed
+            ))
+        ));
+
+        world.drain_sessions().await.unwrap();
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
