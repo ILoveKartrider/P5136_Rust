@@ -75,8 +75,10 @@ use p5136_core::{
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
         classify_startup_request, is_startup_noop, parse_pq_get_rider_task_context,
-        parse_pq_locked_item_get, parse_pq_request_extradata, parse_pq_start_rider_school,
-        parse_pq_update_game_option, parse_pq_web_event_complete_check,
+        parse_pq_locked_item_get, parse_pq_ranker_info, parse_pq_request_extradata,
+        parse_pq_rider_school_expired_check, parse_pq_start_rider_school,
+        parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
+        parse_pq_web_event_complete_check,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
@@ -3218,6 +3220,11 @@ async fn handle_startup_request(
     }
     match request {
         StartupRequest::GetRiderTaskContext => parse_pq_get_rider_task_context(packet)?,
+        StartupRequest::VersusModeRankOne => parse_pq_versus_mode_rank_one(packet)?,
+        StartupRequest::RiderSchoolExpiredCheck => {
+            parse_pq_rider_school_expired_check(packet)?;
+        }
+        StartupRequest::RankerInfo => parse_pq_ranker_info(packet)?,
         StartupRequest::LockedItemList => parse_pq_locked_item_get(packet)?,
         StartupRequest::RequestExtradata => parse_pq_request_extradata(packet)?,
         StartupRequest::WebEventCompleteCheck => parse_pq_web_event_complete_check(packet)?,
@@ -3306,6 +3313,7 @@ fn startup_response(
         StartupRequest::EventReward => startup::serialize_lo_rp_event_reward(),
         StartupRequest::AddRacingTime => startup::serialize_lo_rp_add_racing_time(),
         StartupRequest::EquipTuning => startup::serialize_pr_equip_tuning_failure(),
+        StartupRequest::VersusModeRankOne => startup::serialize_pr_versus_mode_rank_one(),
         StartupRequest::GetGameOption => {
             startup::serialize_pr_get_game_option(&profile_game_options(&profile.game_option))
         }
@@ -3314,6 +3322,10 @@ fn startup_response(
         StartupRequest::GetDuelMissionBulk => startup::serialize_pr_get_duel_mission_bulk(time),
         StartupRequest::RiderSchoolData => startup::serialize_pr_rider_school_data(time),
         StartupRequest::RiderSchoolProgress => startup::serialize_pr_rider_school_progress(),
+        StartupRequest::RiderSchoolExpiredCheck => {
+            startup::serialize_pr_rider_school_expired_check()
+        }
+        StartupRequest::RankerInfo => startup::serialize_pr_ranker_info(profile.rider.ranker),
         StartupRequest::ChannelStatic => startup::serialize_channel_static_reply(),
         StartupRequest::DynamicCommand => startup::serialize_pr_dynamic_command(),
         StartupRequest::PublicCommand => startup::serialize_pr_public_command(),
@@ -4540,7 +4552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_dispatch_replies_to_task_context_and_rejects_unknown_packets() {
+    async fn authenticated_dispatch_replies_to_startup_queries_and_rejects_unknown_packets() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -4554,6 +4566,11 @@ mod tests {
             .claim_identity(session_id, "UnknownPacketClassifier")
             .await
             .unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create(&identity.nickname).unwrap();
+        store
+            .update(&identity.nickname, |profile| profile.rider.ranker = 7)
+            .unwrap();
         let services = SessionServices {
             config: &config,
             world: &world,
@@ -4563,13 +4580,34 @@ mod tests {
         let mut context = bind_test_profile(&profiles, &identity).await;
         let hash = 0xDEAD_BEEF_u32;
 
-        let task_context = PacketWriter::named("PqGetRiderTaskContext").into_inner();
-        assert_eq!(
-            dispatch_packet(&services, &task_context, &mut context)
-                .await
-                .unwrap(),
-            vec![vec![0x50, 0x08, 0x84, 0x58, 0, 0, 0, 0]]
-        );
+        for (request_name, expected) in [
+            (
+                "PqGetRiderTaskContext",
+                vec![0x50, 0x08, 0x84, 0x58, 0, 0, 0, 0],
+            ),
+            (
+                "PqVersusModeRankOnePacket",
+                vec![
+                    0xD5, 0x09, 0xDA, 0x7F, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+            ),
+            (
+                "PqRiderSchoolExpiredCheck",
+                vec![0xCF, 0x09, 0xD9, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                "PqRankerInfoPacket",
+                vec![0x09, 0x07, 0xD7, 0x41, 0, 7, 0, 0, 0xC8, 0x42, 0, 0, 0, 0],
+            ),
+        ] {
+            let request = PacketWriter::named(request_name).into_inner();
+            assert_eq!(
+                dispatch_packet(&services, &request, &mut context)
+                    .await
+                    .unwrap(),
+                vec![expected]
+            );
+        }
         assert!(
             dispatch_packet(
                 &services,

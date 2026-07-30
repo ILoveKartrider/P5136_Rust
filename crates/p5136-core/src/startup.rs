@@ -34,6 +34,18 @@ pub const GET_RIDER_TASK_CONTEXT_REQUEST_NAME: &str = "PqGetRiderTaskContext";
 pub const GET_RIDER_TASK_CONTEXT_REPLY_NAME: &str = "PrGetRiderTaskContext";
 pub const GET_RIDER_TASK_CONTEXT_REQUEST_HASH: u32 = 0x5870_084F;
 pub const GET_RIDER_TASK_CONTEXT_REPLY_HASH: u32 = 0x5884_0850;
+pub const VERSUS_MODE_RANK_ONE_REQUEST_NAME: &str = "PqVersusModeRankOnePacket";
+pub const VERSUS_MODE_RANK_ONE_REPLY_NAME: &str = "PrVersusModeRankOnePacket";
+pub const VERSUS_MODE_RANK_ONE_REQUEST_HASH: u32 = 0x7FC2_09D4;
+pub const VERSUS_MODE_RANK_ONE_REPLY_HASH: u32 = 0x7FDA_09D5;
+pub const RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME: &str = "PqRiderSchoolExpiredCheck";
+pub const RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME: &str = "PrRiderSchoolExpiredCheck";
+pub const RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_HASH: u32 = 0x7EC1_09CE;
+pub const RIDER_SCHOOL_EXPIRED_CHECK_REPLY_HASH: u32 = 0x7ED9_09CF;
+pub const RANKER_INFO_REQUEST_NAME: &str = "PqRankerInfoPacket";
+pub const RANKER_INFO_REPLY_NAME: &str = "PrRankerInfoPacket";
+pub const RANKER_INFO_REQUEST_HASH: u32 = 0x41C6_0708;
+pub const RANKER_INFO_REPLY_HASH: u32 = 0x41D7_0709;
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -89,6 +101,7 @@ pub enum StartupRequest {
     EquipTuning,
     GetRider,
     GetRiderTaskContext,
+    VersusModeRankOne,
     UpdateGameOption,
     GetGameOption,
     SetPlaytimeEventTick,
@@ -96,7 +109,9 @@ pub enum StartupRequest {
     GetDuelMissionBulk,
     RiderSchoolData,
     RiderSchoolProgress,
+    RiderSchoolExpiredCheck,
     StartRiderSchool,
+    RankerInfo,
     ChannelStatic,
     DynamicCommand,
     PublicCommand,
@@ -121,6 +136,7 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::EquipTuning,
     StartupRequest::GetRider,
     StartupRequest::GetRiderTaskContext,
+    StartupRequest::VersusModeRankOne,
     StartupRequest::UpdateGameOption,
     StartupRequest::GetGameOption,
     StartupRequest::SetPlaytimeEventTick,
@@ -128,7 +144,9 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::GetDuelMissionBulk,
     StartupRequest::RiderSchoolData,
     StartupRequest::RiderSchoolProgress,
+    StartupRequest::RiderSchoolExpiredCheck,
     StartupRequest::StartRiderSchool,
+    StartupRequest::RankerInfo,
     StartupRequest::ChannelStatic,
     StartupRequest::DynamicCommand,
     StartupRequest::PublicCommand,
@@ -156,6 +174,7 @@ impl StartupRequest {
             Self::EquipTuning => "PqEquipTuningPacket",
             Self::GetRider => "PqGetRider",
             Self::GetRiderTaskContext => GET_RIDER_TASK_CONTEXT_REQUEST_NAME,
+            Self::VersusModeRankOne => VERSUS_MODE_RANK_ONE_REQUEST_NAME,
             Self::UpdateGameOption => "PqUpdateGameOption",
             Self::GetGameOption => "PqGetGameOption",
             Self::SetPlaytimeEventTick => "PqSetPlaytimeEventTick",
@@ -163,7 +182,9 @@ impl StartupRequest {
             Self::GetDuelMissionBulk => "PqGetDuelMissionBulk",
             Self::RiderSchoolData => "PqRiderSchoolDataPacket",
             Self::RiderSchoolProgress => "PqRiderSchoolProPacket",
+            Self::RiderSchoolExpiredCheck => RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME,
             Self::StartRiderSchool => START_RIDER_SCHOOL_REQUEST_NAME,
+            Self::RankerInfo => RANKER_INFO_REQUEST_NAME,
             Self::ChannelStatic => "ChRequestChStaticRequestPacket",
             Self::DynamicCommand => "PqDynamicCommand",
             Self::PublicCommand => "PqPubCommandPacket",
@@ -191,6 +212,7 @@ impl StartupRequest {
             Self::EquipTuning => Some("PrEquipTuningPacket"),
             Self::GetRider => Some("PrGetRider"),
             Self::GetRiderTaskContext => Some(GET_RIDER_TASK_CONTEXT_REPLY_NAME),
+            Self::VersusModeRankOne => Some(VERSUS_MODE_RANK_ONE_REPLY_NAME),
             Self::UpdateGameOption => None,
             Self::GetGameOption => Some("PrGetGameOption"),
             Self::SetPlaytimeEventTick => Some("PrSetPlaytimeEventTick"),
@@ -198,7 +220,9 @@ impl StartupRequest {
             Self::GetDuelMissionBulk => Some("PrGetDuelMissionBulk"),
             Self::RiderSchoolData => Some("PrRiderSchoolDataPacket"),
             Self::RiderSchoolProgress => Some("PrRiderSchoolProPacket"),
+            Self::RiderSchoolExpiredCheck => Some(RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME),
             Self::StartRiderSchool => Some(START_RIDER_SCHOOL_REPLY_NAME),
+            Self::RankerInfo => Some(RANKER_INFO_REPLY_NAME),
             Self::ChannelStatic => Some("ChRequestChStaticReplyPacket"),
             Self::DynamicCommand => Some("PrDynamicCommand"),
             Self::PublicCommand => Some("PrPubCommandPacket"),
@@ -363,6 +387,21 @@ pub fn parse_pq_locked_item_get(packet: &[u8]) -> Result<(), StartupError> {
 /// compatibility boundary strict instead of accepting unproven trailing data.
 pub fn parse_pq_get_rider_task_context(packet: &[u8]) -> Result<(), StartupError> {
     parse_hash_only_request(packet, GET_RIDER_TASK_CONTEXT_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact hash-only versus-rank summary request.
+pub fn parse_pq_versus_mode_rank_one(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, VERSUS_MODE_RANK_ONE_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact hash-only rider-school expiration request.
+pub fn parse_pq_rider_school_expired_check(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact hash-only ranker-info request.
+pub fn parse_pq_ranker_info(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, RANKER_INFO_REQUEST_NAME)
 }
 
 /// Parses the stock client's exact hash-only extra-data request.
@@ -671,6 +710,34 @@ pub fn serialize_pr_get_rider_task_context() -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the empty/default versus-mode rank-one result.
+#[must_use]
+pub fn serialize_pr_versus_mode_rank_one() -> Vec<u8> {
+    let mut packet = PacketWriter::named(VERSUS_MODE_RANK_ONE_REPLY_NAME);
+    packet.write_u8(0);
+    packet.write_bytes(&[u8::MAX; 8]);
+    packet.into_inner()
+}
+
+/// Serializes the all-clear rider-school expiration result.
+#[must_use]
+pub fn serialize_pr_rider_school_expired_check() -> Vec<u8> {
+    let mut packet = PacketWriter::named(RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME);
+    packet.write_bytes(&[0; 10]);
+    packet.into_inner()
+}
+
+/// Serializes the profile-backed ranker summary used during startup.
+#[must_use]
+pub fn serialize_pr_ranker_info(ranker: u8) -> Vec<u8> {
+    let mut packet = PacketWriter::named(RANKER_INFO_REPLY_NAME);
+    packet.write_u8(0);
+    packet.write_u8(ranker);
+    packet.write_u32(100.0_f32.to_bits());
+    packet.write_u32(0);
+    packet.into_inner()
+}
+
 /// Serializes the legacy four-byte server clock representation.
 #[must_use]
 pub fn serialize_pr_server_time(time: LegacyTime) -> Vec<u8> {
@@ -825,14 +892,20 @@ mod tests {
         GET_RIDER_TASK_CONTEXT_REPLY_HASH, GET_RIDER_TASK_CONTEXT_REPLY_NAME,
         GET_RIDER_TASK_CONTEXT_REQUEST_HASH, GET_RIDER_TASK_CONTEXT_REQUEST_NAME, GameOptions,
         LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME, MAX_GAME_OPTION_TRAILING_BYTES,
-        PrGetRiderFields, REQUEST_EXTRADATA_REPLY_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
-        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, START_RIDER_SCHOOL_REPLY_HASH,
+        PrGetRiderFields, RANKER_INFO_REPLY_HASH, RANKER_INFO_REPLY_NAME, RANKER_INFO_REQUEST_HASH,
+        RANKER_INFO_REQUEST_NAME, REQUEST_EXTRADATA_REPLY_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, RIDER_SCHOOL_EXPIRED_CHECK_REPLY_HASH,
+        RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME, RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_HASH,
+        RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME, START_RIDER_SCHOOL_REPLY_HASH,
         START_RIDER_SCHOOL_REPLY_NAME, START_RIDER_SCHOOL_REQUEST_HASH,
         START_RIDER_SCHOOL_REQUEST_NAME, StartupError, StartupRequest,
+        VERSUS_MODE_RANK_ONE_REPLY_HASH, VERSUS_MODE_RANK_ONE_REPLY_NAME,
+        VERSUS_MODE_RANK_ONE_REQUEST_HASH, VERSUS_MODE_RANK_ONE_REQUEST_NAME,
         WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_request_extradata,
-        parse_pq_start_rider_school, parse_pq_update_game_option,
+        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_ranker_info,
+        parse_pq_request_extradata, parse_pq_rider_school_expired_check,
+        parse_pq_start_rider_school, parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
         parse_pq_web_event_complete_check, serialize_channel_static_reply,
         serialize_empty_locked_item_list, serialize_lo_rp_add_racing_time,
         serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
@@ -841,11 +914,12 @@ mod tests {
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
         serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_get_rider_task_context,
         serialize_pr_kart_pass_init, serialize_pr_kart_pass_reward, serialize_pr_login_vip_info,
-        serialize_pr_public_command, serialize_pr_quest_ux_second, serialize_pr_request_extradata,
-        serialize_pr_rider_school_data, serialize_pr_rider_school_progress,
+        serialize_pr_public_command, serialize_pr_quest_ux_second, serialize_pr_ranker_info,
+        serialize_pr_request_extradata, serialize_pr_rider_school_data,
+        serialize_pr_rider_school_expired_check, serialize_pr_rider_school_progress,
         serialize_pr_server_time, serialize_pr_set_playtime_event_tick,
         serialize_pr_start_rider_school, serialize_pr_sync_dictionary_info,
-        serialize_pr_web_event_complete_check,
+        serialize_pr_versus_mode_rank_one, serialize_pr_web_event_complete_check,
     };
     use crate::{
         adler32, encoded,
@@ -879,26 +953,77 @@ mod tests {
     }
 
     #[test]
+    fn post_rider_startup_queries_preserve_exact_pairs_and_replies() {
+        type HashOnlyParser = fn(&[u8]) -> Result<(), StartupError>;
+        let startup_queries: &[(&str, u32, &str, u32, StartupRequest, HashOnlyParser)] = &[
+            (
+                GET_RIDER_TASK_CONTEXT_REQUEST_NAME,
+                GET_RIDER_TASK_CONTEXT_REQUEST_HASH,
+                GET_RIDER_TASK_CONTEXT_REPLY_NAME,
+                GET_RIDER_TASK_CONTEXT_REPLY_HASH,
+                StartupRequest::GetRiderTaskContext,
+                parse_pq_get_rider_task_context,
+            ),
+            (
+                VERSUS_MODE_RANK_ONE_REQUEST_NAME,
+                VERSUS_MODE_RANK_ONE_REQUEST_HASH,
+                VERSUS_MODE_RANK_ONE_REPLY_NAME,
+                VERSUS_MODE_RANK_ONE_REPLY_HASH,
+                StartupRequest::VersusModeRankOne,
+                parse_pq_versus_mode_rank_one,
+            ),
+            (
+                RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME,
+                RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_HASH,
+                RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME,
+                RIDER_SCHOOL_EXPIRED_CHECK_REPLY_HASH,
+                StartupRequest::RiderSchoolExpiredCheck,
+                parse_pq_rider_school_expired_check,
+            ),
+            (
+                RANKER_INFO_REQUEST_NAME,
+                RANKER_INFO_REQUEST_HASH,
+                RANKER_INFO_REPLY_NAME,
+                RANKER_INFO_REPLY_HASH,
+                StartupRequest::RankerInfo,
+                parse_pq_ranker_info,
+            ),
+        ];
+        for &(request_name, request_hash, reply_name, reply_hash, request, parser) in
+            startup_queries
+        {
+            assert_eq!(adler32::packet_hash(request_name), request_hash);
+            assert_eq!(adler32::packet_hash(reply_name), reply_hash);
+            assert_eq!(classify_startup_request(request_hash), Some(request));
+            assert_eq!(request.reply_name(), Some(reply_name));
+            assert_strict_hash_only_parser(parser, request_name);
+        }
+
+        assert_eq!(
+            serialize_pr_get_rider_task_context(),
+            [0x50, 0x08, 0x84, 0x58, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_pr_versus_mode_rank_one(),
+            [
+                0xD5, 0x09, 0xDA, 0x7F, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+            ]
+        );
+        assert_eq!(
+            serialize_pr_rider_school_expired_check(),
+            [0xCF, 0x09, 0xD9, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_pr_ranker_info(7),
+            [0x09, 0x07, 0xD7, 0x41, 0, 7, 0, 0, 0xC8, 0x42, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
     fn strict_stock_hash_only_requests_preserve_exact_pairs_and_replies() {
-        assert_eq!(
-            adler32::packet_hash(GET_RIDER_TASK_CONTEXT_REQUEST_NAME),
-            GET_RIDER_TASK_CONTEXT_REQUEST_HASH
-        );
-        assert_eq!(
-            adler32::packet_hash(GET_RIDER_TASK_CONTEXT_REPLY_NAME),
-            GET_RIDER_TASK_CONTEXT_REPLY_HASH
-        );
         assert_eq!(
             adler32::packet_hash(REQUEST_EXTRADATA_REQUEST_NAME),
             0x4466_0748
-        );
-        assert_eq!(
-            classify_startup_request(GET_RIDER_TASK_CONTEXT_REQUEST_HASH),
-            Some(StartupRequest::GetRiderTaskContext)
-        );
-        assert_eq!(
-            StartupRequest::GetRiderTaskContext.reply_name(),
-            Some(GET_RIDER_TASK_CONTEXT_REPLY_NAME)
         );
         assert_eq!(
             adler32::packet_hash(REQUEST_EXTRADATA_REPLY_NAME),
@@ -932,20 +1057,12 @@ mod tests {
         assert!(!is_startup_noop(0x4466_0748));
         assert!(!is_startup_noop(0xA814_0B50));
 
-        assert_strict_hash_only_parser(
-            parse_pq_get_rider_task_context,
-            GET_RIDER_TASK_CONTEXT_REQUEST_NAME,
-        );
         assert_strict_hash_only_parser(parse_pq_request_extradata, REQUEST_EXTRADATA_REQUEST_NAME);
         assert_strict_hash_only_parser(
             parse_pq_web_event_complete_check,
             WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         );
 
-        assert_eq!(
-            serialize_pr_get_rider_task_context(),
-            [0x50, 0x08, 0x84, 0x58, 0, 0, 0, 0]
-        );
         assert_eq!(
             serialize_pr_request_extradata(),
             [0x49, 0x07, 0x77, 0x44, 0, 0]
