@@ -54,7 +54,8 @@ use p5136_core::{
     },
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
-        classify_startup_request, is_startup_noop, parse_pq_update_game_option,
+        classify_startup_request, is_startup_noop, parse_pq_locked_item_get,
+        parse_pq_update_game_option,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
@@ -2667,6 +2668,9 @@ async fn handle_startup_request(
         update_game_options_admitted(world, profiles, session_id, packet, context).await?;
         return Ok(Vec::new());
     }
+    if request == StartupRequest::LockedItemList {
+        parse_pq_locked_item_get(packet)?;
+    }
 
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
@@ -2763,6 +2767,7 @@ fn startup_response(request: StartupRequest, profile: &Profile) -> Option<Vec<u8
         StartupRequest::DisassembleFeeInfo => startup::serialize_pr_disassemble_fee_info(),
         StartupRequest::SyncDictionaryInfo => startup::serialize_pr_sync_dictionary_info(),
         StartupRequest::AddTimeEventInit => startup::serialize_pr_add_time_event_init(time),
+        StartupRequest::LockedItemList => startup::serialize_empty_locked_item_list(),
         StartupRequest::GetRider | StartupRequest::UpdateGameOption => return None,
     })
 }
@@ -3045,7 +3050,10 @@ mod tests {
             ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomProtocolError,
             RoomProtocolRequest,
         },
-        startup::{GameOptions, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH},
+        startup::{
+            GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
+            StartupError, serialize_empty_locked_item_list,
+        },
     };
     use p5136_profile::{
         CatalogInventory, EquipmentExceptions, GrantedKart, MyRoomItemStateError, Profile,
@@ -3821,6 +3829,59 @@ mod tests {
             Err(LoginSessionError::UnsupportedIdentityPacket { hash: actual })
                 if actual == hash
         ));
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn locked_item_list_dispatch_is_strict_and_returns_one_terminal_packet() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_707))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "LockedItemClassifier")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let request = PacketWriter::named(LOCKED_ITEM_LIST_REQUEST_NAME).into_inner();
+        let mut malformed = request.clone();
+        malformed.push(0x51);
+
+        let mut unbound_context = SessionContext::default();
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut unbound_context).await,
+            Err(LoginSessionError::StartupProtocol(
+                StartupError::TrailingBytes {
+                    name: LOCKED_ITEM_LIST_REQUEST_NAME,
+                    count: 1,
+                }
+            ))
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        assert_eq!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_empty_locked_item_list()]
+        );
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),
             identity

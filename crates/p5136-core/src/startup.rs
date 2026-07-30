@@ -17,6 +17,8 @@ use crate::{
 
 pub const RIDER_ITEM_SNAPSHOT_WIRE_LENGTH: usize = 65;
 pub const MAX_GAME_OPTION_TRAILING_BYTES: usize = 80;
+pub const LOCKED_ITEM_LIST_REQUEST_NAME: &str = "PqLockedItemGet";
+pub const LOCKED_ITEM_LIST_REPLY_NAME: &str = "PrLockedItemGet";
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -89,6 +91,7 @@ pub enum StartupRequest {
     DisassembleFeeInfo,
     SyncDictionaryInfo,
     AddTimeEventInit,
+    LockedItemList,
 }
 
 pub const STARTUP_REQUESTS: &[StartupRequest] = &[
@@ -115,6 +118,7 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::DisassembleFeeInfo,
     StartupRequest::SyncDictionaryInfo,
     StartupRequest::AddTimeEventInit,
+    StartupRequest::LockedItemList,
 ];
 
 impl StartupRequest {
@@ -144,6 +148,7 @@ impl StartupRequest {
             Self::DisassembleFeeInfo => "PqDisassembleFeeInfo",
             Self::SyncDictionaryInfo => "PqSyncDictionaryInfoPacket",
             Self::AddTimeEventInit => "PqAddTimeEventInitPacket",
+            Self::LockedItemList => LOCKED_ITEM_LIST_REQUEST_NAME,
         }
     }
 
@@ -173,6 +178,7 @@ impl StartupRequest {
             Self::DisassembleFeeInfo => Some("PrDisassembleFeeInfo"),
             Self::SyncDictionaryInfo => Some("PrSyncDictionaryInfoPacket"),
             Self::AddTimeEventInit => Some("PrAddTimeEventInitPacket"),
+            Self::LockedItemList => Some(LOCKED_ITEM_LIST_REPLY_NAME),
         }
     }
 }
@@ -241,6 +247,9 @@ pub enum StartupError {
 
     #[error("packet has {length} trailing bytes; configured maximum is {maximum}")]
     TrailingLimitExceeded { length: usize, maximum: usize },
+
+    #[error("{name} has {count} trailing bytes")]
+    TrailingBytes { name: &'static str, count: usize },
 }
 
 #[must_use]
@@ -279,6 +288,25 @@ pub fn parse_pq_update_game_option(packet: &[u8]) -> Result<PqUpdateGameOption, 
         options,
         trailing: trailing.to_vec(),
     })
+}
+
+/// Parses the P5136 protected-item list request.
+///
+/// Both the P5136 compatibility handler and the stock-era handler treat this
+/// request as hash-only. Rust requires exact exhaustion before returning the
+/// terminal empty list.
+pub fn parse_pq_locked_item_get(packet: &[u8]) -> Result<(), StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, LOCKED_ITEM_LIST_REQUEST_NAME)?;
+    let trailing = reader.remaining().len();
+    if trailing == 0 {
+        Ok(())
+    } else {
+        Err(StartupError::TrailingBytes {
+            name: LOCKED_ITEM_LIST_REQUEST_NAME,
+            count: trailing,
+        })
+    }
 }
 
 #[must_use]
@@ -502,6 +530,14 @@ pub fn serialize_pr_add_time_event_init(time: LegacyTime) -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the terminal empty protected-item list.
+#[must_use]
+pub fn serialize_empty_locked_item_list() -> Vec<u8> {
+    let mut packet = PacketWriter::named(LOCKED_ITEM_LIST_REPLY_NAME);
+    packet.write_i32(0);
+    packet.into_inner()
+}
+
 fn expect_hash(reader: &mut PacketReader<'_>, name: &'static str) -> Result<(), StartupError> {
     let actual = reader.read_u32()?;
     let expected = adler32::packet_hash(name);
@@ -626,11 +662,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        GameOptions, MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields,
-        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest, channel_static_reply_body,
-        classify_startup_request, is_startup_noop, parse_pq_update_game_option,
-        serialize_channel_static_reply, serialize_lo_rp_add_racing_time,
-        serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
+        GameOptions, LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME,
+        MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
+        StartupError, StartupRequest, channel_static_reply_body, classify_startup_request,
+        is_startup_noop, parse_pq_locked_item_get, parse_pq_update_game_option,
+        serialize_channel_static_reply, serialize_empty_locked_item_list,
+        serialize_lo_rp_add_racing_time, serialize_lo_rp_event_reward,
+        serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
@@ -668,6 +706,49 @@ mod tests {
         )));
         assert!(!is_startup_noop(adler32::packet_hash("PqGetRider")));
         assert_eq!(classify_startup_request(0xdead_beef), None);
+    }
+
+    #[test]
+    fn locked_item_list_is_strict_hash_only_and_exact_terminal_empty() {
+        assert_eq!(
+            adler32::packet_hash(LOCKED_ITEM_LIST_REQUEST_NAME),
+            0x2D81_05C2
+        );
+        assert_eq!(
+            adler32::packet_hash(LOCKED_ITEM_LIST_REPLY_NAME),
+            0x2D8F_05C3
+        );
+
+        let request = PacketWriter::named(LOCKED_ITEM_LIST_REQUEST_NAME).into_inner();
+        assert!(parse_pq_locked_item_get(&request).is_ok());
+        for truncated_length in 0..4 {
+            assert!(matches!(
+                parse_pq_locked_item_get(&request[..truncated_length]),
+                Err(StartupError::Packet(_))
+            ));
+        }
+        assert!(matches!(
+            parse_pq_locked_item_get(&[0; 4]),
+            Err(StartupError::UnexpectedPacketHash {
+                name: LOCKED_ITEM_LIST_REQUEST_NAME,
+                actual: 0,
+                ..
+            })
+        ));
+        let mut trailing = request;
+        trailing.push(0x51);
+        assert!(matches!(
+            parse_pq_locked_item_get(&trailing),
+            Err(StartupError::TrailingBytes {
+                name: LOCKED_ITEM_LIST_REQUEST_NAME,
+                count: 1,
+            })
+        ));
+
+        assert_eq!(
+            serialize_empty_locked_item_list(),
+            [0xC3, 0x05, 0x8F, 0x2D, 0, 0, 0, 0]
+        );
     }
 
     #[test]
