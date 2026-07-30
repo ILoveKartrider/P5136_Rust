@@ -11,6 +11,9 @@ use thiserror::Error;
 
 use crate::{
     adler32,
+    kart_physics::{
+        KartPhysicsBuildError, P5136KartPhysicsSnapshot, build_p5136_kart_physics_block,
+    },
     login::LegacyTime,
     packet::{PacketError, PacketReader, PacketWriter},
 };
@@ -23,6 +26,10 @@ pub const REQUEST_EXTRADATA_REQUEST_NAME: &str = "PqRequestExtradata";
 pub const REQUEST_EXTRADATA_REPLY_NAME: &str = "PrRequestExtradata";
 pub const WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME: &str = "PqWebEventCompleteCheckPacket";
 pub const WEB_EVENT_COMPLETE_CHECK_REPLY_NAME: &str = "PrWebEventCompleteCheckPacket";
+pub const START_RIDER_SCHOOL_REQUEST_NAME: &str = "PqStartRiderSchool";
+pub const START_RIDER_SCHOOL_REPLY_NAME: &str = "PrStartRiderSchool";
+pub const START_RIDER_SCHOOL_REQUEST_HASH: u32 = 0x4327_072D;
+pub const START_RIDER_SCHOOL_REPLY_HASH: u32 = 0x4338_072E;
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -84,6 +91,7 @@ pub enum StartupRequest {
     GetDuelMissionBulk,
     RiderSchoolData,
     RiderSchoolProgress,
+    StartRiderSchool,
     ChannelStatic,
     DynamicCommand,
     PublicCommand,
@@ -114,6 +122,7 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::GetDuelMissionBulk,
     StartupRequest::RiderSchoolData,
     StartupRequest::RiderSchoolProgress,
+    StartupRequest::StartRiderSchool,
     StartupRequest::ChannelStatic,
     StartupRequest::DynamicCommand,
     StartupRequest::PublicCommand,
@@ -147,6 +156,7 @@ impl StartupRequest {
             Self::GetDuelMissionBulk => "PqGetDuelMissionBulk",
             Self::RiderSchoolData => "PqRiderSchoolDataPacket",
             Self::RiderSchoolProgress => "PqRiderSchoolProPacket",
+            Self::StartRiderSchool => START_RIDER_SCHOOL_REQUEST_NAME,
             Self::ChannelStatic => "ChRequestChStaticRequestPacket",
             Self::DynamicCommand => "PqDynamicCommand",
             Self::PublicCommand => "PqPubCommandPacket",
@@ -180,6 +190,7 @@ impl StartupRequest {
             Self::GetDuelMissionBulk => Some("PrGetDuelMissionBulk"),
             Self::RiderSchoolData => Some("PrRiderSchoolDataPacket"),
             Self::RiderSchoolProgress => Some("PrRiderSchoolProPacket"),
+            Self::StartRiderSchool => Some(START_RIDER_SCHOOL_REPLY_NAME),
             Self::ChannelStatic => Some("ChRequestChStaticReplyPacket"),
             Self::DynamicCommand => Some("PrDynamicCommand"),
             Self::PublicCommand => Some("PrPubCommandPacket"),
@@ -236,6 +247,23 @@ pub struct GameOptions {
 pub struct PqUpdateGameOption {
     pub options: GameOptions,
     pub trailing: Vec<u8>,
+}
+
+/// The single encoded byte produced by the stock `PqStartRiderSchool` client.
+///
+/// Neither the stock executable nor the available server code establishes a
+/// business meaning or a narrower valid range. Construction is intentionally
+/// limited to [`parse_pq_start_rider_school`], which accepts the complete
+/// decoded `u8` domain without inventing a policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartRiderSchoolRequest(u8);
+
+impl StartRiderSchoolRequest {
+    /// Returns the decoded but otherwise opaque request value.
+    #[must_use]
+    pub const fn value(self) -> u8 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +363,25 @@ pub fn parse_pq_request_extradata(packet: &[u8]) -> Result<(), StartupError> {
 /// fields. Rust therefore requires complete consumption.
 pub fn parse_pq_web_event_complete_check(packet: &[u8]) -> Result<(), StartupError> {
     parse_hash_only_request(packet, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact five-byte rider-school start request.
+///
+/// The producer writes one encoded byte after the packet hash. The C# handler
+/// ignored both that byte and any trailing data; Rust preserves the evidenced
+/// field while rejecting truncation and every byte beyond it.
+pub fn parse_pq_start_rider_school(packet: &[u8]) -> Result<StartRiderSchoolRequest, StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, START_RIDER_SCHOOL_REQUEST_NAME)?;
+    let request = StartRiderSchoolRequest(reader.read_encoded_u8()?);
+    let trailing = reader.remaining().len();
+    if trailing != 0 {
+        return Err(StartupError::TrailingBytes {
+            name: START_RIDER_SCHOOL_REQUEST_NAME,
+            count: trailing,
+        });
+    }
+    Ok(request)
 }
 
 fn parse_hash_only_request(packet: &[u8], name: &'static str) -> Result<(), StartupError> {
@@ -452,6 +499,25 @@ pub fn serialize_pr_rider_school_progress() -> Vec<u8> {
     packet.write_bytes(&[1, 33, 6, 34]);
     packet.write_bytes(&[0; 12]);
     packet.into_inner()
+}
+
+/// Serializes the safe canonical P5136 rider-school physics reply.
+///
+/// The C# compatibility shortcut hardcoded two start-acceleration fields as
+/// `2305.0` and `3745.0`, while its normal physics formula produces `2304.0`
+/// and `3745.587890625`. Rust deliberately reuses the canonical physics
+/// builder instead of cloning that isolated two-field drift.
+///
+/// # Errors
+///
+/// Returns [`KartPhysicsBuildError`] if the canonical snapshot cannot satisfy
+/// the validated P5136 physics layout.
+pub fn serialize_pr_start_rider_school() -> Result<Vec<u8>, KartPhysicsBuildError> {
+    let physics = build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())?;
+    let mut packet = PacketWriter::named(START_RIDER_SCHOOL_REPLY_NAME);
+    packet.write_u8(1);
+    packet.write_bytes(physics.as_bytes());
+    Ok(packet.into_inner())
 }
 
 #[must_use]
@@ -733,13 +799,16 @@ mod tests {
     use super::{
         GameOptions, LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME,
         MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields, REQUEST_EXTRADATA_REPLY_NAME,
-        REQUEST_EXTRADATA_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError,
+        REQUEST_EXTRADATA_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
+        START_RIDER_SCHOOL_REPLY_HASH, START_RIDER_SCHOOL_REPLY_NAME,
+        START_RIDER_SCHOOL_REQUEST_HASH, START_RIDER_SCHOOL_REQUEST_NAME, StartupError,
         StartupRequest, WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_pq_locked_item_get, parse_pq_request_extradata, parse_pq_update_game_option,
-        parse_pq_web_event_complete_check, serialize_channel_static_reply,
-        serialize_empty_locked_item_list, serialize_lo_rp_add_racing_time,
-        serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
+        parse_pq_locked_item_get, parse_pq_request_extradata, parse_pq_start_rider_school,
+        parse_pq_update_game_option, parse_pq_web_event_complete_check,
+        serialize_channel_static_reply, serialize_empty_locked_item_list,
+        serialize_lo_rp_add_racing_time, serialize_lo_rp_event_reward,
+        serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
@@ -748,12 +817,14 @@ mod tests {
         serialize_pr_quest_ux_second, serialize_pr_request_extradata,
         serialize_pr_rider_school_data, serialize_pr_rider_school_progress,
         serialize_pr_server_time, serialize_pr_set_playtime_event_tick,
-        serialize_pr_sync_dictionary_info, serialize_pr_web_event_complete_check,
+        serialize_pr_start_rider_school, serialize_pr_sync_dictionary_info,
+        serialize_pr_web_event_complete_check,
     };
     use crate::{
-        adler32,
+        adler32, encoded,
         login::LegacyTime,
         packet::{PacketReader, PacketWriter},
+        race_start_protocol::P5136_KART_PHYSICS_BLOCK_LENGTH,
     };
 
     #[test]
@@ -831,6 +902,115 @@ mod tests {
         assert_eq!(
             serialize_pr_web_event_complete_check(),
             [0x51, 0x0B, 0x30, 0xA8]
+        );
+    }
+
+    #[test]
+    fn rider_school_start_is_an_exact_five_byte_encoded_u8_request() {
+        assert_eq!(
+            adler32::packet_hash(START_RIDER_SCHOOL_REQUEST_NAME),
+            START_RIDER_SCHOOL_REQUEST_HASH
+        );
+        assert_eq!(
+            adler32::packet_hash(START_RIDER_SCHOOL_REPLY_NAME),
+            START_RIDER_SCHOOL_REPLY_HASH
+        );
+        assert_eq!(
+            classify_startup_request(START_RIDER_SCHOOL_REQUEST_HASH),
+            Some(StartupRequest::StartRiderSchool)
+        );
+        assert_eq!(
+            StartupRequest::StartRiderSchool.reply_name(),
+            Some(START_RIDER_SCHOOL_REPLY_NAME)
+        );
+
+        let mut writer = PacketWriter::named(START_RIDER_SCHOOL_REQUEST_NAME);
+        writer.write_encoded_u8(0xa5);
+        let request = writer.into_inner();
+        assert_eq!(request.len(), 5);
+        assert_eq!(parse_pq_start_rider_school(&request).unwrap().value(), 0xa5);
+
+        for truncated_length in 0..5 {
+            assert!(matches!(
+                parse_pq_start_rider_school(&request[..truncated_length]),
+                Err(StartupError::Packet(_))
+            ));
+        }
+
+        let mut wrong_hash = request.clone();
+        wrong_hash[..4].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            parse_pq_start_rider_school(&wrong_hash),
+            Err(StartupError::UnexpectedPacketHash {
+                name: START_RIDER_SCHOOL_REQUEST_NAME,
+                expected: START_RIDER_SCHOOL_REQUEST_HASH,
+                actual: 0,
+            })
+        ));
+
+        let mut trailing = request;
+        trailing.push(0x51);
+        assert!(matches!(
+            parse_pq_start_rider_school(&trailing),
+            Err(StartupError::TrailingBytes {
+                name: START_RIDER_SCHOOL_REQUEST_NAME,
+                count: 1,
+            })
+        ));
+
+        // There is no evidence-backed business range. Every encoded byte is
+        // accepted, and the substitution table spans the complete decoded u8
+        // domain, including the value the legacy encoder cannot emit
+        // canonically because of its modulo-255 behavior.
+        let mut seen = [false; 256];
+        for encoded_value in u8::MIN..=u8::MAX {
+            let mut packet = START_RIDER_SCHOOL_REQUEST_HASH.to_le_bytes().to_vec();
+            packet.push(encoded_value);
+            let value = parse_pq_start_rider_school(&packet).unwrap().value();
+            assert_eq!(value, encoded::decode_u8(encoded_value));
+            seen[usize::from(value)] = true;
+        }
+        assert!(seen.iter().all(|value| *value));
+    }
+
+    #[test]
+    fn rider_school_reply_pins_the_canonical_builder_not_csharp_shortcut_drift() {
+        let packet = serialize_pr_start_rider_school().unwrap();
+        assert_eq!(
+            packet.len(),
+            size_of::<u32>() + 1 + P5136_KART_PHYSICS_BLOCK_LENGTH
+        );
+        assert_eq!(
+            u32::from_le_bytes(packet[..4].try_into().unwrap()),
+            START_RIDER_SCHOOL_REPLY_HASH
+        );
+        assert_eq!(packet[4], 1);
+
+        // The normal C# formula and canonical Rust builder produce these two
+        // fields. Deliberately do not clone the compatibility shortcut's
+        // isolated 2305.0 / 3745.0 hardcodes.
+        let physics_start = 5;
+        assert_eq!(
+            encoded::decode_f32(
+                packet[physics_start + 138..physics_start + 142]
+                    .try_into()
+                    .unwrap()
+            )
+            .to_bits(),
+            2_304.0_f32.to_bits()
+        );
+        assert_eq!(
+            encoded::decode_f32(
+                packet[physics_start + 142..physics_start + 146]
+                    .try_into()
+                    .unwrap()
+            )
+            .to_bits(),
+            0x456A_1968
+        );
+        assert_eq!(
+            format!("{:X}", Sha256::digest(&packet)),
+            "52F16BC897E349AD220B226F3563653CB02718A2A2827076249ECE194104AD9E"
         );
     }
 

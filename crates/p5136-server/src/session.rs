@@ -48,6 +48,10 @@ use p5136_core::{
         parse_game_control_request, parse_team_booster_request,
     },
     race_start_protocol::P5136KartPhysicsBlock,
+    rider_info_protocol::{
+        GET_RIDER_INFO_REQUEST_HASH, RiderInfoProtocolError, parse_get_rider_info_request,
+        serialize_get_rider_info_failure,
+    },
     room_protocol::{
         RoomPlayer, RoomProtocolError, RoomProtocolRequest, classify_room_protocol_request,
         parse_ch_create_room_request, parse_ch_get_room_list_request, parse_ch_join_room_request,
@@ -60,7 +64,8 @@ use p5136_core::{
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
         classify_startup_request, is_startup_noop, parse_pq_locked_item_get,
-        parse_pq_request_extradata, parse_pq_update_game_option, parse_pq_web_event_complete_check,
+        parse_pq_request_extradata, parse_pq_start_rider_school, parse_pq_update_game_option,
+        parse_pq_web_event_complete_check,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
@@ -229,6 +234,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     ShopProtocol(#[from] ShopProtocolError),
+
+    #[error(transparent)]
+    RiderInfoProtocol(#[from] RiderInfoProtocolError),
 
     #[error(transparent)]
     MyRoomItemState(#[from] MyRoomItemStateError),
@@ -1538,8 +1546,8 @@ async fn dispatch_packet_admitted(
     };
     let world = services.world.admitted(operation);
 
-    if classify_shop_buy_request(hash).is_some() {
-        return handle_shop_buy_failure(&world, packet, context).await;
+    if let Some(result) = dispatch_fail_closed_request(&world, hash, packet, context).await {
+        return result;
     }
 
     if hash == adler32::packet_hash("PqChannelSwitch") {
@@ -1613,6 +1621,39 @@ async fn dispatch_packet_admitted(
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
     Err(LoginSessionError::UnsupportedIdentityPacket { hash })
+}
+
+async fn dispatch_fail_closed_request(
+    world: &AdmittedWorldHandle<'_>,
+    hash: u32,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Option<Result<Vec<Vec<u8>>, LoginSessionError>> {
+    if hash == GET_RIDER_INFO_REQUEST_HASH {
+        return Some(handle_get_rider_info_failure(world, packet, context).await);
+    }
+    if classify_shop_buy_request(hash).is_some() {
+        return Some(handle_shop_buy_failure(world, packet, context).await);
+    }
+    None
+}
+
+async fn handle_get_rider_info_failure(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // Parse the entire stock request before packet-specific authorization so
+    // malformed live traffic cannot be mistaken for a valid lookup. Global
+    // generation and quiesce admission still precede this handler.
+    let _request = parse_get_rider_info_request(packet)?;
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+
+    // Cross-profile visibility and offline lookup policy are not yet defined.
+    // Fail closed without logging the target, touching profile storage, or
+    // publishing a request-specific World command.
+    Ok(vec![serialize_get_rider_info_failure()])
 }
 
 async fn handle_shop_buy_failure(
@@ -2806,12 +2847,15 @@ async fn handle_startup_request(
         StartupRequest::LockedItemList => parse_pq_locked_item_get(packet)?,
         StartupRequest::RequestExtradata => parse_pq_request_extradata(packet)?,
         StartupRequest::WebEventCompleteCheck => parse_pq_web_event_complete_check(packet)?,
+        StartupRequest::StartRiderSchool => {
+            let _ = parse_pq_start_rider_school(packet)?;
+        }
         _ => {}
     }
 
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
-    Ok(startup_response(request, profile).into_iter().collect())
+    Ok(startup_response(request, profile)?.into_iter().collect())
 }
 
 async fn handle_get_rider_admitted(
@@ -2878,9 +2922,12 @@ fn profile_rider_fields(nickname: String, profile: &Profile) -> PrGetRiderFields
     }
 }
 
-fn startup_response(request: StartupRequest, profile: &Profile) -> Option<Vec<u8>> {
+fn startup_response(
+    request: StartupRequest,
+    profile: &Profile,
+) -> Result<Option<Vec<u8>>, KartPhysicsBuildError> {
     let time = current_legacy_time();
-    Some(match request {
+    let response = match request {
         StartupRequest::LoginVipInfo => startup::serialize_pr_login_vip_info(profile.rider.premium),
         StartupRequest::EventReward => startup::serialize_lo_rp_event_reward(),
         StartupRequest::AddRacingTime => startup::serialize_lo_rp_add_racing_time(),
@@ -2908,8 +2955,10 @@ fn startup_response(request: StartupRequest, profile: &Profile) -> Option<Vec<u8
         StartupRequest::LockedItemList => startup::serialize_empty_locked_item_list(),
         StartupRequest::RequestExtradata => startup::serialize_pr_request_extradata(),
         StartupRequest::WebEventCompleteCheck => startup::serialize_pr_web_event_complete_check(),
-        StartupRequest::GetRider | StartupRequest::UpdateGameOption => return None,
-    })
+        StartupRequest::StartRiderSchool => startup::serialize_pr_start_rider_school()?,
+        StartupRequest::GetRider | StartupRequest::UpdateGameOption => return Ok(None),
+    };
+    Ok(Some(response))
 }
 
 fn profile_game_options(options: &p5136_profile::GameOptions) -> startup::GameOptions {
@@ -3188,6 +3237,9 @@ mod tests {
         race_protocol::{
             GameControlRequest, RaceProtocolError, RaceRequest, parse_game_control_request,
         },
+        rider_info_protocol::{
+            GET_RIDER_INFO_REQUEST_NAME, RiderInfoProtocolError, serialize_get_rider_info_failure,
+        },
         room_protocol::{
             ChCreateRoomRequest, ChJoinRoomRequest, MAX_CLUB_NAME_UTF16_UNITS,
             ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomProtocolError,
@@ -3196,8 +3248,9 @@ mod tests {
         shop_protocol::{ShopBuyRequest, serialize_shop_buy_failure},
         startup::{
             GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
-            RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
-            serialize_empty_locked_item_list, serialize_pr_request_extradata,
+            RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, START_RIDER_SCHOOL_REQUEST_NAME, StartupError,
+            WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME, serialize_empty_locked_item_list,
+            serialize_pr_request_extradata, serialize_pr_start_rider_school,
             serialize_pr_web_event_complete_check,
         },
     };
@@ -3340,6 +3393,23 @@ mod tests {
         if kind == ShopBuyRequest::ItemPreset {
             packet.write_u16(0xBEEF);
         }
+        packet.into_inner()
+    }
+
+    fn exact_get_rider_info_request(target_nickname: &str, mode: u8) -> Vec<u8> {
+        let mut packet = PacketWriter::named(GET_RIDER_INFO_REQUEST_NAME);
+        packet.write_u32(0);
+        packet.write_i32(0);
+        packet
+            .write_utf16(target_nickname)
+            .expect("test nickname fits the P5136 length prefix");
+        packet.write_u8(mode);
+        packet.into_inner()
+    }
+
+    fn exact_start_rider_school_request(value: u8) -> Vec<u8> {
+        let mut packet = PacketWriter::named(START_RIDER_SCHOOL_REQUEST_NAME);
+        packet.write_encoded_u8(value);
         packet.into_inner()
     }
 
@@ -4536,6 +4606,280 @@ mod tests {
                 WorldError::OutboundProductionClosed
             ))
         ));
+
+        world.drain_sessions().await.unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rider_info_lookup_fails_closed_without_reading_or_creating_remote_profiles() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_715))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "RiderInfoCaller")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let request = exact_get_rider_info_request("OfflineTarget", u8::MAX);
+        assert_eq!(
+            request.len(),
+            17 + 2 * "OfflineTarget".encode_utf16().count()
+        );
+
+        let mut unbound_context = SessionContext::default();
+        assert!(matches!(
+            dispatch_packet(&services, &request, &mut unbound_context).await,
+            Err(LoginSessionError::ProfileNotBound)
+        ));
+
+        // Exact wire validation precedes the packet-specific profile fence for
+        // an otherwise live, globally admitted identity.
+        let mut trailing = request.clone();
+        trailing.push(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, &trailing, &mut unbound_context).await,
+            Err(LoginSessionError::RiderInfoProtocol(
+                RiderInfoProtocolError::TrailingBytes {
+                    name: GET_RIDER_INFO_REQUEST_NAME,
+                    count: 1
+                }
+            ))
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let in_memory_before = context.profile_for(&identity).unwrap().clone();
+        let store = ProfileStore::new(profile_root.path());
+        let durable_before = store.reload(&identity.nickname).unwrap();
+
+        assert_eq!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_get_rider_info_failure()]
+        );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+        assert_eq!(context.profile_for(&identity).unwrap(), &in_memory_before);
+
+        let server_time = PacketWriter::named("PqServerTime");
+        let follow_up = dispatch_packet(&services, server_time.as_slice(), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(
+            &follow_up[0][..4],
+            &adler32::packet_hash("PrServerTime").to_le_bytes()
+        );
+
+        let durable_after = store.reload(&identity.nickname).unwrap();
+        assert_eq!(durable_after.revision, durable_before.revision);
+        assert_eq!(durable_after.profile, durable_before.profile);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rider_school_start_is_strict_canonical_and_profile_read_only() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_716))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "SchoolStarter")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let request = exact_start_rider_school_request(0xA5);
+        assert_eq!(request.len(), 5);
+
+        let mut unbound_context = SessionContext::default();
+        assert!(matches!(
+            dispatch_packet(&services, &request, &mut unbound_context).await,
+            Err(LoginSessionError::ProfileNotBound)
+        ));
+        assert!(matches!(
+            dispatch_packet(&services, &request[..4], &mut unbound_context).await,
+            Err(LoginSessionError::StartupProtocol(StartupError::Packet(
+                PacketError::Truncated { .. }
+            )))
+        ));
+        let mut trailing = request.clone();
+        trailing.push(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, &trailing, &mut unbound_context).await,
+            Err(LoginSessionError::StartupProtocol(
+                StartupError::TrailingBytes {
+                    name: START_RIDER_SCHOOL_REQUEST_NAME,
+                    count: 1
+                }
+            ))
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let in_memory_before = context.profile_for(&identity).unwrap().clone();
+        let store = ProfileStore::new(profile_root.path());
+        let durable_before = store.reload(&identity.nickname).unwrap();
+        let expected = serialize_pr_start_rider_school().unwrap();
+        assert_eq!(expected.len(), 240);
+        assert_eq!(expected[4], 1);
+
+        assert_eq!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap(),
+            vec![expected]
+        );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+        assert_eq!(context.profile_for(&identity).unwrap(), &in_memory_before);
+
+        let server_time = PacketWriter::named("PqServerTime");
+        let follow_up = dispatch_packet(&services, server_time.as_slice(), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(
+            &follow_up[0][..4],
+            &adler32::packet_hash("PrServerTime").to_le_bytes()
+        );
+
+        let durable_after = store.reload(&identity.nickname).unwrap();
+        assert_eq!(durable_after.revision, durable_before.revision);
+        assert_eq!(durable_after.profile, durable_before.profile);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rider_lookup_and_school_start_obey_generation_and_quiesce_fences() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(peer_ip, 49_717))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(peer_ip, 49_718))
+            .await
+            .unwrap();
+        let source_identity = world
+            .claim_identity(source, "RiderBoundaryFence")
+            .await
+            .unwrap();
+        let mut source_context = bind_test_profile(&profiles, &source_identity).await;
+        let source_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: source,
+        };
+
+        let token = MigrationToken::new(0x5A15).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 14,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let completion = world
+            .complete_migration(
+                destination,
+                source_identity.user_no,
+                14,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        let rider_info = exact_get_rider_info_request("FenceTarget", 1);
+        let mut malformed_rider_info = rider_info.clone();
+        malformed_rider_info.push(0x51);
+        let rider_school = exact_start_rider_school_request(1);
+        let mut malformed_rider_school = rider_school.clone();
+        malformed_rider_school.push(0x51);
+        let requests = [
+            rider_info,
+            malformed_rider_info,
+            rider_school,
+            malformed_rider_school,
+        ];
+
+        // Global admission rejects stale ownership before either strict parser
+        // can inspect a well-formed or malformed packet.
+        for request in &requests {
+            assert!(matches!(
+                dispatch_packet(&source_services, request, &mut source_context).await,
+                Err(LoginSessionError::World(WorldError::Identity(
+                    IdentityError::StaleSession(id)
+                ))) if id == source
+            ));
+        }
+        assert_eq!(
+            world.authorize_identity(destination).await.unwrap(),
+            completion.binding
+        );
+
+        let destination_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: destination,
+        };
+        let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
+        world.quiesce().await.unwrap();
+
+        // The producer barrier likewise closes before either parser runs.
+        for request in &requests {
+            assert!(matches!(
+                dispatch_packet(&destination_services, request, &mut destination_context).await,
+                Err(LoginSessionError::World(
+                    WorldError::OutboundProductionClosed
+                ))
+            ));
+        }
 
         world.drain_sessions().await.unwrap();
         profile_runtime.shutdown().await.unwrap();

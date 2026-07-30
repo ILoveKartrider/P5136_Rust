@@ -23,6 +23,7 @@ pub mod ports;
 pub mod race_protocol;
 pub mod race_result_protocol;
 pub mod race_start_protocol;
+pub mod rider_info_protocol;
 pub mod room_protocol;
 pub mod shop_protocol;
 pub mod startup;
