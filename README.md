@@ -24,6 +24,8 @@ server. The implemented foundation provides:
   and MyRoom cache refresh;
 - exact ready-stage, race-control, race-start, settlement, and 235-byte kart
   physics codecs used by the actor-integrated human race flow;
+- strict TCP `GameSlotPacket` decoding with generation-fenced, atomically
+  reserved type-9/10/11/12 relay;
 - bounded login concurrency and opt-in remote profile creation;
 - PIN/BML patching with immutable backups, a process lock, and atomic writes;
 - executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
@@ -94,10 +96,32 @@ It performs no profile-store I/O or shared-state mutation. Nonempty protected
 items and `PqLockedItemUpdate` remain unimplemented because their
 P5136-specific wire and persistence policy lacks producer or capture proof.
 
-The remaining compatibility work is concentrated in the remaining MyRoom and
-economy requests, capture-derived movement sequencing and UDP first-bind
-capabilities, packet fixtures, green cross-platform CI evidence, and
-stock-client end-to-end validation. See
+TCP `GameSlotPacket` is handled separately from the opaque UDP packet that
+shares its name. Rust bounds the complete TCP packet at 1013 bytes and each
+nested blob at 960 bytes, validates P5136 types 1, 2, 9, 10, 11, and 12, and
+freezes the audited 74 type-12 operation pairs in a static allowlist. The
+World actor accepts only an exact frozen-generation human racer during
+`Running` or the still-open `Settling` window. It relays the original bytes to
+the exact current frozen audience, applies the type-11 recipient mask, and
+reserves every recipient queue before publishing. Valid Barricade placement
+is the sole sender-inclusive relay. Malformed, spoofed, unsupported,
+inactive-frozen-generation, wrong-phase, and backpressured item events are
+observable nonfatal drops; stale global identity ownership, actor termination,
+and invariant failures still propagate.
+
+Rust deliberately does not copy the C# item side effects called out by the
+stability audit. Type 1/2 pickup packets require a server-selected item in a
+different wire field, so they are validated and explicitly deferred instead
+of relaying the client rank as an item ID. Type 10/11 packets are relayed
+without speculative kart effects, bonus-item synthesis, probability rerolls,
+or double item transformation. Those behaviors remain capture- and
+design-blocked rather than bug-for-bug cloned.
+
+The remaining compatibility work is concentrated in authoritative item-pickup
+synthesis, capture-backed GameSlot bodies and side effects, the remaining
+MyRoom and economy requests, capture-derived movement sequencing and UDP
+first-bind capabilities, packet fixtures, green cross-platform CI evidence,
+and stock-client end-to-end validation. See
 [PORTING_STATUS.md](PORTING_STATUS.md) for the exact handoff and
 [PORTING.md](PORTING.md) for the feature ledger.
 

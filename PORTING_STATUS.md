@@ -27,17 +27,94 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`7c9b8a1 Port terminal locked-item list`
+`5dec4d9 Port bounded TCP GameSlot relay`
 
 ## Current Rust checkpoint
 
-The current checkpoint closes one bounded authenticated compatibility packet:
-`PqLockedItemGet` now returns the exact terminal empty
-`PrLockedItemGet`. The P5136 compatibility handler and the stock-era handler
-agree on that reply, while Rust deliberately requires exact request
-exhaustion instead of inheriting C#'s unchecked trailing-body behavior.
-Nonempty protected-item state and updates remain unimplemented because their
-P5136-specific wire and persistence policy is unproven. C# remains unchanged.
+The current checkpoint implements the previously missing bounded TCP
+`GameSlotPacket` path without copying the risky C# behavior. Korean P5136
+types 1, 2, 9, 10, 11, and 12 now pass through a bounded semantic codec before
+an actor-owned policy decision. Valid relay types preserve the exact original
+bytes but use the frozen race roster, exact identity generations, and
+all-recipient queue reservation. Item pickup and speculative server side
+effects remain explicitly deferred instead of copying the C# behaviors
+identified as risky by the stability audit. Malformed or expected gameplay
+rejections no longer terminate the authenticated session. C# remains
+unchanged.
+
+### Bounded TCP GameSlot relay
+
+- `GameSlotPacket` is `0x27C00574` and its TCP common envelope is
+  `hash:u32 | claimed_player_id:i32 | item_or_mask:u32 | type:u8`. Rust caps
+  the complete logical TCP packet at 1013 bytes and every nested blob at 960
+  bytes before copying it. This codec is independent of the opaque UDP relay
+  envelope that happens to use the same packet name; the TCP cap is never
+  applied to UDP movement traffic.
+- The accepted Korean P5136 types are exactly `1`, `2`, `9`, `10`, `11`, and
+  `12`. Claimed player IDs must be in `0..=15`; type-specific masks, exact
+  declared lengths, complete consumption, item-vector counts, pickup
+  operation hashes, and finite pickup coordinates are validated before the
+  actor command is created. Modern-only types `5`, `7`, `8`, and `17` are
+  nonfatal unsupported drops.
+- Type 12 uses a checked-in static allowlist of 74 exact
+  operation/base-operation hash pairs rather than scanning a packet-name enum
+  at runtime. Tests independently recompute every pair from its two names,
+  require 74 unique entries, and parse every entry. Banana, Course, Rocket,
+  and Barricade also require captured raw lengths `30`, `32`, `73`, and `73`;
+  a wrong length cannot fall back to the generic branch.
+- A Barricade operation additionally requires its marker, inner owner,
+  reserved field, and all twelve transform floats to be valid. Only that
+  validated operation includes the sender. The remaining 70 generic pairs
+  currently prove only the pair, nonzero low-16 mask, bounded exact envelope,
+  and overall cap; their inner bodies are not claimed to be capture-verified.
+- `ParsedGameSlotPacket` is a parser-minted, move-only capability. Its raw
+  bytes, actor action, body, claimed ID, and mask are private; read-only
+  accessors expose the validated facts and `into_raw(self)` consumes the
+  capability. Allocation of the owned raw packet occurs only after all wire
+  checks succeed. This prevents another crate from changing a pickup into a
+  relay action or accidentally cloning one accepted command into two actor
+  publications.
+- The World actor reauthorizes the admitted identity, finds the exact frozen
+  generation, requires a human racer source, and compares the claimed player
+  ID with the actor-owned frozen slot. Observers remain receive-only. Lobby
+  and Loading reject item traffic; Running accepts it, and Settling accepts it
+  only while the deadline is open and finalization is still
+  `AwaitingDeadline`. The open Settling path is required because Rust enters
+  Settling at the first finish while other racers may still send late item
+  events.
+- Type 9, type 10, and ordinary type 12 relay the exact original bytes to all
+  active exact-generation frozen recipients except the sender. Type 11 sends
+  only to frozen player IDs selected by its low-16 recipient mask and still
+  excludes the sender. A validated Barricade reaches the whole exact audience,
+  including its sender. Missing, migrated, released, or replacement
+  generations are never silently substituted.
+- All recipient queue permits are reserved before the first publication. One
+  full queue drops the whole time-sensitive event, releases earlier permits,
+  leaves race state unchanged, and does not enqueue a heartbeat retry. An
+  empty audience is a valid zero-recipient outcome. Quiesce continues to block
+  the enclosing `WorldCommand::Race` before publication.
+- Valid type-1/type-2 pickup frames are not relayed. In C#, the field at the
+  live-rank offset is replaced with a server-selected item before a new room
+  packet is synthesized; relaying the request would present rank as item ID.
+  Rust records an explicit deferred/no-relay outcome until an authoritative
+  item award and serializer are supported by stronger fixtures.
+- Rust also omits the C# type-10/type-11 kart side effects, bonus item
+  synthesis, probability rerolls, and item remapping. The stability audit
+  identifies double transformation and synthetic packet behavior as failure
+  risks. Exact raw relay is implemented without reproducing those defects.
+- GameSlot wire errors, unsupported P5136 types, wrong phase, spoofing,
+  observer source, inactive frozen membership, closed settlement, and outbound
+  saturation are structured nonfatal drops. Stale global identity ownership,
+  actor termination, invariant failures, quiesce closure, and an impossible
+  command/outcome mismatch still propagate. Logs include only bounded metadata
+  and typed reasons, never raw packet bodies.
+- The audit records 1,471 compatible C# traces, but that corpus is not checked
+  into either repository and could not be replayed independently. Actual
+  type-9/type-10 and generic type-12 capture-derived differential fixtures,
+  authoritative pickup synthesis, and stock-client E2E remain evidence gaps.
+  GameSlot-specific quiesce and session-after-queue-full tests are also absent;
+  the shared Race quiesce gate, actor atomic backpressure test, and session
+  expected-rejection test cover those mechanisms separately.
 
 ### Terminal protected-item list
 
@@ -643,6 +720,12 @@ these areas:
   the ordered ACK is published and before all migration state commits.
 - Keep UDP source admission separate from recipient lookup. Freezing a source
   must not hide valid outbound recipients.
+- Keep TCP GameSlot and the opaque UDP relay as separate codecs and policy
+  domains. The TCP logical/blob caps must not constrain UDP relay bodies.
+- Keep parsed TCP GameSlot commands move-only and parser-minted. Do not expose
+  mutable action, audience, claimed-identity, or raw-wire fields.
+- Reserve the complete exact-generation GameSlot audience before publishing
+  any recipient. Queue-full drops are atomic and must not enter a retry queue.
 - Do not replace pre-reserved completion permits with untracked spawned
   callbacks or best-effort `try_send`.
 - Do not release a profile lane before World has revalidated and published the
@@ -664,12 +747,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 706 regular tests and 2 opt-in proprietary-fixture tests passed
+# 727 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 706 regular passing tests comprise 9 CLI, 35 connector, 142 core, 85
-profile, 13 RHO5, 414 server unit, and 8 server integration tests. The two
+The 727 regular passing tests comprise 9 CLI, 35 connector, 157 core, 85
+profile, 13 RHO5, 420 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
@@ -687,6 +770,18 @@ Focused regressions cover:
 - cross-World capability rejection on ordinary and durable paths;
 - typed zero-capacity World startup and observable actor termination;
 - malformed room/race packets before mutation;
+- TCP GameSlot hash classification; strict type 1/2/9/10/11/12 parsing;
+  1013-byte logical and 960-byte blob limits; every supported-frame
+  truncation; nonfatal malformed/unsupported dispatch followed by a live
+  request; and no direct synthetic response;
+- all 74 fixed type-12 name/hash pairs, uniqueness, actual parse admission,
+  four capture-derived exact lengths, Cube/CubeForBoss/Lucci exclusion,
+  pickup and Barricade finite values, and strict Barricade body ownership;
+- exact frozen-generation GameSlot routing for type 9/10/11/12, observer
+  receive-only policy, claimed-ID spoof rejection, Loading and closed
+  settlement rejection, open Settling relay, pickup deferral, byte-exact
+  sender inclusion/exclusion, masked observer delivery, stale replacement
+  exclusion, and all-recipient queue rollback/retry;
 - exact MyRoom owner-item packets for owner, visitor, empty owner, and missing
   owner, plus strict malformed input;
 - owner-item generation/topology/visibility revalidation, requester
@@ -798,10 +893,18 @@ These items prevent a "port complete" claim.
 
 4. **Evidence-dependent packet behavior**
 
-   Add captures/fixtures for generic type-12 bodies, special observer-map
-   master policy, AI roster/start and nonzero AI-master payloads, the real
-   track-pool/control surface, and any P5136-vs-modern packet difference still
-   represented by a fallback.
+   TCP GameSlot now has a strict bounded envelope and safe relay policy.
+   Capture real type-9/type-10 frames and each generic type-12 body before
+   narrowing their internal layouts. Capture type-1/type-2 pickup requests and
+   authoritative server replies before implementing item selection or
+   synthesis. Do not add the C# type-10/type-11 side effects until fixtures
+   prove both their state transition and any extra wire packet without double
+   transformation.
+
+   Also add captures/fixtures for special observer-map master policy, AI
+   roster/start and nonzero AI-master payloads, the real track-pool/control
+   surface, and any P5136-vs-modern packet difference still represented by a
+   fallback.
 
 5. **Race-wide crash atomicity**
 
@@ -828,13 +931,12 @@ These items prevent a "port complete" claim.
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. The generic authenticated fallback now
    returns `UnsupportedIdentityPacket`; it no longer reports silent success.
-2. Port the bounded TCP `GameSlotPacket` codec identified by the stability
-   audit. Validate the P5136 envelope, size limits, player identity, type
-   allowlist, masks, finite numeric fields, and known type-12 operation/length
-   pairs before actor work. Malformed or deliberately unsupported item
-   effects must be observable nonfatal drops, not session-ending generic
-   packet errors. Do not apply the TCP cap to the separate UDP movement
-   envelope.
+2. Keep the completed bounded TCP GameSlot slice frozen at its current
+   evidence boundary. Collect stock-client type-1/type-2 request/reply,
+   type-9/type-10, and generic type-12 fixtures before implementing pickup
+   synthesis, inner-body rules, or server item side effects. Differentially
+   verify exact bytes and recipient behavior; never apply the TCP cap to the
+   separate opaque UDP movement envelope.
 3. Capture endpoint-report behavior with two stock clients and NAT-relevant
    topologies before adding a live peer-refresh/fanout packet or coupling the
    durable presentation port to observed UDP routing. Existing peers may

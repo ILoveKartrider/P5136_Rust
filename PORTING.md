@@ -59,6 +59,7 @@ been demonstrated.
 - [x] generation-bound Game/P2P endpoint registration and relay
 - [x] synchronized UDP receive/activation order across generation boundaries
 - [x] exact-generation actor-owned UDP audience selection
+- [x] bounded TCP GameSlot parsing and exact-generation atomic relay
 - [x] Messenger identity validation, chat rooms, and single-writer queues
 - [x] Messenger split/coalesced frame and mid-frame generation fencing
 - [x] bounded actor-output flushing without read-loop starvation
@@ -94,6 +95,8 @@ been demonstrated.
 - [ ] stock-client RequestEmblems/main-emblem E2E
 - [x] generation-bound P2P-port report, persistence, and cache refresh
 - [x] strict terminal empty protected-item list
+- [ ] authoritative type-1/type-2 item pickup award and synthesis
+- [ ] evidence-backed GameSlot item-use/reaction server side effects
 - [ ] club rename after global membership/namespace invariants are specified
 - [x] exact MyRoom Career empty-list reply and kind-2 grant consumption
 - [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
