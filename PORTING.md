@@ -47,6 +47,7 @@ been demonstrated.
 - [x] deferred releases count toward capacity and shutdown barriers
 - [x] cross-World capability misuse is rejected
 - [x] authenticated `PqServerTime` / `PrServerTime` legacy clock reply
+- [x] strict stock `PqRequestExtradata` and web-event completion replies
 
 ## World, Messenger, and UDP
 

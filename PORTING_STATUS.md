@@ -27,19 +27,59 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`f08aafa Port fail-closed P5136 shop buys`
+`44c1266 Port strict stateless compatibility replies`
 
 ## Current Rust checkpoint
 
-The current checkpoint closes both P5136 shop-buy aliases without introducing
-an incomplete economy. Stock-executable producer evidence establishes their
-exact request shapes, and corroborating C# serializers establish the common
-failure response. Rust fully parses each request, passes the normal
-identity/profile fences, and returns only that exact failure. It performs no
-shop-specific actor mutation, profile write, inventory or currency change, or
-fanout. Malformed shop bodies remain nonfatal session-local drops, while stale
-ownership, missing profile binding, quiesce, and system errors still
-propagate. The C# repository remains unchanged and is evidence only.
+The current checkpoint closes two additional stateless authenticated startup
+gaps. Stock-executable producers prove that `PqRequestExtradata` and
+`PqWebEventCompleteCheckPacket` are exact hash-only requests, so Rust rejects
+the trailing bytes that the C# handlers silently accepted. Their exact
+fail-closed replies are returned directly without profile I/O, state mutation,
+or fanout. The request-specific parser and the global identity-operation fence
+retain distinct typed error priorities, now fixed by combination tests. The C#
+repository remains unchanged and is evidence only.
+
+### Strict stateless compatibility replies
+
+- `PqRequestExtradata` is `0x44660748`; its producer constructs only the base
+  packet, so the logical request is exactly four bytes. `PrRequestExtradata` is
+  `0x44770749` and its safe fixed body is exactly `u8 code 0 | u8 optional
+  absent`, for six total bytes.
+- The stock reply codec can represent an optional value for another code, and
+  the client compares the code with 99. The server-side business meaning and
+  value policy are not established, so Rust exposes only the evidenced code-0
+  absent-value reply and does not invent a success API or optional string.
+- `PqWebEventCompleteCheckPacket` is `0xA8140B50` and is likewise an exact
+  four-byte base-only request. `PrWebEventCompleteCheckPacket` is
+  `0xA8300B51` with no body, also exactly four bytes. The client consumes it to
+  clear its pending state and advance the corresponding local state machine.
+- Both request producers allocate the base packet and send it without a field
+  write. Rust therefore uses the shared strict hash-only parser and complete
+  consumption. Every 0–3-byte prefix, wrong hash, and trailing byte is a typed
+  protocol error; the C# handlers' acceptance of a suffix is not cloned.
+- Global identity-operation admission is outermost. For a live admitted
+  identity, strict parsing precedes `AuthorizeIdentity` and the bound-profile
+  fence, so malformed plus unbound returns the protocol error. A stale owner
+  or quiesced producer is rejected during global admission before the
+  packet-specific parser, preserving `StaleSession` or
+  `OutboundProductionClosed`.
+- Valid requests then pass `AuthorizeIdentity` and the bound-profile fence and
+  return one direct reply. They create no request-specific World command,
+  profile-store I/O, profile revision, shared-state mutation, persistence,
+  retry queue, or peer publication.
+- Tests pin all four hashes, both exact request/reply byte sequences, strict
+  truncation/wrong-hash/trailing rejection, both authenticated dispatch paths,
+  profile and revision immutability, identity continuity, a live follow-up
+  request, unbound profile behavior, stale migration ownership, quiesce, and
+  the malformed/error-priority combinations.
+- These were tracked as additional shared startup-handler gaps rather than
+  members of the 40 direct P5136 request-disposition set. That direct ledger
+  therefore remains 30 of 40 explicit with 10 missing; the deliberate no-op
+  table remains 25 of 25 explicit.
+- Stock analysis artifacts remain outside this repository. Stock-client E2E
+  behavior and the successful extra-data value policy remain open evidence
+  gaps.
 
 ### Fail-closed P5136 shop buys
 
@@ -803,8 +843,9 @@ these areas:
 - Reserve required outbound capacity before mutating state. Expected
   backpressure is a typed request error; impossible actor-state contradictions
   remain typed terminal errors.
-- Parse and validate malformed request bodies before any actor mutation or
-  authorization side effect when the protocol requires parsing.
+- Keep global identity-operation admission outermost. After admission, parse
+  before packet-specific mutation; any request that deliberately authorizes
+  before parsing must document and test that error-priority boundary.
 - Bounded mailboxes, collections, wire fields, and identity counts must remain
   bounded on all error paths.
 
@@ -817,18 +858,23 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 739 regular tests and 2 opt-in proprietary-fixture tests passed
+# 742 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 739 regular passing tests comprise 9 CLI, 35 connector, 166 core, 85
-profile, 13 RHO5, 423 server unit, and 8 server integration tests. The two
+The 742 regular passing tests comprise 9 CLI, 35 connector, 167 core, 85
+profile, 13 RHO5, 425 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
+- exact hash-only extra-data/web-event requests; all four packet hashes; exact
+  six-/four-byte replies; truncation, wrong-hash, and trailing rejection;
+  authenticated direct dispatch; profile/revision immutability; identity
+  continuity; follow-up liveness; unbound, stale, and quiesced fences; and the
+  malformed/error-priority combinations;
 - exact normal/item-preset shop-buy hashes, 9/11-byte request bodies, decoded
   boundary values, all truncated prefixes, cross-kind/trailing rejection,
   exact common 29-byte failure response, authenticated alias dispatch,
@@ -1013,11 +1059,13 @@ These items prevent a "port complete" claim.
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. `PqServerTime` and both fail-closed shop
    aliases are now explicit; 30 of 40 direct P5136 requests are classified,
-   leaving 10. The next low-state evidence targets are
-   `PqWebEventCompleteCheckPacket` and `PqRequestExtradata`. Do not declare
-   either body strict until a producer or capture proves its layout. The
-   generic authenticated fallback returns `UnsupportedIdentityPacket`; it
-   never reports silent success.
+   leaving 10. The additional shared `PqRequestExtradata` and
+   `PqWebEventCompleteCheckPacket` paths are also explicit and strict from
+   stock producer evidence. Next inspect `PqGetRiderInfo` and
+   `PqStartRiderSchool`, then the club-query group; do not implement a request
+   or success policy before its producer, consumer, and serializer boundaries
+   are established. The generic authenticated fallback returns
+   `UnsupportedIdentityPacket`; it never reports silent success.
 2. Keep the completed bounded TCP GameSlot slice frozen at its current
    evidence boundary. Collect stock-client type-1/type-2 request/reply,
    type-9/type-10, and generic type-12 fixtures before implementing pickup

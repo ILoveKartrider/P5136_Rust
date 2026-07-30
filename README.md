@@ -107,6 +107,15 @@ direct and read-only. It uses the shared identity-operation admission and
 authorization actor commands but creates no ServerTime-specific mutation,
 disk I/O, or fanout.
 
+Stock producers prove that `PqRequestExtradata` and
+`PqWebEventCompleteCheckPacket` are both exact hash-only requests. Rust rejects
+the trailing bytes that the C# handlers silently accepted. The web-event reply
+is the exact empty four-byte named packet; the six-byte extra-data reply is an
+exact zero code plus an absent optional-value marker. Rust exposes no
+speculative extra-data success code or value. Both paths reuse global identity
+admission and authorization, return one direct requester reply, and leave
+profile, disk, World domain state, and peer queues unchanged.
+
 Both stock P5136 shop-buy aliases are also explicit. Rust strictly parses the
 producer-derived 9-byte normal body and 11-byte item-preset body, then returns
 the exact common 29-byte failure packet. It does not execute a purchase,
