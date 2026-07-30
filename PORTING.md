@@ -96,6 +96,7 @@ been demonstrated.
 - [ ] stock-client RequestEmblems/main-emblem E2E
 - [x] generation-bound P2P-port report, persistence, and cache refresh
 - [x] strict terminal empty protected-item list
+- [x] exact normal/preset shop-buy parsing and fail-closed failure reply
 - [ ] authoritative type-1/type-2 item pickup award and synthesis
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
 - [ ] club rename after global membership/namespace invariants are specified

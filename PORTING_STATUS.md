@@ -27,19 +27,65 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`76387e8 Port legacy server time reply`
+`f08aafa Port fail-closed P5136 shop buys`
 
 ## Current Rust checkpoint
 
-The current checkpoint closes one stateless authenticated packet-disposition
-gap. `PqServerTime` now returns the exact four-byte legacy clock body in
-`PrServerTime`, reusing the existing `LegacyTime` representation and writer.
-The inspected C# handlers do not consume a request body, and no producer or
-capture proves a stricter layout, so Rust deliberately does not invent one.
-The request still passes through the normal identity-operation and bound
-profile fences. Beyond those shared admission and authorization commands, the
-reply performs no ServerTime-specific actor mutation, persistence, or fanout.
-C# remains unchanged.
+The current checkpoint closes both P5136 shop-buy aliases without introducing
+an incomplete economy. Stock-executable producer evidence establishes their
+exact request shapes, and corroborating C# serializers establish the common
+failure response. Rust fully parses each request, passes the normal
+identity/profile fences, and returns only that exact failure. It performs no
+shop-specific actor mutation, profile write, inventory or currency change, or
+fanout. Malformed shop bodies remain nonfatal session-local drops, while stale
+ownership, missing profile binding, quiesce, and system errors still
+propagate. The C# repository remains unchanged and is evidence only.
+
+### Fail-closed P5136 shop buys
+
+- `SpReqNormalShopBuyItemPacket` is `0x9E700B05` with the exact body
+  `stock_id:i32 | unknown:i32 | mode:u8`, for 9 body bytes and 13 total bytes.
+  `SpReqItemPresetShopBuyItemPacket` is `0xCE5F0C9E` and appends one trailing
+  `preset_or_slot:u16`, for 11 body bytes and 15 total bytes.
+- The stock executable's two request producers and serializers establish those
+  widths and ordering. Rust preserves the full scalar domains and does not
+  invent allowed ranges or business meaning for `unknown`, `mode`, or the
+  trailing `u16`. No proprietary executable, capture, or external analysis
+  artifact is copied into this repository.
+- The same hash classifier gates dispatch and is reused inside the
+  exact-consumption parser. Its parsed representation has private fields and a
+  private tagged variant, so callers cannot construct a normal request with a
+  preset value or a preset request without one. Every truncated prefix,
+  cross-kind length mismatch, unknown hash, and trailing byte is rejected.
+- Both aliases return `SpRepBuyItemPacket` (`0x415B0701`) with the exact body
+  `u8 1 | 24 zero bytes`, for 29 total bytes. The server does not echo parsed
+  fields or raw request data and does not create a shop-specific World command,
+  mutate economy/profile state, persist, or publish to peers.
+- Shared identity-operation admission, `AuthorizeIdentity`, and the bound
+  profile fence run before parsing and the direct response. Once those fences
+  succeed, wire truncation and trailing bytes produce only a bounded metadata
+  log and no reply, then the session can handle another request. An impossible
+  classifier/parser hash disagreement remains a typed fatal invariant path.
+  Stale generation, unbound profile, quiesce, actor termination, and other
+  system errors are never downgraded.
+- Tests cover exact hashes, both golden request layouts and decoded boundary
+  values, every truncated prefix, cross-kind drift, trailing input, the exact
+  failure bytes, both authenticated dispatch aliases, session liveness after
+  malformed input, identity continuity, stale migration ownership, and
+  quiesce rejection. Stock-client purchase UI/E2E behavior and the meanings of
+  the unknown fields remain open evidence gaps.
+- The direct P5136 request-disposition audit is now 30 of 40 explicit, leaving
+  10 missing requests after these two aliases were closed. The separate
+  deliberate compatibility no-op table remains 25 of 25 explicit.
+- The remaining direct-request names are `PqGetRiderInfo`,
+  `PqStartRiderSchool`, `LoRqDeleteItemPacket`, `PqUnLockedItem`,
+  `PqFavoriteItemUpdate`, `PqCheckMyClubStatePacket`,
+  `PqGetUserWaitingJoinClubPacket`, `PqCheckCreateClubConditionPacket`,
+  `PqGetClubListCountPacket`, and `PqGetClubWaitingCrewCountPacket`.
+  `LoRqDeleteItemPacket` must not copy the C# success-without-deletion
+  behavior. A future `PqFavoriteItemUpdate` must fully parse and validate
+  before one atomic durable mutation instead of reproducing C# partial-update
+  exposure.
 
 ### Authenticated legacy server time
 
@@ -771,18 +817,23 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 729 regular tests and 2 opt-in proprietary-fixture tests passed
+# 739 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 729 regular passing tests comprise 9 CLI, 35 connector, 158 core, 85
-profile, 13 RHO5, 421 server unit, and 8 server integration tests. The two
+The 739 regular passing tests comprise 9 CLI, 35 connector, 166 core, 85
+profile, 13 RHO5, 423 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
+- exact normal/item-preset shop-buy hashes, 9/11-byte request bodies, decoded
+  boundary values, all truncated prefixes, cross-kind/trailing rejection,
+  exact common 29-byte failure response, authenticated alias dispatch,
+  malformed-session liveness, identity continuity, stale-generation
+  rejection, and quiesce propagation;
 - exact `PqServerTime`/`PrServerTime` hashes and four-byte legacy clock body,
   bounded unused request suffix, authenticated dispatch, and identity
   continuity;
@@ -912,6 +963,10 @@ These items prevent a "port complete" claim.
    The terminal empty protected-item list is implemented. Nonempty
    protected-item ownership and `PqLockedItemUpdate` remain blocked by
    unproven P5136 wire semantics and durable-state policy.
+   Both shop-buy aliases now parse their exact producer-derived bodies and fail
+   closed with the exact common response. Actual purchase authorization,
+   pricing, inventory/currency transactions, replay/idempotency policy, and
+   stock-client success behavior remain an economy design and evidence slice.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
    fields; a later storage redesign should add zeroization/at-rest protection
@@ -956,12 +1011,13 @@ These items prevent a "port complete" claim.
 
 1. Continue the packet-disposition ledger: every known request must be
    implemented, an evidence-backed deliberate no-reply, explicitly
-   unsupported, or capture-blocked. `PqServerTime` is now explicit. The next
-   low-state candidates are the P5136 fail-closed shop reply and the terminal
-   web-event-complete reply; neither request body should be declared strict
-   until a producer or capture proves its layout. The generic authenticated
-   fallback returns `UnsupportedIdentityPacket`; it never reports silent
-   success.
+   unsupported, or capture-blocked. `PqServerTime` and both fail-closed shop
+   aliases are now explicit; 30 of 40 direct P5136 requests are classified,
+   leaving 10. The next low-state evidence targets are
+   `PqWebEventCompleteCheckPacket` and `PqRequestExtradata`. Do not declare
+   either body strict until a producer or capture proves its layout. The
+   generic authenticated fallback returns `UnsupportedIdentityPacket`; it
+   never reports silent success.
 2. Keep the completed bounded TCP GameSlot slice frozen at its current
    evidence boundary. Collect stock-client type-1/type-2 request/reply,
    type-9/type-10, and generic type-12 fixtures before implementing pickup

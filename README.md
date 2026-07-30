@@ -16,6 +16,8 @@ server. The implemented foundation provides:
 - request-driven startup replies, legacy server time, and catalog-backed rider
   inventory/equipment;
 - strict terminal empty protected-item list compatibility reply;
+- exact normal/preset shop-buy decoding with a fail-closed compatibility reply
+  and no economy mutation;
 - actor-owned channel rooms with create/list/join/leave, bounded fan-out, and
   stale-generation cancellation;
 - bounded messenger TCP sessions with generation-fenced identity publication;
@@ -104,6 +106,15 @@ frame bound instead of claiming an unproven hash-only schema. The reply is
 direct and read-only. It uses the shared identity-operation admission and
 authorization actor commands but creates no ServerTime-specific mutation,
 disk I/O, or fanout.
+
+Both stock P5136 shop-buy aliases are also explicit. Rust strictly parses the
+producer-derived 9-byte normal body and 11-byte item-preset body, then returns
+the exact common 29-byte failure packet. It does not execute a purchase,
+change inventory or currency, persist profile data, or fan out a request.
+Malformed shop packets are bounded nonfatal drops so the authenticated session
+remains usable; stale identity ownership, an unbound profile, quiesce, and
+actor/system failures still propagate. Field widths and order are evidenced,
+but unknown business meanings and value ranges are deliberately not invented.
 
 TCP `GameSlotPacket` is handled separately from the opaque UDP packet that
 shares its name. Rust bounds the complete TCP packet at 1013 bytes and each
