@@ -35,6 +35,7 @@ use tokio::{
 
 use crate::{
     IdentityBinding, ReleasedIdentity,
+    packet_log::{PacketDirection, trace_packet},
     udp_state::{
         CurrentUdpEndpoint, UdpEndpointBindStatus, UdpEndpointState, UdpEndpointStateError,
         UdpTransport,
@@ -774,6 +775,13 @@ async fn run_reader(
     loop {
         match arrival_clock.recv_from(&socket, &mut buffer).await {
             Ok((length, source, arrival_epoch)) => {
+                trace_packet(
+                    udp_transport_label(transport),
+                    "wire",
+                    PacketDirection::Received,
+                    Some(source),
+                    &buffer[..length],
+                );
                 let mut ingress = match decode_udp_ingress(
                     transport,
                     source,
@@ -898,13 +906,14 @@ async fn dispatch_ingress(
         });
     }
 
+    let transport = request.ingress.transport;
     let binding = endpoints.bind_authorized_ingress(
-        request.ingress.transport,
+        transport,
         &request.identity,
         request.ingress.source,
         request.ingress.route_hash,
     )?;
-    let socket = match request.ingress.transport {
+    let socket = match transport {
         UdpTransport::Game => game_socket,
         UdpTransport::P2p => p2p_socket,
     };
@@ -922,6 +931,7 @@ async fn dispatch_ingress(
             record_send(
                 &mut outcome,
                 send_packet(
+                    transport,
                     socket,
                     request.ingress.source,
                     request.ingress.account_id,
@@ -938,6 +948,7 @@ async fn dispatch_ingress(
             record_send(
                 &mut outcome,
                 send_packet(
+                    transport,
                     socket,
                     request.ingress.source,
                     request.ingress.account_id,
@@ -953,6 +964,7 @@ async fn dispatch_ingress(
             outcome.action = UdpDispatchAction::GameSlotRelay;
             relay_to_targets(
                 endpoints,
+                transport,
                 socket,
                 &request.identity,
                 request.ingress.route_hash,
@@ -968,6 +980,7 @@ async fn dispatch_ingress(
             outcome.action = UdpDispatchAction::RoomSlotRelay;
             relay_to_targets(
                 endpoints,
+                transport,
                 socket,
                 &request.identity,
                 request.ingress.route_hash,
@@ -1002,6 +1015,7 @@ impl<'a> UdpRelayBody<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn relay_to_targets(
     endpoints: &UdpEndpointState,
+    transport: UdpTransport,
     socket: &UdpSocket,
     source_identity: &IdentityBinding,
     source_route_hash: u32,
@@ -1032,6 +1046,7 @@ async fn relay_to_targets(
         record_send(
             outcome,
             send_packet(
+                transport,
                 socket,
                 target.endpoint.endpoint,
                 target.identity.user_no.get(),
@@ -1055,6 +1070,7 @@ fn p5136_tick_from_elapsed_millis(elapsed_millis: u128) -> u32 {
 }
 
 async fn send_packet(
+    transport: UdpTransport,
     socket: &UdpSocket,
     target: SocketAddr,
     account_id: u32,
@@ -1073,10 +1089,27 @@ async fn send_packet(
     let Ok(wire) = encode_datagram(&logical, rand::random(), maximum_payload) else {
         return false;
     };
-    matches!(
+    let sent = matches!(
         socket.send_to(&wire, target).await,
         Ok(sent) if sent == wire.len()
-    )
+    );
+    if sent {
+        trace_packet(
+            udp_transport_label(transport),
+            "wire",
+            PacketDirection::Sent,
+            Some(target),
+            &wire,
+        );
+    }
+    sent
+}
+
+const fn udp_transport_label(transport: UdpTransport) -> &'static str {
+    match transport {
+        UdpTransport::Game => "game-udp",
+        UdpTransport::P2p => "p2p-udp",
+    }
 }
 
 fn record_send(outcome: &mut UdpDispatchOutcome, sent: bool, stats: &SharedStats) {

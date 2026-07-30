@@ -15,10 +15,12 @@ use p5136_connector::{
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
 use p5136_server::{BoundServer, ServerConfig, ServerEndpoints};
 
+use crate::LoggingRuntime;
+
 const WINDOW_TITLE: &str = "KartRider P5136";
 const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
-pub(crate) fn run() -> Result<()> {
+pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 680.0])
@@ -30,7 +32,7 @@ pub(crate) fn run() -> Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         options,
-        Box::new(|_creation_context| Ok(Box::new(P5136GuiApp::new()))),
+        Box::new(move |_creation_context| Ok(Box::new(P5136GuiApp::new(log_path)))),
     )
     .map_err(|error| anyhow!("failed to run desktop connector: {error}"))
 }
@@ -355,6 +357,7 @@ enum GuiEvent {
 }
 
 struct P5136GuiApp {
+    log_path: PathBuf,
     selected_tab: GuiTab,
     connector_inputs: GuiInputs,
     connector_run_state: GuiRunState,
@@ -371,9 +374,10 @@ struct P5136GuiApp {
 }
 
 impl P5136GuiApp {
-    fn new() -> Self {
+    fn new(log_path: PathBuf) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         Self {
+            log_path,
             selected_tab: GuiTab::Server,
             connector_inputs: GuiInputs::default(),
             connector_run_state: GuiRunState::Idle,
@@ -947,6 +951,7 @@ impl eframe::App for P5136GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(WINDOW_TITLE);
+            ui.small(format!("Runtime log: {}", self.log_path.display()));
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, GuiTab::Server, "Server");
                 ui.selectable_value(&mut self.selected_tab, GuiTab::Connector, "Connector");
@@ -1091,7 +1096,7 @@ const fn stage_label(stage: ConnectorStage) -> &'static str {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr},
-        path::Path,
+        path::{Path, PathBuf},
         time::Duration,
     };
 
@@ -1220,7 +1225,7 @@ mod tests {
     #[test]
     fn dropping_the_gui_cancels_its_active_worker_before_launch() {
         let cancellation = ConnectorCancellation::new();
-        let mut app = P5136GuiApp::new();
+        let mut app = P5136GuiApp::new(PathBuf::from("p5136-test.log"));
         app.cancellation = Some(cancellation.clone());
 
         drop(app);

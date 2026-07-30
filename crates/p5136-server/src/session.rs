@@ -116,6 +116,7 @@ use crate::{
         MyRoomInfoWriteReceipt,
     },
     operation_gate::{WireOperationGate, WireOperationGuard},
+    packet_log::{PacketDirection, trace_packet},
     profile_io::{
         MyRoomProfileLease, ProfileIoError, ProfileIoHandle, ProfileJobAdmission,
         ProfileLanePermit, myroom_profile_presentation,
@@ -1240,6 +1241,88 @@ where
     Ok(frame::decode_encrypted(&wire, iv, maximum)?)
 }
 
+/// Reads one encrypted login frame while retaining malformed or partial wire
+/// bytes in the local diagnostic sink. The public reader remains uninstrumented
+/// for protocol fixtures; a live session uses this peer-aware boundary.
+async fn read_encrypted_frame_with_diagnostics<R>(
+    reader: &mut R,
+    iv: &mut u32,
+    maximum: usize,
+    peer: Option<SocketAddr>,
+) -> Result<Vec<u8>, LoginSessionError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; 4];
+    let mut header_read = 0;
+    if let Err(error) = read_exact_with_count(reader, &mut header, &mut header_read).await {
+        if header_read != 0 {
+            trace_packet(
+                "login-tcp",
+                "partial-wire",
+                PacketDirection::Received,
+                peer,
+                &header[..header_read],
+            );
+        }
+        return Err(error.into());
+    }
+    let encoded_header = u32::from_le_bytes(header);
+    let body_length = match frame::encrypted_body_length(encoded_header, *iv, maximum) {
+        Ok(length) => length,
+        Err(error) => {
+            trace_packet(
+                "login-tcp",
+                "wire",
+                PacketDirection::Received,
+                peer,
+                &header,
+            );
+            return Err(error.into());
+        }
+    };
+
+    let mut wire = Vec::with_capacity(body_length + 4);
+    wire.extend_from_slice(&header);
+    wire.resize(body_length + 4, 0);
+    let mut body_read = 0;
+    if let Err(error) = read_exact_with_count(reader, &mut wire[4..], &mut body_read).await {
+        trace_packet(
+            "login-tcp",
+            "partial-wire",
+            PacketDirection::Received,
+            peer,
+            &wire[..4 + body_read],
+        );
+        return Err(error.into());
+    }
+    match frame::decode_encrypted(&wire, iv, maximum) {
+        Ok(packet) => Ok(packet),
+        Err(error) => {
+            trace_packet("login-tcp", "wire", PacketDirection::Received, peer, &wire);
+            Err(error.into())
+        }
+    }
+}
+
+async fn read_exact_with_count<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    read: &mut usize,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    while *read < buffer.len() {
+        let count = reader.read(&mut buffer[*read..]).await?;
+        if count == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        *read += count;
+    }
+    Ok(())
+}
+
 async fn read_session_frame<R>(
     reader: &mut R,
     iv: &mut u32,
@@ -1247,18 +1330,25 @@ async fn read_session_frame<R>(
     authenticated: bool,
     login_deadline: time::Instant,
     idle_timeout: std::time::Duration,
+    peer: Option<SocketAddr>,
 ) -> Result<Vec<u8>, LoginSessionError>
 where
     R: AsyncRead + Unpin,
 {
     if authenticated {
-        time::timeout(idle_timeout, read_encrypted_frame(reader, iv, maximum))
-            .await
-            .map_err(|_| LoginSessionError::SessionIdleTimeout)?
+        time::timeout(
+            idle_timeout,
+            read_encrypted_frame_with_diagnostics(reader, iv, maximum, peer),
+        )
+        .await
+        .map_err(|_| LoginSessionError::SessionIdleTimeout)?
     } else {
-        time::timeout_at(login_deadline, read_encrypted_frame(reader, iv, maximum))
-            .await
-            .map_err(|_| LoginSessionError::LoginTimeout)?
+        time::timeout_at(
+            login_deadline,
+            read_encrypted_frame_with_diagnostics(reader, iv, maximum, peer),
+        )
+        .await
+        .map_err(|_| LoginSessionError::LoginTimeout)?
     }
 }
 
@@ -1368,6 +1458,13 @@ async fn run_registered_session(
         _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
         result = write_session_bytes(stream, &wire, config.session_write_timeout) => result?,
     }
+    trace_packet(
+        "login-tcp",
+        "logical",
+        PacketDirection::Sent,
+        peer,
+        &payload,
+    );
 
     // Authentication packets may precede PqLogin, but they do not reset this
     // absolute deadline. A client cannot hold a slot forever by trickling
@@ -1385,6 +1482,7 @@ async fn run_registered_session(
             context.is_authenticated(),
             login_deadline,
             config.session_idle_timeout,
+            peer,
         );
         tokio::pin!(frame);
         let mut outbound_burst = 0;
@@ -1398,6 +1496,7 @@ async fn run_registered_session(
                         outbound,
                         &mut send_iv,
                         config,
+                        peer,
                     )
                     .await;
                 }
@@ -1421,6 +1520,7 @@ async fn run_registered_session(
                             batch,
                             &mut send_iv,
                             config,
+                            peer,
                         ) => result?,
                     }
                     outbound_burst += 1;
@@ -1429,6 +1529,14 @@ async fn run_registered_session(
             }
         };
 
+        trace_packet(
+            "login-tcp",
+            "logical",
+            PacketDirection::Received,
+            peer,
+            &packet,
+        );
+
         let Some(wire_operation) = wire_operations.try_begin_request() else {
             return drain_outbound_until_cancelled(
                 &mut writer,
@@ -1436,6 +1544,7 @@ async fn run_registered_session(
                 outbound,
                 &mut send_iv,
                 config,
+                peer,
             )
             .await;
         };
@@ -1449,7 +1558,6 @@ async fn run_registered_session(
             None
         };
         let operation = SessionFrameOperation::new(wire_operation, identity_operation);
-        trace_packet(peer, &packet)?;
         tokio::select! {
             biased;
             _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
@@ -1460,6 +1568,7 @@ async fn run_registered_session(
                 &mut context,
                 &mut send_iv,
                 &operation,
+                peer,
             ) => result?,
         }
         // Actor-owned replies are enqueued before their command acknowledgement
@@ -1480,6 +1589,7 @@ async fn run_registered_session(
                     batch,
                     &mut send_iv,
                     config,
+                    peer,
                 ) => result?,
             }
         }
@@ -1493,6 +1603,7 @@ async fn drain_outbound_until_cancelled<W>(
     outbound: &mut mpsc::Receiver<OutboundBatch>,
     send_iv: &mut u32,
     config: &ServerConfig,
+    peer: Option<SocketAddr>,
 ) -> Result<(), LoginSessionError>
 where
     W: AsyncWrite + Unpin,
@@ -1506,7 +1617,7 @@ where
                 tokio::select! {
                     biased;
                     _ = &mut *cancellation => return Ok(()),
-                    result = write_outbound_batch(writer, batch, send_iv, config) => result?,
+                    result = write_outbound_batch(writer, batch, send_iv, config, peer) => result?,
                 }
             }
         }
@@ -1520,13 +1631,14 @@ async fn process_and_write<W>(
     context: &mut SessionContext,
     send_iv: &mut u32,
     operation: &SessionFrameOperation,
+    peer: Option<SocketAddr>,
 ) -> Result<(), LoginSessionError>
 where
     W: AsyncWrite + Unpin,
 {
     let responses =
         dispatch_packet_admitted(services, packet, context, operation.identity()).await?;
-    write_logical_packets(writer, &responses, send_iv, services.config).await
+    write_logical_packets(writer, &responses, send_iv, services.config, peer).await
 }
 
 async fn write_outbound_batch<W>(
@@ -1534,12 +1646,13 @@ async fn write_outbound_batch<W>(
     batch: OutboundBatch,
     send_iv: &mut u32,
     config: &ServerConfig,
+    peer: Option<SocketAddr>,
 ) -> Result<(), LoginSessionError>
 where
     W: AsyncWrite + Unpin,
 {
     let (packets, _operation) = batch.into_write_parts();
-    write_logical_packets(writer, &packets, send_iv, config).await
+    write_logical_packets(writer, &packets, send_iv, config, peer).await
 }
 
 /// Writes one ordered logical response under one aggregate deadline.
@@ -1552,6 +1665,7 @@ async fn write_logical_packets<W>(
     packets: &[Vec<u8>],
     send_iv: &mut u32,
     config: &ServerConfig,
+    peer: Option<SocketAddr>,
 ) -> Result<(), LoginSessionError>
 where
     W: AsyncWrite + Unpin,
@@ -1560,6 +1674,7 @@ where
         for packet in packets {
             let wire = frame::encode_encrypted(packet, send_iv, config.max_login_payload)?;
             writer.write_all(&wire).await?;
+            trace_packet("login-tcp", "logical", PacketDirection::Sent, peer, packet);
         }
         Ok::<(), LoginSessionError>(())
     })
@@ -3277,16 +3392,6 @@ fn peer_label(stream: &TcpStream) -> Option<SocketAddr> {
     stream.peer_addr().ok()
 }
 
-fn trace_packet(peer: Option<SocketAddr>, packet: &[u8]) -> Result<(), LoginSessionError> {
-    let hash = packet_hash(packet)?;
-    tracing::debug!(
-        ?peer,
-        packet_hash = format_args!("0x{hash:08X}"),
-        "login packet"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 async fn dispatch_packet(
     services: &SessionServices<'_>,
@@ -3499,9 +3604,9 @@ mod tests {
         SessionContext, SessionReadEvent, SessionServices, dispatch_packet, handle_channel_move_in,
         handle_equipment_request, handle_get_rider, handle_lobby_request, handle_race_request,
         handle_room_request, myroom_player_slot_from_profile, myroom_profile_presentation,
-        read_encrypted_frame, read_session_frame, room_participant_from_profile,
-        room_physics_metadata, select_session_read_event, update_game_options,
-        write_outbound_batch, write_session_bytes,
+        read_encrypted_frame, read_encrypted_frame_with_diagnostics, read_session_frame,
+        room_participant_from_profile, room_physics_metadata, select_session_read_event,
+        update_game_options, write_outbound_batch, write_session_bytes,
     };
     use crate::equipment_persistence::validate_rider_item_selection;
     use crate::operation_gate::WireOperationGate;
@@ -4076,6 +4181,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diagnostic_reader_keeps_partial_login_frame_failure_typed() {
+        let (mut writer, mut reader) = duplex(16);
+        writer.write_all(&[1, 2]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let mut receive_iv = 0xa1b7_1c9b;
+
+        let error = read_encrypted_frame_with_diagnostics(
+            &mut reader,
+            &mut receive_iv,
+            DEFAULT_MAX_PAYLOAD,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LoginSessionError::Io(ref source) if source.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[tokio::test]
     async fn partial_frame_barrier_and_outbound_quota_cannot_starve_the_read() {
         let payload = vec![0x5a; 96];
         let mut send_iv = 0xa1b7_1c9b;
@@ -4155,6 +4282,7 @@ mod tests {
                 false,
                 deadline,
                 Duration::from_secs(1),
+                None,
             )
             .await
             .unwrap(),
@@ -4169,6 +4297,7 @@ mod tests {
                 false,
                 deadline,
                 Duration::from_secs(1),
+                None,
             )
             .await,
             Err(LoginSessionError::LoginTimeout)
@@ -4182,6 +4311,7 @@ mod tests {
                 true,
                 time::Instant::now() + Duration::from_secs(1),
                 Duration::from_millis(20),
+                None,
             )
             .await,
             Err(LoginSessionError::SessionIdleTimeout)
@@ -4212,7 +4342,7 @@ mod tests {
         let mut send_iv = 0x1234_5678;
         let result = async {
             let _request = request;
-            write_outbound_batch(&mut writer, batch, &mut send_iv, &config).await
+            write_outbound_batch(&mut writer, batch, &mut send_iv, &config, None).await
         }
         .await;
         assert!(matches!(result, Err(LoginSessionError::WriteTimeout)));
@@ -4248,7 +4378,7 @@ mod tests {
         let (mut writer, mut reader) = duplex(4_096);
         let initial_iv = 0x1357_2468;
         let mut send_iv = initial_iv;
-        write_outbound_batch(&mut writer, batch, &mut send_iv, &config)
+        write_outbound_batch(&mut writer, batch, &mut send_iv, &config, None)
             .await
             .unwrap();
 

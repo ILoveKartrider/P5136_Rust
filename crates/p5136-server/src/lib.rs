@@ -10,6 +10,7 @@ mod messenger_runtime;
 mod myroom_hub;
 mod myroom_persistence;
 mod operation_gate;
+mod packet_log;
 mod profile_durability;
 mod profile_io;
 mod profile_presentation_persistence;

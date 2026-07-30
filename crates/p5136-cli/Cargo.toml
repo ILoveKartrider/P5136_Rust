@@ -24,6 +24,7 @@ p5136-core = { path = "../p5136-core" }
 p5136-server = { path = "../p5136-server" }
 tokio.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

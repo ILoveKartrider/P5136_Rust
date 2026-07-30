@@ -1,7 +1,10 @@
 use std::{
+    fs::OpenOptions,
+    io,
     net::{IpAddr, Ipv4Addr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -15,7 +18,8 @@ use p5136_server::{
     BoundServer, DEFAULT_MAX_LOGIN_SESSIONS, RewardPersistenceRuntimeError, ServerConfig,
     ServerError, ServerHandle,
 };
-use tracing_subscriber::EnvFilter;
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod gui;
 
@@ -149,12 +153,12 @@ enum RunnerKind {
 
 fn main() -> Result<()> {
     if should_start_gui(std::env::args_os()) {
-        init_tracing(false);
-        return gui::run();
+        let logging = init_tracing(false)?;
+        return gui::run(logging.log_path.clone(), logging);
     }
 
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    let _logging = init_tracing(cli.verbose)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -179,11 +183,89 @@ async fn run_cli(cli: Cli) -> Result<()> {
     }
 }
 
-fn init_tracing(verbose: bool) {
+struct LoggingRuntime {
+    log_path: PathBuf,
+    _file_worker: WorkerGuard,
+}
+
+fn init_tracing(verbose: bool) -> Result<LoggingRuntime> {
     let default_level = if verbose { "debug" } else { "info" };
-    let filter =
+    let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let log_path = create_log_file()?;
+    let file = OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open log file {}", log_path.display()))?;
+
+    let console = tracing_subscriber::fmt::layer()
+        .with_writer(io::stderr)
+        .with_filter(console_filter);
+    // Packet events deliberately have their own filter: the default terminal
+    // level stays concise, while every transport-boundary packet is retained
+    // in the diagnostic file even without `--verbose` or `RUST_LOG=debug`.
+    let (file_writer, file_worker) = NonBlockingBuilder::default()
+        .buffered_lines_limit(4_096)
+        .lossy(true)
+        .finish(file);
+    let packet_file = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(file_writer)
+        .with_filter(EnvFilter::new("info,p5136_packet=debug"));
+    tracing_subscriber::registry()
+        .with(console)
+        .with(packet_file)
+        .init();
+    tracing::info!(log_file = %log_path.display(), "file logging enabled");
+    Ok(LoggingRuntime {
+        log_path,
+        _file_worker: file_worker,
+    })
+}
+
+fn create_log_file() -> Result<PathBuf> {
+    let directory = match std::env::var_os("P5136_LOG_DIR") {
+        Some(directory) if !directory.is_empty() => PathBuf::from(directory),
+        _ => default_log_directory()?,
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    create_log_file_in(&directory, timestamp, std::process::id())
+}
+
+fn create_log_file_in(directory: &Path, timestamp: u128, process: u32) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("failed to create log directory {}", directory.display()))?;
+    for sequence in 0_u8..=99 {
+        let suffix = if sequence == 0 {
+            String::new()
+        } else {
+            format!("-{sequence}")
+        };
+        let path = directory.join(format!("p5136-{timestamp}-{process}{suffix}.log"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create log file {}", path.display()));
+            }
+        }
+    }
+    bail!(
+        "could not reserve a unique P5136 log file in {}",
+        directory.display()
+    )
+}
+
+fn default_log_directory() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("failed to locate the p5136 executable")?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("p5136 executable has no parent directory"))?;
+    Ok(parent.join("logs"))
 }
 
 async fn run_server(args: ServerArgs) -> Result<()> {
@@ -554,5 +636,18 @@ mod tests {
             super::build_runner(&args).unwrap(),
             p5136_connector::Runner::Native
         ));
+    }
+
+    #[test]
+    fn file_log_reservation_creates_distinct_appendable_files() {
+        let temporary = tempdir().unwrap();
+        let directory = temporary.path().join("nested").join("logs");
+        let first = super::create_log_file_in(&directory, 123, 456).unwrap();
+        let second = super::create_log_file_in(&directory, 123, 456).unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "p5136-123-456.log");
+        assert_eq!(second.file_name().unwrap(), "p5136-123-456-1.log");
+        assert!(first.is_file());
+        assert!(second.is_file());
     }
 }

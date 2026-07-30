@@ -52,6 +52,7 @@ use crate::messenger_hub::{
     LeaveClaim, MessengerDelivery, MessengerEvent, MessengerHub, MessengerHubError,
     MessengerHubLimits, MessengerIdentity, MessengerRoomId, MessengerSessionId,
 };
+use crate::packet_log::{PacketDirection, trace_packet};
 
 pub const DEFAULT_MESSENGER_MAILBOX_CAPACITY: usize = 1_024;
 pub const DEFAULT_MESSENGER_CONNECTION_CAPACITY: usize = 256;
@@ -690,6 +691,7 @@ impl MessengerServiceHandle {
         let session = registered.registration.lease.session;
         let result = run_registered_connection(
             stream,
+            peer,
             session,
             self,
             registered.generation,
@@ -1423,6 +1425,86 @@ where
     Ok(logical)
 }
 
+/// Reads one messenger frame while preserving partial/malformed wire input in
+/// the packet diagnostics. Public codec tests use the bare reader above;
+/// live connections use this peer-aware transport boundary.
+async fn read_messenger_frame_with_diagnostics<R>(
+    reader: &mut R,
+    maximum: usize,
+    peer: SocketAddr,
+) -> Result<Vec<u8>, MessengerConnectionError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; MESSENGER_FRAME_HEADER_LENGTH];
+    let mut header_read = 0;
+    if let Err(error) = read_messenger_exact_with_count(reader, &mut header, &mut header_read).await
+    {
+        if header_read != 0 {
+            trace_packet(
+                "messenger-tcp",
+                "partial-wire",
+                PacketDirection::Received,
+                Some(peer),
+                &header[..header_read],
+            );
+        }
+        return Err(error.into());
+    }
+    let length = match decode_frame_length(header, maximum) {
+        Ok(length) => length,
+        Err(error) => {
+            trace_packet(
+                "messenger-tcp",
+                "wire",
+                PacketDirection::Received,
+                Some(peer),
+                &header,
+            );
+            return Err(error.into());
+        }
+    };
+    let mut wire = Vec::with_capacity(MESSENGER_FRAME_HEADER_LENGTH + length);
+    wire.extend_from_slice(&header);
+    wire.resize(MESSENGER_FRAME_HEADER_LENGTH + length, 0);
+    let mut body_read = 0;
+    if let Err(error) = read_messenger_exact_with_count(
+        reader,
+        &mut wire[MESSENGER_FRAME_HEADER_LENGTH..],
+        &mut body_read,
+    )
+    .await
+    {
+        trace_packet(
+            "messenger-tcp",
+            "partial-wire",
+            PacketDirection::Received,
+            Some(peer),
+            &wire[..MESSENGER_FRAME_HEADER_LENGTH + body_read],
+        );
+        return Err(error.into());
+    }
+    Ok(wire.split_off(MESSENGER_FRAME_HEADER_LENGTH))
+}
+
+async fn read_messenger_exact_with_count<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    read: &mut usize,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    while *read < buffer.len() {
+        let count = reader.read(&mut buffer[*read..]).await?;
+        if count == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        *read += count;
+    }
+    Ok(())
+}
+
 /// Reads one authenticated frame and stamps the socket poll that consumes its
 /// first byte.
 ///
@@ -1436,6 +1518,7 @@ async fn read_generation_fenced_messenger_frame<R>(
     reader: &mut R,
     maximum: usize,
     generation: &AtomicU64,
+    peer: Option<SocketAddr>,
 ) -> Result<(Vec<u8>, u64), MessengerConnectionError>
 where
     R: AsyncRead + Unpin,
@@ -1463,6 +1546,13 @@ where
                     if after == before {
                         std::task::Poll::Ready(Ok(before))
                     } else {
+                        trace_packet(
+                            "messenger-tcp",
+                            "partial-wire",
+                            PacketDirection::Received,
+                            peer,
+                            &header[..1],
+                        );
                         std::task::Poll::Ready(Err(
                             MessengerServiceError::StaleIdentityGeneration.into()
                         ))
@@ -1472,18 +1562,67 @@ where
         },
     )
     .await?;
-    reader.read_exact(&mut header[1..]).await?;
-    let length = decode_frame_length(header, maximum)?;
+    let mut header_read = 1;
+    if let Err(error) = read_messenger_exact_with_count(reader, &mut header, &mut header_read).await
+    {
+        trace_packet(
+            "messenger-tcp",
+            "partial-wire",
+            PacketDirection::Received,
+            peer,
+            &header[..header_read],
+        );
+        return Err(error.into());
+    }
+    let length = match decode_frame_length(header, maximum) {
+        Ok(length) => length,
+        Err(error) => {
+            trace_packet(
+                "messenger-tcp",
+                "wire",
+                PacketDirection::Received,
+                peer,
+                &header,
+            );
+            return Err(error.into());
+        }
+    };
     let mut logical = vec![0_u8; length];
-    reader.read_exact(&mut logical).await?;
+    let mut body_read = 0;
+    if let Err(error) = read_messenger_exact_with_count(reader, &mut logical, &mut body_read).await
+    {
+        let mut partial = Vec::with_capacity(MESSENGER_FRAME_HEADER_LENGTH + body_read);
+        partial.extend_from_slice(&header);
+        partial.extend_from_slice(&logical[..body_read]);
+        trace_packet(
+            "messenger-tcp",
+            "partial-wire",
+            PacketDirection::Received,
+            peer,
+            &partial,
+        );
+        return Err(error.into());
+    }
     if generation.load(Ordering::Acquire) != admitted_generation {
+        trace_packet(
+            "messenger-tcp",
+            "logical",
+            PacketDirection::Received,
+            peer,
+            &logical,
+        );
         return Err(MessengerServiceError::StaleIdentityGeneration.into());
     }
     Ok((logical, admitted_generation))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the connection owner passes the independently linear session, generation, cancellation, and bounded outbound capabilities explicitly"
+)]
 async fn run_registered_connection<S>(
     stream: S,
+    peer: SocketAddr,
     session: MessengerSessionId,
     service: &MessengerServiceHandle,
     generation: Arc<AtomicU64>,
@@ -1503,11 +1642,18 @@ where
         }
         result = time::timeout_at(
             enter_deadline,
-            read_messenger_frame(&mut reader, config.max_frame_payload),
+            read_messenger_frame_with_diagnostics(&mut reader, config.max_frame_payload, peer),
         ) => {
             result.map_err(|_| MessengerConnectionError::EnterTimeout)??
         }
     };
+    trace_packet(
+        "messenger-tcp",
+        "logical",
+        PacketDirection::Received,
+        Some(peer),
+        &logical,
+    );
     let request = parse_request(&logical, config.max_string_utf16_units)?;
     let MessengerRequest::EnterChatServer {
         user_no,
@@ -1543,6 +1689,7 @@ where
                 &mut reader,
                 config.max_frame_payload,
                 generation.as_ref(),
+                Some(peer),
             ),
         );
         tokio::pin!(read);
@@ -1564,6 +1711,7 @@ where
                         &frame,
                         config.write_timeout,
                         &mut cancellation,
+                        peer,
                     )
                     .await?;
                 }
@@ -1572,6 +1720,14 @@ where
                 }
             }
         };
+
+        trace_packet(
+            "messenger-tcp",
+            "logical",
+            PacketDirection::Received,
+            Some(peer),
+            &logical,
+        );
 
         let request = parse_request(&logical, config.max_string_utf16_units)?;
         if matches!(request, MessengerRequest::EnterChatServer { .. }) {
@@ -1604,11 +1760,12 @@ async fn write_with_cancellation<W>(
     frame: &[u8],
     timeout: Duration,
     cancellation: &mut oneshot::Receiver<MessengerCancellation>,
+    peer: SocketAddr,
 ) -> Result<(), MessengerConnectionError>
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         cancelled = cancellation => Err(cancellation_error(&cancelled)),
         result = time::timeout(timeout, writer.write_all(frame)) => {
@@ -1616,7 +1773,19 @@ where
                 .map_err(|_| MessengerConnectionError::WriteTimeout)?
                 .map_err(MessengerConnectionError::Io)
         }
-    }
+    };
+    result?;
+    // Messenger outbound queues carry the 4-byte signed-length frame header;
+    // the packet trace deliberately records the logical payload to match the
+    // inbound side and the login TCP diagnostics after the write commits.
+    trace_packet(
+        "messenger-tcp",
+        "logical",
+        PacketDirection::Sent,
+        Some(peer),
+        frame.get(MESSENGER_FRAME_HEADER_LENGTH..).unwrap_or(frame),
+    );
+    Ok(())
 }
 
 fn cancellation_error(
@@ -1642,8 +1811,8 @@ mod tests {
     use p5136_core::{
         adler32,
         messenger::{
-            MessengerFrameError, encode_frame, parse_request, serialize_chat, serialize_guild_chat,
-            serialize_invite_chat, serialize_leave_chat,
+            MESSENGER_FRAME_HEADER_LENGTH, MessengerFrameError, encode_frame, parse_request,
+            serialize_chat, serialize_guild_chat, serialize_invite_chat, serialize_leave_chat,
         },
         packet::{PacketReader, PacketWriter},
     };
@@ -1660,6 +1829,7 @@ mod tests {
         MessengerCommitLease, MessengerConnectionError, MessengerRegistrationLease,
         MessengerRuntimeConfig, MessengerServiceHandle, MessengerServiceSnapshot,
         read_generation_fenced_messenger_frame, read_messenger_frame,
+        read_messenger_frame_with_diagnostics,
     };
     use crate::messenger_hub::{
         EnterClaim, MessengerHubError, MessengerHubLimits, MessengerIdentity, MessengerSessionId,
@@ -1991,13 +2161,39 @@ mod tests {
         };
 
         assert!(matches!(
-            read_generation_fenced_messenger_frame(&mut reader, MAXIMUM, generation.as_ref()).await,
+            read_generation_fenced_messenger_frame(&mut reader, MAXIMUM, generation.as_ref(), None)
+                .await,
             Err(MessengerConnectionError::Service(
                 super::MessengerServiceError::StaleIdentityGeneration
             ))
         ));
         assert_eq!(generation.load(Ordering::Acquire), 2);
         assert_eq!(reader.offset, 1);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reader_keeps_partial_messenger_frame_failure_typed() {
+        let (mut writer, mut reader) = duplex(16);
+        let frame = encode_frame(&[1, 2, 3, 4], MAXIMUM).unwrap();
+        writer
+            .write_all(&frame[..MESSENGER_FRAME_HEADER_LENGTH + 1])
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let error = read_messenger_frame_with_diagnostics(
+            &mut reader,
+            MAXIMUM,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 39_313)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MessengerConnectionError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[tokio::test]
