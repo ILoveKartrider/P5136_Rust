@@ -3,6 +3,7 @@
 pub mod adler32;
 pub mod bml;
 pub mod channel;
+pub mod club_query_protocol;
 pub mod crypto;
 pub mod datagram;
 pub mod dotnet_decimal;

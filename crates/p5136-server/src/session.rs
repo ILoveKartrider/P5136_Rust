@@ -11,6 +11,12 @@ use p5136_core::{
         parse_client_endpoint_report, parse_pq_channel_movein, parse_pq_channel_switch,
         resolve_channel_id, serialize_pr_channel_move_in, serialize_pr_channel_switch,
     },
+    club_query_protocol::{
+        ClubQueryProtocolError, ClubQueryRequest, classify_club_query_request,
+        parse_club_query_request, serialize_club_creation_unavailable_reply,
+        serialize_empty_club_list_count_reply, serialize_no_club_state_reply,
+        serialize_no_pending_club_join_reply, serialize_unavailable_waiting_crew_count_reply,
+    },
     equipment_protocol::{
         EquipmentProtocolError, EquipmentRequest, PlantPartEquipRequest, RiderItemSelection,
         classify_equipment_request, parse_equip_plant_part, parse_set_rider_items,
@@ -237,6 +243,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     RiderInfoProtocol(#[from] RiderInfoProtocolError),
+
+    #[error(transparent)]
+    ClubQueryProtocol(#[from] ClubQueryProtocolError),
 
     #[error(transparent)]
     MyRoomItemState(#[from] MyRoomItemStateError),
@@ -1632,6 +1641,9 @@ async fn dispatch_fail_closed_request(
     if hash == GET_RIDER_INFO_REQUEST_HASH {
         return Some(handle_get_rider_info_failure(world, packet, context).await);
     }
+    if classify_club_query_request(hash).is_some() {
+        return Some(handle_club_query(world, packet, context).await);
+    }
     if classify_shop_buy_request(hash).is_some() {
         return Some(handle_shop_buy_failure(world, packet, context).await);
     }
@@ -1654,6 +1666,33 @@ async fn handle_get_rider_info_failure(
     // Fail closed without logging the target, touching profile storage, or
     // publishing a request-specific World command.
     Ok(vec![serialize_get_rider_info_failure()])
+}
+
+async fn handle_club_query(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // Exact producer-shape validation precedes packet-specific identity and
+    // profile checks. Global stale-generation and shutdown admission remain
+    // outside this handler.
+    let request = parse_club_query_request(packet)?;
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+
+    // There is no authoritative club repository yet. Return only the
+    // consumer-evidenced empty/unavailable state without request-specific
+    // World commands, profile I/O, persistence, mutation, or peer fanout.
+    let response = match request.kind() {
+        ClubQueryRequest::CheckMyClubState => serialize_no_club_state_reply()?,
+        ClubQueryRequest::GetUserWaitingJoinClub => serialize_no_pending_club_join_reply()?,
+        ClubQueryRequest::CheckCreateClubCondition => serialize_club_creation_unavailable_reply(),
+        ClubQueryRequest::GetClubListCount => serialize_empty_club_list_count_reply(),
+        ClubQueryRequest::GetClubWaitingCrewCount => {
+            serialize_unavailable_waiting_crew_count_reply()
+        }
+    };
+    Ok(vec![response])
 }
 
 async fn handle_shop_buy_failure(
@@ -3209,6 +3248,11 @@ mod tests {
     use p5136_core::{
         adler32,
         channel::serialize_pr_channel_move_in,
+        club_query_protocol::{
+            ClubQueryProtocolError, ClubQueryRequest, serialize_club_creation_unavailable_reply,
+            serialize_empty_club_list_count_reply, serialize_no_club_state_reply,
+            serialize_no_pending_club_join_reply, serialize_unavailable_waiting_crew_count_reply,
+        },
         equipment_protocol::{
             EquipmentRequest, PlantPartEquipRequest, RiderItemSelection,
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
@@ -3411,6 +3455,43 @@ mod tests {
         let mut packet = PacketWriter::named(START_RIDER_SCHOOL_REQUEST_NAME);
         packet.write_encoded_u8(value);
         packet.into_inner()
+    }
+
+    fn exact_club_query_request(kind: ClubQueryRequest) -> Vec<u8> {
+        let mut packet = PacketWriter::named(kind.request_name());
+        match kind {
+            ClubQueryRequest::CheckMyClubState
+            | ClubQueryRequest::GetUserWaitingJoinClub
+            | ClubQueryRequest::CheckCreateClubCondition => {}
+            ClubQueryRequest::GetClubListCount => {
+                packet
+                    .write_utf16("ClubFilter")
+                    .expect("test club filter fits");
+                packet
+                    .write_utf16("MasterFilter")
+                    .expect("test master filter fits");
+            }
+            ClubQueryRequest::GetClubWaitingCrewCount => packet.write_u32(10_000),
+        }
+        packet.into_inner()
+    }
+
+    fn expected_club_query_reply(kind: ClubQueryRequest) -> Vec<u8> {
+        match kind {
+            ClubQueryRequest::CheckMyClubState => {
+                serialize_no_club_state_reply().expect("fixed strings fit")
+            }
+            ClubQueryRequest::GetUserWaitingJoinClub => {
+                serialize_no_pending_club_join_reply().expect("fixed string fits")
+            }
+            ClubQueryRequest::CheckCreateClubCondition => {
+                serialize_club_creation_unavailable_reply()
+            }
+            ClubQueryRequest::GetClubListCount => serialize_empty_club_list_count_reply(),
+            ClubQueryRequest::GetClubWaitingCrewCount => {
+                serialize_unavailable_waiting_crew_count_reply()
+            }
+        }
     }
 
     async fn bind_test_profile(
@@ -4606,8 +4687,201 @@ mod tests {
                 WorldError::OutboundProductionClosed
             ))
         ));
+        world.drain_sessions().await.unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn club_query_global_fences_precede_packet_specific_parsing() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(peer_ip, 49_717))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(peer_ip, 49_718))
+            .await
+            .unwrap();
+        let source_identity = world
+            .claim_identity(source, "ClubQueryFence")
+            .await
+            .unwrap();
+        let mut source_context = bind_test_profile(&profiles, &source_identity).await;
+        let source_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: source,
+        };
+        let request = exact_club_query_request(ClubQueryRequest::GetClubListCount);
+        let mut malformed = request.clone();
+        malformed.push(0x51);
+
+        let token = MigrationToken::new(0x5A15).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 14,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        let completion = world
+            .complete_migration(
+                destination,
+                source_identity.user_no,
+                14,
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        for packet in [&request, &malformed] {
+            assert!(matches!(
+                dispatch_packet(&source_services, packet, &mut source_context).await,
+                Err(LoginSessionError::World(WorldError::Identity(
+                    IdentityError::StaleSession(id)
+                ))) if id == source
+            ));
+        }
+
+        let destination_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: destination,
+        };
+        let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
+        world.quiesce().await.unwrap();
+        for packet in [&request, &malformed] {
+            assert!(matches!(
+                dispatch_packet(&destination_services, packet, &mut destination_context).await,
+                Err(LoginSessionError::World(
+                    WorldError::OutboundProductionClosed
+                ))
+            ));
+        }
 
         world.drain_sessions().await.unwrap();
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn club_queries_are_strict_read_only_and_preserve_the_live_session() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_717))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ClubQueryCaller")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+
+        let requests = [
+            ClubQueryRequest::CheckMyClubState,
+            ClubQueryRequest::GetUserWaitingJoinClub,
+            ClubQueryRequest::CheckCreateClubCondition,
+            ClubQueryRequest::GetClubListCount,
+            ClubQueryRequest::GetClubWaitingCrewCount,
+        ];
+        let mut unbound_context = SessionContext::default();
+        for kind in requests {
+            assert!(matches!(
+                dispatch_packet(
+                    &services,
+                    &exact_club_query_request(kind),
+                    &mut unbound_context
+                )
+                .await,
+                Err(LoginSessionError::ProfileNotBound)
+            ));
+        }
+
+        let mut trailing = exact_club_query_request(ClubQueryRequest::CheckMyClubState);
+        trailing.push(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, &trailing, &mut unbound_context).await,
+            Err(LoginSessionError::ClubQueryProtocol(
+                ClubQueryProtocolError::TrailingBytes {
+                    name,
+                    count: 1
+                }
+            )) if name == ClubQueryRequest::CheckMyClubState.request_name()
+        ));
+
+        let mut zero_code =
+            PacketWriter::named(ClubQueryRequest::GetClubWaitingCrewCount.request_name());
+        zero_code.write_u32(0);
+        assert!(matches!(
+            dispatch_packet(&services, zero_code.as_slice(), &mut unbound_context).await,
+            Err(LoginSessionError::ClubQueryProtocol(
+                ClubQueryProtocolError::ZeroClubCode
+            ))
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let in_memory_before = context.profile_for(&identity).unwrap().clone();
+        let store = ProfileStore::new(profile_root.path());
+        let durable_before = store.reload(&identity.nickname).unwrap();
+
+        for _ in 0..2 {
+            for kind in requests {
+                assert_eq!(
+                    dispatch_packet(&services, &exact_club_query_request(kind), &mut context)
+                        .await
+                        .unwrap(),
+                    vec![expected_club_query_reply(kind)],
+                    "{}",
+                    kind.request_name()
+                );
+            }
+        }
+
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+        assert_eq!(context.profile_for(&identity).unwrap(), &in_memory_before);
+
+        let server_time = PacketWriter::named("PqServerTime");
+        let follow_up = dispatch_packet(&services, server_time.as_slice(), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(
+            &follow_up[0][..4],
+            &adler32::packet_hash("PrServerTime").to_le_bytes()
+        );
+
+        let durable_after = store.reload(&identity.nickname).unwrap();
+        assert_eq!(durable_after.revision, durable_before.revision);
+        assert_eq!(durable_after.profile, durable_before.profile);
+
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
