@@ -291,6 +291,35 @@ impl MyRoomWirePlan {
     }
 }
 
+/// Minimal actor-minted authorization for one owner-item response.
+///
+/// Unrelated visitor churn is deliberately absent. Only the requester
+/// generation, membership owner, owner generation, and item-password policy
+/// can invalidate this plan while profile I/O runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomOwnerItemPlan {
+    requester: IdentityBinding,
+    owner: IdentityBinding,
+    visible: bool,
+}
+
+impl MyRoomOwnerItemPlan {
+    #[must_use]
+    pub(crate) fn requester(&self) -> &IdentityBinding {
+        &self.requester
+    }
+
+    #[must_use]
+    pub(crate) fn owner(&self) -> &IdentityBinding {
+        &self.owner
+    }
+
+    #[must_use]
+    pub(crate) const fn visible(&self) -> bool {
+        self.visible
+    }
+}
+
 /// Profile-fresh player presentation sealed to one actor-minted topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MyRoomWireProjection {
@@ -1368,6 +1397,64 @@ impl MyRoomHub {
         };
         let owner = OwnerKey(membership.owner);
         Ok(Some(self.wire_plan(identity, owner)?))
+    }
+
+    /// Mints the smallest topology and policy stamp needed to authorize an
+    /// owner-item read outside the actor.
+    pub(crate) fn owner_item_plan_if_member(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomOwnerItemPlan>, MyRoomHubError> {
+        let Some(membership) = self.membership_if_member(identity)? else {
+            return Ok(None);
+        };
+        let owner = OwnerKey(membership.owner);
+        let room = self.room(owner)?;
+        if room.owner.identity.user_no != owner.user_no() {
+            return Err(MyRoomInvariantViolation::WrongOwnerPresentation {
+                owner: owner.user_no(),
+                actual: room.owner.identity.user_no,
+            }
+            .into());
+        }
+        self.require_canonical_identity(&room.owner.identity)?;
+        Ok(Some(MyRoomOwnerItemPlan {
+            requester: identity.clone(),
+            owner: room.owner.identity.clone(),
+            visible: identity.user_no == owner.user_no() || room.info.use_item_password == 0,
+        }))
+    }
+
+    /// Revalidates only state that can change the owner-item result.
+    pub(crate) fn revalidate_owner_item_plan(
+        &self,
+        requester: &IdentityBinding,
+        plan: &MyRoomOwnerItemPlan,
+    ) -> Result<(), MyRoomHubError> {
+        if requester != plan.requester() {
+            return Err(MyRoomHubError::WirePlanRequesterMismatch {
+                planned_user_no: plan.requester.user_no,
+                planned_generation: plan.requester.generation.get(),
+                supplied_user_no: requester.user_no,
+                supplied_generation: requester.generation.get(),
+            });
+        }
+        let current = match self.owner_item_plan_if_member(requester) {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                return Err(MyRoomHubError::StaleWirePlan {
+                    owner: plan.owner.user_no,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if current == *plan {
+            Ok(())
+        } else {
+            Err(MyRoomHubError::StaleWirePlan {
+                owner: plan.owner.user_no,
+            })
+        }
     }
 
     /// Revalidates a returned wire plan after profile I/O. Expected requester
@@ -3695,6 +3782,142 @@ mod tests {
             MyRoomHubError::StaleGeneration { .. }
         ));
         assert!(!generation_error.is_wire_plan_stale());
+    }
+
+    #[test]
+    fn owner_item_plan_ignores_unrelated_visitor_topology_churn() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let requester = claim(&mut registry, 2, "Requester");
+        let unrelated = claim(&mut registry, 3, "Unrelated");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&requester), owner(&owner_id)).unwrap();
+        let plan = hub.owner_item_plan_if_member(&requester).unwrap().unwrap();
+
+        assert_eq!(plan.requester(), &requester);
+        assert_eq!(plan.owner(), &owner_id);
+        assert!(plan.visible());
+        hub.revalidate_owner_item_plan(&requester, &plan).unwrap();
+
+        enter(&mut hub, participant(&unrelated), owner(&owner_id)).unwrap();
+        hub.revalidate_owner_item_plan(&requester, &plan).unwrap();
+
+        leave(&mut hub, &unrelated).unwrap();
+        hub.revalidate_owner_item_plan(&requester, &plan).unwrap();
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn owner_item_plan_rejects_requester_generation_change() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let requester_g1 = claim(&mut registry, 2, "Requester");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&requester_g1), owner(&owner_id)).unwrap();
+        let plan = hub
+            .owner_item_plan_if_member(&requester_g1)
+            .unwrap()
+            .unwrap();
+
+        let requester_g2 = replacement_identity(&mut registry, 2, 3, "Requester");
+        let transition = hub
+            .advance_identity(&requester_g1, participant(&requester_g2))
+            .unwrap();
+        let _ = transition.commit(&mut hub).unwrap();
+
+        let error = hub
+            .revalidate_owner_item_plan(&requester_g2, &plan)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MyRoomHubError::WirePlanRequesterMismatch { .. }
+        ));
+        assert!(error.is_wire_plan_stale());
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn owner_item_plan_rejects_owner_generation_change() {
+        let mut registry = IdentityRegistry::new();
+        let owner_g1 = claim(&mut registry, 1, "Owner");
+        let requester = claim(&mut registry, 2, "Requester");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_g1), owner(&owner_g1)).unwrap();
+        enter(&mut hub, participant(&requester), owner(&owner_g1)).unwrap();
+        let plan = hub.owner_item_plan_if_member(&requester).unwrap().unwrap();
+
+        let owner_g2 = replacement_identity(&mut registry, 1, 3, "Owner");
+        let transition = hub
+            .advance_identity(&owner_g1, participant(&owner_g2))
+            .unwrap();
+        let _ = transition.commit(&mut hub).unwrap();
+
+        let error = hub
+            .revalidate_owner_item_plan(&requester, &plan)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MyRoomHubError::StaleWirePlan { owner } if owner == owner_g1.user_no
+        ));
+        assert!(error.is_wire_plan_stale());
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn owner_item_plan_rejects_membership_owner_change() {
+        let mut registry = IdentityRegistry::new();
+        let first_owner = claim(&mut registry, 1, "FirstOwner");
+        let second_owner = claim(&mut registry, 2, "SecondOwner");
+        let requester = claim(&mut registry, 3, "Requester");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&first_owner), owner(&first_owner)).unwrap();
+        enter(&mut hub, participant(&second_owner), owner(&second_owner)).unwrap();
+        enter(&mut hub, participant(&requester), owner(&first_owner)).unwrap();
+        let plan = hub.owner_item_plan_if_member(&requester).unwrap().unwrap();
+
+        enter(&mut hub, participant(&requester), owner(&second_owner)).unwrap();
+
+        let error = hub
+            .revalidate_owner_item_plan(&requester, &plan)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MyRoomHubError::StaleWirePlan { owner } if owner == first_owner.user_no
+        ));
+        assert!(error.is_wire_plan_stale());
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn owner_item_plan_rejects_item_password_visibility_change() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let requester = claim(&mut registry, 2, "Requester");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&requester), owner(&owner_id)).unwrap();
+        let plan = hub.owner_item_plan_if_member(&requester).unwrap().unwrap();
+        assert!(plan.visible());
+
+        let mut locked_info = hub.room_info(owner_id.user_no).unwrap().clone();
+        locked_info.use_item_password = 1;
+        locked_info.item_password = "locked".to_owned();
+        let transition = hub.update_owner_info(&owner_id, locked_info).unwrap();
+        let _ = transition.commit(&mut hub).unwrap();
+        let current = hub.owner_item_plan_if_member(&requester).unwrap().unwrap();
+        assert!(!current.visible());
+
+        let error = hub
+            .revalidate_owner_item_plan(&requester, &plan)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MyRoomHubError::StaleWirePlan { owner } if owner == owner_id.user_no
+        ));
+        assert!(error.is_wire_plan_stale());
+        hub.audit_invariants().unwrap();
     }
 
     #[test]

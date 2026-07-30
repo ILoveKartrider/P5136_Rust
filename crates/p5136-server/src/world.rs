@@ -18,8 +18,8 @@ use p5136_core::{
         serialize_start_room_reply,
     },
     myroom_protocol::{
-        MyRoomInfo, MyRoomProtocolError, MyRoomSlot, serialize_myroom_info, serialize_secede_reply,
-        serialize_slot_data,
+        MyRoomInfo, MyRoomProtocolError, MyRoomSlot, serialize_missing_owner_items,
+        serialize_myroom_info, serialize_secede_reply, serialize_slot_data,
     },
     nickname::canonical_nickname_key,
     race_protocol::{
@@ -70,9 +70,9 @@ use crate::identity::{
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 use crate::myroom_hub::{
-    MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError, MyRoomTransition,
-    MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError, RoomEffect as MyRoomEffect,
-    RoomPublication as MyRoomPublication,
+    MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError, MyRoomOwnerItemPlan,
+    MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError,
+    RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
 };
 use crate::myroom_persistence::{
     MigrationAcknowledgement, MigrationProfileCompletion, MyRoomCompletionBridge,
@@ -82,7 +82,9 @@ use crate::myroom_persistence::{
     RegisteredMyRoomInfoWrite,
 };
 use crate::operation_gate::{WireOperationGate, WireOperationGuard};
-use crate::profile_io::{DurableRewardReceipt, MyRoomProfileLease, ProfileJobAdmission};
+use crate::profile_io::{
+    DurableRewardReceipt, MyRoomProfileLease, ProfileJobAdmission, ProfileLanePermit,
+};
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
     UdpIngressBody, UdpService, UdpServiceError,
@@ -159,6 +161,11 @@ impl OutboundBatch {
         );
         self.operation = Some(operation);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_for_test(self, operation: WireOperationGuard) -> Self {
+        self.track(operation)
     }
 
     pub(crate) fn into_write_parts(self) -> (Vec<Vec<u8>>, Option<WireOperationGuard>) {
@@ -962,6 +969,92 @@ pub(crate) struct MyRoomPreparedCommand {
     projection: Option<MyRoomWireProjection>,
 }
 
+/// Profile-derived owner-item packets paired with the canonical profile lane
+/// and exact requester operation that produced them.
+#[derive(Debug)]
+pub(crate) struct MyRoomOwnerItemLoad {
+    owner: IdentityBinding,
+    packets: Vec<Vec<u8>>,
+    lane: ProfileLanePermit,
+}
+
+impl MyRoomOwnerItemLoad {
+    pub(crate) fn new(
+        owner: IdentityBinding,
+        packets: Vec<Vec<u8>>,
+        lane: ProfileLanePermit,
+    ) -> Self {
+        Self {
+            owner,
+            packets,
+            lane,
+        }
+    }
+}
+
+/// Actor-minted minimal authorization for one owner-item response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MyRoomOwnerItemsPlan {
+    expected: IdentityBinding,
+    owner: Option<MyRoomOwnerItemPlan>,
+}
+
+impl MyRoomOwnerItemsPlan {
+    pub(crate) fn expected_identity(&self) -> &IdentityBinding {
+        &self.expected
+    }
+
+    pub(crate) fn owner_identity(&self) -> Option<&IdentityBinding> {
+        self.owner.as_ref().map(MyRoomOwnerItemPlan::owner)
+    }
+
+    #[must_use]
+    pub(crate) fn owner_items_visible(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(MyRoomOwnerItemPlan::visible)
+    }
+
+    pub(crate) fn complete(
+        self,
+        loaded: Option<MyRoomOwnerItemLoad>,
+    ) -> Result<MyRoomPreparedOwnerItems, WorldError> {
+        match (&self.owner, &loaded) {
+            (None, None) => {}
+            (Some(plan), None) if !plan.visible() => {}
+            (Some(plan), Some(loaded)) if plan.visible() => {
+                if loaded.owner != *plan.owner()
+                    || canonical_nickname_key(loaded.lane.subject().nickname())
+                        != canonical_nickname_key(&plan.owner().nickname)
+                    || loaded.packets.is_empty()
+                {
+                    return Err(WorldError::MyRoomOwnerItemPlanMismatch {
+                        session: self.expected.owner,
+                    });
+                }
+            }
+            (Some(_), None | Some(_)) | (None, Some(_)) => {
+                return Err(WorldError::MyRoomOwnerItemPlanMismatch {
+                    session: self.expected.owner,
+                });
+            }
+        }
+        Ok(MyRoomPreparedOwnerItems {
+            expected: self.expected,
+            owner: self.owner,
+            loaded,
+        })
+    }
+}
+
+/// Actor-minted authorization plus a profile-lane-backed owner-item result.
+#[derive(Debug)]
+pub(crate) struct MyRoomPreparedOwnerItems {
+    expected: IdentityBinding,
+    owner: Option<MyRoomOwnerItemPlan>,
+    loaded: Option<MyRoomOwnerItemLoad>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MyRoomSessionRole {
     PresentOwner,
@@ -1043,6 +1136,11 @@ pub enum WorldError {
         "MyRoom live profile projection does not belong to the actor-minted plan for session {session:?}"
     )]
     MyRoomWireProjectionMismatch { session: SessionId },
+
+    #[error(
+        "MyRoom owner-item result does not belong to the actor-minted plan for session {session:?}"
+    )]
+    MyRoomOwnerItemPlanMismatch { session: SessionId },
 
     #[error("MyRoom profile lane for {actual:?} cannot refresh identity {expected:?}")]
     MyRoomProfileSubjectMismatch { expected: String, actual: String },
@@ -1509,10 +1607,19 @@ enum WorldCommand {
         session: SessionId,
         reply: oneshot::Sender<Result<MyRoomCommandPlan, WorldError>>,
     },
+    PrepareMyRoomOwnerItems {
+        session: SessionId,
+        reply: oneshot::Sender<Result<MyRoomOwnerItemsPlan, WorldError>>,
+    },
     MyRoom {
         session: SessionId,
         payload: MyRoomCommandPayload,
         prepared: Box<MyRoomPreparedCommand>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    PublishMyRoomOwnerItems {
+        session: SessionId,
+        prepared: Box<MyRoomPreparedOwnerItems>,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     RegisterMyRoomInfoWrite {
@@ -2454,6 +2561,18 @@ impl AdmittedWorldHandle<'_> {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn prepare_myroom_owner_items(
+        &self,
+    ) -> Result<MyRoomOwnerItemsPlan, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::PrepareMyRoomOwnerItems {
+            session: self.session_id(),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub(crate) async fn myroom_command(
         &self,
         payload: MyRoomCommandPayload,
@@ -2463,6 +2582,20 @@ impl AdmittedWorldHandle<'_> {
         self.send(WorldCommand::MyRoom {
             session: self.session_id(),
             payload,
+            prepared: Box::new(prepared),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn publish_myroom_owner_items(
+        &self,
+        prepared: MyRoomPreparedOwnerItems,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::PublishMyRoomOwnerItems {
+            session: self.session_id(),
             prepared: Box::new(prepared),
             reply,
         })
@@ -3902,6 +4035,18 @@ impl World {
         Ok(MyRoomCommandPlan { expected, wire })
     }
 
+    fn prepare_myroom_owner_items(
+        &self,
+        session: SessionId,
+    ) -> Result<MyRoomOwnerItemsPlan, WorldOperationError> {
+        let expected = self.authorize_session_operation(session)?;
+        let owner = self
+            .myroom
+            .owner_item_plan_if_member(&expected)
+            .map_err(|source| myroom_hub_error("owner-item plan query", source))?;
+        Ok(MyRoomOwnerItemsPlan { expected, owner })
+    }
+
     fn myroom_command(
         &mut self,
         session: SessionId,
@@ -3980,6 +4125,56 @@ impl World {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    fn publish_myroom_owner_items(
+        &mut self,
+        session: SessionId,
+        prepared: MyRoomPreparedOwnerItems,
+    ) -> Result<(), WorldOperationError> {
+        let identity = self.authorize_session_operation(session)?;
+        if identity != prepared.expected {
+            return Err(WorldError::MyRoomWirePlanStale { session }.into());
+        }
+
+        match prepared.owner.as_ref() {
+            Some(plan) => {
+                if let Err(source) = self.myroom.revalidate_owner_item_plan(&identity, plan) {
+                    if source.is_wire_plan_stale() {
+                        return Err(WorldError::MyRoomWirePlanStale { session }.into());
+                    }
+                    return Err(myroom_hub_error("owner-item plan revalidation", source).into());
+                }
+            }
+            None => {
+                match self
+                    .myroom
+                    .owner_item_plan_if_member(&identity)
+                    .map_err(|source| myroom_hub_error("owner-item plan query", source))?
+                {
+                    None => {}
+                    Some(_) => return Err(WorldError::MyRoomWirePlanStale { session }.into()),
+                }
+            }
+        }
+
+        let (packets, profile_lane) = match (prepared.owner.as_ref(), prepared.loaded) {
+            (None, None) => (vec![serialize_missing_owner_items()], None),
+            (Some(plan), None) if !plan.visible() => (vec![serialize_missing_owner_items()], None),
+            (Some(plan), Some(loaded)) if plan.visible() => (loaded.packets, Some(loaded.lane)),
+            (None | Some(_), Some(_)) | (Some(_), None) => {
+                return Err(WorldError::MyRoomOwnerItemPlanMismatch { session }.into());
+            }
+        };
+
+        let reserved = self
+            .try_reserve_myroom_outbound(vec![(session, OutboundBatch::ordered(packets))])
+            .map_err(|error| WorldError::MyRoomCommandOutboundUnavailable {
+                session: error.session,
+            })?;
+        Self::publish_reserved(reserved);
+        drop(profile_lane);
         Ok(())
     }
 
@@ -4173,7 +4368,7 @@ impl World {
         else {
             return Ok(None);
         };
-        let info =
+        let mut info =
             self.myroom
                 .room_info(membership.owner)
                 .cloned()
@@ -4188,6 +4383,10 @@ impl World {
         } else {
             MyRoomSessionRole::Visitor
         };
+        if role == MyRoomSessionRole::Visitor {
+            info.room_password.clear();
+            info.item_password.clear();
+        }
         Ok(Some(MyRoomSessionView { role, info }))
     }
 
@@ -9072,7 +9271,9 @@ async fn dispatch_unwrapped_command(
         } => dispatch_rider_equipment_registration(world, session, prepared, request_reply, reply)?,
         command @ (WorldCommand::MyRoomSessionView { .. }
         | WorldCommand::PrepareMyRoom { .. }
+        | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::MyRoom { .. }
+        | WorldCommand::PublishMyRoomOwnerItems { .. }
         | WorldCommand::DrainSessions { .. }) => {
             dispatch_guarded_world_command(world, sidecars, command).await?;
         }
@@ -9116,6 +9317,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
         | WorldCommand::PublishRoomEquipment { reply, .. }
         | WorldCommand::LeaveRoom { reply, .. }
         | WorldCommand::MyRoom { reply, .. }
+        | WorldCommand::PublishMyRoomOwnerItems { reply, .. }
         | WorldCommand::RetryRewardDeadLetter { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
@@ -9147,6 +9349,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
         | WorldCommand::DrainOutboundProducers { .. }
         | WorldCommand::DrainSessions { .. }
         | WorldCommand::PrepareMyRoom { .. }
+        | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::RegisterMyRoomInfoWrite { .. }
         | WorldCommand::RegisterRiderEquipmentWrite { .. }
         | WorldCommand::MyRoomSessionView { .. }
@@ -9203,6 +9406,10 @@ async fn dispatch_guarded_world_command(
             let result = world.prepare_myroom_command(session);
             reply_after_world_operation(world, sidecars, reply, result).await
         }
+        WorldCommand::PrepareMyRoomOwnerItems { session, reply } => {
+            let result = world.prepare_myroom_owner_items(session);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
         WorldCommand::MyRoom {
             session,
             payload,
@@ -9210,6 +9417,14 @@ async fn dispatch_guarded_world_command(
             reply,
         } => {
             let result = world.myroom_command(session, payload, *prepared);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        WorldCommand::PublishMyRoomOwnerItems {
+            session,
+            prepared,
+            reply,
+        } => {
+            let result = world.publish_myroom_owner_items(session, *prepared);
             reply_after_world_operation(world, sidecars, reply, result).await
         }
         WorldCommand::DrainSessions { reply } => {
@@ -9436,7 +9651,9 @@ async fn dispatch_utility_command(
         | WorldCommand::Lobby { .. }
         | WorldCommand::Race { .. }
         | WorldCommand::PrepareMyRoom { .. }
+        | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::MyRoom { .. }
+        | WorldCommand::PublishMyRoomOwnerItems { .. }
         | WorldCommand::RegisterMyRoomInfoWrite { .. }
         | WorldCommand::RegisterRiderEquipmentWrite { .. }
         | WorldCommand::MyRoomSessionView { .. }
@@ -9482,6 +9699,7 @@ pub(crate) mod test_support {
         world: &mut World,
         nickname: &str,
         source_port: u16,
+        outbound_capacity: usize,
     ) -> (SessionId, IdentityBinding, mpsc::Receiver<OutboundBatch>) {
         let source_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
@@ -9497,7 +9715,7 @@ pub(crate) mod test_support {
             .identities
             .begin_migration(source, channel, token, Instant::now())
             .unwrap();
-        let (outbound, receiver) = mpsc::channel(SESSION_OUTBOUND_CAPACITY);
+        let (outbound, receiver) = mpsc::channel(outbound_capacity);
         let destination = world
             .register_session(
                 SocketAddr::new(source_ip, source_port + 1),
@@ -9581,11 +9799,22 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn spawn_myroom_world(owner_info: MyRoomInfo) -> MyRoomWorld {
+        spawn_myroom_world_with_outbound_capacity(owner_info, SESSION_OUTBOUND_CAPACITY)
+    }
+
+    pub(crate) fn spawn_myroom_world_with_outbound_capacity(
+        owner_info: MyRoomInfo,
+        outbound_capacity: usize,
+    ) -> MyRoomWorld {
         let mut world = World::default();
         let (owner_session, owner_identity, owner_outbound) =
-            register_channel_session(&mut world, "SessionMyRoomOwner", 47_000);
-        let (visitor_session, visitor_identity, visitor_outbound) =
-            register_channel_session(&mut world, "SessionMyRoomVisitor", 47_100);
+            register_channel_session(&mut world, "SessionMyRoomOwner", 47_000, outbound_capacity);
+        let (visitor_session, visitor_identity, visitor_outbound) = register_channel_session(
+            &mut world,
+            "SessionMyRoomVisitor",
+            47_100,
+            outbound_capacity,
+        );
         let owner = MyRoomOwner::new(myroom_participant(&owner_identity), owner_info).unwrap();
         world
             .myroom
@@ -9647,8 +9876,12 @@ pub(crate) mod test_support {
 
         for (index, nickname) in nicknames.iter().enumerate() {
             let source_port = 46_000 + u16::try_from(index * 2).unwrap();
-            let (session, identity, mut outbound) =
-                register_channel_session(&mut world, nickname, source_port);
+            let (session, identity, mut outbound) = register_channel_session(
+                &mut world,
+                nickname,
+                source_port,
+                SESSION_OUTBOUND_CAPACITY,
+            );
             world
                 .room_protocol(
                     session,
@@ -9786,8 +10019,9 @@ mod tests {
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
         },
         myroom_protocol::{
-            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot, serialize_myroom_info,
-            serialize_secede_reply, serialize_slot_data,
+            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot,
+            serialize_missing_owner_items, serialize_myroom_info, serialize_secede_reply,
+            serialize_slot_data,
         },
         nickname::canonical_nickname_key,
         race_protocol::{
@@ -16367,6 +16601,40 @@ mod tests {
             None
         );
         world.myroom.audit_invariants().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_myroom_owner_item_ack_still_publishes_the_actor_owned_batch() {
+        let mut world = World::default();
+        let mut outsider =
+            register_channel_session(&mut world, "DroppedItemAckOutsider", 67, 56_105, 1);
+        let plan = world.prepare_myroom_owner_items(outsider.session).unwrap();
+        let prepared = plan.complete(None).unwrap();
+        let (reply, response) = oneshot::channel();
+        drop(response);
+
+        assert!(
+            !dispatch_command(
+                &mut world,
+                WorldCommand::PublishMyRoomOwnerItems {
+                    session: outsider.session,
+                    prepared: Box::new(prepared),
+                    reply,
+                },
+                &WorldSidecars::default(),
+                &ServerClock::new(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            take_single_packet(&mut outsider.outbound),
+            serialize_missing_owner_items()
+        );
+        assert!(matches!(
+            outsider.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

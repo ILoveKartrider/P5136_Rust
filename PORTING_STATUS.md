@@ -27,12 +27,48 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Committed baseline before the current tranche:
-`4f4a1d5 Document graceful wire drain checkpoint`
+`c18d0ad Harden identity and migration generation fences`
 
 ## Current Rust checkpoint
 
-The current worktree closes the active-operation and migration-publication
-gaps identified after the C# stability review.
+The current worktree builds on the exact-generation operation and migration
+checkpoint and closes the MyRoom `RequestItems` vertical slice identified by
+the C# stability review.
+
+### MyRoom RequestItems
+
+- The hash-only request is classified explicitly and parsed strictly before
+  actor or profile work. Trailing bytes are a typed protocol error and cannot
+  publish a partial response.
+- The World actor mints a minimal plan containing the exact requester
+  generation, membership owner, exact owner generation, and item-visibility
+  policy. Unrelated visitor churn does not invalidate or repeat a large
+  profile read.
+- The owner sidecars are read under the canonical owner profile lane and a
+  retained child of the requester's exact identity operation. The disk result
+  is itself typed to the planned owner binding; cancellation cannot let
+  migration drain before the worker finishes.
+- `TuneData.json`, `NewKart.json`, and `PartsData.json` are bounded by file,
+  record, aggregate packet, and aggregate response-byte limits. The unused
+  `Parts12Data.json` is not read.
+- The actor revalidates requester, membership, owner generation, and
+  visibility after profile I/O, then reserves and publishes the full ordered
+  response in one outbound batch. Stale authorization retries at most three
+  times; queue backpressure is typed and cannot publish a prefix.
+- Every ordered login response has one aggregate write deadline. A slow-drip
+  peer cannot multiply the configured timeout by the RequestItems packet
+  count while retaining request, identity, outbound, or shutdown guards.
+- Missing owners receive only the zero-count enchant packet. An existing owner
+  with no items receives the distinct explicit empty owner-item packet.
+- The C# kart-empty early return loses valid parts. Rust deliberately fixes
+  this data-loss defect: a parts-only inventory is serialized normally.
+- A visitor may read a public owner inventory. When `use_item_password != 0`,
+  the current request has no credential/capability to validate, so Rust
+  conservatively denies the visitor before disk I/O while still allowing the
+  owner. Integrated visitor info responses retain policy flags but redact raw
+  room and item passwords. The eventual password flow must replace this
+  conservative denial with an actor-minted capability rather than exposing or
+  comparing packet-supplied plaintext.
 
 ### Exact-generation operation ownership
 
@@ -104,8 +140,8 @@ gaps identified after the C# stability review.
   by run/user/attempt identity.
 - MyRoom actor state includes bounded entry topology and generation-aware
   migration/disconnect cleanup. Production dispatch currently integrates
-  fresh FirstState projection, owner-info durability, and Secede;
-  RequestItems and direct/random/re-enter are still missing.
+  fresh FirstState projection, owner-info durability, bounded RequestItems,
+  and Secede; direct/random/re-enter are still missing.
 - Rider equipment/plant persistence is cancellation-independent and refreshes
   the actor caches only after durable confirmation.
 - Graceful shutdown drains wire admission, accepted durable work, completion
@@ -138,6 +174,13 @@ these areas:
 - Bounds are enforced before variable-size allocation where Rust owns the
   decoder. The audit's broader C# "checksum before allocation" wording is not
   treated as a compatibility rule.
+- RequestItems never publishes Tune chunks before later sidecar validation,
+  never reads unused Parts12 data, never uses the C# process-global
+  `PreventItem` race, and never drops parts merely because the kart list is
+  empty.
+- Visitor-facing integrated MyRoom info does not disclose stored room/item
+  passwords. Protected owner-item reads are denied without disk access until a
+  real password capability is implemented.
 
 ## Non-negotiable invariants
 
@@ -177,11 +220,11 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 583 passed, 0 failed
+# 598 passed, 0 failed
 git diff --check
 ```
 
-The 583 tests comprise 9 CLI, 35 connector, 133 core, 80 profile, 318 server
+The 598 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 332 server
 unit, and 8 server integration tests. Doc-tests also passed.
 
 Focused regressions cover:
@@ -197,6 +240,12 @@ Focused regressions cover:
 - cross-World capability rejection on ordinary and durable paths;
 - typed zero-capacity World startup and observable actor termination;
 - malformed room/race packets before mutation;
+- exact MyRoom owner-item packets for owner, visitor, empty owner, and missing
+  owner, plus strict malformed input;
+- owner-item generation/topology/visibility revalidation, requester
+  cancellation, dropped ACK, and atomic queue backpressure;
+- aggregate multi-packet write timeout, guard drain, exact packet order, and
+  IV progression;
 - bounded ready-output flushing.
 
 Production Rust contains no `unsafe` syntax; the workspace also forbids it.
@@ -221,11 +270,11 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Finish direct/random/re-enter, RequestItems TCP dispatch/publication,
-   character-position and chat fanout, password/emblem flows, main-emblem
-   persistence, P2P-port profile writes, club create/rename refresh, and any
-   request still intentionally classified as a no-op. Finish kart
-   tuning/upgrades and the remaining quest/attendance/progression surface.
+   Finish direct/random/re-enter, character-position and chat fanout, the
+   actor-minted password capability and emblem flows, main-emblem persistence,
+   P2P-port profile writes, club create/rename refresh, and any request still
+   intentionally classified as a no-op. Finish kart tuning/upgrades and the
+   remaining quest/attendance/progression surface.
 
 4. **Evidence-dependent packet behavior**
 

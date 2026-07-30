@@ -31,7 +31,10 @@ Room admission, first-state, messenger, and UDP/P2P runtime flows are
 integrated. UDP authorization and room audience selection run inside the world
 actor so channel migration cannot race a stale relay decision. Human
 ready/loading, race start, finish, ranking, settlement, reward persistence, and
-the MyRoom FirstState/owner-info/Secede paths are also actor-integrated.
+the MyRoom FirstState/owner-info/RequestItems/Secede paths are also
+actor-integrated. RequestItems loads a bounded owner snapshot under the
+canonical profile lane and publishes its complete ordered response as one
+actor-owned queue batch.
 Migration freezes and drains exact generation-bound operation
 leases, then crosses a pre-reserved ACK and result-free
 identity/MyRoom/protocol commit boundary. Messenger frames are rechecked across

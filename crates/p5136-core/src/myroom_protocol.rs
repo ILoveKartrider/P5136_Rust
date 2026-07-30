@@ -196,8 +196,8 @@ pub struct MyRoomParts {
 /// Exact allocation plan for the complete owner-item response.
 ///
 /// The plan includes both enchant packets and kart/parts packets, including
-/// the original server's early-return behavior that emits one empty owner-item
-/// packet and omits every parts record when the kart collection is empty.
+/// the explicit empty owner-item packet used when both the kart and parts
+/// collections are empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MyRoomOwnerItemWirePlan {
     packet_count: usize,
@@ -559,8 +559,10 @@ pub fn plan_owner_item_packets(
         OWNER_TUNE_WIRE_LENGTH,
     )?;
 
-    let (item_packets, item_bytes) = if kart_count == 0 {
-        // The early-return packet deliberately omits every parts record.
+    let (item_packets, item_bytes) = if kart_count == 0 && parts_count == 0 {
+        // An owner with no kart or parts still receives one explicit empty
+        // owner-item packet. This keeps an empty inventory distinct from a
+        // missing owner, which uses `RmOwnerItemEnchantPacket` instead.
         (1, OWNER_ITEM_PACKET_OVERHEAD)
     } else {
         let kart_packets = kart_count.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
@@ -625,9 +627,9 @@ pub fn plan_owner_item_packets(
 ///
 /// Packet ordinals are global across both item types while the first two
 /// counters are local to their type. P5136 deliberately excludes the later
-/// `Parts12` form. It also preserves the original server's early-return quirk:
-/// when no kart exists, one 28-byte empty body is emitted and every parts
-/// entry is omitted.
+/// `Parts12` form. An owner with neither karts nor parts receives one explicit
+/// empty packet. Unlike the C# implementation, a parts-only inventory is not
+/// discarded merely because the kart collection is empty.
 pub fn serialize_owner_items(
     karts: &[MyRoomKart],
     parts: &[MyRoomParts],
@@ -636,7 +638,7 @@ pub fn serialize_owner_items(
     checked_collection_len("kart", karts.len())?;
     checked_collection_len("parts", parts.len())?;
 
-    if karts.is_empty() {
+    if karts.is_empty() && parts.is_empty() {
         let mut packet = PacketWriter::named(OWNER_ITEM_NAME);
         packet.write_i32(1);
         packet.write_i32(1);
@@ -1361,14 +1363,35 @@ mod tests {
     }
 
     #[test]
-    fn empty_owner_karts_preserve_the_p5136_early_return_and_omit_parts() {
+    fn parts_only_owner_inventory_is_not_discarded_when_karts_are_empty() {
         let parts = [MyRoomParts {
             item_id: 5136,
+            serial_number: 7,
             ..MyRoomParts::default()
         }];
         let packets = serialize_owner_items(&[], &parts, false).unwrap();
         assert_eq!(packets.len(), 1);
         assert_eq!(adler32::packet_hash(OWNER_ITEM_NAME), 998_114_993);
+
+        let mut reader = PacketReader::new(&packets[0]);
+        assert_eq!(reader.read_u32().unwrap(), 998_114_993);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 5136);
+        assert_eq!(reader.read_i16().unwrap(), 7);
+        assert_eq!(reader.read_bytes(36).unwrap().len(), 36);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert!(reader.remaining().is_empty());
+    }
+
+    #[test]
+    fn completely_empty_owner_inventory_keeps_the_explicit_empty_packet() {
+        let packets = serialize_owner_items(&[], &[], false).unwrap();
+        assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].len(), 4 + 28);
 
         let mut reader = PacketReader::new(&packets[0]);

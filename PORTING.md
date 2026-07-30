@@ -74,7 +74,9 @@ been demonstrated.
 - [x] fresh MyRoom FirstState projection
 - [x] durable owner-info update and exact owner echo
 - [x] MyRoom Secede behavior
-- [ ] MyRoom RequestItems TCP dispatch and publication
+- [x] bounded MyRoom RequestItems TCP dispatch and atomic publication
+- [x] exact requester/owner-generation item authorization and stale-plan retry
+- [x] visitor MyRoom secret redaction and conservative protected-item denial
 - [x] race start/grid/readiness with deterministic fallback track
 - [ ] live track-pool/mode/random-track control surface
 - [x] finish, ranking, settlement, team booster, and DNF deadline

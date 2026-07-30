@@ -38,9 +38,9 @@ use p5136_core::{
     },
     myroom_protocol::{
         MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest,
-        classify_myroom_request, parse_first_request, parse_secede_request, parse_update_info,
-        plan_owner_item_packets, serialize_myroom_info, serialize_owner_item_enchants,
-        serialize_owner_items,
+        classify_myroom_request, parse_first_request, parse_request_items, parse_secede_request,
+        parse_update_info, plan_owner_item_packets, serialize_myroom_info,
+        serialize_owner_item_enchants, serialize_owner_items,
     },
     packet::PacketError,
     race_protocol::{
@@ -93,8 +93,8 @@ use crate::{
     },
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
-        MyRoomSessionRole, OutboundBatch, RaceCommandPayload, RoomCommandPayload, RoomParticipant,
-        StartRoomPlan,
+        MyRoomOwnerItemLoad, MyRoomSessionRole, OutboundBatch, RaceCommandPayload,
+        RoomCommandPayload, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -106,6 +106,7 @@ const MAX_MYROOM_OWNER_ITEM_PACKETS: usize =
     3 * MAX_MYROOM_ITEM_RECORDS.div_ceil(MYROOM_ITEM_CHUNK_SIZE);
 const MAX_MYROOM_OWNER_ITEM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MYROOM_WIRE_PLAN_ATTEMPTS: usize = 3;
+const MYROOM_OWNER_ITEM_READ_OPERATION: &str = "load MyRoom owner items";
 
 enum SessionReadEvent {
     Outbound(Option<OutboundBatch>),
@@ -347,6 +348,8 @@ pub(crate) struct ProfileCoordinator {
     catalog: Option<Arc<CatalogInventory>>,
     #[cfg(test)]
     blocking_update_hook: Option<Arc<BlockingUpdateHook>>,
+    #[cfg(test)]
+    blocking_owner_item_hook: Option<Arc<BlockingUpdateHook>>,
 }
 
 /// A fully serialized owner-item response that has passed the server's
@@ -419,13 +422,6 @@ impl MyRoomOwnerItemPacketBatch {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the pending MyRoom session-dispatch integration"
-        )
-    )]
     fn into_packets(self) -> Vec<Vec<u8>> {
         self.packets
     }
@@ -456,6 +452,8 @@ impl ProfileCoordinator {
             catalog,
             #[cfg(test)]
             blocking_update_hook: None,
+            #[cfg(test)]
+            blocking_owner_item_hook: None,
         }
     }
 
@@ -478,6 +476,12 @@ impl ProfileCoordinator {
     #[cfg(test)]
     fn with_blocking_update_hook(mut self, hook: Arc<BlockingUpdateHook>) -> Self {
         self.blocking_update_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_blocking_owner_item_hook(mut self, hook: Arc<BlockingUpdateHook>) -> Self {
+        self.blocking_owner_item_hook = Some(hook);
         self
     }
 
@@ -620,21 +624,21 @@ impl ProfileCoordinator {
         Ok((profile, info, lane))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the pending MyRoom session-dispatch integration"
-        )
-    )]
     async fn load_myroom_owner_items(
         &self,
         nickname: String,
         admission: ProfileJobAdmission,
     ) -> Result<(MyRoomOwnerItemPacketBatch, ProfileLanePermit), LoginSessionError> {
         Self::ensure_admitted_subject(&admission, &nickname)?;
+        #[cfg(test)]
+        let blocking_owner_item_hook = self.blocking_owner_item_hook.clone();
         let completed = admission
             .run("load MyRoom owner items", move |store, _, subject| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_owner_item_hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
                 if !store.profile_exists(subject.nickname())? {
                     return Err(LoginSessionError::ProfileCreationDenied { nickname });
                 }
@@ -1254,10 +1258,7 @@ where
 {
     let responses =
         dispatch_packet_admitted(services, packet, context, operation.identity()).await?;
-    for response in responses {
-        write_logical_packet(writer, &response, send_iv, services.config).await?;
-    }
-    Ok(())
+    write_logical_packets(writer, &responses, send_iv, services.config).await
 }
 
 async fn write_outbound_batch<W>(
@@ -1270,23 +1271,32 @@ where
     W: AsyncWrite + Unpin,
 {
     let (packets, _operation) = batch.into_write_parts();
-    for packet in packets {
-        write_logical_packet(writer, &packet, send_iv, config).await?;
-    }
-    Ok(())
+    write_logical_packets(writer, &packets, send_iv, config).await
 }
 
-async fn write_logical_packet<W>(
+/// Writes one ordered logical response under one aggregate deadline.
+///
+/// A batch may contain thousands of small packets. Resetting the timeout for
+/// every packet would let a slow-drip peer retain request and outbound
+/// operation guards for `packet_count * timeout`.
+async fn write_logical_packets<W>(
     writer: &mut W,
-    packet: &[u8],
+    packets: &[Vec<u8>],
     send_iv: &mut u32,
     config: &ServerConfig,
 ) -> Result<(), LoginSessionError>
 where
     W: AsyncWrite + Unpin,
 {
-    let wire = frame::encode_encrypted(packet, send_iv, config.max_login_payload)?;
-    write_session_bytes(writer, &wire, config.session_write_timeout).await
+    time::timeout(config.session_write_timeout, async {
+        for packet in packets {
+            let wire = frame::encode_encrypted(packet, send_iv, config.max_login_payload)?;
+            writer.write_all(&wire).await?;
+        }
+        Ok::<(), LoginSessionError>(())
+    })
+    .await
+    .map_err(|_| LoginSessionError::WriteTimeout)?
 }
 
 async fn dispatch_packet_admitted(
@@ -1668,6 +1678,11 @@ async fn handle_myroom_request(
             .await?;
             return Ok(Vec::new());
         }
+        MyRoomRequest::RequestItems => {
+            parse_request_items(packet)?;
+            execute_myroom_owner_items(world, profiles, session_id, context).await?;
+            return Ok(Vec::new());
+        }
         MyRoomRequest::Secede => {
             parse_secede_request(packet)?;
             execute_live_myroom_command(
@@ -1719,6 +1734,54 @@ async fn handle_myroom_request(
         "applied durable MyRoom owner info to the bound session profile"
     );
     Ok(Vec::new())
+}
+
+async fn execute_myroom_owner_items(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    context: &SessionContext,
+) -> Result<(), LoginSessionError> {
+    for attempt in 0..MAX_MYROOM_WIRE_PLAN_ATTEMPTS {
+        let plan = world.prepare_myroom_owner_items().await?;
+        let _ = context.profile_for(plan.expected_identity())?;
+        let loaded = if plan.owner_items_visible() {
+            let owner = plan
+                .owner_identity()
+                .ok_or(WorldError::MyRoomOwnerItemPlanMismatch {
+                    session: session_id,
+                })?
+                .clone();
+            let owner_nickname = owner.nickname.clone();
+            let admission = profiles
+                .admit_for_operation(
+                    world.operation(),
+                    &owner_nickname,
+                    MYROOM_OWNER_ITEM_READ_OPERATION,
+                )
+                .await?;
+            let (batch, lane) = profiles
+                .load_myroom_owner_items(owner_nickname, admission)
+                .await?;
+            Some(MyRoomOwnerItemLoad::new(owner, batch.into_packets(), lane))
+        } else {
+            None
+        };
+        let prepared = plan.complete(loaded)?;
+        match world.publish_myroom_owner_items(prepared).await {
+            Err(WorldError::MyRoomWirePlanStale { .. })
+                if attempt + 1 < MAX_MYROOM_WIRE_PLAN_ATTEMPTS =>
+            {
+                tracing::trace!(
+                    session_id = session_id.get(),
+                    attempt = attempt + 1,
+                    "retrying MyRoom owner items after authorization changed during profile I/O"
+                );
+            }
+            result => return Ok(result?),
+        }
+    }
+    unreachable!("the bounded MyRoom owner-item plan loop always returns on its final attempt")
 }
 
 async fn execute_live_myroom_command(
@@ -2422,8 +2485,11 @@ mod tests {
         array,
         fmt::Write as _,
         fs,
+        future::Future,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        pin::Pin,
         sync::Arc,
+        task::{Context, Poll},
         time::{Duration, Instant},
     };
 
@@ -2438,8 +2504,10 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomProtocolError,
-            MyRoomSlot, OWNER_ITEM_NAME, plan_owner_item_packets, serialize_myroom_info,
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart,
+            MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
+            REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_missing_owner_items,
+            serialize_myroom_info, serialize_owner_item_enchants, serialize_owner_items,
             serialize_secede_reply, serialize_slot_data,
         },
         packet::{PacketReader, PacketWriter},
@@ -2457,7 +2525,7 @@ mod tests {
         CatalogInventory, EquipmentExceptions, GrantedKart, MyRoomItemStateError, Profile,
         ProfileStore, rider_item_snapshot,
     };
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
     use tokio::sync::{mpsc, oneshot};
     use tokio::time;
 
@@ -2470,16 +2538,59 @@ mod tests {
         handle_get_rider, handle_lobby_request, handle_race_request, handle_room_request,
         myroom_player_slot_from_profile, myroom_profile_presentation, read_encrypted_frame,
         read_session_frame, room_participant_from_profile, room_physics_metadata,
-        select_session_read_event, update_game_options, write_session_bytes,
+        select_session_read_event, update_game_options, write_outbound_batch, write_session_bytes,
     };
     use crate::equipment_persistence::validate_rider_item_selection;
+    use crate::operation_gate::WireOperationGate;
     use crate::profile_io::MyRoomProfileLease;
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
         WorldError, WorldHandle,
-        world::test_support::spawn_myroom_world,
+        world::test_support::{spawn_myroom_world, spawn_myroom_world_with_outbound_capacity},
         world::{OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload},
     };
+
+    struct DelayedPacketWriter {
+        delay: Duration,
+        pending: Option<Pin<Box<time::Sleep>>>,
+    }
+
+    impl DelayedPacketWriter {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                pending: None,
+            }
+        }
+    }
+
+    impl AsyncWrite for DelayedPacketWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let sleep = this
+                .pending
+                .get_or_insert_with(|| Box::pin(time::sleep(this.delay)));
+            match sleep.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    this.pending = None;
+                    Poll::Ready(Ok(buffer.len()))
+                }
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn test_catalog() -> Arc<CatalogInventory> {
         const GRANT_CATEGORIES: &[u16] = &[
@@ -2947,6 +3058,75 @@ mod tests {
         let (mut writer, _reader) = duplex(1);
         let result = write_session_bytes(&mut writer, &[0_u8; 64], Duration::from_millis(20)).await;
         assert!(matches!(result, Err(LoginSessionError::WriteTimeout)));
+    }
+
+    #[tokio::test]
+    async fn ordered_batch_has_one_write_deadline_and_releases_shutdown_guards() {
+        let operations = WireOperationGate::new();
+        let request = operations.try_begin_request().unwrap();
+        let outbound = operations.try_begin_outbound().unwrap();
+        let batch = OutboundBatch::ordered(vec![vec![0x51; 4]; 3]).track_for_test(outbound);
+        assert_eq!(operations.close_request_admission(), 1);
+        assert_eq!(operations.close_outbound_admission(), 1);
+
+        let config = ServerConfig {
+            session_write_timeout: Duration::from_millis(45),
+            ..ServerConfig::default()
+        };
+        let mut writer = DelayedPacketWriter::new(Duration::from_millis(20));
+        let mut send_iv = 0x1234_5678;
+        let result = async {
+            let _request = request;
+            write_outbound_batch(&mut writer, batch, &mut send_iv, &config).await
+        }
+        .await;
+        assert!(matches!(result, Err(LoginSessionError::WriteTimeout)));
+        assert_eq!(operations.active_counts().requests, 0);
+        assert_eq!(operations.active_counts().outbound, 0);
+        assert!(
+            time::timeout(
+                Duration::from_millis(50),
+                operations.wait_for_request_drain_or_bypass(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            time::timeout(
+                Duration::from_millis(50),
+                operations.wait_for_outbound_drain_or_bypass(),
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_batch_success_preserves_packet_order_and_iv_progression() {
+        let expected = vec![
+            vec![0x51, 0x36, 0x00, 0x01],
+            vec![0x51, 0x36, 0x00, 0x02, 0x03],
+            vec![0x51, 0x36, 0x00, 0x04, 0x05, 0x06],
+        ];
+        let batch = OutboundBatch::ordered(expected.clone());
+        let config = ServerConfig::default();
+        let (mut writer, mut reader) = duplex(4_096);
+        let initial_iv = 0x1357_2468;
+        let mut send_iv = initial_iv;
+        write_outbound_batch(&mut writer, batch, &mut send_iv, &config)
+            .await
+            .unwrap();
+
+        let mut receive_iv = initial_iv;
+        for packet in expected {
+            assert_eq!(
+                read_encrypted_frame(&mut reader, &mut receive_iv, DEFAULT_MAX_PAYLOAD)
+                    .await
+                    .unwrap(),
+                packet
+            );
+        }
+        assert_eq!(receive_iv, send_iv);
     }
 
     #[tokio::test]
@@ -3632,11 +3812,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn myroom_info_dispatch_is_silent_for_nonmember_and_skips_visitor_body() {
+    async fn myroom_info_dispatch_redacts_visitor_secrets_and_skips_visitor_body() {
         let initial = MyRoomInfo {
             room_id: 17,
             bgm: 3,
+            use_room_password: 1,
             room_password: "initial room".to_owned(),
+            use_item_password: 1,
+            item_password: "initial item".to_owned(),
             ..MyRoomInfo::default()
         };
         let fixture = spawn_myroom_world(initial.clone());
@@ -3658,6 +3841,9 @@ mod tests {
             session_id: visitor.session,
         };
         let malformed_visitor_packet = PacketWriter::named("RmNotiMyRoomInfoPacket").into_inner();
+        let mut redacted = initial.clone();
+        redacted.room_password.clear();
+        redacted.item_password.clear();
         assert_eq!(
             dispatch_packet(
                 &visitor_services,
@@ -3666,8 +3852,8 @@ mod tests {
             )
             .await
             .unwrap(),
-            vec![serialize_myroom_info(&initial).unwrap()],
-            "a visitor receives the owner's current info without parsing its malformed body"
+            vec![serialize_myroom_info(&redacted).unwrap()],
+            "a visitor receives policy flags but never the owner's raw secrets"
         );
 
         let outsider_session = world
@@ -3695,6 +3881,452 @@ mod tests {
             .unwrap()
             .is_empty(),
             "a nonmember is ignored before its malformed body is parsed"
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exact ordered response test keeps disk fixtures, wire expectations, and both requester roles together"
+    )]
+    async fn myroom_request_items_publishes_one_ordered_owner_snapshot_to_each_requester() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let mut owner_profile = Profile::default();
+        owner_profile.server_setting.prevent_item_use = 1;
+        let owner_saved = store
+            .save(&owner.identity.nickname, &owner_profile)
+            .unwrap();
+        let visitor_saved = store
+            .save(&visitor.identity.nickname, &Profile::default())
+            .unwrap();
+        let owner_directory = owner_saved.path.parent().unwrap();
+        fs::write(
+            owner_directory.join("TuneData.json"),
+            br#"[{"ID":101,"SN":2,"Tune1":3,"Tune2":4,"Tune3":5,"Slot1":6,"Count1":7,"Slot2":8,"Count2":9}]"#,
+        )
+        .unwrap();
+        fs::write(
+            owner_directory.join("NewKart.json"),
+            br#"[{"KartID":5136,"KartSN":17}]"#,
+        )
+        .unwrap();
+        fs::write(
+            owner_directory.join("PartsData.json"),
+            br#"[{"ID":201,"SN":19,"Engine":11,"EngineGrade":12,"EngineValue":13}]"#,
+        )
+        .unwrap();
+        fs::write(
+            visitor_saved.path.parent().unwrap().join("NewKart.json"),
+            br#"[{"KartID":999,"KartSN":1}]"#,
+        )
+        .unwrap();
+
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        let tunes = [MyRoomTune {
+            item_id: 101,
+            serial_number: 2,
+            tune_1: 3,
+            tune_2: 4,
+            tune_3: 5,
+            slot_1: 6,
+            count_1: 7,
+            slot_2: 8,
+            count_2: 9,
+        }];
+        let karts = [MyRoomKart {
+            kart_id: 5136,
+            serial_number: 17,
+        }];
+        let parts = [MyRoomParts {
+            item_id: 201,
+            serial_number: 19,
+            engine: 11,
+            engine_grade: 12,
+            engine_value: 13,
+            ..MyRoomParts::default()
+        }];
+        let mut expected = serialize_owner_item_enchants(&tunes).unwrap();
+        expected.extend(serialize_owner_items(&karts, &parts, true).unwrap());
+        assert_eq!(expected.len(), 3);
+
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        assert!(
+            dispatch_packet(&owner_services, &request, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(owner.outbound.try_recv().unwrap().into_packets(), expected);
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "owner-item responses are requester-only, never room broadcasts"
+        );
+
+        let visitor_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        assert!(
+            dispatch_packet(&visitor_services, &request, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            expected,
+            "a public visitor must read the room owner's snapshot, not its own sidecars"
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_request_items_strictly_rejects_trailing_data_and_types_missing_owner() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            owner: _owner,
+            visitor: _visitor,
+        } = fixture;
+        let (outsider_session, _cancelled, mut outsider_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_739),
+                crate::operation_gate::WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let outsider_identity = world
+            .claim_identity(outsider_session, "SessionMyRoomItemOutsider")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut context = bind_test_profile(&profiles, &outsider_identity).await;
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: outsider_session,
+        };
+        let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        let mut malformed = request.clone();
+        malformed.push(0xa5);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::TrailingBytes {
+                    name: REQUEST_MYROOM_ITEMS_NAME,
+                    count: 1,
+                }
+            ))
+        ));
+        assert!(
+            outsider_outbound.try_recv().is_err(),
+            "a malformed request cannot publish any partial response"
+        );
+
+        assert!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outsider_outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_missing_owner_items()]
+        );
+        assert!(outsider_outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_request_items_distinguishes_empty_inventory_from_missing_owner() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let _owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        assert!(
+            dispatch_packet(&services, &request, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let expected_empty = serialize_owner_items(&[], &[], false).unwrap();
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            expected_empty
+        );
+        assert_ne!(
+            expected_empty,
+            vec![serialize_missing_owner_items()],
+            "an existing owner with an empty inventory is not a missing owner"
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protected_myroom_items_are_denied_before_disk_read_and_secrets_are_redacted() {
+        let protected = MyRoomInfo {
+            use_room_password: 1,
+            room_password: "room secret".to_owned(),
+            use_item_password: 1,
+            item_password: "item secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(protected);
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let owner_saved = store
+            .save(&owner.identity.nickname, &Profile::default())
+            .unwrap();
+        store
+            .save(&visitor.identity.nickname, &Profile::default())
+            .unwrap();
+        fs::write(
+            owner_saved.path.parent().unwrap().join("NewKart.json"),
+            b"[{",
+        )
+        .unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        assert!(
+            dispatch_packet(&services, &request, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the protected visitor path must not touch the malformed owner sidecar"
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_missing_owner_items()]
+        );
+
+        let view = world
+            .myroom_session_view(visitor.session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.info().use_room_password, 1);
+        assert_eq!(view.info().use_item_password, 1);
+        assert!(view.info().room_password.is_empty());
+        assert!(view.info().item_password.is_empty());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_request_items_backpressure_is_atomic_and_retryable() {
+        let fixture = spawn_myroom_world_with_outbound_capacity(MyRoomInfo::default(), 1);
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            visitor: _visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        assert!(
+            dispatch_packet(&services, &request, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            dispatch_packet(&services, &request, &mut owner_context).await,
+            Err(LoginSessionError::World(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == owner.session
+        ));
+
+        let expected = serialize_owner_items(&[], &[], false).unwrap();
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            expected,
+            "the failed publication cannot alter the already queued batch"
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        assert!(
+            dispatch_packet(&services, &request, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "draining the single queue slot makes the same request retryable"
+        );
+        assert_eq!(owner.outbound.try_recv().unwrap().into_packets(), expected);
+        assert!(owner.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_myroom_item_request_retains_identity_until_profile_read_finishes() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            visitor: _visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let hook = BlockingUpdateHook::new();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let profiles = profiles.with_blocking_owner_item_hook(Arc::clone(&hook));
+        let owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let destination = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50_101))
+            .await
+            .unwrap();
+        let token = MigrationToken::new(0x5137).unwrap();
+        world
+            .begin_migration(
+                owner.session,
+                ChannelBinding {
+                    channel_id: 12,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        let request_world = world.clone();
+        let request_profiles = profiles.clone();
+        let request_session = owner.session;
+        let mut request_context = owner_context;
+        let request = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        let request_task = tokio::spawn(async move {
+            let config = ServerConfig::default();
+            let services = SessionServices {
+                config: &config,
+                world: &request_world,
+                profiles: &request_profiles,
+                session_id: request_session,
+            };
+            dispatch_packet(&services, &request, &mut request_context).await
+        });
+        let entered_hook = Arc::clone(&hook);
+        tokio::task::spawn_blocking(move || entered_hook.entered.wait())
+            .await
+            .unwrap();
+
+        request_task.abort();
+        assert!(request_task.await.unwrap_err().is_cancelled());
+
+        let migration_world = world.clone();
+        let migration_profiles = profiles.clone();
+        let user_no = owner.identity.user_no;
+        let nickname = owner.identity.nickname.clone();
+        let (attempting, attempted) = oneshot::channel();
+        let mut migration = tokio::spawn(async move {
+            let preflight = migration_world
+                .preflight_migration(destination, user_no, 12, token, Instant::now())
+                .await
+                .unwrap();
+            let _ = attempting.send(());
+            preflight.wait_for_operations_drained().await.unwrap();
+            let admission = migration_profiles
+                .admit(&nickname, "test RequestItems migration handoff")
+                .await
+                .unwrap();
+            let (profile, lane) = migration_profiles
+                .load(nickname, false, admission)
+                .await
+                .unwrap();
+            let profile =
+                MyRoomProfileLease::new(myroom_profile_presentation(&profile.profile), lane);
+            migration_world
+                .complete_preflighted_migration(preflight, profile)
+                .await
+        });
+        attempted.await.unwrap();
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut migration)
+                .await
+                .is_err(),
+            "migration drained while the cancelled RequestItems disk read still owned its child lease"
+        );
+
+        let release_hook = Arc::clone(&hook);
+        tokio::task::spawn_blocking(move || release_hook.release.wait())
+            .await
+            .unwrap();
+        migration.await.unwrap().unwrap();
+        assert!(
+            owner.outbound.try_recv().is_err(),
+            "a cancelled request cannot publish its completed disk result"
         );
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
@@ -3897,7 +4529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn myroom_owner_item_read_preserves_kart_empty_quirk_and_typed_sidecar_errors() {
+    async fn myroom_owner_item_read_keeps_parts_without_karts_and_types_sidecar_errors() {
         let profile_root = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(profile_root.path());
         let mut profile = Profile::default();
@@ -3924,10 +4556,14 @@ mod tests {
             .unwrap();
         let packets = batch.into_packets();
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].len(), 32);
+        assert_eq!(packets[0].len(), 72);
         assert_eq!(
             u32::from_le_bytes(packets[0][..4].try_into().unwrap()),
             p5136_core::adler32::packet_hash(OWNER_ITEM_NAME)
+        );
+        assert_eq!(
+            i16::from_le_bytes(packets[0][24..26].try_into().unwrap()),
+            5136
         );
         drop(lane);
 
