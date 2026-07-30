@@ -35,8 +35,9 @@ integrated. UDP authorization and room audience selection run inside the world
 actor so channel migration cannot race a stale relay decision. Human
 ready/loading, race start, finish, ranking, settlement, reward persistence, and
 the MyRoom direct/re-enter/random-public-entry, FirstState, owner-info,
-RequestItems, RequestEmblems, three-slot main-emblem update,
-character-position, RiderTalk, and Secede paths are also actor-integrated.
+RequestItems, RequestEmblems, terminal Career-list, three-slot main-emblem
+update, character-position, RiderTalk, and Secede paths are also
+actor-integrated.
 Reenter restores an exact current membership before falling back to the
 rider's own room. Random entry selects only actor-tracked, owner-present,
 non-full public rooms. Direct entry strictly parses the required owner and
@@ -50,12 +51,18 @@ Garage and Item Dictionary grants authorize exactly one `RequestItems`.
 RequestItems loads a bounded owner snapshot under the canonical profile lane
 and publishes its complete ordered response as one actor-owned queue batch.
 The matching Emblem grant authorizes exactly one bounded `RequestEmblems`
-response and is consumed even if its requester queue is full. Main-emblem
-updates parse the stock client's exact three-`i16` body, require the present
-owner, validate every nonzero ID against an immutable positive-ID catalog, and
-publish success only after a transactional profile write is durable. The
-ordinary room cache is refreshed silently; no unsupported MyRoom peer fanout
-is invented.
+response and is consumed even if its requester queue is full. The matching
+Career grant likewise authorizes exactly one strict hash-only
+`RequestCareerList`; Rust publishes only the conservative 16-byte terminal
+empty list derived from the client's marker-equality rule and consumes the
+grant even when publication is stale or backpressured. Nonempty Career
+records, marker progression, and the separate owner-info exchange remain
+unimplemented until stronger evidence defines their ownership and policy.
+Main-emblem updates parse the stock client's exact three-`i16` body, require
+the present owner, validate every nonzero ID against an immutable positive-ID
+catalog, and publish success only after a transactional profile write is
+durable. The ordinary room cache is refreshed silently; no unsupported
+MyRoom peer fanout is invented.
 Client endpoint reports are exact ten-byte packets. Rust discards the claimed
 IPv4 bytes, derives the advertised address from the authenticated TCP peer,
 persists only the reported P2P port, and publishes it only for the same active
@@ -81,7 +88,7 @@ returns a typed session error instead of being mistaken for a successful
 handler. MyRoom dispatch is exhaustive so new protocol variants cannot
 silently fall through.
 
-The remaining compatibility work is concentrated in the unported MyRoom and
+The remaining compatibility work is concentrated in the remaining MyRoom and
 economy requests, capture-derived movement sequencing and UDP first-bind
 capabilities, packet fixtures, green cross-platform CI evidence, and
 stock-client end-to-end validation. See

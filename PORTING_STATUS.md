@@ -27,16 +27,17 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`d2fb318 Port generation-bound client P2P reports`
+`64a6d55 Port terminal MyRoom Career list`
 
 ## Current Rust checkpoint
 
-The current checkpoint ports exact client Game-UDP/P2P endpoint reports and
-the durable, generation-bound P2P presentation update. It deliberately fixes
-the C# trust and lifetime problems instead of cloning them: client-claimed
-address bytes never become endpoint authority, historical profile values
-never revive as a new connection's live port, and only the exact active
-generation may publish a durable port into actor caches. C# remains unchanged.
+The current checkpoint uses available stock-client static analysis to make one
+Career behavior wire-safe without inventing server data: an exact hash-only
+list request and a conservative terminal `0,0,0` response. It reuses the
+actor-owned owner-resource authorization boundary, consumes only the kind-2
+capability for protected visitors, and does not clone the incomplete C#
+server's silent fallthrough. Nonempty records and owner-info remain
+evidence-limited. C# remains unchanged.
 
 ### Generation-bound client P2P reports
 
@@ -106,8 +107,10 @@ generation may publish a durable port into actor caches. C# remains unchanged.
   protected visitor needs the exact kind-1 one-shot grant scoped to requester,
   owner, resource, and room-info revision. A matching attempt consumes the
   grant in the actor turn before response reservation, including queue-full
-  failure. A grant for another resource is preserved; outsiders and stale or
-  owner-absent memberships receive no packet.
+  failure. A grant for another resource is preserved; outsiders and stale
+  plans receive no packet. The shared owner-resource policy retains access for
+  a public owner-Secede tombstone, while a protected owner tombstone is denied
+  after its grants are revoked.
 - The C# response exposes its process-global definition list as though it were
   the current owner's emblem inventory. Rust currently preserves that
   client-visible list policy behind stricter authorization because no separate
@@ -223,9 +226,8 @@ generation may publish a durable port into actor caches. C# remains unchanged.
   actor-owned grant scoped to the exact requester binding, exact owner
   binding, protected resource, and the owner's room-info revision. Garage and
   Item Dictionary grants are consumed by the next `RequestItems` prepare;
-  the Emblem grant is consumed only by `RequestEmblems`; the Career grant
-  remains reserved for the next exact Career request path. Neither can
-  authorize another resource.
+  the Emblem grant is consumed only by `RequestEmblems`; the Career grant is
+  consumed only by `RequestCareerList`. None can authorize another resource.
 - The uncached stock-client path sends at most one matching follow-up after a
   successful check, so grants are deliberately one-shot. An unused grant may
   remain until it is consumed or revoked; successful entry/reentry, room
@@ -237,29 +239,50 @@ generation may publish a durable port into actor caches. C# remains unchanged.
   serves owner items without checking the item password. Rust deliberately
   does not reproduce that bypass.
 
-### MyRoom Career static wire evidence (next slice)
+### Terminal MyRoom Career list
 
 - The bundled C# server exposes the four Career packet-name hashes but has no
   usable handler. It remains unchanged and cannot define the missing behavior.
-  Stock-client static analysis now supplies exact layouts, so a safe terminal
-  empty-list path no longer needs to wait for a capture.
+  Stock-client static analysis supplies the exact layouts used here; this is
+  not presented as captured original-server behavior.
 - `RmRequestCareerListPacket` (`0x801309EE`) is an exact hash-only request.
   `RmOwnerCareerListPacket` (`0x6B740910`) starts with signed `i32 marker_b`,
   `i32 marker_a`, and `i32 count`. Each nonempty entry is exactly 17 bytes:
   `i32 field0`, `i32 field1`, `u8 field2`, `i32 field3`, `i16 field4`, and
   `i16 field5`. The client treats `marker_a == marker_b` as terminal, making
-  `0,0,0` the conservative complete empty-list response.
+  `0,0,0` the conservative complete empty-list response. Rust now strictly
+  accepts only the four-byte request and serializes exactly the 16-byte
+  response hash plus those three zero `i32` values.
+- The session parses and fully consumes the request before any actor mutation
+  or grant consumption. Publication is requester-only through the actor-owned
+  outbound queue; there is no direct session reply, extra ACK, peer broadcast,
+  profile-store read, Career data lookup, or persistence side effect. The
+  already-bound in-memory profile identity is still revalidated.
+- Owners and public visitors may request the terminal list repeatedly. A
+  protected visitor needs the exact kind-2 one-shot grant. Kind-0/3 owner-item
+  and kind-1 emblem grants are preserved, while kind-2 is consumed when the
+  actor mints a move-only Career plan, before queue reservation.
+- The shared private owner-resource plan performs the common membership,
+  owner, policy-revision, and generation checks, but distinct move-only
+  Emblem and Career wrapper types prevent one resource capability from being
+  published through the other path. Requester and owner generations are
+  revalidated again at publication.
+- Queue saturation is a logged packet drop rather than a session failure.
+  Queue-full, policy-stale, owner-generation-stale, requester-generation-stale,
+  and quiesced paths publish nothing. None of those outcomes, nor requester
+  cancellation after prepare, restores a consumed kind-2 grant. Outsiders
+  receive no packet. The established shared policy permits the terminal list
+  for a retained public owner-Secede tombstone and denies a protected
+  tombstone after revocation.
 - The second request (`0xB7D40BE9`) is signed `i32 requester_no` plus a
   bounded UTF-16 nickname. Its response (`0x6A500900`) begins with
   `u8 present`; when present it continues with UTF-16 nickname, `i32 level`,
   `u8 rank`, and `i32 career_points`.
-- The next implementation should strictly parse the hash-only list request,
-  reuse the exact owner/member/resource authorization policy, consume only a
-  matching kind-2 one-shot grant, reserve the requester queue before
-  publication while preserving the established queue-full one-shot semantics,
-  and return the terminal empty list. Nonempty entry ownership,
-  pagination/marker meaning beyond the terminal equality, and the owner-info
-  lookup policy remain evidence-limited and must not be invented.
+  That owner-info exchange is not implemented. Nonempty entry ownership and
+  field meanings, marker/pagination behavior beyond terminal equality,
+  owner-info lookup/authorization/data policy, and any Career persistence,
+  reward, or progression semantics remain evidence-limited and must not be
+  invented.
 
 ### MyRoom Reenter and random public entry
 
@@ -620,12 +643,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 699 regular tests and 2 opt-in proprietary-fixture tests passed
+# 704 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 699 regular passing tests comprise 9 CLI, 35 connector, 140 core, 85
-profile, 13 RHO5, 409 server unit, and 8 server integration tests. The two
+The 704 regular passing tests comprise 9 CLI, 35 connector, 141 core, 85
+profile, 13 RHO5, 413 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
@@ -678,6 +701,11 @@ Focused regressions cover:
   public/owner access, protected exact kind-1 grant consumption, wrong-resource
   preservation, stale-plan suppression, queue-full one-shot behavior, and
   malformed/duplicate/nonpositive XML rejection;
+- exact hash-only `RequestCareerList` parsing and 16-byte terminal empty
+  response; owner/public and protected exact kind-2 access; wrong-resource
+  preservation; policy, owner-generation, and requester-generation stale-plan
+  suppression; queue-full grant burning; public/protected owner-tombstone
+  distinction; requester-only publication; and quiesce rejection;
 - exact three-slot main-emblem parsing, fail-closed catalog validation,
   present-owner preflight before profile admission, all-or-nothing
   transaction, durability-before-ACK, cancellation survival, stale-generation
@@ -725,16 +753,16 @@ These items prevent a "port complete" claim.
    handler is a compile error. Complete the evidence ledger for the existing
    deliberate no-reply list.
 
-   Implement the exact terminal empty `RmOwnerCareerListPacket` and consume
-   only the matching kind-2 Career grant. Static client analysis establishes
-   the safe layouts and `marker_a == marker_b` terminal condition, but
-   nonempty ownership, marker/pagination semantics, and owner-info policy still
-   need stronger evidence. The bundled C# code contains only the four
-   packet-name hashes and silently drops the requests, so it is not a
-   behavioral specification. Club rename requires a global membership/name
-   namespace; club creation is a separate system-design slice rather than a
-   per-profile string write. Finish kart tuning/upgrades and the remaining
-   quest/attendance/progression surface.
+   The exact terminal empty `RmOwnerCareerListPacket` and matching kind-2
+   grant path are implemented. Static client analysis establishes that safe
+   terminal shape, but nonempty ownership and field meanings,
+   marker/pagination semantics beyond equality, and owner-info
+   lookup/authorization/data policy still need stronger evidence. The bundled
+   C# code contains only the four packet-name hashes and silently drops the
+   requests, so it is not a behavioral specification. Club rename requires a
+   global membership/name namespace; club creation is a separate system-design
+   slice rather than a per-profile string write. Finish kart tuning/upgrades
+   and the remaining quest/attendance/progression surface.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
    fields; a later storage redesign should add zeroization/at-rest protection
@@ -773,11 +801,10 @@ These items prevent a "port complete" claim.
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. The generic authenticated fallback now
    returns `UnsupportedIdentityPacket`; it no longer reports silent success.
-2. Port the exact hash-only Career-list request and terminal `0,0,0` response.
-   Reuse the actor-owned owner/member/resource authorization, consume only an
-   exact kind-2 one-shot grant with the established queue-full one-shot
-   semantics, and add strict malformed/stale/backpressure/grant-separation
-   tests. Do not invent nonempty records or owner-info policy.
+2. Select the next evidence-complete request from that ledger and keep it a
+   bounded codec/dispatch slice. Leave nonempty Career records and owner-info
+   explicitly capture/evidence-blocked rather than inferring ownership,
+   pagination, or authorization policy.
 3. Capture endpoint-report behavior with two stock clients and NAT-relevant
    topologies before adding a live peer-refresh/fanout packet or coupling the
    durable presentation port to observed UDP routing. Existing peers may
