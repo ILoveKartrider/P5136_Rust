@@ -2,6 +2,7 @@
 
 pub mod adler32;
 pub mod bml;
+pub mod captured_query_protocol;
 pub mod channel;
 pub mod club_query_protocol;
 pub mod crypto;
@@ -27,6 +28,7 @@ pub mod race_result_protocol;
 pub mod race_start_protocol;
 pub mod rider_info_protocol;
 pub mod room_protocol;
+pub mod scenario_protocol;
 pub mod shop_protocol;
 pub mod startup;
 pub mod track;

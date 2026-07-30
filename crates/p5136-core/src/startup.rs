@@ -374,6 +374,9 @@ pub enum StartupError {
 
     #[error("{name} has {count} trailing bytes")]
     TrailingBytes { name: &'static str, count: usize },
+
+    #[error("SpRqKoinBalance mode must be 1, received {actual}")]
+    UnexpectedKoinBalanceMode { actual: u8 },
 }
 
 #[must_use]
@@ -457,9 +460,27 @@ pub fn parse_sp_rq_get_max_gift_id(packet: &[u8]) -> Result<(), StartupError> {
     parse_hash_only_request(packet, GET_MAX_GIFT_ID_REQUEST_NAME)
 }
 
-/// Parses the exact hash-only KOIN balance query.
+/// Parses the exact five-byte KOIN balance query found in every retained
+/// stock-client initialization capture.
+///
+/// The C# handler ignores the terminal byte, so its business meaning is not
+/// established. Rust still requires the one observed value (`1`) and exact
+/// exhaustion instead of treating arbitrary trailing bytes as valid.
 pub fn parse_sp_rq_koin_balance(packet: &[u8]) -> Result<(), StartupError> {
-    parse_hash_only_request(packet, KOIN_BALANCE_REQUEST_NAME)
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, KOIN_BALANCE_REQUEST_NAME)?;
+    let actual = reader.read_u8()?;
+    if actual != 1 {
+        return Err(StartupError::UnexpectedKoinBalanceMode { actual });
+    }
+    let trailing = reader.remaining().len();
+    if trailing != 0 {
+        return Err(StartupError::TrailingBytes {
+            name: KOIN_BALANCE_REQUEST_NAME,
+            count: trailing,
+        });
+    }
+    Ok(())
 }
 
 /// Parses the exact hash-only favorite-track projection query.
@@ -1184,14 +1205,6 @@ mod tests {
                 parse_sp_rq_get_max_gift_id,
             ),
             (
-                KOIN_BALANCE_REQUEST_NAME,
-                KOIN_BALANCE_REQUEST_HASH,
-                KOIN_BALANCE_REPLY_NAME,
-                KOIN_BALANCE_REPLY_HASH,
-                StartupRequest::KoinBalance,
-                parse_sp_rq_koin_balance,
-            ),
-            (
                 FAVORITE_TRACK_MAP_REQUEST_NAME,
                 FAVORITE_TRACK_MAP_REQUEST_HASH,
                 FAVORITE_TRACK_MAP_REPLY_NAME,
@@ -1256,6 +1269,47 @@ mod tests {
             serialize_sp_rp_remain_tc_cash(0x99AA_BBCC),
             [0x6F, 0x08, 0xCE, 0x5F, 99, 0, 0, 0, 0xCC, 0xBB, 0xAA, 0x99]
         );
+    }
+
+    #[test]
+    fn koin_balance_uses_the_exact_captured_request_shape() {
+        assert_eq!(
+            adler32::packet_hash(KOIN_BALANCE_REQUEST_NAME),
+            KOIN_BALANCE_REQUEST_HASH
+        );
+        assert_eq!(
+            adler32::packet_hash(KOIN_BALANCE_REPLY_NAME),
+            KOIN_BALANCE_REPLY_HASH
+        );
+        assert_eq!(
+            classify_startup_request(KOIN_BALANCE_REQUEST_HASH),
+            Some(StartupRequest::KoinBalance)
+        );
+        assert_eq!(
+            StartupRequest::KoinBalance.reply_name(),
+            Some(KOIN_BALANCE_REPLY_NAME)
+        );
+
+        let exact_request = [0xBD, 0x05, 0x4C, 0x2D, 1];
+        assert!(parse_sp_rq_koin_balance(&exact_request).is_ok());
+        for truncated_length in 0..exact_request.len() {
+            assert!(parse_sp_rq_koin_balance(&exact_request[..truncated_length]).is_err());
+        }
+        let mut wrong_mode = exact_request;
+        wrong_mode[4] = 0;
+        assert!(matches!(
+            parse_sp_rq_koin_balance(&wrong_mode),
+            Err(StartupError::UnexpectedKoinBalanceMode { actual: 0 })
+        ));
+        let mut trailing_request = exact_request.to_vec();
+        trailing_request.push(0);
+        assert!(matches!(
+            parse_sp_rq_koin_balance(&trailing_request),
+            Err(StartupError::TrailingBytes {
+                name: KOIN_BALANCE_REQUEST_NAME,
+                count: 1,
+            })
+        ));
     }
 
     #[test]

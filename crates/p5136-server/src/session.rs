@@ -6,6 +6,10 @@ use std::{
 use chrono::{Local, NaiveDate, Timelike};
 use p5136_core::{
     adler32,
+    captured_query_protocol::{
+        CapturedQueryError, CapturedQueryRequest, classify_captured_query_request,
+        process_captured_query_request,
+    },
     channel::{
         ChannelError, ClientEndpointReportKind, classify_client_endpoint_report,
         parse_client_endpoint_report, parse_pq_channel_movein, parse_pq_channel_switch,
@@ -67,6 +71,11 @@ use p5136_core::{
         RoomPlayer, RoomProtocolError, RoomProtocolRequest, classify_room_protocol_request,
         parse_ch_create_room_request, parse_ch_get_room_list_request, parse_ch_join_room_request,
         parse_ch_leave_room_request, parse_gr_first_request,
+    },
+    scenario_protocol::{
+        ScenarioProtocolError, ScenarioRequest, classify_scenario_request,
+        parse_complete_scenario_request, parse_start_scenario_request,
+        serialize_complete_scenario_reply, serialize_start_scenario_reply,
     },
     shop_protocol::{
         ShopProtocolError, classify_shop_buy_request, parse_shop_buy_request,
@@ -223,6 +232,9 @@ pub enum LoginSessionError {
     StartupProtocol(#[from] StartupError),
 
     #[error(transparent)]
+    CapturedQueryProtocol(#[from] CapturedQueryError),
+
+    #[error(transparent)]
     ProfileStore(#[from] ProfileStoreError),
 
     #[error(transparent)]
@@ -236,6 +248,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     RoomProtocol(#[from] RoomProtocolError),
+
+    #[error(transparent)]
+    ScenarioProtocol(#[from] ScenarioProtocolError),
 
     #[error(transparent)]
     LobbyProtocol(#[from] LobbyProtocolError),
@@ -783,6 +798,39 @@ impl ProfileCoordinator {
                 }
                 store.update(subject.nickname(), |profile| {
                     apply_game_options(&mut profile.game_option, &options);
+                })
+            })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
+        Ok((
+            ProfileSnapshot {
+                profile,
+                revision: Some(saved.revision),
+                source_path: saved.path,
+            },
+            lane,
+        ))
+    }
+
+    async fn update_scenario_type(
+        &self,
+        nickname: String,
+        scenario_type: i32,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        #[cfg(test)]
+        let blocking_update_hook = self.blocking_update_hook.clone();
+        let completed = admission
+            .run("update scenario type", move |store, _, subject| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_update_hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
+                store.update(subject.nickname(), |profile| {
+                    profile.rider.scenario_type = scenario_type;
                 })
             })
             .await?;
@@ -1828,6 +1876,10 @@ async fn dispatch_packet_admitted(
         return result;
     }
 
+    if let Some(request) = classify_captured_query_request(hash) {
+        return handle_captured_query_request(&world, request, packet, context).await;
+    }
+
     if is_startup_noop(hash) {
         let identity = world.authorize_identity().await?;
         let _ = context.profile_for(&identity)?;
@@ -1841,6 +1893,51 @@ async fn dispatch_packet_admitted(
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
     Err(LoginSessionError::UnsupportedIdentityPacket { hash })
+}
+
+async fn handle_captured_query_request(
+    world: &AdmittedWorldHandle<'_>,
+    request: CapturedQueryRequest,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let reply = process_captured_query_request(request, packet)?;
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+    Ok(vec![reply])
+}
+
+async fn handle_scenario_request(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    request: ScenarioRequest,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    if request == ScenarioRequest::Complete {
+        parse_complete_scenario_request(packet)?;
+        let identity = world.authorize_identity().await?;
+        let profile = context.profile_for(&identity)?;
+        return Ok(vec![serialize_complete_scenario_reply(
+            profile.rider.scenario_type,
+        )]);
+    }
+
+    let start = parse_start_scenario_request(packet)?;
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let admission = profiles
+        .admit_for_operation(world.operation(), &before.nickname, "update scenario type")
+        .await?;
+    let (profile, lane) = profiles
+        .update_scenario_type(before.nickname.clone(), start.scenario_type, admission)
+        .await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let _ = context.profile_for(&after)?;
+    context.bind_profile(after, profile);
+    drop(lane);
+    Ok(vec![serialize_start_scenario_reply(start.scenario_type)])
 }
 
 async fn dispatch_profile_bound_request(
@@ -1872,6 +1969,11 @@ async fn dispatch_profile_bound_request(
                 context,
             )
             .await,
+        );
+    }
+    if let Some(request) = classify_scenario_request(hash) {
+        return Some(
+            handle_scenario_request(world, services.profiles, request, packet, context).await,
         );
     }
     None
@@ -3601,6 +3703,7 @@ mod tests {
 
     use p5136_core::{
         adler32,
+        captured_query_protocol::{CAPTURED_QUERY_REQUESTS, CapturedQueryRequest},
         channel::serialize_pr_channel_move_in,
         club_query_protocol::{
             ClubQueryProtocolError, ClubQueryRequest, serialize_club_creation_unavailable_reply,
@@ -3648,6 +3751,10 @@ mod tests {
             ChCreateRoomRequest, ChJoinRoomRequest, MAX_CLUB_NAME_UTF16_UNITS,
             ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomProtocolError,
             RoomProtocolRequest,
+        },
+        scenario_protocol::{
+            COMPLETE_SCENARIO_REQUEST_NAME, START_SCENARIO_REQUEST_NAME,
+            serialize_complete_scenario_reply, serialize_start_scenario_reply,
         },
         shop_protocol::{ShopBuyRequest, serialize_shop_buy_failure},
         startup::{
@@ -4708,9 +4815,12 @@ mod tests {
                 vec![0x6F, 0x08, 0xCE, 0x5F, 99, 0, 0, 0, 0xCC, 0xBB, 0xAA, 0x99],
             ),
         ] {
-            let request = PacketWriter::named(request_name).into_inner();
+            let mut request = PacketWriter::named(request_name);
+            if request_name == "SpRqKoinBalance" {
+                request.write_u8(1);
+            }
             assert_eq!(
-                dispatch_packet(&services, &request, &mut context)
+                dispatch_packet(&services, request.as_slice(), &mut context)
                     .await
                     .unwrap(),
                 vec![expected]
@@ -4722,6 +4832,223 @@ mod tests {
         assert_eq!(after.profile.rider.koin, 0x1122_3344);
         assert_eq!(after.profile.rider.cash, 0x5566_7788);
         assert_eq!(after.profile.rider.tc_cash, 0x99AA_BBCC);
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_dispatch_handles_every_captured_read_only_query_without_mutation() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_708))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "CapturedReadOnlyQueries")
+            .await
+            .unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create(&identity.nickname).unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+
+        let mut unbound_context = SessionContext::default();
+        let current_cmp = CapturedQueryRequest::CurrentCompetition;
+        assert!(matches!(
+            dispatch_packet(
+                &services,
+                &current_cmp.request_hash().to_le_bytes(),
+                &mut unbound_context,
+            )
+            .await,
+            Err(LoginSessionError::ProfileNotBound)
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let before_revision = store.load_or_create(&identity.nickname).unwrap().revision;
+        for request in CAPTURED_QUERY_REQUESTS {
+            for &length in request.observed_lengths() {
+                let mut packet = vec![0_u8; length];
+                packet[..4].copy_from_slice(&request.request_hash().to_le_bytes());
+                if *request == CapturedQueryRequest::EventBuyCount {
+                    packet[4..8].copy_from_slice(&4_i32.to_le_bytes());
+                }
+
+                let replies = dispatch_packet(&services, &packet, &mut context)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} length {length} was not handled: {error}",
+                            request.request_name()
+                        )
+                    });
+                assert_eq!(
+                    replies.len(),
+                    1,
+                    "{} length {length}",
+                    request.request_name()
+                );
+            }
+        }
+
+        let malformed = current_cmp.request_hash().to_le_bytes().repeat(2);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::CapturedQueryProtocol(_))
+        ));
+        assert_eq!(
+            store.load_or_create(&identity.nickname).unwrap().revision,
+            before_revision
+        );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stateful_or_unidentified_corpus_gaps_remain_fail_closed() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_710))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "CapturedFailClosed")
+            .await
+            .unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create(&identity.nickname).unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let pending_names = [
+            "GameAiReportPacket",
+            "GameReportPacket",
+            "GrChangeTrackPacket",
+            "GrRequestBasicAiPacket",
+            "GrRequestClosePacket",
+            "GrRiderTalkPacket",
+            "LoRqStartSinglePacket",
+            "LoRqUseItemPacket",
+            "PcGameClientFramePacket",
+            "PcGameRequestRelay",
+            "PcRideEventReportPacket",
+            "PcRidePathReportPacket",
+            "PqEquipXPartsItem",
+            "PqFinishTimeAttack",
+            "PqKartSpec",
+            "PqLockedItemUpdate",
+            "PqNewCareerItemStatePacket",
+            "PqReportUdpReconnect",
+            "PqSendMacroChat",
+            "PqStartTimeAttack",
+        ];
+        let pending_hashes = pending_names
+            .map(adler32::packet_hash)
+            .into_iter()
+            .chain([0x5815_082A]);
+        for hash in pending_hashes {
+            assert!(matches!(
+                dispatch_packet(&services, &hash.to_le_bytes(), &mut context).await,
+                Err(LoginSessionError::UnsupportedIdentityPacket { hash: actual })
+                    if actual == hash
+            ));
+        }
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scenario_start_is_durable_and_completion_reads_the_bound_revision() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_709))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ScenarioPersistence")
+            .await
+            .unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let initial = store.load_or_create(&identity.nickname).unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let mut complete = PacketWriter::named(COMPLETE_SCENARIO_REQUEST_NAME);
+        complete.write_bytes(&[0; 22]);
+        assert_eq!(
+            dispatch_packet(&services, complete.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_complete_scenario_reply(0)]
+        );
+        assert_eq!(
+            store.load_or_create(&identity.nickname).unwrap().revision,
+            initial.revision
+        );
+
+        let scenario_type = 0x0100_0034;
+        let mut start = PacketWriter::named(START_SCENARIO_REQUEST_NAME);
+        start.write_i32(scenario_type);
+        assert_eq!(
+            dispatch_packet(&services, start.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_start_scenario_reply(scenario_type)]
+        );
+        let persisted = store.load_or_create(&identity.nickname).unwrap();
+        assert_ne!(persisted.revision, initial.revision);
+        assert_eq!(persisted.profile.rider.scenario_type, scenario_type);
+
+        assert_eq!(
+            dispatch_packet(&services, complete.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_complete_scenario_reply(scenario_type)]
+        );
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),
             identity
