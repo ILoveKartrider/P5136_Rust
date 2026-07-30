@@ -79,6 +79,7 @@ use crate::myroom_persistence::{
     MyRoomPersistenceInvariantError, MyRoomProfileCompletion, MyRoomProfileJobResult,
     MyRoomProfileTicketId, PreparedMyRoomInfoWrite, RegisteredMyRoomInfoWrite,
 };
+use crate::operation_gate::{WireOperationGate, WireOperationGuard};
 use crate::profile_io::{DurableRewardReceipt, MyRoomProfileLease, ProfileJobAdmission};
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
@@ -122,9 +123,10 @@ impl RewardRollSource for RandomRewardRollSource {
 
 /// One ordered write unit for a login session. A batch consumes one bounded
 /// queue slot even when a protocol response contains many logical packets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct OutboundBatch {
     packets: Vec<Vec<u8>>,
+    operation: Option<WireOperationGuard>,
 }
 
 impl OutboundBatch {
@@ -132,14 +134,36 @@ impl OutboundBatch {
     pub(crate) fn single(packet: Vec<u8>) -> Self {
         Self {
             packets: vec![packet],
+            operation: None,
         }
     }
 
     #[must_use]
     pub(crate) fn ordered(packets: Vec<Vec<u8>>) -> Self {
-        Self { packets }
+        Self {
+            packets,
+            operation: None,
+        }
     }
 
+    fn duplicate(&self) -> Self {
+        Self::ordered(self.packets.clone())
+    }
+
+    fn track(mut self, operation: WireOperationGuard) -> Self {
+        debug_assert!(
+            self.operation.is_none(),
+            "one outbound batch owns at most one write operation"
+        );
+        self.operation = Some(operation);
+        self
+    }
+
+    pub(crate) fn into_write_parts(self) -> (Vec<Vec<u8>>, Option<WireOperationGuard>) {
+        (self.packets, self.operation)
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn into_packets(self) -> Vec<Vec<u8>> {
         self.packets
@@ -1062,6 +1086,12 @@ pub enum WorldError {
     #[error("session shutdown drain requires the world to be quiescing")]
     SessionDrainRequiresQuiesce,
 
+    #[error("outbound producer drain requires the world to be quiescing")]
+    OutboundProducerDrainRequiresQuiesce,
+
+    #[error("world is quiescing and no longer accepts wire-producing commands")]
+    OutboundProductionClosed,
+
     #[error(
         "world shutdown refused while {pending} MyRoom profile writes remain ({indexed} user indexes)"
     )]
@@ -1281,6 +1311,7 @@ enum WorldCommand {
         peer: SocketAddr,
         cancellation: Option<oneshot::Sender<()>>,
         outbound: Option<mpsc::Sender<OutboundBatch>>,
+        outbound_operations: Option<WireOperationGate>,
         reply: oneshot::Sender<Result<SessionId, WorldError>>,
     },
     SessionClosed {
@@ -1349,12 +1380,12 @@ enum WorldCommand {
         reply: oneshot::Sender<Result<RaceCommandOutcome, WorldError>>,
     },
     CreateRoom {
-        reply: oneshot::Sender<RoomId>,
+        reply: oneshot::Sender<Result<RoomId, WorldError>>,
     },
     JoinRoom {
         room: RoomId,
         identity: String,
-        reply: oneshot::Sender<Result<SlotId, RoomError>>,
+        reply: oneshot::Sender<Result<SlotId, WorldError>>,
     },
     JoinRoomForSession {
         room: RoomId,
@@ -1363,7 +1394,7 @@ enum WorldCommand {
     },
     LeaveRoom {
         identity: String,
-        reply: oneshot::Sender<Result<(), RoomError>>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
     },
     RoomSnapshot {
         room: RoomId,
@@ -1386,6 +1417,9 @@ enum WorldCommand {
     },
     Quiesce {
         reply: oneshot::Sender<()>,
+    },
+    DrainOutboundProducers {
+        reply: oneshot::Sender<Result<bool, WorldError>>,
     },
     DrainSessions {
         reply: oneshot::Sender<Result<(), WorldError>>,
@@ -1585,12 +1619,13 @@ impl WorldHandle {
     }
 
     pub async fn register_session(&self, peer: SocketAddr) -> Result<SessionId, WorldError> {
-        self.register_session_inner(peer, None, None).await
+        self.register_session_inner(peer, None, None, None).await
     }
 
     pub(crate) async fn register_login_session(
         &self,
         peer: SocketAddr,
+        outbound_operations: WireOperationGate,
     ) -> Result<
         (
             SessionId,
@@ -1602,7 +1637,12 @@ impl WorldHandle {
         let (cancel, cancelled) = oneshot::channel();
         let (outbound, outbound_receiver) = mpsc::channel(SESSION_OUTBOUND_CAPACITY);
         let id = self
-            .register_session_inner(peer, Some(cancel), Some(outbound))
+            .register_session_inner(
+                peer,
+                Some(cancel),
+                Some(outbound),
+                Some(outbound_operations),
+            )
             .await?;
         Ok((id, cancelled, outbound_receiver))
     }
@@ -1612,6 +1652,7 @@ impl WorldHandle {
         peer: SocketAddr,
         cancellation: Option<oneshot::Sender<()>>,
         outbound: Option<mpsc::Sender<OutboundBatch>>,
+        outbound_operations: Option<WireOperationGate>,
     ) -> Result<SessionId, WorldError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -1619,6 +1660,7 @@ impl WorldHandle {
                 peer,
                 cancellation,
                 outbound,
+                outbound_operations,
                 reply,
             })
             .await
@@ -1864,7 +1906,7 @@ impl WorldHandle {
             .send(WorldCommand::CreateRoom { reply })
             .await
             .map_err(|_| WorldError::Stopped)?;
-        response.await.map_err(|_| WorldError::Stopped)
+        response.await.map_err(|_| WorldError::Stopped)?
     }
 
     pub async fn join_room(
@@ -1881,10 +1923,7 @@ impl WorldHandle {
             })
             .await
             .map_err(|_| WorldError::Stopped)?;
-        response
-            .await
-            .map_err(|_| WorldError::Stopped)?
-            .map_err(WorldError::from)
+        response.await.map_err(|_| WorldError::Stopped)?
     }
 
     /// Applies a room mutation only if `session` is still the current owner of
@@ -1918,10 +1957,7 @@ impl WorldHandle {
             })
             .await
             .map_err(|_| WorldError::Stopped)?;
-        response
-            .await
-            .map_err(|_| WorldError::Stopped)?
-            .map_err(WorldError::from)
+        response.await.map_err(|_| WorldError::Stopped)?
     }
 
     pub async fn room_snapshot(&self, room: RoomId) -> Result<RoomSnapshot, WorldError> {
@@ -1988,6 +2024,19 @@ impl WorldHandle {
             .await
             .map_err(|_| WorldError::Stopped)?;
         response.await.map_err(|_| WorldError::Stopped)
+    }
+
+    /// Retries every actor-owned wire publication that was already pending at
+    /// the quiesce boundary. `true` is a stable producer barrier: timer, UDP,
+    /// migration-expiry, and session-close paths cannot create another batch
+    /// after it is observed.
+    pub(crate) async fn drain_outbound_producers_once(&self) -> Result<bool, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::DrainOutboundProducers { reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
     }
 
     /// Cancels and retires every session through the World actor before the
@@ -2209,6 +2258,7 @@ struct World {
     pending_rider_equipment_by_user: HashMap<UserNo, MyRoomProfileTicketId>,
     next_myroom_ticket: Option<MyRoomProfileTicketId>,
     quiescing: bool,
+    outbound_producers_sealed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2226,6 +2276,18 @@ struct SessionState {
     peer: SocketAddr,
     cancellation: Option<oneshot::Sender<()>>,
     outbound: Option<mpsc::Sender<OutboundBatch>>,
+    outbound_operations: Option<WireOperationGate>,
+}
+
+impl SessionState {
+    fn track_outbound(&self, batch: OutboundBatch) -> Option<OutboundBatch> {
+        let Some(operations) = &self.outbound_operations else {
+            return Some(batch);
+        };
+        operations
+            .try_begin_outbound()
+            .map(|operation| batch.track(operation))
+    }
 }
 
 #[derive(Debug)]
@@ -2985,16 +3047,28 @@ impl Default for World {
             pending_rider_equipment_by_user: HashMap::new(),
             next_myroom_ticket: Some(MyRoomProfileTicketId::FIRST),
             quiescing: false,
+            outbound_producers_sealed: false,
         }
     }
 }
 
 impl World {
+    #[cfg(test)]
     fn register_session(
         &mut self,
         peer: SocketAddr,
         cancellation: Option<oneshot::Sender<()>>,
         outbound: Option<mpsc::Sender<OutboundBatch>>,
+    ) -> Result<SessionId, WorldError> {
+        self.register_session_with_operations(peer, cancellation, outbound, None)
+    }
+
+    fn register_session_with_operations(
+        &mut self,
+        peer: SocketAddr,
+        cancellation: Option<oneshot::Sender<()>>,
+        outbound: Option<mpsc::Sender<OutboundBatch>>,
+        outbound_operations: Option<WireOperationGate>,
     ) -> Result<SessionId, WorldError> {
         if self.quiescing {
             return Err(WorldError::SessionRegistrationClosed);
@@ -3007,6 +3081,7 @@ impl World {
                 peer,
                 cancellation,
                 outbound,
+                outbound_operations,
             },
         );
         Ok(id)
@@ -3171,6 +3246,9 @@ impl World {
         clock: &ServerClock,
         reward_rolls: &mut impl RewardRollSource,
     ) {
+        if self.quiescing {
+            return;
+        }
         let loading_rooms = self
             .protocol_rooms
             .iter()
@@ -3315,6 +3393,75 @@ impl World {
 
     fn quiesce(&mut self) {
         self.quiescing = true;
+    }
+
+    fn drain_outbound_producers_once(&mut self) -> Result<bool, WorldOperationError> {
+        if !self.quiescing {
+            return Err(WorldError::OutboundProducerDrainRequiresQuiesce.into());
+        }
+        if self.outbound_producers_sealed {
+            return Ok(true);
+        }
+
+        // No new migration command is admitted after quiesce. Expire every
+        // earlier permit in one graceful-only reconciliation turn so a caller
+        // holding an abandoned preflight capability cannot keep the producer
+        // barrier false until the normal TTL. World::shutdown without this
+        // explicit barrier retains its existing outstanding-transfer refusal.
+        let now = Instant::now();
+        let migration_deadline = now.checked_add(crate::MIGRATION_TTL).unwrap_or(now);
+        self.expire_migrations_without_wire(migration_deadline)?;
+
+        // Only retry already-materialized publications. Quiescing freezes every
+        // timer-originated state transition, so observing this set empty is a
+        // stable boundary rather than a transient zero between heartbeats.
+        let pending_rooms = self
+            .protocol_rooms
+            .iter()
+            .filter_map(|(room_id, room)| {
+                let ready_settlement =
+                    room.race_progress
+                        .settlement
+                        .as_ref()
+                        .is_some_and(|settlement| {
+                            matches!(
+                                settlement.finalization,
+                                SettlementFinalization::Ready { .. }
+                            )
+                        });
+                (!room.race_progress.pending_fanouts.is_empty() || ready_settlement)
+                    .then_some(*room_id)
+            })
+            .collect::<Vec<_>>();
+        for room_id in pending_rooms {
+            self.try_finalize_settlement(room_id);
+        }
+
+        let pending_race_wire = self.protocol_rooms.values().any(|room| {
+            !room.race_progress.pending_fanouts.is_empty()
+                || room
+                    .race_progress
+                    .settlement
+                    .as_ref()
+                    .is_some_and(|settlement| {
+                        matches!(
+                            settlement.finalization,
+                            SettlementFinalization::Ready { .. }
+                        )
+                    })
+        });
+        let pending_profile_producers = !self.pending_myroom_writes.is_empty()
+            || !self.pending_rider_equipment_writes.is_empty()
+            || self.identities.transfer_in_progress_count() != 0;
+        let drained = !pending_race_wire && !pending_profile_producers;
+        if drained {
+            // Completion commands remain admissible for exact capability
+            // retirement. Once sealed, this method short-circuits and timer
+            // advancement is frozen, so a late stale (or unexpectedly valid)
+            // completion can never turn its retained state into new wire.
+            self.outbound_producers_sealed = true;
+        }
+        Ok(drained)
     }
 
     fn prepare_myroom_command(
@@ -3472,20 +3619,28 @@ impl World {
         let packet = serialize_myroom_info(prepared.proposed())
             .map_err(MyRoomInfoWriteError::from)
             .map_err(MyRoomInfoRegistrationError::request)?;
-        let outbound = self
-            .sessions
-            .get(&session)
-            .and_then(|state| state.outbound.clone())
-            .ok_or_else(|| {
-                MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
-                    session,
-                })
-            })?;
+        let session_state = self.sessions.get(&session).ok_or_else(|| {
+            MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
+                session,
+            })
+        })?;
+        let outbound = session_state.outbound.clone().ok_or_else(|| {
+            MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
+                session,
+            })
+        })?;
         let permit = outbound.try_reserve_owned().map_err(|_| {
             MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
                 session,
             })
         })?;
+        let batch = session_state
+            .track_outbound(OutboundBatch::single(packet))
+            .ok_or_else(|| {
+                MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::OutboundUnavailable {
+                    session,
+                })
+            })?;
 
         let ticket = self.next_myroom_ticket.ok_or_else(|| {
             MyRoomInfoRegistrationError::terminal(
@@ -3496,10 +3651,7 @@ impl World {
         let pending = PendingMyRoomInfoWrite {
             expected: identity.clone(),
             proposed: prepared.proposed().clone(),
-            echo: ReservedOutbound {
-                permit,
-                batch: OutboundBatch::single(packet),
-            },
+            echo: ReservedOutbound { permit, batch },
             reply,
         };
         let replaced = self.pending_myroom_writes.insert(ticket, pending);
@@ -3911,11 +4063,15 @@ impl World {
         pending: PendingRiderEquipmentWrite,
     ) -> Result<Vec<oneshot::Sender<()>>, RiderEquipmentPublicationInvariantError> {
         if pending.close_requested {
-            self.close_session(pending.expected.owner, Instant::now())
-                .map_err(|source| RiderEquipmentPublicationInvariantError::Delivery {
-                    ticket: ticket.get(),
-                    source: Box::new(source),
-                })?;
+            let result = if self.quiescing {
+                self.close_session_without_wire(pending.expected.owner, Instant::now())
+            } else {
+                self.close_session(pending.expected.owner, Instant::now())
+            };
+            result.map_err(|source| RiderEquipmentPublicationInvariantError::Delivery {
+                ticket: ticket.get(),
+                source: Box::new(source),
+            })?;
         }
         Ok(pending.deferred_close_replies)
     }
@@ -4405,7 +4561,7 @@ impl World {
                 .iter()
                 .filter_map(|participant| {
                     self.exact_identity_in_protocol_room(room_id, &participant.identity)
-                        .map(|identity| (identity.owner, batch.clone()))
+                        .map(|identity| (identity.owner, batch.duplicate()))
                 })
                 .collect()
         };
@@ -6973,7 +7129,7 @@ impl World {
             .filter_map(|user_no| {
                 self.identities
                     .active_identity_by_user_no(user_no)
-                    .map(|identity| (identity.owner, batch.clone()))
+                    .map(|identity| (identity.owner, batch.duplicate()))
             })
             .collect()
     }
@@ -7003,7 +7159,7 @@ impl World {
         Ok(self
             .active_room_sessions(room)?
             .into_iter()
-            .map(|(_, session)| (session, batch.clone()))
+            .map(|(_, session)| (session, batch.duplicate()))
             .collect())
     }
 
@@ -7171,14 +7327,20 @@ impl World {
     ) -> Result<Vec<ReservedOutbound>, MyRoomOutboundReservationError> {
         let mut reserved = Vec::with_capacity(deliveries.len());
         for (session, batch) in deliveries {
-            let outbound = self
+            let state = self
                 .sessions
                 .get(&session)
-                .and_then(|state| state.outbound.clone())
+                .ok_or(MyRoomOutboundReservationError { session })?;
+            let outbound = state
+                .outbound
+                .clone()
                 .ok_or(MyRoomOutboundReservationError { session })?;
             let permit = outbound
                 .try_reserve_owned()
                 .map_err(|_| MyRoomOutboundReservationError { session })?;
+            let batch = state
+                .track_outbound(batch)
+                .ok_or(MyRoomOutboundReservationError { session })?;
             reserved.push(ReservedOutbound { permit, batch });
         }
         Ok(reserved)
@@ -7190,14 +7352,20 @@ impl World {
     ) -> Result<Vec<ReservedOutbound>, LobbyError> {
         let mut reserved = Vec::with_capacity(deliveries.len());
         for (session, batch) in deliveries {
-            let outbound = self
+            let state = self
                 .sessions
                 .get(&session)
-                .and_then(|state| state.outbound.clone())
+                .ok_or(LobbyError::OutboundUnavailable { session })?;
+            let outbound = state
+                .outbound
+                .clone()
                 .ok_or(LobbyError::OutboundUnavailable { session })?;
             let permit = outbound
                 .try_reserve_owned()
                 .map_err(|_| LobbyError::OutboundUnavailable { session })?;
+            let batch = state
+                .track_outbound(batch)
+                .ok_or(LobbyError::OutboundUnavailable { session })?;
             reserved.push(ReservedOutbound { permit, batch });
         }
         Ok(reserved)
@@ -7217,18 +7385,23 @@ impl World {
         let mut pending = VecDeque::from(deliveries);
         let mut failed_sessions = HashSet::new();
         while let Some((session, batch)) = pending.pop_front() {
-            let outbound = self
-                .sessions
-                .get(&session)
-                .and_then(|state| state.outbound.clone());
-            let failed = match outbound {
-                Some(outbound) => outbound.try_send(batch).is_err(),
+            let tracked = self.sessions.get(&session).and_then(|state| {
+                let outbound = state.outbound.clone()?;
+                let batch = state.track_outbound(batch)?;
+                Some((outbound, batch))
+            });
+            let failed = match tracked {
+                Some((outbound, batch)) => outbound.try_send(batch).is_err(),
                 None => self.sessions.contains_key(&session),
             };
             if failed && failed_sessions.insert(session) {
                 let mut no_reply = None;
                 if !self.defer_session_close_for_rider_equipment(session, &mut no_reply) {
-                    pending.extend(self.close_session_state(session, now)?);
+                    if self.quiescing {
+                        self.close_session_without_wire(session, now)?;
+                    } else {
+                        pending.extend(self.close_session_state(session, now)?);
+                    }
                 }
             }
         }
@@ -7280,6 +7453,22 @@ impl World {
         }
     }
 
+    fn close_session_without_wire(
+        &mut self,
+        session: SessionId,
+        now: Instant,
+    ) -> Result<(), MyRoomLifecycleError> {
+        if let Some(mut state) = self.sessions.remove(&session)
+            && let Some(cancellation) = state.cancellation.take()
+        {
+            let _ = cancellation.send(());
+        }
+        if let DisconnectOutcome::Released(identity) = self.identities.disconnect(session, now) {
+            self.release_identity_state_without_wire(&identity)?;
+        }
+        Ok(())
+    }
+
     fn expire_migrations(&mut self, now: Instant) -> Result<(), MyRoomLifecycleError> {
         let identities = self.identities.expire_migrations(now);
         let unavailable = UnavailableReleaseIndex::from_released(&identities);
@@ -7288,6 +7477,14 @@ impl World {
             deliveries.extend(self.release_identity_state_skipping(identity, &unavailable)?);
         }
         self.deliver(deliveries, now)
+    }
+
+    fn expire_migrations_without_wire(&mut self, now: Instant) -> Result<(), MyRoomLifecycleError> {
+        let identities = self.identities.expire_migrations(now);
+        for identity in &identities {
+            self.release_identity_state_without_wire(identity)?;
+        }
+        Ok(())
     }
 
     fn release_identity_state(
@@ -7302,13 +7499,42 @@ impl World {
         identity: &ReleasedIdentity,
         unavailable_releases: &UnavailableReleaseIndex<'_>,
     ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        self.release_identity_state_with_wire_policy(identity, unavailable_releases, true)
+    }
+
+    fn release_identity_state_without_wire(
+        &mut self,
+        identity: &ReleasedIdentity,
+    ) -> Result<(), MyRoomLifecycleError> {
+        let unavailable_releases = UnavailableReleaseIndex::default();
+        drop(self.release_identity_state_with_wire_policy(
+            identity,
+            &unavailable_releases,
+            false,
+        )?);
+        Ok(())
+    }
+
+    fn release_identity_state_with_wire_policy(
+        &mut self,
+        identity: &ReleasedIdentity,
+        unavailable_releases: &UnavailableReleaseIndex<'_>,
+        publish_wire: bool,
+    ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
         let transition = self
             .myroom
             .disconnect_released(identity)
             .map_err(|error| myroom_hub_error("identity release", error))?;
-        self.commit_myroom_transition(transition, |world, outcome: &MyRoomDisconnectOutcome| {
-            world.myroom_disconnect_deliveries(outcome, unavailable_releases)
-        })?;
+        if publish_wire {
+            self.commit_myroom_transition(
+                transition,
+                |world, outcome: &MyRoomDisconnectOutcome| {
+                    world.myroom_disconnect_deliveries(outcome, unavailable_releases)
+                },
+            )?;
+        } else {
+            drop(self.commit_silent_myroom_transition(transition)?);
+        }
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Release(identity.clone()));
         if let Some(room_id) = self.room_by_identity.remove(&identity.nickname)
@@ -7322,7 +7548,7 @@ impl World {
         }
         let deliveries = self.remove_protocol_user(identity.user_no);
         self.debug_assert_invariants();
-        Ok(deliveries)
+        Ok(if publish_wire { deliveries } else { Vec::new() })
     }
 
     fn create_room(&mut self) -> RoomId {
@@ -7917,6 +8143,9 @@ async fn run_world_actor_with_timers(
             biased;
 
             _ = timers.migration_expiry.tick() => {
+                if world.quiescing {
+                    continue;
+                }
                 let now = Instant::now();
                 world.advance_loading(now, &clock);
                 world.expire_migrations(now)?;
@@ -8005,6 +8234,9 @@ async fn run_world_actor_with_timers(
                     udp_receiver = None;
                     continue;
                 };
+                if world.quiescing {
+                    continue;
+                }
                 let Some(udp) = sidecars.udp.as_ref() else {
                     debug_assert!(false, "UDP ingress mailbox requires a UDP sidecar");
                     continue;
@@ -8030,14 +8262,28 @@ async fn dispatch_command(
     sidecars: &WorldSidecars,
     clock: &ServerClock,
 ) -> Result<bool, WorldSidecarError> {
+    let command = if world.quiescing {
+        let Some(command) = admit_command_during_quiesce(command) else {
+            return Ok(false);
+        };
+        command
+    } else {
+        command
+    };
     match command {
         WorldCommand::RegisterSession {
             peer,
             cancellation,
             outbound,
+            outbound_operations,
             reply,
         } => {
-            let result = world.register_session(peer, cancellation, outbound);
+            let result = world.register_session_with_operations(
+                peer,
+                cancellation,
+                outbound,
+                outbound_operations,
+            );
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::SessionClosed { id, reply } => {
@@ -8142,6 +8388,78 @@ async fn dispatch_command(
     Ok(false)
 }
 
+/// Rejects externally initiated work which could mutate player-visible state
+/// or publish another transport batch after the quiesce boundary.
+///
+/// Completion, reconciliation, read-only, status, drain, and shutdown commands
+/// remain admitted. Profile-write registrations are also routed normally so
+/// their domain-specific `WorldQuiescing` errors remain observable.
+fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
+    match command {
+        WorldCommand::RegisterSession { reply, .. } => {
+            let _ = reply.send(Err(WorldError::SessionRegistrationClosed));
+            None
+        }
+        WorldCommand::ClaimIdentity { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::BeginMigration { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::CompleteMigration { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::PreflightMigration { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::RoomProtocol { reply, .. }
+        | WorldCommand::PublishRoomEquipment { reply, .. }
+        | WorldCommand::LeaveRoom { reply, .. }
+        | WorldCommand::MyRoom { reply, .. }
+        | WorldCommand::RetryRewardDeadLetter { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::Lobby { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::Race { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::CreateRoom { reply } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::JoinRoom { reply, .. } | WorldCommand::JoinRoomForSession { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        command @ (WorldCommand::SessionClosed { .. }
+        | WorldCommand::AuthorizeIdentity { .. }
+        | WorldCommand::RefreshMyRoomPresentation { .. }
+        | WorldCommand::RoomSnapshot { .. }
+        | WorldCommand::SessionCount { .. }
+        | WorldCommand::TakeDueRewardTasks { .. }
+        | WorldCommand::CompleteRewardTask { .. }
+        | WorldCommand::Quiesce { .. }
+        | WorldCommand::DrainOutboundProducers { .. }
+        | WorldCommand::DrainSessions { .. }
+        | WorldCommand::PrepareMyRoom { .. }
+        | WorldCommand::RegisterMyRoomInfoWrite { .. }
+        | WorldCommand::RegisterRiderEquipmentWrite { .. }
+        | WorldCommand::MyRoomSessionView { .. }
+        | WorldCommand::RewardDrainStatus { .. }
+        | WorldCommand::Shutdown { .. }
+        | WorldCommand::ForceShutdown { .. }) => Some(command),
+    }
+}
+
 async fn dispatch_session_closed(
     world: &mut World,
     sidecars: &WorldSidecars,
@@ -8151,7 +8469,11 @@ async fn dispatch_session_closed(
     if world.defer_session_close_for_rider_equipment(session, &mut reply) {
         return Ok(());
     }
-    world.close_session(session, Instant::now())?;
+    if world.quiescing {
+        world.close_session_without_wire(session, Instant::now())?;
+    } else {
+        world.close_session(session, Instant::now())?;
+    }
     flush_identity_lifecycle(world, sidecars).await?;
     if let Some(reply) = reply {
         let _ = reply.send(());
@@ -8273,7 +8595,7 @@ async fn dispatch_utility_command(
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::CreateRoom { reply } => {
-            let result = world.create_room();
+            let result = Ok(world.create_room());
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::JoinRoom {
@@ -8281,7 +8603,7 @@ async fn dispatch_utility_command(
             identity,
             reply,
         } => {
-            let result = world.join_room(room, identity);
+            let result = world.join_room(room, identity).map_err(WorldError::from);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::JoinRoomForSession {
@@ -8293,7 +8615,7 @@ async fn dispatch_utility_command(
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::LeaveRoom { identity, reply } => {
-            let result = world.leave_room(&identity);
+            let result = world.leave_room(&identity).map_err(WorldError::from);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::RoomSnapshot { room, reply } => {
@@ -8323,6 +8645,10 @@ async fn dispatch_utility_command(
         WorldCommand::Quiesce { reply } => {
             world.quiesce();
             reply_after_identity_lifecycle(world, sidecars, reply, ()).await?;
+        }
+        WorldCommand::DrainOutboundProducers { reply } => {
+            let result = world.drain_outbound_producers_once();
+            reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::RewardDrainStatus { reply } => {
             let result = world.reward_drain_status();
@@ -8787,6 +9113,7 @@ mod tests {
         MyRoomCompletionBridge, MyRoomInfoPublication, MyRoomInfoWriteError,
         PreparedMyRoomInfoWrite,
     };
+    use crate::operation_gate::WireOperationGate;
     use crate::profile_io::{MyRoomProfileLease, ProfileIoBootstrap, ProfileIoLimits};
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, MessengerHubLimits, MessengerRuntimeConfig,
@@ -9574,6 +9901,106 @@ mod tests {
         );
         assert_eq!(i32::from_le_bytes(packets[1][4..8].try_into().unwrap()), 1);
         u32::from_le_bytes(packets[1][9..13].try_into().unwrap())
+    }
+
+    fn register_tracked_outbound_session(
+        world: &mut World,
+        port: u16,
+        capacity: usize,
+    ) -> (SessionId, WireOperationGate, mpsc::Receiver<OutboundBatch>) {
+        let gate = WireOperationGate::new();
+        let (outbound, receiver) = mpsc::channel(capacity);
+        let session = world
+            .register_session_with_operations(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                None,
+                Some(outbound),
+                Some(gate.clone()),
+            )
+            .unwrap();
+        (session, gate, receiver)
+    }
+
+    #[test]
+    fn reserved_outbound_lease_survives_queue_handoff_until_batch_retirement() {
+        let mut world = World::default();
+        let (session, gate, mut receiver) =
+            register_tracked_outbound_session(&mut world, 39_001, 1);
+
+        let reserved = world
+            .reserve_outbound(vec![(session, OutboundBatch::single(vec![0xA1]))])
+            .unwrap();
+        assert_eq!(gate.active_counts().outbound, 1);
+        World::publish_reserved(reserved);
+        assert_eq!(gate.active_counts().outbound, 1);
+
+        let batch = receiver.try_recv().unwrap();
+        assert_eq!(gate.active_counts().outbound, 1);
+        let (packets, operation) = batch.into_write_parts();
+        assert_eq!(packets, vec![vec![0xA1]]);
+        drop(packets);
+        assert_eq!(gate.active_counts().outbound, 1);
+        drop(operation);
+        assert_eq!(gate.active_counts().outbound, 0);
+    }
+
+    #[test]
+    fn closed_outbound_gate_fails_atomic_reservations_without_leaking_leases() {
+        let mut world = World::default();
+        let (first, first_gate, mut first_receiver) =
+            register_tracked_outbound_session(&mut world, 39_011, 1);
+        let (closed, closed_gate, mut closed_receiver) =
+            register_tracked_outbound_session(&mut world, 39_012, 1);
+        closed_gate.close_outbound_admission();
+
+        assert!(matches!(
+            world.reserve_outbound(vec![
+                (first, OutboundBatch::single(vec![0xB1])),
+                (closed, OutboundBatch::single(vec![0xB2])),
+            ]),
+            Err(LobbyError::OutboundUnavailable { session }) if session == closed
+        ));
+        assert_eq!(first_gate.active_counts().outbound, 0);
+        assert_eq!(closed_gate.active_counts().outbound, 0);
+        assert!(first_receiver.try_recv().is_err());
+        assert!(closed_receiver.try_recv().is_err());
+
+        assert_eq!(
+            world
+                .try_reserve_myroom_outbound(vec![(closed, OutboundBatch::single(vec![0xB3]),)])
+                .unwrap_err()
+                .session,
+            closed
+        );
+        assert_eq!(closed_gate.active_counts().outbound, 0);
+        assert!(closed_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn best_effort_delivery_tracks_open_batches_and_retires_closed_sessions() {
+        let mut world = World::default();
+        let (open, open_gate, mut open_receiver) =
+            register_tracked_outbound_session(&mut world, 39_021, 1);
+        let (closed, closed_gate, mut closed_receiver) =
+            register_tracked_outbound_session(&mut world, 39_022, 1);
+        closed_gate.close_outbound_admission();
+
+        world
+            .deliver(
+                vec![
+                    (open, OutboundBatch::single(vec![0xC1])),
+                    (closed, OutboundBatch::single(vec![0xC2])),
+                ],
+                Instant::now(),
+            )
+            .unwrap();
+
+        assert_eq!(open_gate.active_counts().outbound, 1);
+        assert_eq!(closed_gate.active_counts().outbound, 0);
+        assert!(!world.sessions.contains_key(&closed));
+        assert!(closed_receiver.try_recv().is_err());
+        drop(open_receiver.try_recv().unwrap());
+        assert_eq!(open_gate.active_counts().outbound, 0);
     }
 
     #[test]
@@ -12272,6 +12699,393 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the producer-barrier regression keeps queue pressure, settlement completion, actor sealing, and post-seal admission in one causal scenario"
+    )]
+    async fn outbound_producer_barrier_retries_backpressure_then_permanently_seals_wire_work() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "BarrierOwner", 67, 42_369, 64);
+        let mut guest = register_channel_session(&mut world, "BarrierGuest", 67, 42_371, 1);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        world
+            .lobby_command(
+                guest.session,
+                LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        force_running(&mut world, room_id);
+
+        let operations = WireOperationGate::new();
+        world
+            .sessions
+            .get_mut(&owner.session)
+            .unwrap()
+            .outbound_operations = Some(operations.clone());
+        world
+            .sessions
+            .get_mut(&guest.session)
+            .unwrap()
+            .outbound_operations = Some(operations.clone());
+        let guest_sender = world.sessions[&guest.session].outbound.clone().unwrap();
+        guest_sender
+            .try_send(OutboundBatch::single(vec![0xD1]))
+            .unwrap();
+
+        let finished_at = Instant::now();
+        let clock = ServerClock::new();
+        world
+            .race_command_with_clock(
+                owner.session,
+                game_control_request_with_value(2, 1_337),
+                finished_at,
+                &clock,
+            )
+            .unwrap();
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .pending_fanouts
+                .len(),
+            1
+        );
+        assert_eq!(operations.active_counts().outbound, 0);
+
+        let deadline = world.protocol_rooms[&room_id]
+            .race_progress
+            .settlement
+            .as_ref()
+            .unwrap()
+            .deadline;
+        world.advance_loading(deadline, &clock);
+        let completed_tasks = complete_all_due_rewards(&mut world, deadline);
+        assert_eq!(completed_tasks.len(), 2);
+        assert!(matches!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .settlement
+                .as_ref()
+                .unwrap()
+                .finalization,
+            super::SettlementFinalization::Ready { .. }
+        ));
+
+        let (handle, actor) = spawn_prepared_world(world, 16);
+        assert!(matches!(
+            handle.drain_outbound_producers_once().await,
+            Err(WorldError::OutboundProducerDrainRequiresQuiesce)
+        ));
+        handle.quiesce().await.unwrap();
+
+        assert!(!handle.drain_outbound_producers_once().await.unwrap());
+        assert_eq!(operations.active_counts().outbound, 0);
+        assert_eq!(
+            guest.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xD1]]
+        );
+
+        // The first retry publishes the retained race-time batch. The final
+        // settlement remains blocked because that publication consumes the
+        // guest's sole queue slot.
+        assert!(!handle.drain_outbound_producers_once().await.unwrap());
+        assert_eq!(operations.active_counts().outbound, 2);
+        drop(owner.outbound.try_recv().unwrap());
+        drop(guest.outbound.try_recv().unwrap());
+        assert_eq!(operations.active_counts().outbound, 0);
+
+        // Once both writers make progress, one actor turn publishes the final
+        // settlement, releases every reward lane, and permanently seals all
+        // future wire-producing commands.
+        assert!(handle.drain_outbound_producers_once().await.unwrap());
+        assert_eq!(operations.active_counts().outbound, 2);
+
+        let external = handle.clone();
+        assert!(matches!(
+            external
+                .room_protocol(owner.session, RoomCommandPayload::FirstState)
+                .await,
+            Err(WorldError::OutboundProductionClosed)
+        ));
+        assert!(matches!(
+            external.create_room().await,
+            Err(WorldError::OutboundProductionClosed)
+        ));
+        assert_eq!(operations.active_counts().outbound, 2);
+
+        // Read-only and stale completion work remains admissible after the
+        // producer seal and cannot resurrect a retired reward lane.
+        assert_eq!(
+            external.authorize_identity(owner.session).await.unwrap(),
+            owner.identity
+        );
+        assert!(
+            external
+                .take_due_reward_tasks(deadline, super::ROOM_CAPACITY)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            external
+                .complete_reward_task(
+                    super::RewardPersistenceCompletion::RetryableFailure(
+                        completed_tasks[0].clone(),
+                    ),
+                    deadline,
+                )
+                .await
+                .unwrap(),
+            super::RewardCompletionDisposition::IgnoredStale
+        );
+        assert_eq!(operations.active_counts().outbound, 2);
+
+        drop(owner.outbound.try_recv().unwrap());
+        drop(guest.outbound.try_recv().unwrap());
+        assert_eq!(operations.active_counts().outbound, 0);
+        assert!(handle.drain_outbound_producers_once().await.unwrap());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[test]
+    fn quiesce_freezes_a_scheduled_loading_timer_before_it_can_publish() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "FrozenTimerOwner", 67, 42_373, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+
+        let operations = WireOperationGate::new();
+        world
+            .sessions
+            .get_mut(&owner.session)
+            .unwrap()
+            .outbound_operations = Some(operations.clone());
+        let armed_at = Instant::now();
+        world
+            .race_command(owner.session, game_control_request(0), armed_at)
+            .unwrap();
+        let timeout = armed_at + Duration::from_secs(30);
+        let clock = ServerClock::new();
+        world.advance_loading(timeout, &clock);
+        let scheduled = world.protocol_rooms[&room_id].loading_handshake.clone();
+        assert!(matches!(scheduled, LoadingHandshake::StartScheduled { .. }));
+
+        world.quiesce();
+        world.advance_loading(timeout + Duration::from_secs(2), &clock);
+        assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Loading);
+        assert_eq!(world.protocol_rooms[&room_id].loading_handshake, scheduled);
+        assert!(owner.outbound.try_recv().is_err());
+        assert_eq!(operations.active_counts().outbound, 0);
+    }
+
+    #[tokio::test]
+    async fn quiesced_actor_drops_udp_ingress_before_sidecar_dispatch() {
+        let world = World::default();
+        let (sender, receiver) = mpsc::channel(8);
+        let (udp_sender, udp_receiver) = mpsc::channel(8);
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(world.identity_capacity);
+        let handle = WorldHandle {
+            sender,
+            udp_sender: Some(udp_sender),
+            myroom_completions,
+        };
+        let actor = tokio::spawn(async move {
+            super::run_world_actor(
+                world,
+                receiver,
+                completion_receiver,
+                Some(udp_receiver),
+                WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await
+        });
+
+        handle.quiesce().await.unwrap();
+        handle
+            .try_udp_ingress(UdpIngress {
+                transport: UdpTransport::Game,
+                source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_375),
+                iv: 0x5136_5136,
+                account_id: 1,
+                route_hash: 0x1234_5678,
+                body: UdpIngressBody::GameSlotPacket(Vec::new()),
+            })
+            .unwrap();
+        time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !actor.is_finished(),
+            "quiesced UDP ingress reached the deliberately absent UDP sidecar"
+        );
+        assert_eq!(handle.session_count().await.unwrap(), 0);
+        assert!(handle.drain_outbound_producers_once().await.unwrap());
+
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_close_during_quiesce_reconciles_rooms_without_wire_publication() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "SilentCloseOwner", 67, 42_377, 8);
+        let mut guest = register_channel_session(&mut world, "SilentCloseGuest", 67, 42_379, 8);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 77),
+            Ipv4Addr::new(192, 0, 2, 77),
+        );
+        enter_myroom(
+            &mut world,
+            &guest.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 78),
+            Ipv4Addr::new(192, 0, 2, 77),
+        );
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+        let operations = WireOperationGate::new();
+        world
+            .sessions
+            .get_mut(&owner.session)
+            .unwrap()
+            .outbound_operations = Some(operations.clone());
+        world
+            .sessions
+            .get_mut(&guest.session)
+            .unwrap()
+            .outbound_operations = Some(operations.clone());
+        world.quiesce();
+
+        let (reply, response) = oneshot::channel();
+        assert!(
+            !dispatch_command(
+                &mut world,
+                WorldCommand::SessionClosed {
+                    id: guest.session,
+                    reply: Some(reply),
+                },
+                &WorldSidecars::default(),
+                &ServerClock::new(),
+            )
+            .await
+            .unwrap()
+        );
+        response.await.unwrap();
+
+        assert!(!world.sessions.contains_key(&guest.session));
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&guest.identity.user_no)
+        );
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .members_by_id
+                .iter()
+                .flatten()
+                .count(),
+            1
+        );
+        assert_eq!(world.myroom.member_count(), 1);
+        assert_eq!(
+            world.myroom.membership_if_member(&guest.identity).unwrap(),
+            None
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(guest.outbound.try_recv().is_err());
+        assert_eq!(operations.active_counts().outbound, 0);
+    }
+
+    #[test]
+    fn producer_barrier_expires_an_ownerless_preflight_without_wire_or_resurrection() {
+        let mut world = World::default();
+        let source = world
+            .register_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_381),
+                None,
+                None,
+            )
+            .unwrap();
+        let identity = world.claim_identity(source, "BarrierMigration").unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(42_381).unwrap();
+        let issued_at = Instant::now();
+        world
+            .identities
+            .begin_migration(source, channel, token, issued_at)
+            .unwrap();
+        let (outbound, mut destination_outbound) = mpsc::channel(1);
+        let operations = WireOperationGate::new();
+        let destination = world
+            .register_session_with_operations(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_383),
+                None,
+                Some(outbound),
+                Some(operations.clone()),
+            )
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                identity.user_no,
+                channel.channel_id,
+                token,
+                issued_at,
+            )
+            .unwrap();
+        assert_eq!(world.identities.transfer_in_progress_count(), 1);
+
+        world.quiesce();
+        world.close_session_without_wire(source, issued_at).unwrap();
+        assert!(world.identities.is_current_ownerless_binding(&identity));
+        assert!(world.drain_outbound_producers_once().unwrap());
+        assert_eq!(world.identities.transfer_in_progress_count(), 0);
+        assert_eq!(world.identities.active_count(), 0);
+        assert!(world.outbound_producers_sealed);
+
+        assert!(matches!(
+            world.complete_preflighted_migration(preflight, None, Instant::now()),
+            Err(WorldOperationError::Command(WorldError::Identity(
+                IdentityError::UnknownUserNo(_)
+                    | IdentityError::NoMigrationPermit { .. }
+                    | IdentityError::StaleMigrationPreflight
+            )))
+        ));
+        assert_eq!(world.identities.transfer_in_progress_count(), 0);
+        assert!(destination_outbound.try_recv().is_err());
+        assert_eq!(operations.active_counts().outbound, 0);
+    }
+
     #[test]
     fn completion_at_or_after_lease_deadline_expires_before_it_can_apply() {
         for (index, lateness) in [Duration::ZERO, Duration::from_nanos(1)]
@@ -13009,8 +13823,10 @@ mod tests {
     async fn migration_cancels_old_owner_and_rejects_its_queued_mutation() {
         let (world, task) = WorldHandle::spawn(64);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50_000);
-        let (source, source_cancelled, _outbound) =
-            world.register_login_session(peer).await.unwrap();
+        let (source, source_cancelled, _outbound) = world
+            .register_login_session(peer, WireOperationGate::new())
+            .await
+            .unwrap();
         let destination = world
             .register_session(SocketAddr::new(peer.ip(), 50_001))
             .await
@@ -13766,7 +14582,9 @@ mod tests {
 
         world.drain_sessions().await.unwrap();
         assert!(matches!(
-            world.register_login_session(peer).await,
+            world
+                .register_login_session(peer, WireOperationGate::new())
+                .await,
             Err(WorldError::SessionRegistrationClosed)
         ));
         assert_eq!(world.session_count().await.unwrap(), 0);
@@ -14969,9 +15787,11 @@ mod tests {
             request_result.await.is_err(),
             "force shutdown must close the deliberately abandoned final reply"
         );
-        assert_eq!(
-            owner.outbound.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected),
+        assert!(
+            matches!(
+                owner.outbound.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
             "force shutdown must not publish the reserved owner echo"
         );
         drop(registered);

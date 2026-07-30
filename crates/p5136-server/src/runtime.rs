@@ -24,6 +24,7 @@ use crate::{
     MessengerServiceHandle, ServerClock, ServerConfig, ServerEndpoints, UdpRuntime,
     UdpRuntimeConfig, UdpRuntimeEvent, UdpRuntimeFailure, UdpRuntimeStartError, UdpServiceError,
     WorldError, WorldHandle,
+    operation_gate::WireOperationGate,
     profile_io::{
         DurableRewardReceipt, ProfileIoBootstrap, ProfileIoConfigError, ProfileIoHandle,
         ProfileIoRuntime, ProfileIoShutdownError, RewardFailureClassification,
@@ -324,8 +325,10 @@ impl BoundServer {
             clock,
         );
         let (profile_io, profile_runtime) = profiles.spawn();
+        let wire_operations = WireOperationGate::new();
         let supervisor_world = world.clone();
         let supervisor_force_shutdown = Arc::clone(&force_shutdown_requested);
+        let supervisor_wire_operations = wire_operations.clone();
         let task = tokio::spawn(async move {
             run_supervisor(
                 SupervisorTransports {
@@ -336,6 +339,7 @@ impl BoundServer {
                     login_tcp,
                     messenger_tcp,
                     udp,
+                    wire_operations: supervisor_wire_operations,
                 },
                 shutdown_receiver,
                 supervisor_world,
@@ -352,6 +356,7 @@ impl BoundServer {
             shutdown,
             world,
             force_shutdown_requested,
+            wire_operations,
             supervisor: AsyncMutex::new(SupervisorJoin::Running(task)),
         })
     }
@@ -431,6 +436,7 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     world: WorldHandle,
     force_shutdown_requested: Arc<AtomicBool>,
+    wire_operations: WireOperationGate,
     supervisor: AsyncMutex<SupervisorJoin>,
 }
 
@@ -493,6 +499,14 @@ impl ServerHandle {
     /// in force mode without a corresponding stop request.
     pub async fn force_shutdown(&self) -> Result<(), ServerError> {
         self.force_shutdown_requested.store(true, Ordering::Release);
+        let abandoned = self.wire_operations.force_bypass();
+        if abandoned.requests != 0 || abandoned.outbound != 0 {
+            tracing::warn!(
+                active_requests = abandoned.requests,
+                active_outbound = abandoned.outbound,
+                "force shutdown is abandoning admitted wire operations"
+            );
+        }
         let _ = self.shutdown.send(true);
         let world = self.world.clone();
         let force_request = tokio::spawn(async move { world.force_shutdown().await });
@@ -584,21 +598,34 @@ async fn load_catalog(path: Option<PathBuf>) -> Result<Option<Arc<CatalogInvento
     Ok(Some(Arc::new(catalog)))
 }
 
+#[derive(Clone)]
+struct LoginSessionRuntime {
+    config: ServerConfig,
+    world: WorldHandle,
+    profiles: ProfileCoordinator,
+    wire_operations: WireOperationGate,
+}
+
 fn spawn_login_session(
     sessions: &mut JoinSet<()>,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     permit: OwnedSemaphorePermit,
-    config: &ServerConfig,
-    world: &WorldHandle,
-    profiles: &ProfileCoordinator,
+    runtime: &LoginSessionRuntime,
 ) {
-    let world = world.clone();
-    let config = config.clone();
-    let profiles = profiles.clone();
+    let runtime = runtime.clone();
     sessions.spawn(async move {
         let _permit = permit;
-        if let Err(error) = run_login_session(stream, peer, config, world, profiles).await {
+        if let Err(error) = run_login_session(
+            stream,
+            peer,
+            runtime.config,
+            runtime.world,
+            runtime.profiles,
+            runtime.wire_operations,
+        )
+        .await
+        {
             tracing::debug!(%peer, %error, "login session closed");
         }
     });
@@ -651,9 +678,7 @@ fn handle_login_accept(
     sessions: &mut JoinSet<()>,
     permits: &Arc<Semaphore>,
     maximum: usize,
-    config: &ServerConfig,
-    world: &WorldHandle,
-    profiles: &ProfileCoordinator,
+    runtime: &LoginSessionRuntime,
 ) -> Result<(), ServerError> {
     let (stream, peer) = accepted.map_err(|source| ServerError::ListenerIo {
         service: "login TCP",
@@ -663,7 +688,7 @@ fn handle_login_accept(
         drop(stream);
         return Ok(());
     };
-    spawn_login_session(sessions, stream, peer, permit, config, world, profiles);
+    spawn_login_session(sessions, stream, peer, permit, runtime);
     Ok(())
 }
 
@@ -1172,6 +1197,7 @@ struct SupervisorTransports {
     login_tcp: TcpListener,
     messenger_tcp: TcpListener,
     udp: UdpRuntime,
+    wire_operations: WireOperationGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1197,6 +1223,18 @@ struct CoreActors {
     messenger: MessengerServiceHandle,
     messenger_task: JoinHandle<()>,
     messenger_state: RuntimeTaskState,
+    profile_runtime: ProfileIoRuntime,
+    profile_state: RuntimeTaskState,
+}
+
+struct CoreShutdownActors {
+    sessions: JoinSet<()>,
+    world: WorldHandle,
+    world_task: JoinHandle<Result<(), WorldSidecarError>>,
+    world_state: RuntimeTaskState,
+    reward_pump: RewardPersistencePump,
+    reward_task: JoinHandle<Result<(), RewardPersistenceRuntimeError>>,
+    reward_state: RuntimeTaskState,
     profile_runtime: ProfileIoRuntime,
     profile_state: RuntimeTaskState,
 }
@@ -1266,10 +1304,7 @@ async fn stop_reward_runtime(
     }
 }
 
-async fn quiesce_and_drain_sessions(
-    world: &WorldHandle,
-    world_state: RuntimeTaskState,
-) -> Option<ServerError> {
+async fn quiesce_world(world: &WorldHandle, world_state: RuntimeTaskState) -> Option<ServerError> {
     if !world_state.is_running() {
         return None;
     }
@@ -1280,6 +1315,16 @@ async fn quiesce_and_drain_sessions(
             return None;
         }
         return Some(error.into());
+    }
+    None
+}
+
+async fn drain_world_sessions(
+    world: &WorldHandle,
+    world_state: RuntimeTaskState,
+) -> Option<ServerError> {
+    if !world_state.is_running() {
+        return None;
     }
     match world.drain_sessions().await {
         Ok(()) | Err(WorldError::Stopped) => None,
@@ -1389,35 +1434,88 @@ async fn stop_profile_runtime(
     result.err().map(ServerError::from)
 }
 
-async fn finish_supervisor(
-    mut sessions: JoinSet<()>,
-    actors: CoreActors,
-    transport_result: Result<(), ServerError>,
+async fn close_and_drain_request_operations(wire_operations: &WireOperationGate) -> bool {
+    wire_operations.close_request_admission();
+    wire_operations.wait_for_request_drain_or_bypass().await
+}
+
+async fn close_and_drain_outbound_operations(wire_operations: &WireOperationGate) -> bool {
+    wire_operations.close_outbound_admission();
+    wire_operations.wait_for_outbound_drain_or_bypass().await
+}
+
+async fn drain_world_outbound_producers(
+    world: &WorldHandle,
+    world_state: RuntimeTaskState,
     force_shutdown_requested: &AtomicBool,
-) -> Result<(), ServerError> {
-    let CoreActors {
+) -> Result<bool, ServerError> {
+    if !world_state.is_running() {
+        return Err(ServerError::WorldActorStopped);
+    }
+    loop {
+        if force_shutdown_requested.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        match world.drain_outbound_producers_once().await {
+            Ok(true) => return Ok(true),
+            Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(WorldError::Stopped) if force_shutdown_requested.load(Ordering::Acquire) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn abandon_wire_operations(wire_operations: &WireOperationGate) {
+    let abandoned = wire_operations.force_bypass();
+    if abandoned.requests != 0 || abandoned.outbound != 0 {
+        tracing::warn!(
+            active_requests = abandoned.requests,
+            active_outbound = abandoned.outbound,
+            "abandoning admitted wire operations during forced or failure cleanup"
+        );
+    }
+}
+
+fn can_gracefully_drain_wire_operations(
+    transport_result: &Result<(), ServerError>,
+    force_shutdown_requested: &AtomicBool,
+    world_state: RuntimeTaskState,
+    profile_state: RuntimeTaskState,
+) -> bool {
+    transport_result.is_ok()
+        && !force_shutdown_requested.load(Ordering::Acquire)
+        && world_state.is_running()
+        && profile_state.is_running()
+}
+
+async fn abort_sessions(mut sessions: JoinSet<()>) {
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+}
+
+async fn finish_graceful_core_runtimes(
+    actors: CoreShutdownActors,
+    force_shutdown_requested: &AtomicBool,
+    wire_operations: &WireOperationGate,
+) -> Option<ServerError> {
+    let CoreShutdownActors {
+        sessions,
         world,
         world_task,
         world_state,
         reward_pump,
         reward_task,
         reward_state,
-        udp,
-        messenger,
-        messenger_task,
-        messenger_state,
         profile_runtime,
         profile_state,
     } = actors;
     let mut cleanup_error = None;
 
-    if let Some(error) = quiesce_and_drain_sessions(&world, world_state).await {
+    if let Some(error) = quiesce_world(&world, world_state).await {
         cleanup_error = Some(error);
     }
-
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
-
     if let Some(error) = stop_reward_runtime(reward_pump, reward_task, reward_state).await {
         let expected_forced_stop = force_shutdown_requested.load(Ordering::Acquire)
             && matches!(
@@ -1434,51 +1532,208 @@ async fn finish_supervisor(
             );
         }
     }
-    // Reward workers no longer need profile admission. Graceful teardown keeps
-    // World alive until every accepted profile job has synchronously queued
-    // its completion and the dedicated FIFO barrier has been observed.
-    if force_shutdown_requested.load(Ordering::Acquire) {
-        if let Some(error) =
-            stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
-        {
-            retain_cleanup_error(
-                &mut cleanup_error,
-                error,
-                "World force shutdown also failed during cleanup",
-            );
-        }
-        if let Some(error) = stop_profile_runtime(profile_runtime, profile_state).await {
-            retain_cleanup_error(
-                &mut cleanup_error,
-                error,
-                "profile I/O drain also failed after forced World shutdown",
-            );
-        }
-    } else {
-        if let Some(error) = stop_profile_runtime(profile_runtime, profile_state).await {
-            retain_cleanup_error(
-                &mut cleanup_error,
-                error,
-                "profile I/O drain also failed during server cleanup",
-            );
-        }
-        if world_state.is_running()
-            && let Err(error) = world.drain_myroom_completions().await
-        {
-            // The World task is the authoritative source for a closed or
-            // failed completion barrier and is joined immediately below.
+
+    if let Some(error) = stop_profile_runtime(profile_runtime, profile_state).await {
+        retain_cleanup_error(
+            &mut cleanup_error,
+            error,
+            "profile I/O drain also failed during server cleanup",
+        );
+    }
+
+    // Profile shutdown drains every accepted job. The FIFO World barrier then
+    // proves that all resulting actor publications have been admitted before
+    // outbound admission closes.
+    let mut completion_barrier_drained = true;
+    if world_state.is_running()
+        && let Err(error) = world.drain_myroom_completions().await
+    {
+        completion_barrier_drained = false;
+        if !force_shutdown_requested.load(Ordering::Acquire) {
             tracing::error!(%error, "MyRoom completion drain barrier failed");
         }
-        if let Some(error) =
-            stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
-        {
+    }
+
+    let producers_drained = if completion_barrier_drained {
+        match drain_world_outbound_producers(&world, world_state, force_shutdown_requested).await {
+            Ok(drained) => drained,
+            Err(error) => {
+                retain_cleanup_error(
+                    &mut cleanup_error,
+                    error,
+                    "World outbound producer barrier also failed during cleanup",
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if producers_drained {
+        if !close_and_drain_outbound_operations(wire_operations).await {
+            tracing::warn!("force shutdown bypassed the actor-owned outbound drain");
+        }
+    } else {
+        abandon_wire_operations(wire_operations);
+    }
+    if let Some(error) = drain_world_sessions(&world, world_state).await {
+        retain_cleanup_error(
+            &mut cleanup_error,
+            error,
+            "World session drain also failed during cleanup",
+        );
+    }
+    abort_sessions(sessions).await;
+
+    if let Some(error) =
+        stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
+    {
+        retain_cleanup_error(
+            &mut cleanup_error,
+            error,
+            "World shutdown also failed during cleanup",
+        );
+    }
+    cleanup_error
+}
+
+async fn finish_abandoned_core_runtimes(
+    actors: CoreShutdownActors,
+    force_shutdown_requested: &AtomicBool,
+) -> Option<ServerError> {
+    let CoreShutdownActors {
+        sessions,
+        world,
+        world_task,
+        world_state,
+        reward_pump,
+        reward_task,
+        reward_state,
+        profile_runtime,
+        profile_state,
+    } = actors;
+    let mut cleanup_error = None;
+
+    if let Some(error) = quiesce_world(&world, world_state).await {
+        cleanup_error = Some(error);
+    }
+    if let Some(error) = drain_world_sessions(&world, world_state).await {
+        retain_cleanup_error(
+            &mut cleanup_error,
+            error,
+            "World session drain also failed during forced or failure cleanup",
+        );
+    }
+    abort_sessions(sessions).await;
+
+    if let Some(error) = stop_reward_runtime(reward_pump, reward_task, reward_state).await {
+        let expected_forced_stop = force_shutdown_requested.load(Ordering::Acquire)
+            && matches!(
+                error,
+                ServerError::RewardPersistence(RewardPersistenceRuntimeError::World(
+                    WorldError::Stopped
+                ))
+            );
+        if !expected_forced_stop {
             retain_cleanup_error(
                 &mut cleanup_error,
                 error,
-                "World shutdown also failed during cleanup",
+                "reward persistence drain also failed during forced or failure cleanup",
             );
         }
     }
+
+    // Forced teardown stops World before draining the durable profile runtime,
+    // so late disk completions cannot publish into an actor the operator chose
+    // to abandon. Accepted writes are still joined and may commit to disk.
+    if let Some(error) =
+        stop_world_runtime(world, world_task, world_state, force_shutdown_requested).await
+    {
+        retain_cleanup_error(
+            &mut cleanup_error,
+            error,
+            "World shutdown also failed during forced or failure cleanup",
+        );
+    }
+    if let Some(error) = stop_profile_runtime(profile_runtime, profile_state).await {
+        retain_cleanup_error(
+            &mut cleanup_error,
+            error,
+            "profile I/O drain also failed after World shutdown",
+        );
+    }
+    cleanup_error
+}
+
+async fn finish_supervisor(
+    sessions: JoinSet<()>,
+    actors: CoreActors,
+    transport_result: Result<(), ServerError>,
+    force_shutdown_requested: &AtomicBool,
+    wire_operations: WireOperationGate,
+) -> Result<(), ServerError> {
+    let CoreActors {
+        world,
+        world_task,
+        world_state,
+        reward_pump,
+        reward_task,
+        reward_state,
+        udp,
+        messenger,
+        messenger_task,
+        messenger_state,
+        profile_runtime,
+        profile_state,
+    } = actors;
+    let mut graceful_wire_drain = can_gracefully_drain_wire_operations(
+        &transport_result,
+        force_shutdown_requested,
+        world_state,
+        profile_state,
+    );
+    if graceful_wire_drain {
+        graceful_wire_drain = close_and_drain_request_operations(&wire_operations).await
+            && !force_shutdown_requested.load(Ordering::Acquire);
+    } else {
+        abandon_wire_operations(&wire_operations);
+    }
+
+    let mut cleanup_error = if graceful_wire_drain {
+        finish_graceful_core_runtimes(
+            CoreShutdownActors {
+                sessions,
+                world,
+                world_task,
+                world_state,
+                reward_pump,
+                reward_task,
+                reward_state,
+                profile_runtime,
+                profile_state,
+            },
+            force_shutdown_requested,
+            &wire_operations,
+        )
+        .await
+    } else {
+        abandon_wire_operations(&wire_operations);
+        finish_abandoned_core_runtimes(
+            CoreShutdownActors {
+                sessions,
+                world,
+                world_task,
+                world_state,
+                reward_pump,
+                reward_task,
+                reward_state,
+                profile_runtime,
+                profile_state,
+            },
+            force_shutdown_requested,
+        )
+        .await
+    };
 
     udp.shutdown().await;
 
@@ -1630,6 +1885,7 @@ async fn run_supervisor(
         login_tcp,
         messenger_tcp,
         mut udp,
+        wire_operations,
     } = transports;
     let (reward_pump, mut reward_task) = RewardPersistencePump::spawn(
         world.clone(),
@@ -1640,6 +1896,12 @@ async fn run_supervisor(
     let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let messenger_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let mut sessions = JoinSet::new();
+    let login_runtime = LoginSessionRuntime {
+        config: config.clone(),
+        world: world.clone(),
+        profiles: profiles.clone(),
+        wire_operations: wire_operations.clone(),
+    };
     let mut world_state = RuntimeTaskState::Running;
     let mut reward_state = RuntimeTaskState::Running;
     let mut messenger_state = RuntimeTaskState::Running;
@@ -1658,9 +1920,7 @@ async fn run_supervisor(
                     &mut sessions,
                     &login_session_permits,
                     config.max_login_sessions,
-                    &config,
-                    &world,
-                    &profiles,
+                    &login_runtime,
                 ) {
                     break Err(error);
                 }
@@ -1731,6 +1991,7 @@ async fn run_supervisor(
         },
         transport_result,
         &force_shutdown_requested,
+        wire_operations,
     )
     .await
 }
@@ -1788,10 +2049,12 @@ mod tests {
     use super::{
         BoundServer, RewardHealthState, RewardPersistencePump, RewardPersistenceRuntimeError,
         RewardTaskContext, RuntimeTaskState, ServerError, ServerHandle, SupervisorJoin,
-        SupervisorTransports, is_expected_forced_reward_exit, is_expected_forced_world_exit,
-        is_terminal_reward_scheduler_error, load_catalog, messenger_runtime_config,
-        request_world_shutdown, retain_cleanup_error, run_supervisor, stop_reward_runtime,
-        stop_world_runtime, udp_runtime_config, unexpected_profile_exit, world_sidecar_error,
+        SupervisorTransports, close_and_drain_outbound_operations,
+        close_and_drain_request_operations, is_expected_forced_reward_exit,
+        is_expected_forced_world_exit, is_terminal_reward_scheduler_error, load_catalog,
+        messenger_runtime_config, request_world_shutdown, retain_cleanup_error, run_supervisor,
+        stop_reward_runtime, stop_world_runtime, udp_runtime_config, unexpected_profile_exit,
+        world_sidecar_error,
     };
     use crate::{
         ChannelBinding, MessengerServiceHandle, MigrationToken, ProfileIoConfigError,
@@ -1799,6 +2062,7 @@ mod tests {
         ServerEndpoints, UdpIngress, UdpIngressBody, UdpRuntime, UdpTransport, WorldError,
         WorldHandle, decode_udp_ingress,
         myroom_persistence::{MyRoomInfoPublication, MyRoomInfoWriteError},
+        operation_gate::WireOperationGate,
         profile_io::{ProfileIoBootstrap, ProfileIoLimits},
         read_encrypted_frame,
         world::{
@@ -1965,6 +2229,7 @@ mod tests {
                 shutdown,
                 world,
                 force_shutdown_requested: Arc::new(AtomicBool::new(false)),
+                wire_operations: WireOperationGate::new(),
                 supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor_task)),
             },
             world_task,
@@ -2012,6 +2277,8 @@ mod tests {
         let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
         let force_shutdown_requested = Arc::new(AtomicBool::new(false));
         let supervisor_force_shutdown = Arc::clone(&force_shutdown_requested);
+        let wire_operations = WireOperationGate::new();
+        let supervisor_wire_operations = wire_operations.clone();
         let supervisor = tokio::spawn(run_supervisor(
             SupervisorTransports {
                 config,
@@ -2021,6 +2288,7 @@ mod tests {
                 login_tcp,
                 messenger_tcp,
                 udp,
+                wire_operations: supervisor_wire_operations,
             },
             shutdown_receiver,
             world.clone(),
@@ -2036,6 +2304,7 @@ mod tests {
                 shutdown,
                 world,
                 force_shutdown_requested,
+                wire_operations,
                 supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor)),
             },
             test_profile_io,
@@ -2058,7 +2327,7 @@ mod tests {
             .begin_migration(source, channel, token, Instant::now())
             .await?;
         let (destination, _cancelled, _outbound) = world
-            .register_login_session(SocketAddr::new(ip, 43_501))
+            .register_login_session(SocketAddr::new(ip, 43_501), WireOperationGate::new())
             .await?;
         world
             .complete_migration(
@@ -2230,6 +2499,46 @@ mod tests {
         assert!(first.is_ok());
         assert!(second.is_ok());
         server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graceful_server_shutdown_keeps_world_live_until_admitted_wire_work_retires()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let profile_root = tempfile::tempdir()?;
+        let (server, _) = start_test_server(profile_root.path(), None).await;
+        let operation = server
+            .wire_operations
+            .try_begin_request()
+            .expect("production wire gate admits work before shutdown");
+        let mut shutdown = Box::pin(server.shutdown());
+        assert!(
+            time::timeout(Duration::from_millis(10), &mut shutdown)
+                .await
+                .is_err(),
+            "graceful server shutdown must wait for admitted wire work"
+        );
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(probe) = server.wire_operations.try_begin_request() else {
+                    break;
+                };
+                drop(probe);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the supervisor closes new wire admission");
+
+        let session = server
+            .world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_001))
+            .await
+            .expect("World remains live until admitted wire work drains");
+        server.world.session_closed(session).await?;
+
+        drop(operation);
+        time::timeout(Duration::from_secs(1), shutdown).await??;
         Ok(())
     }
 
@@ -2437,6 +2746,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wire_operation_cleanup_drains_each_phase_and_force_bypasses() {
+        let graceful_gate = WireOperationGate::new();
+        let request = graceful_gate
+            .try_begin_request()
+            .expect("graceful request admitted");
+        let outbound = graceful_gate
+            .try_begin_outbound()
+            .expect("graceful outbound admitted");
+        let waiting_gate = graceful_gate.clone();
+        let mut request_cleanup =
+            tokio::spawn(async move { close_and_drain_request_operations(&waiting_gate).await });
+        assert!(
+            time::timeout(Duration::from_millis(10), &mut request_cleanup)
+                .await
+                .is_err(),
+            "graceful request cleanup must retain admitted work"
+        );
+        drop(request);
+        assert!(
+            time::timeout(Duration::from_secs(1), request_cleanup)
+                .await
+                .expect("request cleanup observes the final guard")
+                .expect("request cleanup task succeeds")
+        );
+
+        let waiting_gate = graceful_gate.clone();
+        let mut outbound_cleanup =
+            tokio::spawn(async move { close_and_drain_outbound_operations(&waiting_gate).await });
+        assert!(
+            time::timeout(Duration::from_millis(10), &mut outbound_cleanup)
+                .await
+                .is_err(),
+            "graceful outbound cleanup must retain admitted work"
+        );
+        drop(outbound);
+        assert!(
+            time::timeout(Duration::from_secs(1), outbound_cleanup)
+                .await
+                .expect("outbound cleanup observes the final guard")
+                .expect("outbound cleanup task succeeds")
+        );
+
+        let forced_gate = WireOperationGate::new();
+        let forced_request = forced_gate
+            .try_begin_request()
+            .expect("forced request admitted");
+        let forced_outbound = forced_gate
+            .try_begin_outbound()
+            .expect("forced outbound admitted");
+        let abandoned = forced_gate.force_bypass();
+        assert_eq!(abandoned.requests, 1);
+        assert_eq!(abandoned.outbound, 1);
+        assert!(
+            !time::timeout(
+                Duration::from_secs(1),
+                forced_gate.wait_for_request_drain_or_bypass(),
+            )
+            .await
+            .expect("forced request wait is released")
+        );
+        assert!(
+            !time::timeout(
+                Duration::from_secs(1),
+                forced_gate.wait_for_outbound_drain_or_bypass(),
+            )
+            .await
+            .expect("forced outbound wait is released")
+        );
+        assert!(forced_gate.try_begin_request().is_none());
+        assert!(forced_gate.try_begin_outbound().is_none());
+        drop(forced_request);
+        drop(forced_outbound);
+    }
+
+    #[tokio::test]
+    async fn force_shutdown_wakes_an_in_progress_graceful_wire_drain()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let profile_root = tempfile::tempdir()?;
+        let (server, _) = start_test_server(profile_root.path(), None).await;
+        let operation = server
+            .wire_operations
+            .try_begin_request()
+            .expect("request admitted before shutdown");
+        let mut graceful = Box::pin(server.shutdown());
+        assert!(
+            time::timeout(Duration::from_millis(10), &mut graceful)
+                .await
+                .is_err(),
+            "the held request must keep graceful shutdown in its drain"
+        );
+
+        let (forced, graceful_result) = time::timeout(Duration::from_secs(2), async {
+            tokio::join!(server.force_shutdown(), &mut graceful)
+        })
+        .await
+        .expect("force must release the already-running graceful drain");
+        forced?;
+        graceful_result?;
+        drop(operation);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn force_shutdown_preserves_unrelated_supervisor_failure()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         let supervisor_task = tokio::spawn(async { Err(ServerError::ProfileIoRuntimeStopped) });
@@ -2470,6 +2882,7 @@ mod tests {
             shutdown,
             world: fixture.handle,
             force_shutdown_requested: Arc::new(AtomicBool::new(false)),
+            wire_operations: WireOperationGate::new(),
             supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor_task)),
         };
 
@@ -2614,8 +3027,8 @@ mod tests {
         assert_eq!(receipt.info(), &persisted);
         assert_eq!(
             receipt.publication(),
-            MyRoomInfoPublication::PersistedAfterRelease,
-            "session drain releases the owner before the durable completion is published"
+            MyRoomInfoPublication::ActiveOwnerEchoed,
+            "graceful shutdown keeps the owner writer alive through durable publication"
         );
         time::timeout(Duration::from_secs(1), &mut shutdown).await??;
         let loaded = ProfileStore::new(root.path()).load_or_create("SessionMyRoomOwner")?;
@@ -2686,9 +3099,11 @@ mod tests {
             write_result,
             Err(MyRoomInfoWriteError::WorldStopped)
         ));
-        assert_eq!(
-            owner_outbound.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected),
+        assert!(
+            matches!(
+                owner_outbound.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
             "force shutdown must abandon the reserved owner echo"
         );
 

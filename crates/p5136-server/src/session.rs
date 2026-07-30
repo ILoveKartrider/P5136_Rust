@@ -85,6 +85,7 @@ use crate::{
         MYROOM_INFO_WRITE_OPERATION, MyRoomCompletionSlot, MyRoomInfoWriteError,
         MyRoomInfoWriteReceipt,
     },
+    operation_gate::WireOperationGate,
     profile_io::{
         MyRoomProfileLease, ProfileIoError, ProfileIoHandle, ProfileJobAdmission,
         ProfileLanePermit, myroom_profile_presentation,
@@ -969,21 +970,28 @@ pub(crate) async fn run_login_session(
     config: ServerConfig,
     world: WorldHandle,
     profiles: ProfileCoordinator,
+    wire_operations: WireOperationGate,
 ) -> Result<(), LoginSessionError> {
-    let (session_id, mut cancellation, mut outbound) = world.register_login_session(peer).await?;
+    let (session_id, mut cancellation, mut outbound) = world
+        .register_login_session(peer, wire_operations.clone())
+        .await?;
     let registration = SessionRegistration {
         id: session_id,
         world: world.clone(),
         closed: false,
     };
+    let services = SessionServices {
+        config: &config,
+        world: &world,
+        profiles: &profiles,
+        session_id,
+    };
     let result = run_registered_session(
         &mut stream,
-        &config,
-        &world,
-        &profiles,
-        session_id,
+        &services,
         &mut cancellation,
         &mut outbound,
+        &wire_operations,
     )
     .await;
     let close_result = registration.close().await;
@@ -1017,15 +1025,18 @@ impl Drop for SessionRegistration {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cancellation boundary must retain the partially-read frame, outbound fairness state, request lease, and writer-only shutdown transition together"
+)]
 async fn run_registered_session(
     stream: &mut TcpStream,
-    config: &ServerConfig,
-    world: &WorldHandle,
-    profiles: &ProfileCoordinator,
-    session_id: SessionId,
+    services: &SessionServices<'_>,
     cancellation: &mut oneshot::Receiver<()>,
     outbound: &mut mpsc::Receiver<OutboundBatch>,
+    wire_operations: &WireOperationGate,
 ) -> Result<(), LoginSessionError> {
+    let config = services.config;
     let peer = peer_label(stream);
     tokio::select! {
         biased;
@@ -1038,12 +1049,6 @@ async fn run_registered_session(
     let mut receive_iv = handshake::initial_iv();
     let mut send_iv = handshake::initial_iv();
     let mut context = SessionContext::default();
-    let services = SessionServices {
-        config,
-        world,
-        profiles,
-        session_id,
-    };
     let payload = handshake::first_message_payload()?;
     let wire = frame::encode_plain(&payload, config.max_login_payload)?;
     tokio::select! {
@@ -1072,13 +1077,25 @@ async fn run_registered_session(
         tokio::pin!(frame);
         let mut outbound_burst = 0;
         let packet = loop {
-            let event = select_session_read_event(
-                cancellation,
-                outbound,
-                frame.as_mut(),
-                outbound_burst >= MAX_OUTBOUND_BATCH_BURST,
-            )
-            .await?;
+            let event = tokio::select! {
+                biased;
+                () = wire_operations.wait_for_request_admission_close() => {
+                    return drain_outbound_until_cancelled(
+                        &mut writer,
+                        cancellation,
+                        outbound,
+                        &mut send_iv,
+                        config,
+                    )
+                    .await;
+                }
+                event = select_session_read_event(
+                    cancellation,
+                    outbound,
+                    frame.as_mut(),
+                    outbound_burst >= MAX_OUTBOUND_BATCH_BURST,
+                ) => event?,
+            };
             match event {
                 SessionReadEvent::Outbound(batch) => {
                     let batch = batch.ok_or(LoginSessionError::OutboundClosed)?;
@@ -1100,17 +1117,70 @@ async fn run_registered_session(
             }
         };
 
+        let Some(operation) = wire_operations.try_begin_request() else {
+            return drain_outbound_until_cancelled(
+                &mut writer,
+                cancellation,
+                outbound,
+                &mut send_iv,
+                config,
+            )
+            .await;
+        };
         trace_packet(peer, &packet)?;
         tokio::select! {
             biased;
             _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
             result = process_and_write(
                 &mut writer,
-                &services,
+                services,
                 &packet,
                 &mut context,
                 &mut send_iv,
             ) => result?,
+        }
+        // Actor-owned replies are enqueued before their command acknowledgement
+        // resolves. Flush every currently ready batch while the operation guard
+        // is still live so graceful shutdown cannot commit and then discard the
+        // corresponding wire result.
+        while let Ok(batch) = outbound.try_recv() {
+            tokio::select! {
+                biased;
+                _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
+                result = write_outbound_batch(
+                    &mut writer,
+                    batch,
+                    &mut send_iv,
+                    config,
+                ) => result?,
+            }
+        }
+        drop(operation);
+    }
+}
+
+async fn drain_outbound_until_cancelled<W>(
+    writer: &mut W,
+    cancellation: &mut oneshot::Receiver<()>,
+    outbound: &mut mpsc::Receiver<OutboundBatch>,
+    send_iv: &mut u32,
+    config: &ServerConfig,
+) -> Result<(), LoginSessionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut *cancellation => return Ok(()),
+            batch = outbound.recv() => {
+                let batch = batch.ok_or(LoginSessionError::OutboundClosed)?;
+                tokio::select! {
+                    biased;
+                    _ = &mut *cancellation => return Ok(()),
+                    result = write_outbound_batch(writer, batch, send_iv, config) => result?,
+                }
+            }
         }
     }
 }
@@ -1141,7 +1211,8 @@ async fn write_outbound_batch<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    for packet in batch.into_packets() {
+    let (packets, _operation) = batch.into_write_parts();
+    for packet in packets {
         write_logical_packet(writer, &packet, send_iv, config).await?;
     }
     Ok(())
@@ -2394,7 +2465,10 @@ mod tests {
             .await
             .unwrap();
         let (session, _cancellation, outbound) = world
-            .register_login_session(SocketAddr::new(address, source_port + 1))
+            .register_login_session(
+                SocketAddr::new(address, source_port + 1),
+                crate::operation_gate::WireOperationGate::new(),
+            )
             .await
             .unwrap();
         let identity = world
@@ -3088,7 +3162,10 @@ mod tests {
             mut visitor,
         } = fixture;
         let (outsider_session, _outsider_cancelled, mut outsider_outbound) = world
-            .register_login_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_735))
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_735),
+                crate::operation_gate::WireOperationGate::new(),
+            )
             .await
             .unwrap();
         let outsider_identity = world
@@ -4630,11 +4707,17 @@ mod tests {
         let (world, world_task) = WorldHandle::spawn(16);
         let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
         let (source, mut source_cancelled, _source_outbound) = world
-            .register_login_session(SocketAddr::new(remote, 49_910))
+            .register_login_session(
+                SocketAddr::new(remote, 49_910),
+                crate::operation_gate::WireOperationGate::new(),
+            )
             .await
             .unwrap();
         let (destination, _destination_cancelled, _destination_outbound) = world
-            .register_login_session(SocketAddr::new(remote, 49_911))
+            .register_login_session(
+                SocketAddr::new(remote, 49_911),
+                crate::operation_gate::WireOperationGate::new(),
+            )
             .await
             .unwrap();
         let identity = world
