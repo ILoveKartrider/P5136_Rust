@@ -26,14 +26,16 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
-State: clean, reviewed GUI/E2E checkpoint. The protocol resume order remains
-item 1 under **Exact resume plan**; do not reopen the completed favorite-item
-migration without a new compatibility/security finding.
+State: clean, reviewed packet-diagnostics checkpoint. The protocol resume order
+remains item 1 under **Exact resume plan**; do not reopen the completed
+favorite-item migration without a new compatibility/security finding.
 
 Current implementation checkpoint:
 `533df45 Port lease-bound favorite sidecar migration` +
 `bb84027 Harden favorite sidecar import bounds` +
-`9b26159 Add GUI server controls`
+`9b26159 Add GUI server controls` +
+`c67426c Document LAN E2E setup` +
+`8be036e Add bounded packet diagnostics`
 
 ## Current Rust checkpoint
 
@@ -77,6 +79,45 @@ unchanged and is evidence only.
   `unsafe_code = "forbid"`. `cargo test --workspace -q`,
   `cargo clippy --workspace --all-targets -- -D warnings`, and release CLI
   build pass at this checkpoint (817 regular tests, 2 local opt-in ignored).
+
+### File sink and complete packet diagnostics (2026-07-30)
+
+- Every CLI or GUI process reserves a new local log at
+  `<executable directory>\logs\p5136-<timestamp>-<pid>.log`; the GUI displays
+  the exact path. `P5136_LOG_DIR` overrides the directory for a test run.
+  Creation/open failure is a startup error, never a silent console-only
+  fallback. Files are intentionally not rotated or deleted automatically so a
+  just-crashed client run remains available for inspection.
+- The file sink independently enables `p5136_packet=debug`, so it captures
+  packet records even with the normal `info` terminal level. Its records have
+  direction, peer, full length, captured length, and first-word little-endian
+  value (the packet hash for logical TCP/Messenger frames),
+  and uppercase raw hexadecimal bytes. Login TCP is recorded after decryption
+  and before request admission (and after a successful write on output);
+  Messenger is likewise logical-frame payload. UDP records the complete
+  encrypted wire datagram before decode and after a successful send, including
+  malformed ingress that the server drops. Partial/malformed login and
+  Messenger wire frames are separately captured before their decoders return.
+- Packet diagnostics are bounded by design: payload text is capped at the
+  first 4 KiB per record and a process-wide 512-record/second raw-record budget
+  prevents remote disk/CPU amplification. A rate-limited interval reports its
+  suppressed count before the next retained record. The file sink itself uses
+  a bounded, lossy background queue, so a stalled disk never blocks a network
+  runtime; a saturated queue may drop newest diagnostic records. Normal client
+  traffic retains every packet, but overload output is explicitly not a
+  complete capture. Every retained record retains its true byte count and
+  explicit `truncated = true` marker. OS-level receive errors that never
+  produce a datagram have no payload to record and remain ordinary structured
+  errors.
+- Raw wire/logical bytes can contain credentials, nicknames, and chat. These
+  files are local sensitive diagnostics; they are Git-ignored by virtue of
+  being created beside the executable and must not be attached or committed
+  without review. Preserve the matching log when repeating the present client
+  crash, then delete or archive it by operator choice.
+- The first stock-client rerun should keep the server log and the client-side
+  crash evidence together. Compare the final `direction=received` login TCP
+  record (or absence of one) with the client crash time before changing
+  compatibility behavior.
 
 ### Correct stock P5136 and LAN E2E setup (2026-07-30)
 
@@ -529,8 +570,10 @@ unchanged and is evidence only.
   observer source, inactive frozen membership, closed settlement, and outbound
   saturation are structured nonfatal drops. Stale global identity ownership,
   actor termination, invariant failures, quiesce closure, and an impossible
-  command/outcome mismatch still propagate. Logs include only bounded metadata
-  and typed reasons, never raw packet bodies.
+  command/outcome mismatch still propagate. Ordinary runtime events include
+  bounded metadata and typed reasons; the dedicated local `p5136_packet` file
+  sink additionally retains bounded raw packet diagnostics as documented
+  above.
 - The audit records 1,471 compatible C# traces, but that corpus is not checked
   into either repository and could not be replayed independently. Actual
   type-9/type-10 and generic type-12 capture-derived differential fixtures,

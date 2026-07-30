@@ -17,6 +17,7 @@ been demonstrated.
 - [x] encoded primitive substitution table
 - [x] game/P2P UDP envelopes, routed headers, controls, and bounded opaque relay
 - [x] bounded Messenger framing and logical packet codecs
+- [x] per-run bounded file logging at every transport packet boundary
 - [x] workspace-wide `unsafe_code = "forbid"`
 
 ## Connector

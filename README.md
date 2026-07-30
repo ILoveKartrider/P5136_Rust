@@ -189,6 +189,39 @@ available, but `PqGetRider` is deliberately rejected rather than serving an
 incomplete inventory. Profiles default to `./Profile`; use `--profile-root` to
 change that location.
 
+### Runtime packet diagnostics
+
+Every `p5136` run creates a log file at
+`<p5136 executable directory>/logs/p5136-<timestamp>-<pid>.log`. The GUI shows
+the exact path beneath its title; set `P5136_LOG_DIR` to place it elsewhere.
+If the directory or file cannot be created, startup fails instead of silently
+running without diagnostics.
+
+The file records every server transport-boundary packet with direction, peer,
+byte count, first-word little-endian value (the logical frame hash for
+TCP/Messenger), and hexadecimal payload: login TCP plaintext
+logical frames (including the first server frame), complete UDP wire datagrams
+before decode and after a successful send, and Messenger TCP logical frames.
+Malformed/partial TCP and Messenger wire frames are also recorded before their
+decoder returns an error. To keep a hostile maximum-size frame from exhausting
+disk, hexadecimal payload capture is limited to the first 4 KiB per record;
+the record remains present and says `truncated = true` with its full byte
+count.
+
+Normal client traffic records every packet. This is deliberately not an
+unbounded remote-disk-write capability: raw packet records are process-wide
+limited to 512 per second, and the file writer has a bounded asynchronous
+queue. A rate-limited interval emits a `packet diagnostics were rate-limited`
+record with its dropped count; if the file queue itself is full, its newest
+records are dropped rather than stalling the server. Preserve these warnings
+alongside a crash log—there is no claim of complete raw capture during a
+diagnostic-overload attack.
+
+These files can contain authentication material, nicknames, and chat text.
+They are local diagnostic data, are never committed, and should be handled as
+sensitive. There is no automatic deletion: preserve the log from a failing
+client run, then remove it manually when it is no longer needed.
+
 `--client-data-dir` points at the stock client's `Data` directory. At startup,
 the server uses a bounded, read-only RHO5 reader to locate exactly one
 `etc_/emblem/emblem@kr.xml`, authenticate and decompress it in memory, and load
