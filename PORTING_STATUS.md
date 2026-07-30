@@ -1,6 +1,6 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-07-30
+Last updated: 2026-07-29
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
@@ -27,26 +27,80 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Committed baseline before the current tranche:
-`f84282e Port safe MyRoom reentry and random entry`
+`52b35c9 Port strict MyRoom password kind reply`
 
 ## Current Rust checkpoint
 
-The current worktree builds on the Reenter/random-entry checkpoint and closes
-the bounded `CheckPassword` compatibility-response slice without treating it
-as a protected-room password proof.
+The current worktree corrects the committed placeholder password response from
+new stock-client static evidence, finishes direct protected-room entry, and
+connects an uncached protected item-password success to a single matching
+follow-up without retaining credential plaintext.
 
-### MyRoom password-kind compatibility response
+### MyRoom direct protected entry
 
-- `ChRqMyroomCheckPassEtcPacket` is now an explicit session path. Its sole
-  signed 32-bit password-kind field is parsed strictly; truncated or trailing
-  input fails before actor authorization, bound-profile lookup, or response.
-- For a current generation with its matching bound profile, Rust preserves the
-  C# wire response exactly: `ChRpMyroomCheckPassEtcPacket` contains the
-  requested kind followed by `1` only for kind `0`, otherwise `0`.
-- This packet contains no password or credential and mints no World/Hub
-  capability, membership, or session flag. In particular, its success-looking
-  kind-0 ACK cannot authorize protected-room entry. That flow remains
-  capture-blocked until the actual credential-bearing exchange is known.
+- The stock `ChRqEnterMyRoomPacket` codec is exactly two UTF-16 strings:
+  requested owner nickname, then room password. Runtime traces also contain
+  owner plus an empty second string. The C# handler reads the first string and
+  then consumes the empty password length as an unused integer, so it silently
+  ignores every nonempty room password. C# remains read-only; Rust fixes the
+  behavior.
+- Rust requires both bounded fields and exact packet exhaustion. The password
+  is held in a dedicated type whose `Debug` form is always redacted; it is
+  moved into the actor command and never copied into logs, a profile, or a
+  reusable session flag.
+- A public present owner admits the visitor normally. A protected present
+  owner with an empty request receives the exact
+  `ChCmdPwEnterMyRoomPacket(owner)` prompt. A nonempty mismatch returns
+  `ChRpEnterMyRoomPacket` status `4`, which the stock client maps to
+  `cannotEnterMissPassword`; an exact nonempty match enters the room.
+- A protected room whose stored password is empty fails closed: empty input
+  prompts and no nonempty input can match. Inactive, untracked, or
+  owner-absent targets remain unavailable. Successful visitor replies still
+  clear both stored password strings.
+- Owner resolution, comparison, transition construction, serialization,
+  exact-generation queue reservation, and commit occur in one actor turn.
+  Empty prompts and mismatch replies mutate no topology; successful protected
+  entry uses the same all-recipient atomic commit as public entry.
+
+### MyRoom item-password check and one-shot follow-up
+
+- `ChRqMyroomCheckPassEtcPacket` is now parsed as the stock codec actually
+  emits it: signed `i32 kind` followed by a bounded UTF-16 password. Truncated,
+  oversized, or trailing input fails before actor work. Its response is the
+  same kind followed by a typed `i32` status: `0` unsupported/no-op, `1`
+  success, `2` prompt for a password, and `3` wrong password.
+- Client static analysis maps kinds `0..=3` to Garage, Emblem, Career, and
+  Item Dictionary. On an uncached protected visitor open, success sends one
+  matching follow-up request: kinds `0` and `3` send
+  `RmRequestItemsPacket`, kind `1` sends `RmRequestEmblemsPacket`, and kind `2`
+  sends `RmRequestCareerListPacket`. A cached client path may instead open its
+  local UI without another network request.
+- Applying the current owner's `UseItemPwd`/`ItemPwd` to all four shared
+  visitor checks is an explicit Rust product-policy inference from the client
+  flow and the sole item-password fields. There is no original-server runtime
+  capture for this exchange, so this inference is documented rather than
+  presented as captured server behavior.
+- The actor requires an exact current membership and a present exact owner.
+  Owners and visitors to an unprotected item surface receive success. For a
+  protected visitor, empty input returns `2`, an exact match returns `1`, and
+  a nonempty mismatch returns `3`. Invalid kinds, nonmembers, and
+  owner-unavailable rooms return `0`.
+- A successful protected check stores no password. It mints one move-only,
+  actor-owned grant scoped to the exact requester binding, exact owner
+  binding, protected resource, and the owner's room-info revision. Garage and
+  Item Dictionary grants are consumed by the next `RequestItems` prepare;
+  Emblem and Career grants remain reserved for their still-unported matching
+  request paths and cannot authorize owner items.
+- The uncached stock-client path sends at most one matching follow-up after a
+  successful check, so grants are deliberately one-shot. An unused grant may
+  remain until it is consumed or revoked; successful entry/reentry, room
+  movement, Secede, identity migration/release, a new password check, or an
+  owner-info/password-policy revision revokes or invalidates it. Consumption
+  happens before profile I/O; a cancelled, stale, failed, or backpressured
+  request does not turn it into reusable authority.
+- The C# path parses only the kind, returns a kind-0-only placeholder, and
+  serves owner items without checking the item password. Rust deliberately
+  does not reproduce that bypass.
 
 ### MyRoom Reenter and random public entry
 
@@ -104,12 +158,12 @@ as a protected-room password proof.
   may refine that choice, but must preserve the exact-generation capability
   and atomic publication boundaries.
 
-### MyRoom direct public entry
+### MyRoom direct entry
 
-- `ChRqEnterMyRoomPacket` is now an explicit session path. The owner nickname is
-  parsed with the existing bounded UTF-16 codec; only the protocol's optional
-  reserved dword is accepted, and it is not reinterpreted as a password or
-  authority token.
+- `ChRqEnterMyRoomPacket` is an explicit session path. Its required owner and
+  password strings use bounded UTF-16 codecs and exact exhaustion; the C#
+  implementation's apparent optional dword was the empty password string's
+  length, not a reserved field.
 - No extra profile job or profile lane is introduced. The session projects its
   already generation-bound in-memory profile into an opaque
   `MyRoomEntryInput`; malformed presentation or self-room info fails before the
@@ -123,11 +177,11 @@ as a protected-room password proof.
   room exists. Re-entry into an existing owned room preserves the actor's
   authoritative owner presentation and info rather than overwriting them with
   a stale session copy.
-- Visitor entry is deliberately narrower and safer than C#: the exact target
-  must already own an actor-tracked room, occupy its slot zero, remain the
-  active generation, and have `use_room_password == 0`. Inactive, untracked,
-  owner-absent, or protected targets all return `OwnerUnavailable`; only an
-  otherwise admissible public room can reveal `Full`.
+- Visitor entry requires the exact target to own an actor-tracked room, occupy
+  its slot zero, and remain the active generation. Public rooms admit
+  immediately; protected rooms use the prompt/mismatch/match states described
+  above. Inactive, untracked, and owner-absent targets return
+  `OwnerUnavailable`; only an otherwise admissible room can reveal `Full`.
 - Successful self replies contain the owner's full room info. Visitor replies
   preserve BGM, policy flags, `TalkLock`, and kart fields but clear both raw
   password strings. The reply always uses the canonical actor-resolved owner
@@ -145,10 +199,9 @@ as a protected-room password proof.
   members receive only the post-move old-room snapshot. A dropped ACK receiver
   cannot cancel accepted actor work, while quiesce rejects the command before
   publication.
-- Protected-room password proof remains unported. The separately implemented
-  password-kind compatibility ACK is not accepted as proof. Rust does not copy
-  the C# bug that ignores room passwords or leaks both stored plaintext
-  passwords to visitors.
+- Room-entry passwords and item-surface passwords are intentionally separate.
+  A `CheckPassword` success can never authorize entry, and a direct room
+  password can never authorize owner-item reads.
 
 ### MyRoom CharacterPosition
 
@@ -173,9 +226,11 @@ as a protected-room password proof.
   Dropping the requester-side ACK future does not cancel an actor-accepted
   publication, and quiesce rejects new position production before publication.
 - `RiderTalk` deliberately remains unported in this tranche. The C# handler
-  ignores `TalkLock`, while the available source does not establish whether
-  zero or one means locked or whether the owner is exempt. Rust will not guess
-  that authorization policy merely to clone the unsafe C# behavior.
+  ignores `TalkLock`, but stock-client static analysis now establishes that
+  zero is chat-off and any nonzero value is chat-enabled. The next slice can
+  therefore enforce the authoritative owner policy, canonical sender slot,
+  sender exclusion, and all-peer queue reservation without guessing the flag
+  direction.
 
 ### MyRoom RequestItems
 
@@ -205,12 +260,12 @@ as a protected-room password proof.
 - The C# kart-empty early return loses valid parts. Rust deliberately fixes
   this data-loss defect: a parts-only inventory is serialized normally.
 - A visitor may read a public owner inventory. When `use_item_password != 0`,
-  the current request has no credential/capability to validate, so Rust
-  conservatively denies the visitor before disk I/O while still allowing the
-  owner. Integrated visitor info responses retain policy flags but redact raw
-  room and item passwords. The eventual password flow must replace this
-  conservative denial with an actor-minted capability rather than exposing or
-  comparing packet-supplied plaintext.
+  Rust denies an ungranted visitor before disk I/O while still allowing the
+  owner. A successful kind-0 or kind-3 item-password check authorizes exactly
+  the next protected `RequestItems` plan; the grant is consumed before the
+  bounded owner profile read and is revalidated against membership, owner
+  generation/presence, and policy revision before publication. Integrated
+  visitor info responses retain policy flags but redact raw passwords.
 
 ### Exact-generation operation ownership
 
@@ -283,10 +338,10 @@ as a protected-room password proof.
 - MyRoom actor state includes bounded entry topology and generation-aware
   migration/disconnect cleanup. Production dispatch currently integrates
   direct self/public entry, current-membership Reenter, bounded random public
-  entry, the strict password-kind compatibility ACK, fresh FirstState
-  projection, owner-info durability, bounded RequestItems, exact-generation
-  character-position fanout, and Secede; protected password entry is still
-  missing.
+  entry, direct protected entry, strict item-password checks and one-shot
+  protected owner-item grants, fresh FirstState projection, owner-info
+  durability, bounded RequestItems, exact-generation character-position
+  fanout, and Secede.
 - Rider equipment/plant persistence is cancellation-independent and refreshes
   the actor caches only after durable confirmation.
 - Graceful shutdown drains wire admission, accepted durable work, completion
@@ -324,12 +379,13 @@ these areas:
   `PreventItem` race, and never drops parts merely because the kart list is
   empty.
 - Visitor-facing integrated MyRoom info does not disclose stored room/item
-  passwords. Protected owner-item reads are denied without disk access until a
-  real password capability is implemented.
+  passwords. Protected owner-item reads require a successful, move-only,
+  one-shot item-password grant before disk access.
 - Direct MyRoom entry does not ignore the room-password flag or serialize
-  stored plaintext passwords to visitors. Only an exact, present, actor-tracked
-  public owner can admit a visitor; all queue reservations precede the combined
-  old/new topology commit, so the C# reply-then-best-effort fanout window is not
+  stored plaintext passwords to visitors. An exact present owner admits a
+  public request or validates the packet-carried protected-room password
+  inside the actor; all queue reservations precede the combined old/new
+  topology commit, so the C# reply-then-best-effort fanout window is not
   reproduced.
 - Reenter is not aliased to random-online-player selection. It preserves an
   exact current membership before falling back to the requester's own room.
@@ -380,11 +436,11 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 631 passed, 0 failed
+# 637 passed, 0 failed
 git diff --check
 ```
 
-The 631 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 365 server
+The 637 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 371 server
 unit, and 8 server integration tests. Doc-tests also passed.
 
 Focused regressions cover:
@@ -406,18 +462,22 @@ Focused regressions cover:
   cancellation, dropped ACK, and atomic queue backpressure;
 - aggregate multi-packet write timeout, guard drain, exact packet order, and
   IV progression;
-- direct-entry self bootstrap/re-entry, public visitor redaction,
-  protected/untracked/owner-absent denial, public-room full mapping, canonical
-  nickname lookup, old/new move audiences, atomic backpressure rollback and
-  typed session propagation, stale requester generation, dropped ACK, and
-  quiesce rejection;
+- direct-entry self bootstrap/re-entry, public visitor redaction, exact
+  owner-plus-password parsing, protected empty prompt, status-4 mismatch,
+  successful protected entry, untracked/owner-absent denial, room-full
+  mapping, canonical nickname lookup, old/new move audiences, atomic
+  backpressure rollback and typed session propagation, stale requester
+  generation, dropped ACK, and quiesce rejection;
 - strict Reenter/random empty-packet dispatch; current protected membership,
   owner-absent membership, owned-room fallback, and self bootstrap; stable
   eligible-owner filtering, no-candidate status, bounded-choice invariant
   failure, deferred invalid-self fallback, secret redaction, and atomic
   random-entry backpressure/retry;
-- strict password-kind parsing, exact kind-0/nonzero compatibility replies,
-  and no protected-entry capability or actor mutation;
+- strict kind-plus-password parsing, exact status `0/1/2/3` replies, owner and
+  public bypass, protected prompt/mismatch/success, invalid/nonmember/absent
+  rejection, kind/resource separation, one-shot protected owner-item access,
+  empty-stored-secret fail-closed behavior, policy-revision invalidation, and
+  grant revocation on entry, Secede, migration, and release;
 - strict character-position input, canonical sender slots, nonmember and
   self-echo suppression, stale-source migration fencing, exact peer packets,
   atomic multi-peer backpressure/retry, dropped ACK, and quiesce rejection;
@@ -445,11 +505,16 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Finish protected-room entry and chat fanout; add the actor-minted password
-   capability and emblem flows, main-emblem persistence, P2P-port profile
-   writes, club create/rename refresh, and any request still intentionally
-   classified as a no-op. Finish kart tuning/upgrades and the remaining
-   quest/attendance/progression surface.
+   Finish TalkLock-aware chat fanout, consume the reserved kind-1/kind-2
+   one-shot grants in the emblem/career flows, add the bounded emblem catalog,
+   main-emblem persistence, P2P-port profile writes, club create/rename
+   refresh, and any request still intentionally classified as a no-op. Finish
+   kart tuning/upgrades and the remaining quest/attendance/progression surface.
+   Password request values are bounded and redacted but still use ordinary
+   `String` storage and comparison, matching the existing plaintext profile
+   fields; a later storage redesign should add zeroization/at-rest protection
+   and per-requester attempt throttling without weakening actor admission
+   bounds.
 
 4. **Evidence-dependent packet behavior**
 
@@ -481,14 +546,14 @@ These items prevent a "port complete" claim.
 
 1. Enumerate every classified request and mark it implemented, intentionally
    unsupported with a typed response, or capture-blocked. No silent fallthrough.
-2. Keep the explicit `CheckPassword` compatibility ACK separate from entry
-   authority and capture the missing credential-bearing exchange before
-   enabling protected entry: the known P5136 packet carries only a
-   password-kind integer, not a password. If evidence establishes a proof step,
-   represent it as an actor-minted exact-generation capability; never place
-   plaintext credentials in a reusable session-global flag. Continue the
-   remaining MyRoom requests in small vertical slices with malformed-input,
-   stale-generation, cancellation/backpressure, and exact-packet tests.
+2. Preserve the now-explicit separation between direct room-password entry and
+   item-password UI checks. Keep one-shot grants move-only, plaintext-free, and
+   scoped to exact requester/owner generations plus owner-info revision.
+   Connect the reserved Emblem and Career resources only when their matching
+   request paths are implemented; never broaden a grant to another resource or
+   a reusable session-global flag. Continue the remaining MyRoom requests in
+   small vertical slices with malformed-input, stale-generation,
+   cancellation/backpressure, and exact-packet tests.
 3. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
 4. Capture and implement movement sequence/tick behavior per sender and exact

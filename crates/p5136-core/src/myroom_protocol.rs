@@ -4,7 +4,7 @@
 //! accepts complete, structurally valid client packets and produces the
 //! replies whose field order is independent of inventory/profile I/O.
 
-use std::net::Ipv4Addr;
+use std::{fmt, net::Ipv4Addr};
 
 use thiserror::Error;
 
@@ -19,6 +19,7 @@ pub const REENTER_MYROOM_REQUEST_NAME: &str = "ChReRqEnterMyRoomPacket";
 pub const ENTER_RANDOM_MYROOM_REQUEST_NAME: &str = "ChRqEnterRandomMyRoomPacket";
 pub const ENTER_MYROOM_REQUEST_NAME: &str = "ChRqEnterMyRoomPacket";
 pub const ENTER_MYROOM_REPLY_NAME: &str = "ChRpEnterMyRoomPacket";
+pub const PASSWORD_ENTER_MYROOM_COMMAND_NAME: &str = "ChCmdPwEnterMyRoomPacket";
 pub const FIRST_MYROOM_REQUEST_NAME: &str = "RmFirstRequestPacket";
 pub const REQUEST_MYROOM_ITEMS_NAME: &str = "RmRequestItemsPacket";
 pub const NOTIFY_MYROOM_INFO_NAME: &str = "RmNotiMyRoomInfoPacket";
@@ -71,11 +72,38 @@ pub enum MyRoomRequest {
     UpdateMainEmblem,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct EnterMyRoomRequest {
     pub owner_nickname: String,
-    /// P5136 sometimes appends one unused dword.
-    pub reserved: Option<i32>,
+    pub password: MyRoomPassword,
+}
+
+/// A bounded legacy `MyRoom` credential whose debug form never exposes its
+/// plaintext value.
+#[derive(PartialEq, Eq)]
+pub struct MyRoomPassword(String);
+
+impl MyRoomPassword {
+    pub fn new(value: String) -> Result<Self, MyRoomProtocolError> {
+        validate_string("MyRoom password", &value, MAX_MYROOM_PASSWORD_UTF16_UNITS)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for MyRoomPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MyRoomPassword([REDACTED])")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,9 +146,56 @@ pub struct RiderTalkRequest {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CheckPasswordRequest {
     pub password_kind: i32,
+    pub password: MyRoomPassword,
+}
+
+impl CheckPasswordRequest {
+    #[must_use]
+    pub const fn protected_feature(&self) -> Option<MyRoomProtectedFeature> {
+        MyRoomProtectedFeature::from_wire(self.password_kind)
+    }
+}
+
+/// Client continuation selected after a successful item-password check.
+///
+/// Despite the legacy field name, the integer does not select a credential:
+/// the stock client routes all four visitor features through the same check
+/// packet. Applying the owner's sole item-password policy to every feature is
+/// an explicit Rust product-policy inference; no original-server capture is
+/// available for this exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum MyRoomProtectedFeature {
+    Garage = 0,
+    Emblem = 1,
+    Career = 2,
+    ItemDictionary = 3,
+}
+
+impl MyRoomProtectedFeature {
+    #[must_use]
+    pub const fn from_wire(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Garage),
+            1 => Some(Self::Emblem),
+            2 => Some(Self::Career),
+            3 => Some(Self::ItemDictionary),
+            _ => None,
+        }
+    }
+}
+
+/// P5136's three positive item-password outcomes plus its no-op fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum CheckPasswordStatus {
+    Unsupported = 0,
+    Success = 1,
+    PasswordRequired = 2,
+    WrongPassword = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +297,7 @@ pub enum EnterMyRoomStatus {
     Success = 0,
     Full = 1,
     OwnerUnavailable = 3,
+    PasswordMismatch = 4,
     NoAvailableRoom = 5,
 }
 
@@ -298,20 +374,12 @@ pub fn parse_enter_request(packet: &[u8]) -> Result<EnterMyRoomRequest, MyRoomPr
     let mut reader = PacketReader::new(packet);
     expect_hash(&mut reader, ENTER_MYROOM_REQUEST_NAME)?;
     let owner_nickname = reader.read_utf16_bounded(MAX_RIDER_NICKNAME_UTF16_UNITS)?;
-    let reserved = match reader.remaining().len() {
-        0 => None,
-        4 => Some(reader.read_i32()?),
-        _ => {
-            return Err(MyRoomProtocolError::TrailingBytes {
-                name: ENTER_MYROOM_REQUEST_NAME,
-                count: reader.remaining().len(),
-            });
-        }
-    };
+    let password =
+        MyRoomPassword::new(reader.read_utf16_bounded(MAX_MYROOM_PASSWORD_UTF16_UNITS)?)?;
     ensure_exhausted(&reader, ENTER_MYROOM_REQUEST_NAME)?;
     Ok(EnterMyRoomRequest {
         owner_nickname,
-        reserved,
+        password,
     })
 }
 
@@ -364,6 +432,7 @@ pub fn parse_check_password(packet: &[u8]) -> Result<CheckPasswordRequest, MyRoo
     expect_hash(&mut reader, CHECK_PASSWORD_REQUEST_NAME)?;
     let request = CheckPasswordRequest {
         password_kind: reader.read_i32()?,
+        password: MyRoomPassword::new(reader.read_utf16_bounded(MAX_MYROOM_PASSWORD_UTF16_UNITS)?)?,
     };
     ensure_exhausted(&reader, CHECK_PASSWORD_REQUEST_NAME)?;
     Ok(request)
@@ -408,6 +477,19 @@ pub fn serialize_enter_error(status: EnterMyRoomStatus) -> Result<Vec<u8>, MyRoo
     serialize_enter_reply("", status, &MyRoomInfo::default())
 }
 
+pub fn serialize_password_enter_myroom_command(
+    owner_nickname: &str,
+) -> Result<Vec<u8>, MyRoomProtocolError> {
+    validate_string(
+        "MyRoom owner nickname",
+        owner_nickname,
+        MAX_RIDER_NICKNAME_UTF16_UNITS,
+    )?;
+    let mut packet = PacketWriter::named(PASSWORD_ENTER_MYROOM_COMMAND_NAME);
+    packet.write_utf16(owner_nickname)?;
+    Ok(packet.into_inner())
+}
+
 pub fn serialize_myroom_info(info: &MyRoomInfo) -> Result<Vec<u8>, MyRoomProtocolError> {
     validate_myroom_info(info)?;
     let mut packet = PacketWriter::named(NOTIFY_MYROOM_INFO_NAME);
@@ -446,10 +528,10 @@ pub fn serialize_secede_reply() -> Vec<u8> {
 }
 
 #[must_use]
-pub fn serialize_check_password_reply(password_kind: i32) -> Vec<u8> {
+pub fn serialize_check_password_reply(password_kind: i32, status: CheckPasswordStatus) -> Vec<u8> {
     let mut packet = PacketWriter::named(CHECK_PASSWORD_REPLY_NAME);
     packet.write_i32(password_kind);
-    packet.write_i32(i32::from(password_kind == 0));
+    packet.write_i32(status as i32);
     packet.into_inner()
 }
 
@@ -979,14 +1061,15 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, ENTER_MYROOM_REQUEST_NAME,
-        ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus, FIRST_MYROOM_REQUEST_NAME,
-        MAX_MYROOM_EMBLEMS, MAX_MYROOM_PASSWORD_UTF16_UNITS, MAX_MYROOM_TALK_UTF16_UNITS,
-        MYROOM_EMPTY_SLOT_WIRE_LENGTH, MYROOM_ITEM_CHUNK_SIZE, MYROOM_SLOT_COUNT, MyRoomInfo,
-        MyRoomKart, MyRoomParts, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest, MyRoomSlot,
-        MyRoomTune, NOTIFY_MYROOM_INFO_NAME, OWNER_ITEM_ENCHANT_NAME, OWNER_ITEM_NAME,
-        REENTER_MYROOM_REQUEST_NAME, REQUEST_EMBLEMS_NAME, REQUEST_MYROOM_ITEMS_NAME,
-        RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME,
+        CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, CheckPasswordStatus,
+        ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
+        FIRST_MYROOM_REQUEST_NAME, MAX_MYROOM_EMBLEMS, MAX_MYROOM_PASSWORD_UTF16_UNITS,
+        MAX_MYROOM_TALK_UTF16_UNITS, MYROOM_EMPTY_SLOT_WIRE_LENGTH, MYROOM_ITEM_CHUNK_SIZE,
+        MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart, MyRoomParts, MyRoomPassword, MyRoomPlayerSlot,
+        MyRoomProtectedFeature, MyRoomProtocolError, MyRoomRequest, MyRoomSlot, MyRoomTune,
+        NOTIFY_MYROOM_INFO_NAME, OWNER_ITEM_ENCHANT_NAME, OWNER_ITEM_NAME,
+        PASSWORD_ENTER_MYROOM_COMMAND_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_EMBLEMS_NAME,
+        REQUEST_MYROOM_ITEMS_NAME, RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME,
         UPDATE_MAIN_EMBLEM_REQUEST_NAME, classify_myroom_request, parse_character_position,
         parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
         parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
@@ -994,9 +1077,9 @@ mod tests {
         serialize_character_position, serialize_check_password_reply, serialize_enter_error,
         serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
         serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
-        serialize_rider_echo, serialize_secede_reply, serialize_slot_data,
-        serialize_update_main_emblem_reply, validate_myroom_info, validate_myroom_player_slot,
-        wire_count, wire_index,
+        serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
+        serialize_slot_data, serialize_update_main_emblem_reply, validate_myroom_info,
+        validate_myroom_player_slot, wire_count, wire_index,
     };
     use crate::{
         adler32,
@@ -1163,22 +1246,52 @@ mod tests {
     }
 
     #[test]
-    fn parses_enter_requests_with_and_without_the_reserved_dword() {
+    fn parses_enter_request_owner_and_bounded_password() {
         let mut packet = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
         packet.write_utf16("owner").unwrap();
-        packet.write_i32(123);
+        packet.write_utf16("secret").unwrap();
         let request = parse_enter_request(packet.as_slice()).unwrap();
         assert_eq!(request.owner_nickname, "owner");
-        assert_eq!(request.reserved, Some(123));
+        assert_eq!(request.password.expose_secret(), "secret");
+        assert!(!format!("{:?}", request.password).contains("secret"));
 
-        let mut no_reserved = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
-        no_reserved.write_utf16("owner").unwrap();
-        assert_eq!(
-            parse_enter_request(no_reserved.as_slice())
-                .unwrap()
-                .reserved,
-            None
-        );
+        let captured_empty_password = [
+            0x27, 0x08, 0x65, 0x57, 0x04, 0x00, 0x00, 0x00, 0x59, 0x00, 0x61, 0x00, 0x6e, 0x00,
+            0x79, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let request = parse_enter_request(&captured_empty_password).unwrap();
+        assert_eq!(request.owner_nickname, "Yany");
+        assert!(request.password.is_empty());
+
+        let mut missing_password = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        missing_password.write_utf16("owner").unwrap();
+        assert!(matches!(
+            parse_enter_request(missing_password.as_slice()),
+            Err(MyRoomProtocolError::Packet(_))
+        ));
+
+        assert!(matches!(
+            MyRoomPassword::new("x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1)),
+            Err(MyRoomProtocolError::StringTooLong {
+                field: "MyRoom password",
+                actual,
+                maximum: MAX_MYROOM_PASSWORD_UTF16_UNITS,
+            }) if actual == MAX_MYROOM_PASSWORD_UTF16_UNITS + 1
+        ));
+        let mut oversized_password = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        oversized_password.write_utf16("owner").unwrap();
+        oversized_password
+            .write_utf16(&"x".repeat(MAX_MYROOM_PASSWORD_UTF16_UNITS + 1))
+            .unwrap();
+        assert!(matches!(
+            parse_enter_request(oversized_password.as_slice()),
+            Err(MyRoomProtocolError::Packet(
+                crate::packet::PacketError::StringLimitExceeded {
+                    length,
+                    maximum: MAX_MYROOM_PASSWORD_UTF16_UNITS,
+                }
+            )) if length == MAX_MYROOM_PASSWORD_UTF16_UNITS + 1
+        ));
     }
 
     #[test]
@@ -1210,12 +1323,15 @@ mod tests {
 
         let mut password = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
         password.write_i32(1);
+        password.write_utf16("item secret").unwrap();
+        let parsed = parse_check_password(password.as_slice()).unwrap();
+        assert_eq!(parsed.password_kind, 1);
         assert_eq!(
-            parse_check_password(password.as_slice())
-                .unwrap()
-                .password_kind,
-            1
+            parsed.protected_feature(),
+            Some(MyRoomProtectedFeature::Emblem)
         );
+        assert_eq!(parsed.password.expose_secret(), "item secret");
+        assert!(!format!("{parsed:?}").contains("item secret"));
 
         let mut emblem = PacketWriter::named(UPDATE_MAIN_EMBLEM_REQUEST_NAME);
         emblem.write_i16(-7);
@@ -1244,6 +1360,21 @@ mod tests {
         assert_eq!(reader.read_utf16().unwrap(), "");
         assert_eq!(reader.read_u8().unwrap(), 3);
 
+        let password_mismatch = serialize_enter_error(EnterMyRoomStatus::PasswordMismatch).unwrap();
+        let mut reader = PacketReader::new(&password_mismatch);
+        assert_eq!(reader.read_u32().unwrap(), 1_465_059_366);
+        assert_eq!(reader.read_utf16().unwrap(), "");
+        assert_eq!(reader.read_u8().unwrap(), 4);
+
+        let prompt = serialize_password_enter_myroom_command("owner").unwrap();
+        let mut reader = PacketReader::new(&prompt);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash(PASSWORD_ENTER_MYROOM_COMMAND_NAME)
+        );
+        assert_eq!(reader.read_utf16().unwrap(), "owner");
+        assert!(reader.remaining().is_empty());
+
         let info_packet = serialize_myroom_info(&info).unwrap();
         assert_eq!(
             &info_packet[..4],
@@ -1261,12 +1392,20 @@ mod tests {
 
         assert_eq!(serialize_secede_reply()[4..], [1]);
         assert_eq!(
-            serialize_check_password_reply(0)[4..],
+            serialize_check_password_reply(0, CheckPasswordStatus::Success)[4..],
             [0, 0, 0, 0, 1, 0, 0, 0]
         );
         assert_eq!(
-            serialize_check_password_reply(1)[4..],
-            [1, 0, 0, 0, 0, 0, 0, 0]
+            serialize_check_password_reply(1, CheckPasswordStatus::PasswordRequired)[4..],
+            [1, 0, 0, 0, 2, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_check_password_reply(2, CheckPasswordStatus::WrongPassword)[4..],
+            [2, 0, 0, 0, 3, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_check_password_reply(-7, CheckPasswordStatus::Unsupported)[4..],
+            [249, 255, 255, 255, 0, 0, 0, 0]
         );
         assert_eq!(serialize_update_main_emblem_reply(true)[4..], [1, 0]);
     }
@@ -1655,12 +1794,12 @@ mod tests {
             Err(MyRoomProtocolError::UnexpectedPacketHash { .. })
         ));
 
-        let mut partial_reserved = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
-        partial_reserved.write_utf16("owner").unwrap();
-        partial_reserved.write_u8(1);
+        let mut partial_password = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        partial_password.write_utf16("owner").unwrap();
+        partial_password.write_u8(1);
         assert!(matches!(
-            parse_enter_request(partial_reserved.as_slice()),
-            Err(MyRoomProtocolError::TrailingBytes { count: 1, .. })
+            parse_enter_request(partial_password.as_slice()),
+            Err(MyRoomProtocolError::Packet(_))
         ));
 
         let mut invalid_slot = PacketWriter::named(CHAR_POSITION_NAME);

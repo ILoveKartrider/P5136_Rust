@@ -35,14 +35,18 @@ the MyRoom direct/re-enter/random-public-entry, FirstState, owner-info,
 RequestItems, character-position, and Secede paths are also actor-integrated.
 Reenter restores an exact current membership before falling back to the
 rider's own room. Random entry selects only actor-tracked, owner-present,
-non-full public rooms; protected rooms fail closed until a password capability
-exists, and every visitor reply redacts stored secrets. The legacy
-password-kind probe returns its exact compatibility ACK after strict parsing,
-but does not grant protected-room authority. RequestItems loads a bounded owner
-snapshot under the canonical profile lane and publishes its complete ordered
-response as one actor-owned queue batch. Character positions use actor-derived
-sender slots and exact-generation peer audiences with all-recipient atomic
-queue reservation.
+non-full public rooms. Direct entry strictly parses the required owner and
+room-password strings: protected rooms prompt on empty input, return the
+client's status-4 mismatch on an incorrect password, and admit only an exact
+match. Every visitor reply redacts stored secrets. The separate item-password
+flow parses kind plus password and returns the stock client's typed
+`0/1/2/3` statuses. A successful protected check retains no plaintext and
+mints one move-only, exact-generation grant for at most one matching follow-up;
+Garage and Item Dictionary grants authorize exactly one `RequestItems`.
+RequestItems loads a bounded owner snapshot under the canonical profile lane
+and publishes its complete ordered response as one actor-owned queue batch.
+Character positions use actor-derived sender slots and exact-generation peer
+audiences with all-recipient atomic queue reservation.
 Migration freezes and drains exact generation-bound operation
 leases, then crosses a pre-reserved ACK and result-free
 identity/MyRoom/protocol commit boundary. Messenger frames are rechecked across

@@ -292,10 +292,11 @@ impl MyRoomWirePlan {
 /// Unrelated visitor churn is deliberately absent. Only the requester
 /// generation, membership owner, owner generation, and item-password policy
 /// can invalidate this plan while profile I/O runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MyRoomOwnerItemPlan {
     requester: IdentityBinding,
     owner: IdentityBinding,
+    policy_revision: MyRoomRevision,
     visible: bool,
 }
 
@@ -308,6 +309,11 @@ impl MyRoomOwnerItemPlan {
     #[must_use]
     pub(crate) fn owner(&self) -> &IdentityBinding {
         &self.owner
+    }
+
+    #[must_use]
+    pub(crate) const fn policy_revision(&self) -> MyRoomRevision {
+        self.policy_revision
     }
 
     #[must_use]
@@ -883,6 +889,9 @@ struct RoomState {
         allow(dead_code, reason = "the TCP MyRoom info command reads this field")
     )]
     info: MyRoomInfo,
+    /// Changes only when the owner updates room policy/info, so a one-shot
+    /// password grant is not invalidated by unrelated visitor churn.
+    info_revision: MyRoomRevision,
     owner_present: bool,
     visitors: [Option<MyRoomParticipant>; VISITOR_CAPACITY],
 }
@@ -895,10 +904,11 @@ struct RoomState {
     )
 )]
 impl RoomState {
-    fn new(owner: MyRoomOwner) -> Self {
+    fn new(owner: MyRoomOwner, info_revision: MyRoomRevision) -> Self {
         Self {
             owner: owner.participant,
             info: owner.info,
+            info_revision,
             owner_present: false,
             visitors: std::array::from_fn(|_| None),
         }
@@ -1291,7 +1301,7 @@ impl MyRoomHub {
 
         let mut destination_room = match self.rooms.get(&plan.destination) {
             Some(room) => room.clone(),
-            None => RoomState::new(plan.owner.clone()),
+            None => RoomState::new(plan.owner.clone(), plan.next_revision),
         };
         destination_room.add_member(plan.destination_slot, plan.member.clone())?;
         let current_publication = publication(plan.destination, &destination_room);
@@ -1436,6 +1446,7 @@ impl MyRoomHub {
         Ok(Some(MyRoomOwnerItemPlan {
             requester: identity.clone(),
             owner: room.owner.identity.clone(),
+            policy_revision: room.info_revision,
             visible: identity.user_no == owner.user_no() || room.info.use_item_password == 0,
         }))
     }
@@ -1667,6 +1678,7 @@ impl MyRoomHub {
         let next_revision = self.next_revision()?;
         let mut room = self.room(owner)?.clone();
         let previous = std::mem::replace(&mut room.info, info.clone());
+        room.info_revision = next_revision;
         self.transition(
             next_revision,
             vec![RoomChange {
@@ -3673,7 +3685,7 @@ mod tests {
         let identity = claim(&mut registry, 1, "Guard");
         let hub = MyRoomHub::new();
 
-        let room = RoomState::new(owner(&identity));
+        let room = RoomState::new(owner(&identity), MyRoomRevision::default());
         let rooms = (0..=MAX_TRANSITION_ROOMS)
             .map(|_| RoomChange {
                 owner: OwnerKey(identity.user_no),
@@ -4528,7 +4540,7 @@ mod tests {
         let owner_id = claim(&mut registry, 1, "Owner");
         let visitor = claim(&mut registry, 2, "Visitor");
         let intruder = claim(&mut registry, 3, "Intruder");
-        let mut room = RoomState::new(owner(&owner_id));
+        let mut room = RoomState::new(owner(&owner_id), MyRoomRevision::default());
         let slot = MyRoomSlotIndex(1);
         room.add_member(slot, participant(&visitor)).unwrap();
         let before = room.participant(slot).unwrap().clone();

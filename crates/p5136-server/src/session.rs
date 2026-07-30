@@ -1781,9 +1781,11 @@ async fn handle_myroom_check_password(
     context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let request = parse_check_password(packet)?;
+    let password_kind = request.password_kind;
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
-    Ok(vec![serialize_check_password_reply(request.password_kind)])
+    let status = world.myroom_check_password(request).await?;
+    Ok(vec![serialize_check_password_reply(password_kind, status)])
 }
 
 enum SessionMyRoomEntryIntent {
@@ -1809,7 +1811,13 @@ async fn execute_myroom_entry(
             } else {
                 None
             };
-            MyRoomEntryInput::direct(identity, request.owner_nickname, &presentation, self_info)
+            MyRoomEntryInput::direct(
+                identity,
+                request.owner_nickname,
+                request.password,
+                &presentation,
+                self_info,
+            )
         }
         SessionMyRoomEntryIntent::Reenter => MyRoomEntryInput::reenter(
             identity,
@@ -2611,14 +2619,15 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, ENTER_MYROOM_REQUEST_NAME,
-            ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus, MAX_MYROOM_PASSWORD_UTF16_UNITS,
-            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart, MyRoomParts, MyRoomProtocolError,
-            MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME, REENTER_MYROOM_REQUEST_NAME,
-            REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_character_position,
-            serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
-            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
-            serialize_owner_items, serialize_secede_reply, serialize_slot_data,
+            CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, CheckPasswordStatus,
+            ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart,
+            MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
+            REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets,
+            serialize_character_position, serialize_check_password_reply, serialize_enter_error,
+            serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
+            serialize_owner_item_enchants, serialize_owner_items,
+            serialize_password_enter_myroom_command, serialize_secede_reply, serialize_slot_data,
         },
         packet::{PacketReader, PacketWriter},
         race_protocol::{
@@ -3671,7 +3680,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(
         clippy::too_many_lines,
-        reason = "one dispatch fixture proves self bootstrap, optional reserved dword, public visitor entry, password redaction, and actor-owned packet ordering"
+        reason = "one dispatch fixture proves self bootstrap, the captured empty-password field, public visitor entry, password redaction, and actor-owned packet ordering"
     )]
     async fn myroom_direct_entry_dispatch_bootstraps_self_and_redacts_visitor_secrets() {
         let fixture = spawn_myroom_world(MyRoomInfo::default());
@@ -3743,7 +3752,7 @@ mod tests {
 
         let mut self_entry = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
         self_entry.write_utf16("dispatchdirectowner").unwrap();
-        self_entry.write_i32(0x5136);
+        self_entry.write_utf16("").unwrap();
         assert!(
             dispatch_packet(
                 &owner_services,
@@ -3776,6 +3785,7 @@ mod tests {
 
         let mut visitor_entry = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
         visitor_entry.write_utf16("DISPATCHDIRECTOWNER").unwrap();
+        visitor_entry.write_utf16("").unwrap();
         assert!(
             dispatch_packet(
                 &visitor_services,
@@ -3814,6 +3824,133 @@ mod tests {
         assert_eq!(redacted.talk_lock, owner_info.talk_lock);
         assert!(owner.outbound.try_recv().is_err());
         assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the dispatch fixture keeps prompt, mismatch, successful entry, redaction, and exact fanout assertions in one protected-room lifecycle"
+    )]
+    async fn protected_myroom_direct_entry_prompts_until_the_exact_password_matches() {
+        let protected = MyRoomInfo {
+            use_room_password: 1,
+            room_password: "room dispatch secret".to_owned(),
+            use_item_password: 1,
+            item_password: "item dispatch secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(protected.clone());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (outsider_session, _outsider_cancelled, mut outsider_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_745),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let outsider = world
+            .claim_identity(outsider_session, "PasswordDispatchVisitor")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &outsider).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: outsider_session,
+        };
+
+        let mut request = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        request.write_utf16(&owner.identity.nickname).unwrap();
+        request.write_utf16("").unwrap();
+        assert!(
+            dispatch_packet(&services, request.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outsider_outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_password_enter_myroom_command(&owner.identity.nickname).unwrap()]
+        );
+        assert_eq!(
+            world.myroom_session_view(outsider_session).await.unwrap(),
+            None
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let mut request = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        request.write_utf16(&owner.identity.nickname).unwrap();
+        request.write_utf16("wrong password").unwrap();
+        assert!(
+            dispatch_packet(&services, request.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outsider_outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_enter_error(EnterMyRoomStatus::PasswordMismatch).unwrap()]
+        );
+        assert_eq!(
+            world.myroom_session_view(outsider_session).await.unwrap(),
+            None
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let mut request = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        request.write_utf16(&owner.identity.nickname).unwrap();
+        request.write_utf16("room dispatch secret").unwrap();
+        assert!(
+            dispatch_packet(&services, request.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let outsider_packets = outsider_outbound.try_recv().unwrap().into_packets();
+        assert_eq!(outsider_packets.len(), 2);
+        let mut redacted = protected;
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        assert_eq!(
+            outsider_packets[0],
+            serialize_enter_reply(
+                &owner.identity.nickname,
+                EnterMyRoomStatus::Success,
+                &redacted,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![outsider_packets[1].clone()]
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![outsider_packets[1].clone()]
+        );
+        let view = world
+            .myroom_session_view(outsider_session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.info(), &redacted);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+        assert!(outsider_outbound.try_recv().is_err());
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
     }
@@ -4097,45 +4234,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn myroom_check_password_dispatch_is_strict_and_preserves_p5136_status() {
-        let (world, actor) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
-        let (session, _cancelled, mut outbound) = world
-            .register_login_session(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_744),
-                WireOperationGate::new(),
-            )
-            .await
-            .unwrap();
-        let identity = world
-            .claim_identity(session, "CheckPasswordDispatch")
-            .await
-            .unwrap();
+    async fn myroom_check_password_dispatch_is_strict_and_uses_the_owner_item_password() {
+        let protected = MyRoomInfo {
+            use_item_password: 1,
+            item_password: "item dispatch secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(protected);
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let mut context = bind_test_profile(&profiles, &identity).await;
+        let mut context = bind_test_profile(&profiles, &visitor.identity).await;
         let config = ServerConfig::default();
         let services = SessionServices {
             config: &config,
             world: &world,
             profiles: &profiles,
-            session_id: session,
+            session_id: visitor.session,
         };
 
-        for password_kind in [0, 1, -7] {
-            let mut request = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
-            request.write_i32(password_kind);
-            assert_eq!(
-                dispatch_packet(&services, request.as_slice(), &mut context)
-                    .await
-                    .unwrap(),
-                vec![serialize_check_password_reply(password_kind)]
-            );
-            assert!(outbound.try_recv().is_err());
+        for password_kind in 0..=3 {
+            for (password, status) in [
+                ("", CheckPasswordStatus::PasswordRequired),
+                ("wrong password", CheckPasswordStatus::WrongPassword),
+                ("item dispatch secret", CheckPasswordStatus::Success),
+            ] {
+                let mut request = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+                request.write_i32(password_kind);
+                request.write_utf16(password).unwrap();
+                assert_eq!(
+                    dispatch_packet(&services, request.as_slice(), &mut context)
+                        .await
+                        .unwrap(),
+                    vec![serialize_check_password_reply(password_kind, status)]
+                );
+                assert!(owner.outbound.try_recv().is_err());
+                assert!(visitor.outbound.try_recv().is_err());
+            }
         }
 
+        let mut unsupported = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+        unsupported.write_i32(-7);
+        unsupported.write_utf16("item dispatch secret").unwrap();
+        assert_eq!(
+            dispatch_packet(&services, unsupported.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_check_password_reply(
+                -7,
+                CheckPasswordStatus::Unsupported,
+            )]
+        );
+
+        let mut missing_password = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+        missing_password.write_i32(0);
+        assert!(matches!(
+            dispatch_packet(&services, missing_password.as_slice(), &mut context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::Packet(_)
+            ))
+        ));
         let mut malformed = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
         malformed.write_i32(0);
+        malformed.write_utf16("").unwrap();
         malformed.write_u8(0x51);
         assert!(matches!(
             dispatch_packet(&services, malformed.as_slice(), &mut context).await,
@@ -4146,10 +4313,14 @@ mod tests {
                 }
             ))
         ));
-        assert!(outbound.try_recv().is_err());
-        assert_eq!(world.authorize_identity(session).await.unwrap(), identity);
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+        assert_eq!(
+            world.authorize_identity(visitor.session).await.unwrap(),
+            visitor.identity
+        );
 
-        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4233,6 +4404,7 @@ mod tests {
         };
         let mut malformed = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
         malformed.write_utf16(&owner.identity.nickname).unwrap();
+        malformed.write_utf16("").unwrap();
         let mut malformed = malformed.into_inner();
         malformed.push(0x51);
 
@@ -4295,6 +4467,7 @@ mod tests {
         );
         let mut enter = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
         enter.write_utf16(&owner.identity.nickname).unwrap();
+        enter.write_utf16("").unwrap();
         assert!(matches!(
             dispatch_packet(
                 &outsider_services,
@@ -5198,6 +5371,78 @@ mod tests {
         assert_eq!(view.info().use_item_password, 1);
         assert!(view.info().room_password.is_empty());
         assert!(view.info().item_password.is_empty());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn item_password_success_grants_one_protected_owner_item_request() {
+        let protected = MyRoomInfo {
+            use_item_password: 1,
+            item_password: "one shot item secret".to_owned(),
+            ..MyRoomInfo::default()
+        };
+        let fixture = spawn_myroom_world(protected);
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let _owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        let request_items = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        let expected_empty = serialize_owner_items(&[], &[], false).unwrap();
+
+        for password_kind in [0, 3] {
+            let mut check = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+            check.write_i32(password_kind);
+            check.write_utf16("one shot item secret").unwrap();
+            assert_eq!(
+                dispatch_packet(&services, check.as_slice(), &mut visitor_context)
+                    .await
+                    .unwrap(),
+                vec![serialize_check_password_reply(
+                    password_kind,
+                    CheckPasswordStatus::Success,
+                )]
+            );
+
+            assert!(
+                dispatch_packet(&services, &request_items, &mut visitor_context)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                visitor.outbound.try_recv().unwrap().into_packets(),
+                expected_empty
+            );
+
+            assert!(
+                dispatch_packet(&services, &request_items, &mut visitor_context)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                visitor.outbound.try_recv().unwrap().into_packets(),
+                vec![serialize_missing_owner_items()],
+                "the password grant is consumed by exactly one owner-item request"
+            );
+            assert!(owner.outbound.try_recv().is_err());
+            assert!(visitor.outbound.try_recv().is_err());
+        }
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
     }

@@ -76,17 +76,16 @@ been demonstrated.
 - [x] MyRoom Secede behavior
 - [x] bounded MyRoom RequestItems TCP dispatch and atomic publication
 - [x] exact requester/owner-generation item authorization and stale-plan retry
-- [x] visitor MyRoom secret redaction and conservative protected-item denial
+- [x] visitor secret redaction and one-shot protected owner-item authorization
 - [x] exact-generation MyRoom character-position peer fanout
-- [x] direct MyRoom self-bootstrap and actor-tracked public-room entry
+- [x] direct MyRoom self-bootstrap and actor-tracked public/protected entry
 - [x] current-membership Reenter and bounded random public-room entry
-- [x] strict MyRoom password-kind compatibility ACK (not an entry proof)
+- [x] strict MyRoom item-password status flow and one-shot owner-item grant
 - [x] race start/grid/readiness with deterministic fallback track
 - [ ] live track-pool/mode/random-track control surface
 - [x] finish, ranking, settlement, team booster, and DNF deadline
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
-- [ ] password-capable protected MyRoom entry flow
 - [ ] MyRoom talk, emblem-catalog, and main-emblem flows
 - [ ] P2P-port and club-name profile mutation/refresh paths
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface
