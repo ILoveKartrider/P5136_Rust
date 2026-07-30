@@ -118,6 +118,12 @@ unchanged and is evidence only.
   crash evidence together. Compare the final `direction=received` login TCP
   record (or absence of one) with the client crash time before changing
   compatibility behavior.
+- The 2026-07-30 stock-client crash was traced to the exact four-byte
+  `PqGetRiderTaskContext` request (`0x5870084F`). Rust now validates that
+  hash-only request and returns the C#-evidenced
+  `PrGetRiderTaskContext | i32(0)` reply (`0x58840850`) without mutating the
+  profile; repeat the stock-client startup test before treating later traffic
+  as a new compatibility issue.
 
 ### Correct stock P5136 and LAN E2E setup (2026-07-30)
 

@@ -22,6 +22,8 @@ been demonstrated.
 - [x] GUI Windows Korean system-font fallback for localized OS errors
 - [x] stock-client/`Profile` path resolution for the C#-exported catalog and
   sibling client `Data` directory
+- [x] exact `PqGetRiderTaskContext` startup reply from the stock-client crash
+  log (`PrGetRiderTaskContext | i32(0)`)
 - [x] workspace-wide `unsafe_code = "forbid"`
 
 ## Connector
