@@ -103,7 +103,7 @@ been demonstrated.
 - [x] strict terminal empty protected-item list
 - [x] exact normal/preset shop-buy parsing and fail-closed failure reply
 - [x] atomic durable canonical favorite-item Get/Update and session-cache refresh
-- [ ] bounded one-time C# `Favorite.json` import and real encrypted-TCP favorite E2E
+- [x] lease-bound/no-follow C# `Favorite.json` import and encrypted-TCP favorite E2E
 - [ ] authoritative type-1/type-2 item pickup award and synthesis
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
 - [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow

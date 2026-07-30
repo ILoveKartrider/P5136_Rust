@@ -27,23 +27,25 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 State: paused at a clean, reviewed checkpoint. Resume with item 1 under
-**Exact resume plan**; do not start a new packet slice first.
+**Exact resume plan**; do not reopen the completed favorite-item migration
+without a new compatibility/security finding.
 
 Current implementation checkpoint:
-`32ab427 Port safe item-state boundaries`
+`533df45 Port lease-bound favorite sidecar migration` +
+`bb84027 Harden favorite sidecar import bounds`
 
 ## Current Rust checkpoint
 
 The current checkpoint closes the direct-request disposition ledger at 40 of
 40 by adding strict item-state boundaries for `LoRqDeleteItemPacket`,
-`PqUnLockedItem`, `PqFavoriteItemGet`, and `PqFavoriteItemUpdate`.
-Delete and unlock are explicit, authenticated, read-only no-reply outcomes:
-Rust does not clone C# success acknowledgements that would claim deletion or
-unlock without an authoritative durable transition. Favorite Get/Update are
-fully implemented for profiles whose Rust migration marker is already
-`Some(...)`; an absent marker fails closed until the bounded C#
-`Favorite.json` importer is implemented. The C# repository remains unchanged
-and is evidence only.
+`PqUnLockedItem`, `PqFavoriteItemGet`, and `PqFavoriteItemUpdate`. The later
+favorite migration checkpoint resolves an absent Rust marker with a bounded,
+lease-bound C# `Favorite.json` import, then commits that import and the
+incoming Get/Update projection in the same immutable revision. Delete and
+unlock remain explicit, authenticated, read-only no-reply outcomes: Rust does
+not clone C# success acknowledgements that would claim deletion or unlock
+without an authoritative durable transition. The C# repository remains
+unchanged and is evidence only.
 
 ### Safe item-state checkpoint
 
@@ -91,26 +93,37 @@ and is evidence only.
   public session boundary rather than being erased behind `dyn Error`.
 - `Profile.favorite_items: Option<FavoriteItems>` is the migration marker:
   `None` means the external C# sidecar decision is unresolved, while
-  `Some(empty/list)` is canonical Rust state. Until import exists, both Get
-  (implemented as an empty durable batch) and Update return
-  `MigrationPending` for `None`, publish no revision, send no false success,
-  and never erase the future import decision.
-- Resume must implement the importer inside `p5136-profile`/`ProfileStore`, not
-  by joining a raw path in `session.rs`. It must use the lease-bound canonical
-  profile root, bounded handle-relative/no-follow access to
-  `<nickname>/Favorite.json`, strict canonical array parsing, and one profile
-  transaction that imports, applies an incoming batch, sets `Some(result)`,
-  and publishes the exact receipt. Invalid, duplicate, malformed, or oversized
-  sidecars must fail closed without a marker. Run C# and Rust servers
-  separately during this one-time migration; the C# process does not honor the
-  Rust lease.
-- After the importer, add a real encrypted-TCP regression:
-  login -> Update with no reply -> Get on the same connection ->
-  reconnect/relogin -> identical Get, plus malformed and persistence-failure
-  socket-closure cases. Current direct-dispatch tests prove codec, handler,
-  atomicity, cancellation/migration fencing, and cache refresh, but not that
-  full runtime path.
-- Checkpoint gates passed on Windows: 808 regular tests, both opt-in local-data
+  `Some(empty/list)` is canonical Rust state. When it is `None`, the importer
+  captures `Favorite.json` exactly once under the in-process profile lock,
+  parses the strict ordered `{ItemCatID, ItemID, ItemSN}` array (optional UTF-8
+  BOM accepted), applies the incoming batch, and seals `Some(result)` in the
+  same immutable revision. A missing sidecar alone means empty; null, malformed,
+  duplicate, oversized, non-regular, symlink/reparse, or byte-cap-exceeding
+  sidecars fail closed and leave the marker unresolved.
+- `RaceRunLease` now retains a `cap_std::fs::Dir` for the canonical root.
+  Import opens the profile directory with `open_dir_nofollow`, probes its final
+  sidecar entry without following links, then reopens it with final-component
+  no-follow plus nonblocking mode and validates the opened handle is a regular
+  file. Reads are capped at `ProfileStore`'s configured byte maximum and use a
+  sentinel byte to detect growth. No unsafe code is added. The diagnostic
+  `PathBuf` is never used as an I/O authority.
+- The initial sidecar candidate is held across optimistic CAS retries. A retry
+  with no marker reuses that same candidate; a competing canonical marker wins
+  over it. Imported state must fit the current configured favorite reply cap
+  before Rust seals it, while already-canonical over-cap state keeps the
+  existing shrink-only recovery rule.
+- The sidecar is preserved and never read after a Rust marker exists. C# and
+  any other external profile writer must be stopped during the one-time
+  migration: they do not honor the Rust lease. The remaining documented local
+  filesystem assumption is a stable, operator-owned profile root; defending a
+  hostile Unix root rename/replace race requires converting the whole legacy
+  profile load/CAS backend to capability-relative I/O, beyond this slice.
+- Real encrypted TCP now covers login -> one-way Update -> Get on the same
+  connection -> disconnect/identity release -> reconnect/relogin -> identical
+  Get. It independently parses the reply hash/count/items/state/EOF and checks
+  immutable revision one, imported order, and the first Update's no-reply IV
+  behavior.
+- Checkpoint gates passed on Windows: 815 regular tests, both opt-in local-data
   tests, workspace/all-target/all-feature Clippy with `-D warnings`, formatting,
   and `git diff --check`. Workspace `unsafe_code = "forbid"` remains active;
   the new production path has no `unsafe`, panic, `unwrap`, or `expect`.
@@ -346,7 +359,8 @@ and is evidence only.
 - `LoRqDeleteItemPacket` and `PqUnLockedItem` are now explicit safe no-reply
   boundaries, so Rust does not copy C# success-without-state-transition
   behavior. `PqFavoriteItemUpdate` is strictly parsed and atomically persisted
-  for canonical profiles; unresolved C# sidecar migration fails closed.
+  after either canonical-state loading or the bounded, lease-bound sidecar
+  migration; invalid unresolved sidecars fail closed without sealing a marker.
 
 ### Authenticated legacy server time
 
@@ -1088,12 +1102,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 808 regular tests and 2 opt-in local-data tests passed
+# 815 regular tests and 2 opt-in local-data tests passed
 git diff --check
 ```
 
-The 808 regular passing tests comprise 9 CLI, 35 connector, 204 core, 100
-profile, 13 RHO5, 439 server unit, and 8 server integration tests. The two
+The 815 regular passing tests comprise 9 CLI, 35 connector, 204 core, 100
+profile, 13 RHO5, 446 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
@@ -1104,9 +1118,11 @@ Focused regressions cover:
   goldens, every truncated prefix, strict auth/scope/op/exhaustion checks,
   repeated-key wire order, independent batch/aggregate caps, exact Favorite
   Get replies, pure stable/idempotent batch application, atomic durable
-  revision reuse, legacy immutable canonicalization, unresolved-sidecar
-  fail-closed behavior, cancellation/migration fencing, and selective bound
-  session favorite/revision refresh;
+  revision reuse, strict one-time sidecar migration (missing/BOM/malformed,
+  byte/reply caps, post-marker ignore, CAS candidate reuse, and competing
+  canonical-marker precedence), cancellation/migration fencing, selective
+  bound session favorite/revision refresh, and encrypted TCP
+  Update(no-reply) -> Get -> reconnect Get;
 - exact five-request club-query classification and producer shapes, complete
   reply layouts and digests, fail-closed consumer meanings, private
   parser-minted fields, pre-allocation UTF-16 bounds, complete consumption,
@@ -1318,42 +1334,27 @@ These items prevent a "port complete" claim.
 
 ## Exact resume plan
 
-1. Finish the bounded one-time C# favorite-item migration before enabling
-   favorite state for unresolved profiles. Keep `favorite_items=None`
-   fail-closed until this is done. Add a lease-bound `ProfileStore` sidecar
-   capability for enum-selected `Favorite.json`; use handle-relative/no-follow
-   bounded access rather than joining `source_path` in `session.rs`. Strictly
-   parse the ordered `{ItemCatID, ItemID, ItemSN}` array, reject malformed,
-   duplicate, or oversized input without setting a marker, and atomically
-   combine import + incoming update + `Some(result)` in one immutable profile
-   revision. Preserve the sidecar as recovery evidence and document that the
-   C# server must be stopped during migration because it does not honor the
-   Rust lease. Then add the real encrypted-TCP
-   Update(no reply) -> Get -> reconnect/relogin -> Get regression and socket
-   failure cases. The direct disposition ledger is already 40 of 40 explicit;
-   do not reopen delete/unlock until authoritative state and safe success
-   semantics exist.
-2. Keep the completed bounded TCP GameSlot slice frozen at its current
+1. Keep the completed bounded TCP GameSlot slice frozen at its current
    evidence boundary. Collect stock-client type-1/type-2 request/reply,
    type-9/type-10, and generic type-12 fixtures before implementing pickup
    synthesis, inner-body rules, or server item side effects. Differentially
    verify exact bytes and recipient behavior; never apply the TCP cap to the
    separate opaque UDP movement envelope.
-3. Capture endpoint-report behavior with two stock clients and NAT-relevant
+2. Capture endpoint-report behavior with two stock clients and NAT-relevant
    topologies before adding a live peer-refresh/fanout packet or coupling the
    durable presentation port to observed UDP routing. Existing peers may
    retain an earlier serialized endpoint until a normal room snapshot.
-4. Add TCP-issued UDP bind capabilities without weakening the existing
+3. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
-5. Capture and implement movement sequence/tick behavior per sender and exact
+4. Capture and implement movement sequence/tick behavior per sender and exact
    race generation; never copy the broken C# recipient-global predicate.
-6. Close remaining economy and packet-fixture gaps, then design race-wide
+5. Close remaining economy and packet-fixture gaps, then design race-wide
    reward recovery.
-7. Run the existing three-desktop CI matrix to green, record the run, and
+6. Run the existing three-desktop CI matrix to green, record the run, and
    exercise the connector on Wine/CrossOver.
-8. Run the stock two-client end-to-end flow and record its exact environment,
+7. Run the stock two-client end-to-end flow and record its exact environment,
    packets, persistence outcome, and shutdown result.
-9. Before every checkpoint run:
+8. Before every checkpoint run:
 
    ```text
    cargo fmt --all -- --check
