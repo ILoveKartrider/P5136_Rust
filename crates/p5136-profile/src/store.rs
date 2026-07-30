@@ -1183,8 +1183,8 @@ impl ProfileStore {
         }
 
         let read_limit = self.maximum_bytes.saturating_add(1);
-        let initial_capacity = usize::try_from(opened_metadata.len().min(64 * 1024))
-            .expect("64 KiB capacity is representable on every supported platform");
+        let initial_capacity =
+            usize::try_from(opened_metadata.len().min(64 * 1024)).unwrap_or_default();
         let mut bytes = Vec::with_capacity(initial_capacity);
         file.take(read_limit)
             .read_to_end(&mut bytes)
@@ -1195,7 +1195,11 @@ impl ProfileStore {
                     source,
                 )
             })?;
-        let length = u64::try_from(bytes.len()).expect("Vec length is representable as u64");
+        let length = u64::try_from(bytes.len()).map_err(|_| {
+            FavoriteItemImportError::from(ProfileStoreError::InternalInvariant {
+                message: "favorite-item sidecar byte length must fit u64",
+            })
+        })?;
         if length > self.maximum_bytes {
             return Err(FavoriteItemImportError::TooLarge {
                 path: sidecar_path,
