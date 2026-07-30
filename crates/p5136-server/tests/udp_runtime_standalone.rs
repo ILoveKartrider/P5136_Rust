@@ -590,7 +590,8 @@ async fn active_identity(name: &str) -> (IdentityRegistry, IdentityBinding) {
 }
 
 async fn session_ids(count: usize) -> Vec<SessionId> {
-    let (world, world_task) = WorldHandle::spawn(count.max(1) + 1);
+    let (world, world_task) =
+        WorldHandle::spawn(count.max(1) + 1).expect("nonzero World mailbox capacity");
     let mut sessions = Vec::with_capacity(count);
     for index in 0..count {
         let port = u16::try_from(20_000 + index).unwrap();
@@ -602,7 +603,7 @@ async fn session_ids(count: usize) -> Vec<SessionId> {
         );
     }
     world.shutdown().await.unwrap();
-    world_task.await.unwrap();
+    world_task.await.unwrap().unwrap();
     sessions
 }
 

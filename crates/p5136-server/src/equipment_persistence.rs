@@ -83,6 +83,9 @@ pub(crate) enum RiderEquipmentWriteError {
     #[error("the World actor stopped before the rider-equipment write completed")]
     WorldStopped,
 
+    #[error("the rider-equipment write used an identity operation minted by another World actor")]
+    ForeignIdentityOperation,
+
     #[error("the profile-to-World completion mailbox is closed")]
     CompletionMailboxClosed,
 

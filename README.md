@@ -20,7 +20,7 @@ server. The implemented foundation provides:
 - supervised game/P2P UDP sockets with exact Echo/TimeSync replies and
   generation-fenced room relay;
 - exact ready-stage, race-control, race-start, settlement, and 235-byte kart
-  physics codecs ready for actor integration;
+  physics codecs used by the actor-integrated human race flow;
 - bounded login concurrency and opt-in remote profile creation;
 - PIN/BML patching with immutable backups, a process lock, and atomic writes;
 - executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
@@ -29,9 +29,20 @@ server. The implemented foundation provides:
 
 Room admission, first-state, messenger, and UDP/P2P runtime flows are
 integrated. UDP authorization and room audience selection run inside the world
-actor so channel migration cannot race a stale relay decision. The next
-runtime milestone is the ready/start/race/settlement state machine, followed by
-MyRoom and the remaining progression/economy surface.
+actor so channel migration cannot race a stale relay decision. Human
+ready/loading, race start, finish, ranking, settlement, reward persistence, and
+the MyRoom FirstState/owner-info/Secede paths are also actor-integrated.
+Migration freezes and drains exact generation-bound operation
+leases, then crosses a pre-reserved ACK and result-free
+identity/MyRoom/protocol commit boundary. Messenger frames are rechecked across
+generation changes.
+
+The remaining compatibility work is concentrated in the unported MyRoom and
+economy requests, capture-derived movement sequencing and UDP first-bind
+capabilities, packet fixtures, green cross-platform CI evidence, and
+stock-client end-to-end validation. See
+[PORTING_STATUS.md](PORTING_STATUS.md) for the exact handoff and
+[PORTING.md](PORTING.md) for the feature ledger.
 
 ## Build
 

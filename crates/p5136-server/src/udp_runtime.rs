@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -152,6 +152,11 @@ pub enum UdpIngressBody {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpIngress {
+    /// Process-local logical receive order. Production reader tasks stamp this
+    /// from the same synchronized clock used to publish identity-generation
+    /// barriers.
+    /// Zero means the standalone decoder was used without a runtime clock.
+    pub arrival_epoch: u64,
     pub transport: UdpTransport,
     pub source: SocketAddr,
     pub iv: u32,
@@ -222,6 +227,7 @@ pub fn decode_udp_ingress(
         UdpLogicalBody::RoomSlotPacket(body) => UdpIngressBody::RoomSlotPacket(body.to_vec()),
     };
     Ok(UdpIngress {
+        arrival_epoch: 0,
         transport,
         source,
         iv,
@@ -310,17 +316,84 @@ impl SharedStats {
     }
 }
 
+/// One process-local total order shared by both UDP readers and World identity
+/// publication.
+///
+/// The mutex is held only around one nonblocking socket poll or one boundary
+/// increment; it is never held across an `.await`. This makes `Ready` receive
+/// completion and generation activation one exact order without dropping the
+/// first datagram from a receive that was merely pending across activation.
+/// Saturation safely stops admitting later generations instead of wrapping an
+/// old datagram into a future epoch.
+#[derive(Debug, Default)]
+struct UdpArrivalClock {
+    epoch: Mutex<u64>,
+    #[cfg(test)]
+    pending_polls: AtomicU64,
+}
+
+impl UdpArrivalClock {
+    fn lock(&self) -> MutexGuard<'_, u64> {
+        self.epoch.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("recovering a poisoned UDP arrival clock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn increment(epoch: &mut u64) -> u64 {
+        *epoch = epoch.saturating_add(1);
+        *epoch
+    }
+
+    fn advance(&self) -> u64 {
+        Self::increment(&mut self.lock())
+    }
+
+    async fn recv_from(
+        &self,
+        socket: &UdpSocket,
+        buffer: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, u64)> {
+        std::future::poll_fn(|context| {
+            let mut epoch = self.lock();
+            let mut received = tokio::io::ReadBuf::new(&mut *buffer);
+            match socket.poll_recv_from(context, &mut received) {
+                std::task::Poll::Pending => {
+                    #[cfg(test)]
+                    self.pending_polls.fetch_add(1, Ordering::Relaxed);
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+                std::task::Poll::Ready(Ok(source)) => {
+                    let length = received.filled().len();
+                    let arrival_epoch = Self::increment(&mut epoch);
+                    std::task::Poll::Ready(Ok((length, source, arrival_epoch)))
+                }
+            }
+        })
+        .await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UdpService {
     commands: mpsc::Sender<UdpCommand>,
     maximum_relay_targets: usize,
     maximum_active_identities: usize,
+    arrival_clock: Arc<UdpArrivalClock>,
 }
 
 impl UdpService {
     #[must_use]
     pub const fn max_identities(&self) -> usize {
         self.maximum_active_identities
+    }
+
+    /// Publishes a logical generation boundary in the same total order used by
+    /// the reader tasks. Only datagrams stamped strictly after this value may
+    /// operate on the new identity generation.
+    pub(crate) fn advance_arrival_epoch(&self) -> u64 {
+        self.arrival_clock.advance()
     }
 
     pub async fn dispatch(
@@ -484,6 +557,7 @@ impl UdpRuntime {
         let game_socket = Arc::new(game_socket);
         let p2p_socket = Arc::new(p2p_socket);
         let stats = Arc::new(SharedStats::default());
+        let arrival_clock = Arc::new(UdpArrivalClock::default());
         let (admission_tx, admissions) = mpsc::channel(config.admission_capacity);
         let mut tasks = JoinSet::new();
         let mut task_kinds = HashMap::with_capacity(3);
@@ -494,6 +568,7 @@ impl UdpRuntime {
             admission_tx.clone(),
             config.maximum_payload,
             Arc::clone(&stats),
+            Arc::clone(&arrival_clock),
         ));
         task_kinds.insert(game_reader.id(), UdpRuntimeTask::Reader(UdpTransport::Game));
         reader_aborts.push(game_reader);
@@ -503,6 +578,7 @@ impl UdpRuntime {
             admission_tx,
             config.maximum_payload,
             Arc::clone(&stats),
+            Arc::clone(&arrival_clock),
         ));
         task_kinds.insert(p2p_reader.id(), UdpRuntimeTask::Reader(UdpTransport::P2p));
         reader_aborts.push(p2p_reader);
@@ -525,6 +601,7 @@ impl UdpRuntime {
                 commands: command_tx,
                 maximum_relay_targets: config.maximum_relay_targets,
                 maximum_active_identities: config.maximum_active_identities,
+                arrival_clock,
             },
             admissions,
             tasks,
@@ -687,6 +764,7 @@ async fn run_reader(
     admission: mpsc::Sender<UdpIngress>,
     maximum_payload: usize,
     stats: Arc<SharedStats>,
+    arrival_clock: Arc<UdpArrivalClock>,
 ) -> UdpWorkerExit {
     // Always receive the complete platform-maximum UDP datagram. In
     // particular, Winsock reports WSAEMSGSIZE instead of returning a truncated
@@ -694,9 +772,9 @@ async fn run_reader(
     // a single oversized datagram a permanent remote reader shutdown.
     let mut buffer = vec![0_u8; MAX_UDP_RECEIVE_DATAGRAM_SIZE];
     loop {
-        match socket.recv_from(&mut buffer).await {
-            Ok((length, source)) => {
-                let ingress = match decode_udp_ingress(
+        match arrival_clock.recv_from(&socket, &mut buffer).await {
+            Ok((length, source, arrival_epoch)) => {
+                let mut ingress = match decode_udp_ingress(
                     transport,
                     source,
                     &buffer[..length],
@@ -709,6 +787,7 @@ async fn run_reader(
                         continue;
                     }
                 };
+                ingress.arrival_epoch = arrival_epoch;
                 match admission.try_send(ingress) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1016,7 +1095,7 @@ mod tests {
         future, io,
         net::{Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
-        sync::Arc,
+        sync::{Arc, atomic::Ordering},
         time::Duration,
     };
 
@@ -1027,10 +1106,10 @@ mod tests {
     use tokio::{net::UdpSocket, sync::mpsc, task::JoinSet, time::timeout};
 
     use super::{
-        DEFAULT_MAX_DATAGRAM_PAYLOAD, ServerClock, SharedStats, UdpRuntime, UdpRuntimeConfig,
-        UdpRuntimeEvent, UdpRuntimeFailure, UdpRuntimeStartError, UdpRuntimeTask, UdpWorkerExit,
-        is_connection_reset, is_message_too_long, p5136_tick_from_elapsed_millis, run_actor,
-        runtime_event_from_task_completion, validate_config,
+        DEFAULT_MAX_DATAGRAM_PAYLOAD, ServerClock, SharedStats, UdpArrivalClock, UdpRuntime,
+        UdpRuntimeConfig, UdpRuntimeEvent, UdpRuntimeFailure, UdpRuntimeStartError, UdpRuntimeTask,
+        UdpWorkerExit, is_connection_reset, is_message_too_long, p5136_tick_from_elapsed_millis,
+        run_actor, run_reader, runtime_event_from_task_completion, validate_config,
     };
     use crate::udp_state::UdpTransport;
 
@@ -1141,6 +1220,55 @@ mod tests {
         assert_eq!(ingress.account_id, 5_136);
         assert_eq!(ingress.route_hash, 0x1020_3040);
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_receive_linearizes_at_ready_without_dropping_the_first_fresh_datagram() {
+        let server = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let endpoint = server.local_addr().unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (admission, mut admitted) = mpsc::channel(1);
+        let stats = Arc::new(SharedStats::default());
+        let arrival_clock = Arc::new(UdpArrivalClock::default());
+        let reader = tokio::spawn(run_reader(
+            UdpTransport::Game,
+            server,
+            admission,
+            DEFAULT_MAX_DATAGRAM_PAYLOAD,
+            stats,
+            Arc::clone(&arrival_clock),
+        ));
+        timeout(Duration::from_secs(1), async {
+            while arrival_clock.pending_polls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the UDP reader did not enter a pending socket poll");
+        let activation_epoch = arrival_clock.advance();
+
+        let logical = encode_routed_udp_packet(&RoutedUdpPacket {
+            account_id: 5_136,
+            route_hash: 0x1020_3040,
+            body: UdpLogicalBody::PqUdpEcho(PqUdpEchoBody {
+                value_1: 1,
+                value_2: 2,
+            }),
+        })
+        .unwrap();
+        let wire = encode_datagram(&logical, 7, DEFAULT_MAX_DATAGRAM_PAYLOAD).unwrap();
+        client.send_to(&wire, endpoint).await.unwrap();
+        let ingress = timeout(Duration::from_secs(1), admitted.recv())
+            .await
+            .expect("the UDP reader did not publish the datagram")
+            .expect("the UDP admission queue closed");
+        assert!(
+            ingress.arrival_epoch > activation_epoch,
+            "a socket poll that was only pending at activation must stamp its first later datagram as fresh"
+        );
+
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

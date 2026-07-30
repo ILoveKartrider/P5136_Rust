@@ -127,6 +127,9 @@ pub(crate) enum MyRoomInfoWriteError {
     #[error("the World actor stopped before the MyRoom write completed")]
     WorldStopped,
 
+    #[error("the MyRoom write used an identity operation minted by another World actor")]
+    ForeignIdentityOperation,
+
     #[error("the MyRoom completion mailbox is closed")]
     CompletionMailboxClosed,
 
@@ -266,6 +269,19 @@ impl DurableMyRoomInfo {
 pub(crate) type MyRoomProfileJobResult =
     Result<ProfileIoCompletion<Result<DurableMyRoomInfo, MyRoomPersistError>>, ProfileIoError>;
 
+/// Actor-consumable proof of the migration ACK policy.
+///
+/// Production completion always carries an ordered destination packet. Tests
+/// that exercise the lower-level identity/sidecar transition may explicitly
+/// omit transport publication without making that bypass representable in a
+/// production build.
+#[derive(Debug)]
+pub(crate) enum MigrationAcknowledgement {
+    Ordered(Vec<u8>),
+    #[cfg(test)]
+    Omitted,
+}
+
 #[derive(Debug)]
 pub(crate) enum MigrationProfileCompletion {
     Aborted {
@@ -274,6 +290,7 @@ pub(crate) enum MigrationProfileCompletion {
     Ready {
         preflight: Box<MigrationPreflight>,
         profile: Box<MyRoomProfileLease>,
+        acknowledgement: MigrationAcknowledgement,
         reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
     },
 }

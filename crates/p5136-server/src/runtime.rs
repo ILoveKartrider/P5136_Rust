@@ -2220,8 +2220,11 @@ mod tests {
 
     fn synthetic_server_handle(
         supervisor_task: tokio::task::JoinHandle<Result<(), ServerError>>,
-    ) -> (ServerHandle, tokio::task::JoinHandle<()>) {
-        let (world, world_task) = WorldHandle::spawn(16);
+    ) -> (
+        ServerHandle,
+        tokio::task::JoinHandle<Result<(), crate::WorldActorError>>,
+    ) {
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let (shutdown, _shutdown_receiver) = tokio::sync::watch::channel(false);
         (
             ServerHandle {
@@ -2397,7 +2400,7 @@ mod tests {
     #[tokio::test]
     async fn stopped_reward_pump_forces_world_after_guarded_shutdown_refusal()
     -> Result<(), Box<dyn Error + Send + Sync>> {
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         inject_loading_reward_lane(&world).await?;
         let pump = RewardPersistencePump { stop: None };
         let pump_task = tokio::spawn(async {
@@ -2425,7 +2428,7 @@ mod tests {
                 ..
             }))
         ));
-        time::timeout(Duration::from_secs(1), world_task).await??;
+        time::timeout(Duration::from_secs(1), world_task).await???;
         Ok(())
     }
 
@@ -2564,7 +2567,7 @@ mod tests {
         ));
 
         server.world.force_shutdown().await?;
-        world_task.await?;
+        world_task.await??;
         Ok(())
     }
 
@@ -2585,7 +2588,7 @@ mod tests {
         ));
 
         server.world.force_shutdown().await?;
-        world_task.await?;
+        world_task.await??;
         Ok(())
     }
 
@@ -2609,7 +2612,7 @@ mod tests {
         server.wait().await?;
 
         server.world.force_shutdown().await?;
-        world_task.await?;
+        world_task.await??;
         Ok(())
     }
 
@@ -2637,7 +2640,7 @@ mod tests {
         server.shutdown().await?;
 
         server.world.force_shutdown().await?;
-        world_task.await?;
+        world_task.await??;
         Ok(())
     }
 
@@ -2689,9 +2692,9 @@ mod tests {
 
     #[tokio::test]
     async fn world_join_cause_replaces_provisional_stopped_reply() {
-        let (world, stopped_actor) = WorldHandle::spawn(4);
+        let (world, stopped_actor) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
         world.force_shutdown().await.unwrap();
-        stopped_actor.await.unwrap();
+        stopped_actor.await.unwrap().unwrap();
 
         let session = crate::SessionId::new(78);
         let actor = tokio::spawn(async move {
@@ -2863,7 +2866,7 @@ mod tests {
             Err(ServerError::SupervisorPreviouslyFailed { ref message })
                 if message.contains("profile I/O runtime stopped unexpectedly")
         ));
-        world_task.await?;
+        world_task.await??;
         Ok(())
     }
 
@@ -2958,7 +2961,7 @@ mod tests {
             ProfileIoBootstrap::acquire(root.path().to_owned(), ProfileIoLimits::for_tests(2, 2))
                 .unwrap();
         let (profiles, profile_runtime) = bootstrap.spawn();
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let (mut pump, pump_task) = RewardPersistencePump::spawn(world.clone(), profiles, 2);
 
         world.quiesce().await.unwrap();
@@ -2971,6 +2974,7 @@ mod tests {
         world.shutdown().await.unwrap();
         time::timeout(Duration::from_secs(1), world_task)
             .await
+            .unwrap()
             .unwrap()
             .unwrap();
         profile_runtime.shutdown().await.unwrap();
@@ -3209,12 +3213,13 @@ mod tests {
             ProfileIoBootstrap::acquire(root.path().to_owned(), ProfileIoLimits::for_tests(2, 2))
                 .unwrap();
         let (profiles, profile_runtime) = bootstrap.spawn();
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let (_pump, pump_task) = RewardPersistencePump::spawn(world.clone(), profiles, 2);
 
         world.force_shutdown().await.unwrap();
         time::timeout(Duration::from_secs(1), world_task)
             .await
+            .unwrap()
             .unwrap()
             .unwrap();
         let error = time::timeout(Duration::from_secs(1), pump_task)

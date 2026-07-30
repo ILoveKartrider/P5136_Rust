@@ -26,7 +26,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -259,6 +259,7 @@ enum MessengerCommand {
         peer_ip: IpAddr,
         cancellation: oneshot::Sender<MessengerCancellation>,
         outbound: mpsc::Sender<Arc<[u8]>>,
+        generation: Arc<AtomicU64>,
         reply: oneshot::Sender<Result<MessengerRegistrationLease, MessengerServiceError>>,
     },
     Enter {
@@ -270,6 +271,7 @@ enum MessengerCommand {
     },
     Dispatch {
         session: MessengerSessionId,
+        expected_generation: u64,
         request: MessengerRequest,
         gate: Arc<MessengerCommitGate>,
         reply: oneshot::Sender<Result<(), MessengerServiceError>>,
@@ -287,6 +289,7 @@ enum MessengerCommand {
 struct MessengerTransport {
     peer_ip: IpAddr,
     entered_key: Option<String>,
+    generation: Arc<AtomicU64>,
     cancellation: Option<oneshot::Sender<MessengerCancellation>>,
     outbound: mpsc::Sender<Arc<[u8]>>,
 }
@@ -355,6 +358,7 @@ struct MessengerConnectionRegistration {
 
 struct RegisteredConnection {
     registration: MessengerConnectionRegistration,
+    generation: Arc<AtomicU64>,
     cancellation: oneshot::Receiver<MessengerCancellation>,
     outbound: mpsc::Receiver<Arc<[u8]>>,
 }
@@ -688,6 +692,7 @@ impl MessengerServiceHandle {
             stream,
             session,
             self,
+            registered.generation,
             registered.cancellation,
             registered.outbound,
             deadline,
@@ -743,12 +748,14 @@ impl MessengerServiceHandle {
     ) -> Result<RegisteredConnection, MessengerServiceError> {
         let (cancellation, cancelled) = oneshot::channel();
         let (outbound, outbound_receiver) = mpsc::channel(self.config.outbound_capacity);
+        let generation = Arc::new(AtomicU64::new(0));
         let (reply, response) = oneshot::channel();
         self.sender
             .send(MessengerCommand::RegisterConnection {
                 peer_ip,
                 cancellation,
                 outbound,
+                generation: Arc::clone(&generation),
                 reply,
             })
             .await
@@ -761,6 +768,7 @@ impl MessengerServiceHandle {
                 lease,
                 service: self.clone(),
             },
+            generation,
             cancellation: cancelled,
             outbound: outbound_receiver,
         })
@@ -793,6 +801,7 @@ impl MessengerServiceHandle {
     async fn dispatch(
         &self,
         session: MessengerSessionId,
+        expected_generation: u64,
         request: MessengerRequest,
     ) -> Result<(), MessengerServiceError> {
         let (reply, response) = oneshot::channel();
@@ -801,6 +810,7 @@ impl MessengerServiceHandle {
         self.sender
             .send(MessengerCommand::Dispatch {
                 session,
+                expected_generation,
                 request,
                 gate,
                 reply,
@@ -915,6 +925,7 @@ impl MessengerActor {
             .endpoint_updated
             .then(|| self.hub.session_for_identity(&next.nickname))
             .flatten();
+        let next_generation = next.generation.get();
         self.identities_by_key.insert(key.to_owned(), next.clone());
         self.last_advance_by_key.insert(
             key.to_owned(),
@@ -924,6 +935,13 @@ impl MessengerActor {
                 retained_session,
             },
         );
+        if let Some(session) = retained_session
+            && let Some(transport) = self.transports.get(&session)
+        {
+            transport
+                .generation
+                .store(next_generation, Ordering::Release);
+        }
         Ok(MessengerGenerationAdvanceOutcome {
             applied: true,
             hub,
@@ -976,6 +994,7 @@ impl MessengerActor {
         peer_ip: IpAddr,
         cancellation: oneshot::Sender<MessengerCancellation>,
         outbound: mpsc::Sender<Arc<[u8]>>,
+        generation: Arc<AtomicU64>,
     ) -> Result<MessengerSessionId, MessengerServiceError> {
         if self.transports.len() >= self.config.max_connections {
             return Err(MessengerServiceError::ConnectionLimitReached {
@@ -994,6 +1013,7 @@ impl MessengerActor {
             MessengerTransport {
                 peer_ip,
                 entered_key: None,
+                generation,
                 cancellation: Some(cancellation),
                 outbound,
             },
@@ -1035,6 +1055,11 @@ impl MessengerActor {
             .get_mut(&session)
             .expect("validated messenger transport remains registered")
             .entered_key = Some(active.canonical_key().to_owned());
+        self.transports
+            .get(&session)
+            .expect("entered messenger transport remains registered")
+            .generation
+            .store(active.generation.get(), Ordering::Release);
         if let Some(replaced) = outcome.replaced_session {
             self.remove_transport_only(replaced, MessengerCancellation::Replaced);
         }
@@ -1075,9 +1100,13 @@ impl MessengerActor {
     fn dispatch(
         &mut self,
         session: MessengerSessionId,
+        expected_generation: u64,
         request: MessengerRequest,
     ) -> Result<(), MessengerServiceError> {
         let sender = self.current_identity(session)?;
+        if sender.generation.get() != expected_generation {
+            return Err(MessengerServiceError::StaleIdentityGeneration);
+        }
         let deliveries = match request {
             MessengerRequest::EnterChatServer { .. } => {
                 return Err(MessengerServiceError::UnexpectedEnter);
@@ -1271,10 +1300,11 @@ async fn run_messenger_actor(
                 peer_ip,
                 cancellation,
                 outbound,
+                generation,
                 reply,
             } => {
                 let registration = actor
-                    .register_connection(peer_ip, cancellation, outbound)
+                    .register_connection(peer_ip, cancellation, outbound, generation)
                     .map(|session| MessengerRegistrationLease::new(session, Arc::clone(&cleanup)));
                 let _ = reply.send(registration);
                 false
@@ -1296,12 +1326,13 @@ async fn run_messenger_actor(
             }
             MessengerCommand::Dispatch {
                 session,
+                expected_generation,
                 request,
                 gate,
                 reply,
             } => {
                 let result = if gate.claim() {
-                    actor.dispatch(session, request)
+                    actor.dispatch(session, expected_generation, request)
                 } else {
                     Err(MessengerServiceError::CommandCancelled)
                 };
@@ -1392,10 +1423,70 @@ where
     Ok(logical)
 }
 
+/// Reads one authenticated frame and stamps the socket poll that consumes its
+/// first byte.
+///
+/// A connection may sit in an empty read across a generation advance; bytes
+/// arriving afterward belong to the retained new-generation endpoint. The
+/// generation is loaded immediately before the nonblocking read poll and
+/// checked immediately after `Ready`, closing the consume-then-preempt race.
+/// Once that byte is admitted, an advance before the final byte makes the whole
+/// frame stale.
+async fn read_generation_fenced_messenger_frame<R>(
+    reader: &mut R,
+    maximum: usize,
+    generation: &AtomicU64,
+) -> Result<(Vec<u8>, u64), MessengerConnectionError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; MESSENGER_FRAME_HEADER_LENGTH];
+    let admitted_generation = std::future::poll_fn(
+        |context| -> std::task::Poll<Result<u64, MessengerConnectionError>> {
+            let before = generation.load(Ordering::Acquire);
+            if before == 0 {
+                return std::task::Poll::Ready(Err(
+                    MessengerServiceError::StaleIdentityGeneration.into()
+                ));
+            }
+            let mut first_byte = tokio::io::ReadBuf::new(&mut header[..1]);
+            match std::pin::Pin::new(&mut *reader).poll_read(context, &mut first_byte) {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error.into())),
+                std::task::Poll::Ready(Ok(())) if first_byte.filled().is_empty() => {
+                    std::task::Poll::Ready(
+                        Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+                    )
+                }
+                std::task::Poll::Ready(Ok(())) => {
+                    let after = generation.load(Ordering::Acquire);
+                    if after == before {
+                        std::task::Poll::Ready(Ok(before))
+                    } else {
+                        std::task::Poll::Ready(Err(
+                            MessengerServiceError::StaleIdentityGeneration.into()
+                        ))
+                    }
+                }
+            }
+        },
+    )
+    .await?;
+    reader.read_exact(&mut header[1..]).await?;
+    let length = decode_frame_length(header, maximum)?;
+    let mut logical = vec![0_u8; length];
+    reader.read_exact(&mut logical).await?;
+    if generation.load(Ordering::Acquire) != admitted_generation {
+        return Err(MessengerServiceError::StaleIdentityGeneration.into());
+    }
+    Ok((logical, admitted_generation))
+}
+
 async fn run_registered_connection<S>(
     stream: S,
     session: MessengerSessionId,
     service: &MessengerServiceHandle,
+    generation: Arc<AtomicU64>,
     mut cancellation: oneshot::Receiver<MessengerCancellation>,
     mut outbound: mpsc::Receiver<Arc<[u8]>>,
     enter_deadline: time::Instant,
@@ -1448,10 +1539,14 @@ where
     loop {
         let read = time::timeout(
             config.idle_timeout,
-            read_messenger_frame(&mut reader, config.max_frame_payload),
+            read_generation_fenced_messenger_frame(
+                &mut reader,
+                config.max_frame_payload,
+                generation.as_ref(),
+            ),
         );
         tokio::pin!(read);
-        let logical = loop {
+        let (logical, frame_generation) = loop {
             let action = tokio::select! {
                 biased;
                 cancelled = &mut cancellation => {
@@ -1482,7 +1577,7 @@ where
         if matches!(request, MessengerRequest::EnterChatServer { .. }) {
             return Err(MessengerConnectionError::DuplicateEnter);
         }
-        service.dispatch(session, request).await?;
+        service.dispatch(session, frame_generation, request).await?;
     }
 }
 
@@ -1537,14 +1632,17 @@ fn cancellation_error(
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
     use p5136_core::{
         adler32,
         messenger::{
-            MessengerFrameError, encode_frame, serialize_chat, serialize_guild_chat,
+            MessengerFrameError, encode_frame, parse_request, serialize_chat, serialize_guild_chat,
             serialize_invite_chat, serialize_leave_chat,
         },
         packet::{PacketReader, PacketWriter},
@@ -1561,7 +1659,7 @@ mod tests {
         MessengerCancellation, MessengerCleanupQueue, MessengerCommand, MessengerCommitGate,
         MessengerCommitLease, MessengerConnectionError, MessengerRegistrationLease,
         MessengerRuntimeConfig, MessengerServiceHandle, MessengerServiceSnapshot,
-        read_messenger_frame,
+        read_generation_fenced_messenger_frame, read_messenger_frame,
     };
     use crate::messenger_hub::{
         EnterClaim, MessengerHubError, MessengerHubLimits, MessengerIdentity, MessengerSessionId,
@@ -1569,6 +1667,36 @@ mod tests {
 
     const MAXIMUM: usize = 16 * 1_024;
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    struct AdvanceGenerationOnFirstByte {
+        frame: Vec<u8>,
+        offset: usize,
+        generation: Arc<AtomicU64>,
+        advanced: bool,
+    }
+
+    impl AsyncRead for AdvanceGenerationOnFirstByte {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let count = buffer
+                .remaining()
+                .min(this.frame.len().saturating_sub(this.offset));
+            if count == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            buffer.put_slice(&this.frame[this.offset..this.offset + count]);
+            this.offset += count;
+            if !this.advanced {
+                this.generation.store(2, Ordering::Release);
+                this.advanced = true;
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     fn test_config() -> MessengerRuntimeConfig {
         MessengerRuntimeConfig {
@@ -1738,6 +1866,7 @@ mod tests {
                 peer_ip: LOOPBACK,
                 cancellation,
                 outbound,
+                generation: Arc::new(AtomicU64::new(0)),
                 reply,
             })
             .await
@@ -1754,6 +1883,7 @@ mod tests {
                 peer_ip: LOOPBACK,
                 cancellation,
                 outbound,
+                generation: Arc::new(AtomicU64::new(0)),
                 reply,
             })
             .await
@@ -1848,6 +1978,26 @@ mod tests {
             ))
         ));
         actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generation_change_during_first_byte_admission_fails_closed() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut reader = AdvanceGenerationOnFirstByte {
+            frame: encode_frame(&guild_packet("Rider", "stale-prefix"), MAXIMUM).unwrap(),
+            offset: 0,
+            generation: Arc::clone(&generation),
+            advanced: false,
+        };
+
+        assert!(matches!(
+            read_generation_fenced_messenger_frame(&mut reader, MAXIMUM, generation.as_ref()).await,
+            Err(MessengerConnectionError::Service(
+                super::MessengerServiceError::StaleIdentityGeneration
+            ))
+        ));
+        assert_eq!(generation.load(Ordering::Acquire), 2);
+        assert_eq!(reader.offset, 1);
     }
 
     #[tokio::test]
@@ -2350,6 +2500,53 @@ mod tests {
 
         service.release_identity(v2).await.unwrap();
         assert_eq!(service.snapshot().await.unwrap().announced_identities, 1);
+        service.shutdown().await.unwrap();
+        actor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frame_admitted_before_generation_advance_cannot_dispatch_as_the_replacement() {
+        let (service, actor_task) = MessengerServiceHandle::spawn(test_config()).unwrap();
+        let v1 = identity(17, "Rider", 1);
+        let v2 = identity(17, "Rider", 2);
+        service.announce_identity(v1.clone()).await.unwrap();
+        let registered = service.register_connection(LOOPBACK).await.unwrap();
+        let session = registered.registration.lease.session;
+        service
+            .enter(
+                session,
+                EnterClaim {
+                    user_no: 17,
+                    chat_type: 1,
+                    nickname: "Rider".to_owned(),
+                },
+                time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let super::RegisteredConnection {
+            registration,
+            generation,
+            cancellation: _cancellation,
+            mut outbound,
+        } = registered;
+        assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        service.advance_identity(v1, v2.clone()).await.unwrap();
+        assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 2);
+        let stale_request = parse_request(&guild_packet("Rider", "stale"), MAXIMUM).unwrap();
+        assert!(matches!(
+            service.dispatch(session, 1, stale_request).await,
+            Err(super::MessengerServiceError::StaleIdentityGeneration)
+        ));
+        assert!(outbound.try_recv().is_err());
+
+        let fresh_request = parse_request(&guild_packet("Rider", "fresh"), MAXIMUM).unwrap();
+        service.dispatch(session, 2, fresh_request).await.unwrap();
+        assert!(outbound.recv().await.is_some());
+
+        registration.close().await.unwrap();
+        service.release_identity(v2).await.unwrap();
         service.shutdown().await.unwrap();
         actor_task.await.unwrap();
     }

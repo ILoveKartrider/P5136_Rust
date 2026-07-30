@@ -6,6 +6,7 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -63,21 +64,22 @@ use crate::equipment_persistence::{
 };
 use crate::identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
-    IdentityRegistry, MigrationCompletion, MigrationPermit, MigrationPreflight, MigrationToken,
-    ReleasedIdentity, UserNo,
+    IdentityOperationLease, IdentityRegistry, IdentityRegistryInstance, MigrationCompletion,
+    MigrationPermit, MigrationPreflight, MigrationToken, ReleasedIdentity, UserNo,
 };
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 use crate::myroom_hub::{
-    MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError,
-    MyRoomProfilePresentation, MyRoomTransition, MyRoomWirePlan, MyRoomWireProjection,
-    MyRoomWireProjectionError, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
+    MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError, MyRoomTransition,
+    MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError, RoomEffect as MyRoomEffect,
+    RoomPublication as MyRoomPublication,
 };
 use crate::myroom_persistence::{
-    MigrationProfileCompletion, MyRoomCompletionBridge, MyRoomCompletionDrainError,
-    MyRoomCompletionSlot, MyRoomInfoPublication, MyRoomInfoWriteError, MyRoomInfoWriteReceipt,
-    MyRoomPersistenceInvariantError, MyRoomProfileCompletion, MyRoomProfileJobResult,
-    MyRoomProfileTicketId, PreparedMyRoomInfoWrite, RegisteredMyRoomInfoWrite,
+    MigrationAcknowledgement, MigrationProfileCompletion, MyRoomCompletionBridge,
+    MyRoomCompletionDrainError, MyRoomCompletionSlot, MyRoomInfoPublication, MyRoomInfoWriteError,
+    MyRoomInfoWriteReceipt, MyRoomPersistenceInvariantError, MyRoomProfileCompletion,
+    MyRoomProfileJobResult, MyRoomProfileTicketId, PreparedMyRoomInfoWrite,
+    RegisteredMyRoomInfoWrite,
 };
 use crate::operation_gate::{WireOperationGate, WireOperationGuard};
 use crate::profile_io::{DurableRewardReceipt, MyRoomProfileLease, ProfileJobAdmission};
@@ -509,6 +511,7 @@ pub(crate) struct WorldForceShutdownReport {
     rider_equipment_tickets: usize,
     rider_equipment_user_indexes: usize,
     migration_transfers: usize,
+    identity_operations: usize,
 }
 
 impl WorldForceShutdownReport {
@@ -519,6 +522,7 @@ impl WorldForceShutdownReport {
             rider_equipment_tickets: world.pending_rider_equipment_writes.len(),
             rider_equipment_user_indexes: world.pending_rider_equipment_by_user.len(),
             migration_transfers: world.identities.transfer_in_progress_count(),
+            identity_operations: world.identities.outstanding_operation_count(),
         }
     }
 
@@ -528,6 +532,7 @@ impl WorldForceShutdownReport {
             || self.rider_equipment_tickets != 0
             || self.rider_equipment_user_indexes != 0
             || self.migration_transfers != 0
+            || self.identity_operations != 0
     }
 }
 
@@ -1011,8 +1016,23 @@ pub enum WorldError {
     #[error("active identity limit {maximum} reached")]
     IdentityLimitReached { maximum: usize },
 
+    #[error("identity operation capability belongs to a different world actor")]
+    ForeignIdentityOperation,
+
     #[error("MyRoom command could not reserve the outbound queue for session {session:?}")]
     MyRoomCommandOutboundUnavailable { session: SessionId },
+
+    #[error("channel-move acknowledgement queue is unavailable for session {session:?}")]
+    MigrationAcknowledgementUnavailable { session: SessionId },
+
+    #[error("channel migration peer publication queue is unavailable for session {session:?}")]
+    MigrationPublicationUnavailable { session: SessionId },
+
+    #[error("channel migration protocol-room state is inconsistent for user {user_no}")]
+    MigrationProtocolRoomInconsistent { user_no: u32 },
+
+    #[error("channel migration lifecycle queue could not reserve commit capacity")]
+    MigrationCommitCapacityUnavailable,
 
     #[error(
         "MyRoom topology changed while live slot profiles were being loaded for session {session:?}"
@@ -1096,6 +1116,9 @@ pub enum WorldError {
         "world shutdown refused while {pending} MyRoom profile writes remain ({indexed} user indexes)"
     )]
     MyRoomPersistenceShutdownBlocked { pending: usize, indexed: usize },
+
+    #[error("world shutdown refused while {active} identity operations remain active")]
+    IdentityOperationShutdownBlocked { active: usize },
 }
 
 /// A terminal failure while publishing actor-owned state to a process sidecar.
@@ -1122,6 +1145,30 @@ pub(crate) enum WorldSidecarError {
 
     #[error("world identity capacity must be nonzero")]
     InvalidIdentityCapacity,
+}
+
+/// A caller-visible failure to construct the standalone World actor.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WorldSpawnError {
+    #[error("world mailbox capacity must be nonzero")]
+    ZeroMailboxCapacity,
+}
+
+/// A terminal standalone World-actor failure.
+///
+/// The concrete sidecar invariant remains internal, while callers can still
+/// observe and report the original source through [`std::error::Error`].
+#[derive(Debug, Error)]
+#[error("world actor terminated: {source}")]
+pub struct WorldActorError {
+    #[source]
+    source: WorldSidecarError,
+}
+
+impl From<WorldSidecarError> for WorldActorError {
+    fn from(source: WorldSidecarError) -> Self {
+        Self { source }
+    }
 }
 
 #[derive(Debug)]
@@ -1270,9 +1317,30 @@ impl RegisteredMigrationPreflight {
             .destination_ip()
     }
 
+    pub(crate) async fn wait_for_operations_drained(&self) -> Result<(), WorldError> {
+        let Some(preflight) = self.preflight.as_deref() else {
+            debug_assert!(false, "a submitted migration cannot be awaited again");
+            return Err(WorldError::Identity(IdentityError::StaleMigrationPreflight));
+        };
+        preflight
+            .wait_for_operations_drained()
+            .await
+            .map_err(WorldError::from)
+    }
+
+    #[cfg(test)]
     fn submit(
+        self,
+        profile: MyRoomProfileLease,
+        reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
+    ) {
+        self.submit_with_acknowledgement(profile, MigrationAcknowledgement::Omitted, reply);
+    }
+
+    fn submit_with_acknowledgement(
         mut self,
         profile: MyRoomProfileLease,
+        acknowledgement: MigrationAcknowledgement,
         reply: oneshot::Sender<Result<MigrationCompletion, WorldError>>,
     ) {
         let preflight = self
@@ -1287,6 +1355,7 @@ impl RegisteredMigrationPreflight {
             MigrationProfileCompletion::Ready {
                 preflight,
                 profile: Box::new(profile),
+                acknowledgement,
                 reply,
             },
         ));
@@ -1307,6 +1376,17 @@ impl Drop for RegisteredMigrationPreflight {
 
 #[derive(Debug)]
 enum WorldCommand {
+    AdmitIdentityOperation {
+        session: SessionId,
+        reply: oneshot::Sender<Result<IdentityOperationLease, WorldError>>,
+    },
+    /// The retained lease is the authorization capability for the boxed
+    /// command. It remains actor-owned even if the request future is cancelled
+    /// after enqueueing the command.
+    AdmittedIdentityOperation {
+        operation: IdentityOperationLease,
+        command: Box<WorldCommand>,
+    },
     RegisterSession {
         peer: SocketAddr,
         cancellation: Option<oneshot::Sender<()>>,
@@ -1334,6 +1414,7 @@ enum WorldCommand {
         now: Instant,
         reply: oneshot::Sender<Result<MigrationPermit, WorldError>>,
     },
+    #[cfg(test)]
     CompleteMigration {
         destination: SessionId,
         user_no: UserNo,
@@ -1471,6 +1552,15 @@ pub struct WorldHandle {
     sender: mpsc::Sender<WorldCommand>,
     udp_sender: Option<mpsc::Sender<UdpIngress>>,
     myroom_completions: MyRoomCompletionBridge,
+    identity_instance: Arc<IdentityRegistryInstance>,
+}
+
+/// Session-facing view which can enqueue only work retained by one exact,
+/// actor-minted identity operation.
+#[derive(Debug)]
+pub(crate) struct AdmittedWorldHandle<'a> {
+    world: &'a WorldHandle,
+    operation: &'a IdentityOperationLease,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1491,9 +1581,37 @@ impl WorldSidecars {
 }
 
 impl WorldHandle {
+    pub(crate) async fn admit_identity_operation(
+        &self,
+        session: SessionId,
+    ) -> Result<IdentityOperationLease, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::AdmitIdentityOperation { session, reply })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     #[must_use]
-    pub fn spawn(mailbox_capacity: usize) -> (Self, JoinHandle<()>) {
-        let (sender, receiver) = mpsc::channel(mailbox_capacity);
+    pub(crate) const fn admitted<'a>(
+        &'a self,
+        operation: &'a IdentityOperationLease,
+    ) -> AdmittedWorldHandle<'a> {
+        AdmittedWorldHandle {
+            world: self,
+            operation,
+        }
+    }
+
+    pub fn spawn(
+        mailbox_capacity: usize,
+    ) -> Result<(Self, JoinHandle<Result<(), WorldActorError>>), WorldSpawnError> {
+        let mailbox_capacity =
+            NonZeroUsize::new(mailbox_capacity).ok_or(WorldSpawnError::ZeroMailboxCapacity)?;
+        let (sender, receiver) = mpsc::channel(mailbox_capacity.get());
+        let identities = IdentityRegistry::new();
+        let identity_instance = identities.instance();
         let completion_capacity = NonZeroUsize::new(DEFAULT_WORLD_IDENTITY_CAPACITY)
             .expect("the default World identity capacity is nonzero");
         let (myroom_completions, completion_receiver) =
@@ -1502,19 +1620,21 @@ impl WorldHandle {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let task = tokio::spawn(async move {
-            let result = run_world(
+            run_world(
                 receiver,
                 completion_receiver,
                 None,
                 WorldSidecars::default(),
                 ServerClock::new(),
+                identities,
             )
-            .await;
-            debug_assert!(result.is_ok());
+            .await
+            .map_err(WorldActorError::from)
         });
-        (handle, task)
+        Ok((handle, task))
     }
 
     #[cfg(test)]
@@ -1523,6 +1643,8 @@ impl WorldHandle {
         messenger: MessengerServiceHandle,
     ) -> (Self, JoinHandle<Result<(), MessengerServiceError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let identities = IdentityRegistry::new();
+        let identity_instance = identities.instance();
         let sidecars = WorldSidecars {
             messenger: Some(messenger),
             udp: None,
@@ -1539,6 +1661,7 @@ impl WorldHandle {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let task = tokio::spawn(async move {
             match run_world(
@@ -1547,6 +1670,7 @@ impl WorldHandle {
                 None,
                 sidecars,
                 ServerClock::new(),
+                identities,
             )
             .await
             {
@@ -1577,6 +1701,8 @@ impl WorldHandle {
     ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
         let (udp_sender, udp_receiver) = mpsc::channel(udp_mailbox_capacity);
+        let identities = IdentityRegistry::new();
+        let identity_instance = identities.instance();
         let sidecars = WorldSidecars {
             messenger: Some(messenger),
             udp: Some(udp),
@@ -1595,6 +1721,7 @@ impl WorldHandle {
             sender,
             udp_sender: Some(udp_sender),
             myroom_completions,
+            identity_instance,
         };
         let task = tokio::spawn(run_world(
             receiver,
@@ -1602,6 +1729,7 @@ impl WorldHandle {
             Some(udp_receiver),
             sidecars,
             clock,
+            identities,
         ));
         (handle, task)
     }
@@ -1745,7 +1873,8 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
-    pub async fn complete_migration(
+    #[cfg(test)]
+    pub(crate) async fn complete_migration(
         &self,
         destination: SessionId,
         user_no: UserNo,
@@ -1798,7 +1927,7 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn complete_preflighted_migration(
         &self,
         preflight: RegisteredMigrationPreflight,
@@ -1809,6 +1938,22 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn complete_preflighted_migration_with_acknowledgement(
+        &self,
+        preflight: RegisteredMigrationPreflight,
+        profile: MyRoomProfileLease,
+        acknowledgement: Vec<u8>,
+    ) -> Result<MigrationCompletion, WorldError> {
+        let (reply, response) = oneshot::channel();
+        preflight.submit_with_acknowledgement(
+            profile,
+            MigrationAcknowledgement::Ordered(acknowledgement),
+            reply,
+        );
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    #[cfg(test)]
     pub(crate) async fn room_protocol(
         &self,
         session: SessionId,
@@ -1844,28 +1989,7 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
-    /// Updates the actor-owned `MyRoom` cache from one profile snapshot without
-    /// emitting `RmSlotData`. C# exposes the change only through a later
-    /// topology publication or an explicit First request.
-    pub(crate) async fn refresh_myroom_presentation(
-        &self,
-        session: SessionId,
-        expected: IdentityBinding,
-        profile: MyRoomProfileLease,
-    ) -> Result<bool, WorldError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WorldCommand::RefreshMyRoomPresentation {
-                session,
-                expected,
-                profile: Box::new(profile),
-                reply,
-            })
-            .await
-            .map_err(|_| WorldError::Stopped)?;
-        response.await.map_err(|_| WorldError::Stopped)?
-    }
-
+    #[cfg(test)]
     pub(crate) async fn lobby_command(
         &self,
         session: SessionId,
@@ -1883,6 +2007,7 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    #[cfg(test)]
     pub(crate) async fn race_command(
         &self,
         session: SessionId,
@@ -2050,37 +2175,7 @@ impl WorldHandle {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
-    pub(crate) async fn prepare_myroom_command(
-        &self,
-        session: SessionId,
-    ) -> Result<MyRoomCommandPlan, WorldError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WorldCommand::PrepareMyRoom { session, reply })
-            .await
-            .map_err(|_| WorldError::Stopped)?;
-        response.await.map_err(|_| WorldError::Stopped)?
-    }
-
-    pub(crate) async fn myroom_command(
-        &self,
-        session: SessionId,
-        payload: MyRoomCommandPayload,
-        prepared: MyRoomPreparedCommand,
-    ) -> Result<(), WorldError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(WorldCommand::MyRoom {
-                session,
-                payload,
-                prepared: Box::new(prepared),
-                reply,
-            })
-            .await
-            .map_err(|_| WorldError::Stopped)?;
-        response.await.map_err(|_| WorldError::Stopped)?
-    }
-
+    #[cfg(test)]
     pub(crate) async fn persist_myroom_owner_info(
         &self,
         session: SessionId,
@@ -2102,6 +2197,7 @@ impl WorldHandle {
             .map_err(|_| RiderEquipmentWriteError::CompletionMailboxClosed)
     }
 
+    #[cfg(test)]
     pub(crate) async fn persist_rider_equipment(
         &self,
         session: SessionId,
@@ -2144,6 +2240,7 @@ impl WorldHandle {
             .await
     }
 
+    #[cfg(test)]
     async fn persist_prepared_myroom_owner_info(
         &self,
         session: SessionId,
@@ -2171,6 +2268,7 @@ impl WorldHandle {
             .map_err(|_| MyRoomInfoWriteError::WorldStopped)?
     }
 
+    #[cfg(test)]
     pub(crate) async fn myroom_session_view(
         &self,
         session: SessionId,
@@ -2231,6 +2329,242 @@ impl WorldHandle {
     }
 }
 
+impl AdmittedWorldHandle<'_> {
+    fn operation_belongs_to_world(&self) -> bool {
+        self.operation.belongs_to(&self.world.identity_instance)
+    }
+
+    #[must_use]
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.operation.binding().owner
+    }
+
+    pub(crate) const fn operation(&self) -> &IdentityOperationLease {
+        self.operation
+    }
+
+    async fn send(&self, command: WorldCommand) -> Result<(), WorldError> {
+        if !self.operation_belongs_to_world() {
+            return Err(WorldError::ForeignIdentityOperation);
+        }
+        let operation = self.operation.try_retain().map_err(WorldError::from)?;
+        self.world
+            .sender
+            .send(WorldCommand::AdmittedIdentityOperation {
+                operation,
+                command: Box::new(command),
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)
+    }
+
+    pub(crate) async fn authorize_identity(&self) -> Result<IdentityBinding, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::AuthorizeIdentity {
+            session: self.session_id(),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn begin_migration(
+        &self,
+        channel: ChannelBinding,
+        token: MigrationToken,
+        now: Instant,
+    ) -> Result<MigrationPermit, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::BeginMigration {
+            session: self.session_id(),
+            channel,
+            token,
+            now,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn room_protocol(
+        &self,
+        payload: RoomCommandPayload,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::RoomProtocol {
+            session: self.session_id(),
+            payload: Box::new(payload),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn refresh_myroom_presentation(
+        &self,
+        expected: IdentityBinding,
+        profile: MyRoomProfileLease,
+    ) -> Result<bool, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::RefreshMyRoomPresentation {
+            session: self.session_id(),
+            expected,
+            profile: Box::new(profile),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn lobby_command(
+        &self,
+        payload: LobbyCommandPayload,
+    ) -> Result<LobbyCommandOutcome, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::Lobby {
+            session: self.session_id(),
+            payload,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn race_command(
+        &self,
+        payload: RaceCommandPayload,
+    ) -> Result<RaceCommandOutcome, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::Race {
+            session: self.session_id(),
+            payload,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn prepare_myroom_command(&self) -> Result<MyRoomCommandPlan, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::PrepareMyRoom {
+            session: self.session_id(),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn myroom_command(
+        &self,
+        payload: MyRoomCommandPayload,
+        prepared: MyRoomPreparedCommand,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::MyRoom {
+            session: self.session_id(),
+            payload,
+            prepared: Box::new(prepared),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn myroom_session_view(
+        &self,
+    ) -> Result<Option<MyRoomSessionView>, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::MyRoomSessionView {
+            session: self.session_id(),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn persist_myroom_owner_info(
+        &self,
+        proposed: MyRoomInfo,
+        admission: ProfileJobAdmission,
+    ) -> Result<MyRoomInfoWriteReceipt, MyRoomInfoWriteError> {
+        if !self.operation_belongs_to_world() {
+            return Err(MyRoomInfoWriteError::ForeignIdentityOperation);
+        }
+        let completion = self.world.myroom_completions.reserve().await?;
+        let prepared = PreparedMyRoomInfoWrite::new(admission, proposed, completion);
+        let (request_reply, request_response) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
+        let operation = self
+            .operation
+            .try_retain()
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)?;
+        self.world
+            .sender
+            .send(WorldCommand::AdmittedIdentityOperation {
+                operation,
+                command: Box::new(WorldCommand::RegisterMyRoomInfoWrite {
+                    session: self.session_id(),
+                    prepared,
+                    request_reply,
+                    reply,
+                }),
+            })
+            .await
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)?;
+        let registered = response
+            .await
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)??;
+        registered.submit();
+        request_response
+            .await
+            .map_err(|_| MyRoomInfoWriteError::WorldStopped)?
+    }
+
+    pub(crate) async fn reserve_rider_equipment_completion(
+        &self,
+    ) -> Result<MyRoomCompletionSlot, RiderEquipmentWriteError> {
+        if !self.operation_belongs_to_world() {
+            return Err(RiderEquipmentWriteError::ForeignIdentityOperation);
+        }
+        self.world.reserve_rider_equipment_completion().await
+    }
+
+    pub(crate) async fn persist_rider_equipment(
+        &self,
+        prepared: PreparedRiderEquipmentWrite,
+    ) -> Result<RiderEquipmentWriteReceipt, RiderEquipmentWriteError> {
+        if !self.operation_belongs_to_world() {
+            return Err(RiderEquipmentWriteError::ForeignIdentityOperation);
+        }
+        let (request_reply, request_response) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
+        let operation = self
+            .operation
+            .try_retain()
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)?;
+        self.world
+            .sender
+            .send(WorldCommand::AdmittedIdentityOperation {
+                operation,
+                command: Box::new(WorldCommand::RegisterRiderEquipmentWrite {
+                    session: self.session_id(),
+                    prepared,
+                    request_reply,
+                    reply,
+                }),
+            })
+            .await
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)?;
+        let registered = response
+            .await
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)??;
+        registered.submit();
+        request_response
+            .await
+            .map_err(|_| RiderEquipmentWriteError::WorldStopped)?
+    }
+}
+
 #[derive(Debug)]
 struct World {
     sessions: HashMap<SessionId, SessionState>,
@@ -2259,6 +2593,10 @@ struct World {
     next_myroom_ticket: Option<MyRoomProfileTicketId>,
     quiescing: bool,
     outbound_producers_sealed: bool,
+    /// Exact actor-scoped binding supplied by an
+    /// `AdmittedIdentityOperation`. This is never persisted across mailbox
+    /// turns; the enclosing non-clone lease remains live for the full dispatch.
+    admitted_identity: Option<IdentityBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2597,6 +2935,75 @@ struct ProtocolRoomState {
 }
 
 type OutboundDelivery = (SessionId, OutboundBatch);
+
+#[derive(Debug)]
+struct ProtocolMigrationDelta {
+    user_no: UserNo,
+    room_id: RoomId,
+    expected_room: ProtocolRoomState,
+    next_room: Option<ProtocolRoomState>,
+    remove_room: bool,
+    aborted_loading_fence: Option<RaceFence>,
+}
+
+struct ProtocolMigrationCommit<'a> {
+    delta: ProtocolMigrationDelta,
+    protocol_room_by_user: &'a mut HashMap<UserNo, RoomId>,
+    protocol_rooms: &'a mut HashMap<RoomId, ProtocolRoomState>,
+    free_protocol_room_ids: &'a mut BTreeSet<u16>,
+    reward_lanes: &'a mut HashMap<UserNo, RaceFence>,
+}
+
+impl ProtocolMigrationDelta {
+    fn lock<'a>(
+        self,
+        protocol_room_by_user: &'a mut HashMap<UserNo, RoomId>,
+        protocol_rooms: &'a mut HashMap<RoomId, ProtocolRoomState>,
+        free_protocol_room_ids: &'a mut BTreeSet<u16>,
+        reward_lanes: &'a mut HashMap<UserNo, RaceFence>,
+    ) -> Result<ProtocolMigrationCommit<'a>, WorldError> {
+        if protocol_room_by_user.get(&self.user_no) != Some(&self.room_id)
+            || protocol_rooms.get(&self.room_id) != Some(&self.expected_room)
+        {
+            return Err(WorldError::MigrationProtocolRoomInconsistent {
+                user_no: self.user_no.get(),
+            });
+        }
+        Ok(ProtocolMigrationCommit {
+            delta: self,
+            protocol_room_by_user,
+            protocol_rooms,
+            free_protocol_room_ids,
+            reward_lanes,
+        })
+    }
+}
+
+impl ProtocolMigrationCommit<'_> {
+    fn commit(self) {
+        let Self {
+            delta,
+            protocol_room_by_user,
+            protocol_rooms,
+            free_protocol_room_ids,
+            reward_lanes,
+        } = self;
+        let removed_mapping = protocol_room_by_user.remove(&delta.user_no);
+        debug_assert_eq!(removed_mapping, Some(delta.room_id));
+        if delta.remove_room {
+            let removed_room = protocol_rooms.remove(&delta.room_id);
+            debug_assert_eq!(removed_room.as_ref(), Some(&delta.expected_room));
+            free_protocol_room_ids
+                .insert(u16::try_from(delta.room_id.0).expect("protocol room ID fits in u16"));
+        } else if let Some(next_room) = delta.next_room {
+            let previous = protocol_rooms.insert(delta.room_id, next_room);
+            debug_assert_eq!(previous.as_ref(), Some(&delta.expected_room));
+        }
+        if let Some(fence) = delta.aborted_loading_fence {
+            reward_lanes.retain(|_, owned| *owned != fence);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MyRoomOutboundReservationError {
@@ -3048,11 +3455,29 @@ impl Default for World {
             next_myroom_ticket: Some(MyRoomProfileTicketId::FIRST),
             quiescing: false,
             outbound_producers_sealed: false,
+            admitted_identity: None,
         }
     }
 }
 
 impl World {
+    /// Reauthorizes a session at an ordinary mailbox boundary, while allowing
+    /// an operation admitted before a migration freeze to finish under the
+    /// exact binding carried by its enclosing actor-owned lease.
+    fn authorize_session_operation(
+        &self,
+        session: SessionId,
+    ) -> Result<IdentityBinding, IdentityError> {
+        if let Some(binding) = self
+            .admitted_identity
+            .as_ref()
+            .filter(|binding| binding.owner == session)
+        {
+            return Ok(binding.clone());
+        }
+        self.identities.authorize(session)
+    }
+
     #[cfg(test)]
     fn register_session(
         &mut self,
@@ -3452,7 +3877,8 @@ impl World {
         });
         let pending_profile_producers = !self.pending_myroom_writes.is_empty()
             || !self.pending_rider_equipment_writes.is_empty()
-            || self.identities.transfer_in_progress_count() != 0;
+            || self.identities.transfer_in_progress_count() != 0
+            || self.identities.outstanding_operation_count() != 0;
         let drained = !pending_race_wire && !pending_profile_producers;
         if drained {
             // Completion commands remain admissible for exact capability
@@ -3468,7 +3894,7 @@ impl World {
         &self,
         session: SessionId,
     ) -> Result<MyRoomCommandPlan, WorldOperationError> {
-        let expected = self.identities.authorize(session)?;
+        let expected = self.authorize_session_operation(session)?;
         let wire = self
             .myroom
             .wire_plan_if_member(&expected)
@@ -3482,7 +3908,7 @@ impl World {
         payload: MyRoomCommandPayload,
         prepared: MyRoomPreparedCommand,
     ) -> Result<(), WorldOperationError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         if identity != prepared.expected {
             return Err(WorldError::MyRoomWirePlanStale { session }.into());
         }
@@ -3568,7 +3994,7 @@ impl World {
                 MyRoomInfoWriteError::WorldQuiescing,
             ));
         }
-        let identity = self.identities.authorize(session).map_err(|_| {
+        let identity = self.authorize_session_operation(session).map_err(|_| {
             MyRoomInfoRegistrationError::request(MyRoomInfoWriteError::UnauthenticatedSession {
                 session,
             })
@@ -3676,7 +4102,7 @@ impl World {
                 RiderEquipmentWriteError::WorldQuiescing,
             ));
         }
-        let identity = self.identities.authorize(session).map_err(|_| {
+        let identity = self.authorize_session_operation(session).map_err(|_| {
             RiderEquipmentRegistrationError::request(
                 RiderEquipmentWriteError::UnauthenticatedSession { session },
             )
@@ -3736,7 +4162,7 @@ impl World {
         &self,
         session: SessionId,
     ) -> Result<Option<MyRoomSessionView>, WorldOperationError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         let Some(membership) = self
             .myroom
             .membership_if_member(&identity)
@@ -4244,6 +4670,13 @@ impl World {
     fn drain_sessions_for_shutdown(&mut self) -> Result<(), WorldOperationError> {
         if !self.quiescing {
             return Err(WorldError::SessionDrainRequiresQuiesce.into());
+        }
+        let active_operations = self.identities.outstanding_operation_count();
+        if active_operations != 0 {
+            return Err(WorldError::IdentityOperationShutdownBlocked {
+                active: active_operations,
+            }
+            .into());
         }
 
         // Session tasks receive cancellation while their receivers still
@@ -5719,22 +6152,35 @@ impl World {
         })
     }
 
+    #[cfg(test)]
     fn claim_identity(
         &mut self,
         session: SessionId,
         nickname: &str,
     ) -> Result<IdentityBinding, WorldError> {
+        self.claim_identity_at_udp_epoch(session, nickname, 0)
+    }
+
+    fn claim_identity_at_udp_epoch(
+        &mut self,
+        session: SessionId,
+        nickname: &str,
+        activated_udp_epoch: u64,
+    ) -> Result<IdentityBinding, WorldError> {
         let source_ip = self.session_ip(session)?;
         let maximum = self.identity_capacity.get();
-        if self.identities.active_count() >= maximum {
+        if self.identities.retained_identity_count() >= maximum {
             return Err(WorldError::IdentityLimitReached { maximum });
         }
-        let binding = self.identities.claim(session, source_ip, nickname)?;
+        let binding =
+            self.identities
+                .claim_at(session, source_ip, nickname, activated_udp_epoch)?;
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Announce(binding.clone()));
         Ok(binding)
     }
 
+    #[cfg(test)]
     fn complete_migration(
         &mut self,
         destination: SessionId,
@@ -5766,10 +6212,32 @@ impl World {
         )?)
     }
 
+    #[cfg(test)]
     fn complete_preflighted_migration(
         &mut self,
         preflight: MigrationPreflight,
         profile: Option<&MyRoomProfileLease>,
+        now: Instant,
+    ) -> Result<MigrationCompletion, WorldOperationError> {
+        self.complete_preflighted_migration_with_acknowledgement(
+            preflight,
+            profile,
+            MigrationAcknowledgement::Omitted,
+            None,
+            now,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the single actor-turn prepare/lock/ACK/commit sequence stays contiguous so its irreversible boundary is auditable"
+    )]
+    fn complete_preflighted_migration_with_acknowledgement(
+        &mut self,
+        preflight: MigrationPreflight,
+        profile: Option<&MyRoomProfileLease>,
+        acknowledgement: MigrationAcknowledgement,
+        udp: Option<&UdpService>,
         now: Instant,
     ) -> Result<MigrationCompletion, WorldOperationError> {
         if let Some(profile) = profile {
@@ -5805,77 +6273,157 @@ impl World {
             }
             .into());
         }
-        let completion = self
+        if let Err(error) = self
             .identities
-            .complete_preflighted_migration(preflight, now)?;
-        Ok(self.commit_migration_completion(
-            completion,
-            profile.map(MyRoomProfileLease::presentation),
-            now,
-        )?)
-    }
-
-    fn commit_migration_completion(
-        &mut self,
-        completion: MigrationCompletion,
-        presentation: Option<&MyRoomProfilePresentation>,
-        now: Instant,
-    ) -> Result<MigrationCompletion, MyRoomLifecycleError> {
-        let transition = match presentation {
-            Some(presentation) => match self.myroom.advance_profiled_identity_if_tracked(
-                &completion.previous_binding,
-                &completion.binding,
-                presentation,
-            ) {
-                Ok(transition) => transition,
-                Err(MyRoomHubError::Wire(source)) => {
-                    tracing::warn!(
-                        nickname = %completion.binding.nickname,
-                        %source,
-                        "retained the previous MyRoom presentation during identity migration"
-                    );
-                    self.myroom
-                        .advance_migrated_identity_if_tracked(
-                            &completion.previous_binding,
-                            &completion.binding,
-                        )
-                        .map_err(|error| myroom_hub_error("identity migration fallback", error))?
-                }
-                Err(error) => return Err(myroom_hub_error("identity migration", error)),
-            },
-            None => self
-                .myroom
-                .advance_migrated_identity_if_tracked(
+            .validate_preflighted_migration(&preflight, now)
+        {
+            self.identities.abort_preflighted_migration(&preflight);
+            return Err(error.into());
+        }
+        let candidate = self
+            .identities
+            .prepare_preflighted_migration(&preflight, now)?;
+        let prepared = (|| {
+            let completion = candidate.completion();
+            let myroom_transition = match profile.map(MyRoomProfileLease::presentation) {
+                Some(presentation) => match self.myroom.advance_profiled_identity_if_tracked(
                     &completion.previous_binding,
                     &completion.binding,
-                )
-                .map_err(|error| myroom_hub_error("identity migration", error))?,
+                    presentation,
+                ) {
+                    Ok(transition) => transition,
+                    Err(MyRoomHubError::Wire(source)) => {
+                        tracing::warn!(
+                            nickname = %completion.binding.nickname,
+                            %source,
+                            "retained the previous MyRoom presentation during identity migration"
+                        );
+                        self.myroom
+                            .advance_migrated_identity_if_tracked(
+                                &completion.previous_binding,
+                                &completion.binding,
+                            )
+                            .map_err(|error| {
+                                myroom_hub_error("identity migration fallback", error)
+                            })?
+                    }
+                    Err(error) => {
+                        return Err(myroom_hub_error("identity migration", error).into());
+                    }
+                },
+                None => self
+                    .myroom
+                    .advance_migrated_identity_if_tracked(
+                        &completion.previous_binding,
+                        &completion.binding,
+                    )
+                    .map_err(|error| myroom_hub_error("identity migration", error))?,
+            };
+            let (protocol_delta, protocol_deliveries) =
+                self.plan_protocol_migration(&completion.binding)?;
+            let acknowledgement = match acknowledgement {
+                MigrationAcknowledgement::Ordered(packet) => {
+                    let destination = preflight.destination_session();
+                    let reserved = self
+                        .try_reserve_myroom_outbound(vec![(
+                            destination,
+                            OutboundBatch::single(packet),
+                        )])
+                        .map_err(|_| WorldError::MigrationAcknowledgementUnavailable {
+                            session: destination,
+                        })?;
+                    Some(reserved)
+                }
+                #[cfg(test)]
+                MigrationAcknowledgement::Omitted => None,
+            };
+            let protocol_publications = self
+                .try_reserve_myroom_outbound(protocol_deliveries)
+                .map_err(|error| WorldError::MigrationPublicationUnavailable {
+                    session: error.session,
+                })?;
+            self.identity_lifecycle
+                .try_reserve(1)
+                .map_err(|_| WorldError::MigrationCommitCapacityUnavailable)?;
+            Ok((
+                myroom_transition,
+                protocol_delta,
+                acknowledgement,
+                protocol_publications,
+            ))
+        })();
+        let (myroom_transition, protocol_delta, acknowledgement, protocol_publications) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.identities.abort_preflighted_migration(&preflight);
+                    return Err(error);
+                }
+            };
+
+        let completion = {
+            let World {
+                identities,
+                myroom,
+                protocol_room_by_user,
+                protocol_rooms,
+                free_protocol_room_ids,
+                reward_lanes,
+                ..
+            } = self;
+            let myroom_commit = match myroom_transition {
+                Some(transition) => match transition.lock(myroom) {
+                    Ok(commit) => Some(commit),
+                    Err(error) => {
+                        identities.abort_preflighted_migration(&preflight);
+                        return Err(MyRoomLifecycleError::from(error).into());
+                    }
+                },
+                None => None,
+            };
+            let protocol_commit = match protocol_delta {
+                Some(delta) => match delta.lock(
+                    protocol_room_by_user,
+                    protocol_rooms,
+                    free_protocol_room_ids,
+                    reward_lanes,
+                ) {
+                    Ok(commit) => Some(commit),
+                    Err(error) => {
+                        identities.abort_preflighted_migration(&preflight);
+                        return Err(error.into());
+                    }
+                },
+                None => None,
+            };
+            let identity_commit = identities.lock_prepared_migration(preflight, candidate, now)?;
+
+            if let Some(acknowledgement) = acknowledgement {
+                // Actual queue insertion is the ownership-publication barrier.
+                // Every subsequent step is protected by an exclusive commit
+                // capability and has no recoverable rejection path.
+                Self::publish_reserved(acknowledgement);
+            }
+            let activated_udp_epoch = udp.map_or(0, UdpService::advance_arrival_epoch);
+            let completion = identity_commit.commit(activated_udp_epoch);
+            if let Some(commit) = myroom_commit {
+                drop(commit.commit());
+            }
+            if let Some(commit) = protocol_commit {
+                commit.commit();
+            }
+            completion
         };
-        if let Some(transition) = transition {
-            // C# advances the internal channel/session binding without sending
-            // an `RmSlotData` snapshot. A later First or topology operation
-            // observes the replacement generation and fresh presentation.
-            self.commit_silent_myroom_transition(transition)?;
-        }
+        debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Advance {
                 previous: completion.previous_identity.clone(),
                 next: completion.binding.clone(),
             });
-        let changed_room_channel = self
-            .protocol_room_by_user
-            .get(&completion.binding.user_no)
-            .and_then(|room_id| self.protocol_rooms.get(room_id))
-            .is_some_and(|room| completion.binding.channel != Some(room.settings.channel));
-        let deliveries = if changed_room_channel {
-            self.remove_protocol_user(completion.binding.user_no)
-        } else {
-            Vec::new()
-        };
         if let Some(previous_owner) = completion.previous_owner {
             self.cancel_session(previous_owner);
         }
-        self.deliver(deliveries, now)?;
+        Self::publish_reserved(protocol_publications);
         Ok(completion)
     }
 
@@ -5884,7 +6432,7 @@ impl World {
         session: SessionId,
         payload: RoomCommandPayload,
     ) -> Result<(), WorldOperationError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         match payload {
             RoomCommandPayload::List(request) => {
                 self.protocol_room_list(session, &identity, request)
@@ -5907,7 +6455,7 @@ impl World {
         session: SessionId,
         snapshot: [u8; 65],
     ) -> Result<(), WorldOperationError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         let has_membership = self.protocol_room_by_user.contains_key(&identity.user_no);
         let Some(plan) = self.plan_room_equipment(identity.user_no, snapshot)? else {
             debug_assert!(
@@ -5974,7 +6522,7 @@ impl World {
         expected: &IdentityBinding,
         profile: &MyRoomProfileLease,
     ) -> Result<bool, WorldOperationError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         if &identity != expected {
             return Err(IdentityError::StaleSession(session).into());
         }
@@ -6019,7 +6567,7 @@ impl World {
         session: SessionId,
         payload: LobbyCommandPayload,
     ) -> Result<LobbyCommandOutcome, WorldError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         match payload {
             LobbyCommandPayload::SetSlotState(state) => {
                 self.set_slot_state(&identity, state).map_err(Into::into)
@@ -6058,7 +6606,7 @@ impl World {
         now: Instant,
         clock: &ServerClock,
     ) -> Result<RaceCommandOutcome, WorldError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         let room_id = self
             .protocol_room_by_user
             .get(&identity.user_no)
@@ -7084,6 +7632,58 @@ impl World {
         Ok(())
     }
 
+    fn plan_protocol_migration(
+        &self,
+        replacement: &IdentityBinding,
+    ) -> Result<(Option<ProtocolMigrationDelta>, Vec<OutboundDelivery>), WorldOperationError> {
+        let Some(room_id) = self
+            .protocol_room_by_user
+            .get(&replacement.user_no)
+            .copied()
+        else {
+            return Ok((None, Vec::new()));
+        };
+        let expected_room = self.protocol_rooms.get(&room_id).cloned().ok_or(
+            WorldError::MigrationProtocolRoomInconsistent {
+                user_no: replacement.user_no.get(),
+            },
+        )?;
+        if replacement.channel == Some(expected_room.settings.channel) {
+            return Ok((None, Vec::new()));
+        }
+
+        let mut next_room = expected_room.clone();
+        if !next_room.remove_user(replacement.user_no) {
+            return Err(WorldError::MigrationProtocolRoomInconsistent {
+                user_no: replacement.user_no.get(),
+            }
+            .into());
+        }
+        let remove_room = next_room.is_empty()
+            && matches!(next_room.phase, RoomPhase::Lobby | RoomPhase::Loading);
+        let aborted_loading_fence = remove_room
+            .then_some(next_room.race_fence)
+            .flatten()
+            .filter(|_| next_room.phase == RoomPhase::Loading);
+        let deliveries = if next_room.is_empty() {
+            Vec::new()
+        } else {
+            let packet = serialize_gr_slot_data(&next_room.slot_data())?;
+            self.deliveries_for_users(next_room.user_nos(), &OutboundBatch::single(packet))
+        };
+        Ok((
+            Some(ProtocolMigrationDelta {
+                user_no: replacement.user_no,
+                room_id,
+                expected_room,
+                next_room: (!remove_room).then_some(next_room),
+                remove_room,
+                aborted_loading_fence,
+            }),
+            deliveries,
+        ))
+    }
+
     fn remove_protocol_user(&mut self, user_no: UserNo) -> Vec<OutboundDelivery> {
         let Some(room_id) = self.protocol_room_by_user.remove(&user_no) else {
             return Vec::new();
@@ -7449,6 +8049,7 @@ impl World {
             DisconnectOutcome::Released(identity) => self.release_identity_state(&identity),
             DisconnectOutcome::Unauthenticated
             | DisconnectOutcome::Stale(_)
+            | DisconnectOutcome::Draining(_)
             | DisconnectOutcome::Deferred { .. } => Ok(Vec::new()),
         }
     }
@@ -7485,6 +8086,25 @@ impl World {
             self.release_identity_state_without_wire(identity)?;
         }
         Ok(())
+    }
+
+    fn collect_drained_identity_releases(
+        &mut self,
+        now: Instant,
+    ) -> Result<(), MyRoomLifecycleError> {
+        let identities = self.identities.collect_drained_releases();
+        if self.quiescing {
+            for identity in &identities {
+                self.release_identity_state_without_wire(identity)?;
+            }
+            return Ok(());
+        }
+        let unavailable = UnavailableReleaseIndex::from_released(&identities);
+        let mut deliveries = Vec::new();
+        for identity in &identities {
+            deliveries.extend(self.release_identity_state_skipping(identity, &unavailable)?);
+        }
+        self.deliver(deliveries, now)
     }
 
     fn release_identity_state(
@@ -7610,7 +8230,7 @@ impl World {
         room: RoomId,
         session: SessionId,
     ) -> Result<SlotId, WorldError> {
-        let identity = self.identities.authorize(session)?;
+        let identity = self.authorize_session_operation(session)?;
         Ok(self.join_room(room, identity.nickname)?)
     }
 
@@ -7895,6 +8515,9 @@ async fn flush_identity_lifecycle(
     world: &mut World,
     sidecars: &WorldSidecars,
 ) -> Result<(), WorldSidecarError> {
+    world
+        .collect_drained_identity_releases(Instant::now())
+        .map_err(WorldSidecarError::MyRoom)?;
     if sidecars.messenger.is_none() && sidecars.udp.is_none() {
         world.identity_lifecycle.clear();
         return Ok(());
@@ -8009,14 +8632,22 @@ async fn dispatch_udp_ingress(
         );
         return Ok(());
     };
-    let Some(identity) = world.identities.active_identity_by_user_no(user_no) else {
-        tracing::trace!(
-            account_id = ingress.account_id,
-            source = %ingress.source,
-            "dropping UDP ingress without an active world identity"
-        );
-        return Ok(());
+    let operation = match world
+        .identities
+        .admit_udp_operation(user_no, ingress.arrival_epoch)
+    {
+        Ok(operation) => operation,
+        Err(error) => {
+            tracing::trace!(
+                account_id = ingress.account_id,
+                source = %ingress.source,
+                %error,
+                "dropping UDP ingress outside its exact generation admission window"
+            );
+            return Ok(());
+        }
     };
+    let identity = operation.binding().clone();
     let account_id = ingress.account_id;
     let source = ingress.source;
     let readiness_candidate = matches!(&ingress.body, UdpIngressBody::PqUdpTimeSync(_))
@@ -8030,7 +8661,7 @@ async fn dispatch_udp_ingress(
         room_targets,
     };
 
-    match udp.dispatch(request).await {
+    let result = match udp.dispatch(request).await {
         Ok(outcome) => {
             world.apply_udp_dispatch_readiness(readiness_candidate, outcome);
             Ok(())
@@ -8051,7 +8682,9 @@ async fn dispatch_udp_ingress(
             Ok(())
         }
         Err(error) => Err(WorldSidecarError::Udp(error)),
-    }
+    };
+    drop(operation);
+    result
 }
 
 async fn run_world(
@@ -8060,6 +8693,7 @@ async fn run_world(
     udp_receiver: Option<mpsc::Receiver<UdpIngress>>,
     sidecars: WorldSidecars,
     clock: ServerClock,
+    identities: IdentityRegistry,
 ) -> Result<(), WorldSidecarError> {
     let identity_capacity = sidecars
         .identity_capacity()
@@ -8067,6 +8701,7 @@ async fn run_world(
     let identity_capacity =
         NonZeroUsize::new(identity_capacity).ok_or(WorldSidecarError::InvalidIdentityCapacity)?;
     let world = World {
+        identities,
         identity_capacity,
         myroom: MyRoomHub::with_identity_capacity(identity_capacity),
         ..World::default()
@@ -8185,12 +8820,15 @@ async fn run_world_actor_with_timers(
                         MigrationProfileCompletion::Ready {
                             preflight,
                             profile,
+                            acknowledgement,
                             reply,
                         },
                     ) => {
-                        let result = match world.complete_preflighted_migration(
+                        let result = match world.complete_preflighted_migration_with_acknowledgement(
                             *preflight,
                             Some(profile.as_ref()),
+                            acknowledgement,
+                            sidecars.udp.as_ref(),
                             Instant::now(),
                         ) {
                             Ok(completion) => Ok(completion),
@@ -8262,6 +8900,49 @@ async fn dispatch_command(
     sidecars: &WorldSidecars,
     clock: &ServerClock,
 ) -> Result<bool, WorldSidecarError> {
+    match command {
+        WorldCommand::AdmitIdentityOperation { session, reply } => {
+            let result = if world.quiescing {
+                Err(WorldError::OutboundProductionClosed)
+            } else {
+                world
+                    .identities
+                    .admit_operation(session)
+                    .map_err(WorldError::from)
+            };
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+            Ok(false)
+        }
+        WorldCommand::AdmittedIdentityOperation { operation, command } => {
+            if !operation.belongs_to(&world.identities.instance()) {
+                tracing::error!(
+                    binding = ?operation.binding(),
+                    "rejected an identity operation minted by another World actor"
+                );
+                drop(command);
+                drop(operation);
+                return Ok(false);
+            }
+            let previous = world.admitted_identity.replace(operation.binding().clone());
+            let result = Box::pin(dispatch_command(world, *command, sidecars, clock)).await;
+            world.admitted_identity = previous;
+            drop(operation);
+            result
+        }
+        command => return dispatch_unwrapped_command(world, command, sidecars, clock).await,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive actor command dispatcher must visibly own every reply path"
+)]
+async fn dispatch_unwrapped_command(
+    world: &mut World,
+    command: WorldCommand,
+    sidecars: &WorldSidecars,
+    clock: &ServerClock,
+) -> Result<bool, WorldSidecarError> {
     let command = if world.quiescing {
         let Some(command) = admit_command_during_quiesce(command) else {
             return Ok(false);
@@ -8271,6 +8952,10 @@ async fn dispatch_command(
         command
     };
     match command {
+        WorldCommand::AdmitIdentityOperation { .. }
+        | WorldCommand::AdmittedIdentityOperation { .. } => {
+            unreachable!("identity-operation envelopes are removed before ordinary dispatch")
+        }
         WorldCommand::RegisterSession {
             peer,
             cancellation,
@@ -8294,7 +8979,14 @@ async fn dispatch_command(
             nickname,
             reply,
         } => {
-            let result = world.claim_identity(session, &nickname);
+            // A last operation may have retired between actor turns. Publish
+            // its exact Release before admitting a capacity-bearing Announce.
+            flush_identity_lifecycle(world, sidecars).await?;
+            let activated_udp_epoch = sidecars
+                .udp
+                .as_ref()
+                .map_or(0, UdpService::advance_arrival_epoch);
+            let result = world.claim_identity_at_udp_epoch(session, &nickname, activated_udp_epoch);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
         WorldCommand::AuthorizeIdentity { session, reply } => {
@@ -8313,6 +9005,7 @@ async fn dispatch_command(
                 .map_err(WorldError::from);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
+        #[cfg(test)]
         WorldCommand::CompleteMigration {
             destination,
             user_no,
@@ -8396,6 +9089,8 @@ async fn dispatch_command(
 /// their domain-specific `WorldQuiescing` errors remain observable.
 fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
     match command {
+        WorldCommand::AdmitIdentityOperation { .. }
+        | WorldCommand::AdmittedIdentityOperation { .. } => None,
         WorldCommand::RegisterSession { reply, .. } => {
             let _ = reply.send(Err(WorldError::SessionRegistrationClosed));
             None
@@ -8408,6 +9103,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
+        #[cfg(test)]
         WorldCommand::CompleteMigration { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
@@ -8488,8 +9184,7 @@ async fn dispatch_authorize_identity(
     reply: oneshot::Sender<Result<IdentityBinding, WorldError>>,
 ) -> Result<(), WorldSidecarError> {
     let result = world
-        .identities
-        .authorize(session)
+        .authorize_session_operation(session)
         .map_err(WorldError::from);
     reply_after_identity_lifecycle(world, sidecars, reply, result).await
 }
@@ -8665,7 +9360,8 @@ async fn dispatch_utility_command(
                     && world.pending_myroom_by_user.is_empty()
                     && world.pending_rider_equipment_writes.is_empty()
                     && world.pending_rider_equipment_by_user.is_empty()
-                    && world.identities.transfer_in_progress_count() == 0 =>
+                    && world.identities.transfer_in_progress_count() == 0
+                    && world.identities.outstanding_operation_count() == 0 =>
             {
                 let lifecycle = flush_identity_lifecycle(world, sidecars).await;
                 world.cancel_all_sessions();
@@ -8674,17 +9370,25 @@ async fn dispatch_utility_command(
                 return Ok(true);
             }
             Ok(status) if status.is_drained() => {
-                let _ = reply.send(Err(WorldError::MyRoomPersistenceShutdownBlocked {
-                    pending: world
-                        .pending_myroom_writes
-                        .len()
-                        .saturating_add(world.pending_rider_equipment_writes.len())
-                        .saturating_add(world.identities.transfer_in_progress_count()),
-                    indexed: world
-                        .pending_myroom_by_user
-                        .len()
-                        .saturating_add(world.pending_rider_equipment_by_user.len()),
-                }));
+                let active_operations = world.identities.outstanding_operation_count();
+                let error = if active_operations != 0 {
+                    WorldError::IdentityOperationShutdownBlocked {
+                        active: active_operations,
+                    }
+                } else {
+                    WorldError::MyRoomPersistenceShutdownBlocked {
+                        pending: world
+                            .pending_myroom_writes
+                            .len()
+                            .saturating_add(world.pending_rider_equipment_writes.len())
+                            .saturating_add(world.identities.transfer_in_progress_count()),
+                        indexed: world
+                            .pending_myroom_by_user
+                            .len()
+                            .saturating_add(world.pending_rider_equipment_by_user.len()),
+                    }
+                };
+                let _ = reply.send(Err(error));
             }
             Ok(status) => {
                 let _ = reply.send(Err(WorldError::RewardShutdownBlocked {
@@ -8705,6 +9409,7 @@ async fn dispatch_utility_command(
                     pending_rider_equipment_tickets = report.rider_equipment_tickets,
                     pending_rider_equipment_user_indexes = report.rider_equipment_user_indexes,
                     pending_migration_transfers = report.migration_transfers,
+                    pending_identity_operations = report.identity_operations,
                     "force shutdown is abandoning profile publication or migration completion work before actor reconciliation and final request reply"
                 );
             }
@@ -8714,12 +9419,17 @@ async fn dispatch_utility_command(
             let _ = reply.send(report);
             return Ok(true);
         }
-        WorldCommand::RegisterSession { .. }
+        #[cfg(test)]
+        WorldCommand::CompleteMigration { .. } => {
+            unreachable!("test migration completion is dispatched by dispatch_command")
+        }
+        WorldCommand::AdmitIdentityOperation { .. }
+        | WorldCommand::AdmittedIdentityOperation { .. }
+        | WorldCommand::RegisterSession { .. }
         | WorldCommand::SessionClosed { .. }
         | WorldCommand::ClaimIdentity { .. }
         | WorldCommand::AuthorizeIdentity { .. }
         | WorldCommand::BeginMigration { .. }
-        | WorldCommand::CompleteMigration { .. }
         | WorldCommand::RoomProtocol { .. }
         | WorldCommand::PublishRoomEquipment { .. }
         | WorldCommand::RefreshMyRoomPresentation { .. }
@@ -8891,12 +9601,14 @@ pub(crate) mod test_support {
             .unwrap();
 
         let (sender, receiver) = mpsc::channel(32);
+        let identity_instance = world.identities.instance();
         let (myroom_completions, completion_receiver) =
             MyRoomCompletionBridge::channel(world.identity_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let actor = tokio::spawn(async move {
             run_world_actor(
@@ -8987,6 +9699,7 @@ pub(crate) mod test_support {
         }
 
         let (sender, receiver) = mpsc::channel(64);
+        let identity_instance = world.identities.instance();
         let completion_capacity = world.identity_capacity;
         let (myroom_completions, completion_receiver) =
             MyRoomCompletionBridge::channel(completion_capacity);
@@ -8994,6 +9707,7 @@ pub(crate) mod test_support {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let actor = tokio::spawn(async move {
             run_world_actor(
@@ -9023,16 +9737,19 @@ pub(crate) mod test_support {
             .expect("default test World identity capacity is nonzero");
         let (myroom_completions, completion_receiver) =
             MyRoomCompletionBridge::channel(completion_capacity);
+        let world = World::default();
+        let identity_instance = world.identities.instance();
         let handle = WorldHandle {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let (start, started) = oneshot::channel();
         let actor = tokio::spawn(async move {
             let _ = started.await;
             run_world_actor(
-                World::default(),
+                world,
                 receiver,
                 completion_receiver,
                 None,
@@ -9062,6 +9779,7 @@ mod tests {
 
     use p5136_core::{
         adler32,
+        channel::serialize_pr_channel_move_in,
         equipment_protocol::serialize_room_slot_items,
         lobby_protocol::{
             CHANGE_TEAM_REPLY_NAME, PlayerSlotState, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
@@ -9097,12 +9815,13 @@ mod tests {
 
     use super::{
         GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
-        LobbyCommandPayload, LobbyError, MyRoomCommandPayload, MyRoomLifecycleError,
-        MyRoomPreparedCommand, MyRoomWireProjection, OutboundBatch, ROOM_CAPACITY,
-        RaceCommandOutcome, RaceCommandPayload, RaceError, RegisteredMigrationPreflight,
-        RoomCommandPayload, RoomError, RoomId, RoomParticipant, RoomPhase, SessionId,
-        StartRoomPlan, World, WorldCommand, WorldError, WorldHandle, WorldOperationError,
-        WorldSidecarError, WorldSidecars, dispatch_command, source_ipv4,
+        LobbyCommandPayload, LobbyError, MigrationAcknowledgement, MyRoomCommandPayload,
+        MyRoomLifecycleError, MyRoomPreparedCommand, MyRoomWireProjection, OutboundBatch,
+        ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload, RaceError,
+        RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
+        RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
+        WorldOperationError, WorldSidecarError, WorldSidecars, WorldSpawnError, dispatch_command,
+        source_ipv4,
     };
     use crate::equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentWriteError,
@@ -9141,6 +9860,7 @@ mod tests {
         mailbox_capacity: usize,
     ) -> (WorldHandle, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
+        let identity_instance = world.identities.instance();
         let completion_capacity = world.identity_capacity;
         let (myroom_completions, completion_receiver) =
             crate::myroom_persistence::MyRoomCompletionBridge::channel(completion_capacity);
@@ -9148,6 +9868,7 @@ mod tests {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let actor = tokio::spawn(async move {
             let result = super::run_world_actor(
@@ -9656,6 +10377,7 @@ mod tests {
     fn game_slot_request(identity: &IdentityBinding, source_port: u16) -> UdpDispatchRequest {
         UdpDispatchRequest {
             ingress: UdpIngress {
+                arrival_epoch: 0,
                 transport: UdpTransport::Game,
                 source: SocketAddr::new(identity.source_ip, source_port),
                 iv: 0x5136_5136,
@@ -12117,9 +12839,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn standalone_world_spawn_rejects_zero_mailbox_capacity() {
+        assert!(matches!(
+            WorldHandle::spawn(0),
+            Err(WorldSpawnError::ZeroMailboxCapacity)
+        ));
+    }
+
     #[tokio::test]
     async fn reward_task_handle_commands_preserve_actor_fencing() {
-        let (handle, actor) = WorldHandle::spawn(8);
+        let (handle, actor) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         assert!(
             handle
                 .take_due_reward_tasks(Instant::now(), 1)
@@ -12146,7 +12876,7 @@ mod tests {
             super::RewardCompletionDisposition::IgnoredStale
         );
         handle.shutdown().await.unwrap();
-        actor.await.unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -12189,12 +12919,14 @@ mod tests {
             })
             .unwrap();
         let completion_capacity = world.identity_capacity;
+        let identity_instance = world.identities.instance();
         let (myroom_completions, completion_receiver) =
             crate::myroom_persistence::MyRoomCompletionBridge::channel(completion_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let mut migration_expiry = tokio::time::interval(Duration::from_secs(60));
         migration_expiry.tick().await;
@@ -12321,8 +13053,498 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_identity_operation_blocks_session_drain_and_guarded_shutdown() {
+        let (world, actor) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_369))
+            .await
+            .unwrap();
+        world
+            .claim_identity(session, "ShutdownOperation")
+            .await
+            .unwrap();
+        let operation = world.admit_identity_operation(session).await.unwrap();
+
+        world.quiesce().await.unwrap();
+        assert!(matches!(
+            world.drain_sessions().await,
+            Err(WorldError::IdentityOperationShutdownBlocked { active: 1 })
+        ));
+        assert!(matches!(
+            world.shutdown().await,
+            Err(WorldError::IdentityOperationShutdownBlocked { active: 1 })
+        ));
+
+        drop(operation);
+        world.drain_sessions().await.unwrap();
+        world.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_operation_capability_cannot_cross_world_actors() {
+        let (first_world, first_actor) =
+            WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let (second_world, second_actor) =
+            WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let first_session = first_world
+            .register_session(SocketAddr::new(ip, 42_370))
+            .await
+            .unwrap();
+        let second_session = second_world
+            .register_session(SocketAddr::new(ip, 42_371))
+            .await
+            .unwrap();
+        let first_identity = first_world
+            .claim_identity(first_session, "FirstWorld")
+            .await
+            .unwrap();
+        let second_identity = second_world
+            .claim_identity(second_session, "FirstWorld")
+            .await
+            .unwrap();
+        assert_eq!(first_session, second_session);
+        assert_eq!(
+            first_identity, second_identity,
+            "independent registries deliberately collide on every public identity field"
+        );
+
+        let first_operation = first_world
+            .admit_identity_operation(first_session)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_world
+                .admitted(&first_operation)
+                .authorize_identity()
+                .await
+                .unwrap(),
+            first_identity
+        );
+        assert!(matches!(
+            second_world
+                .admitted(&first_operation)
+                .authorize_identity()
+                .await,
+            Err(WorldError::ForeignIdentityOperation)
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) = spawn_test_profile_io(root.path());
+        let foreign = second_world.admitted(&first_operation);
+        let myroom_admission = profiles
+            .admit("FirstWorld", "test foreign MyRoom operation")
+            .await
+            .unwrap();
+        assert!(matches!(
+            foreign
+                .persist_myroom_owner_info(MyRoomInfo::default(), myroom_admission)
+                .await,
+            Err(MyRoomInfoWriteError::ForeignIdentityOperation)
+        ));
+        assert!(matches!(
+            foreign.reserve_rider_equipment_completion().await,
+            Err(RiderEquipmentWriteError::ForeignIdentityOperation)
+        ));
+
+        let equipment_completion = second_world
+            .reserve_rider_equipment_completion()
+            .await
+            .unwrap();
+        let equipment_admission = profiles
+            .admit("FirstWorld", "test foreign rider-equipment operation")
+            .await
+            .unwrap();
+        let prepared = PreparedRiderEquipmentWrite::new(
+            equipment_admission,
+            test_equipment_selection(),
+            Arc::new(test_equipment_catalog()),
+            equipment_completion,
+        );
+        assert!(matches!(
+            foreign.persist_rider_equipment(prepared).await,
+            Err(RiderEquipmentWriteError::ForeignIdentityOperation)
+        ));
+        profile_runtime.shutdown().await.unwrap();
+
+        let second_operation = second_world
+            .admit_identity_operation(second_session)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_world
+                .admitted(&second_operation)
+                .authorize_identity()
+                .await
+                .unwrap(),
+            second_identity
+        );
+
+        drop(first_operation);
+        drop(second_operation);
+        first_world.shutdown().await.unwrap();
+        second_world.shutdown().await.unwrap();
+        first_actor.await.unwrap().unwrap();
+        second_actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_cannot_release_an_actor_owned_identity_operation() {
+        let mut state = World::default();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = state
+            .register_session(SocketAddr::new(ip, 42_372), None, None)
+            .unwrap();
+        let identity = state.claim_identity(source, "QueuedOperation").unwrap();
+        let operation = state.identities.admit_operation(source).unwrap();
+
+        let (sender, receiver) = mpsc::channel(8);
+        let identity_instance = state.identities.instance();
+        let completion_capacity = state.identity_capacity;
+        let (myroom_completions, completion_receiver) =
+            MyRoomCompletionBridge::channel(completion_capacity);
+        let handle = WorldHandle {
+            sender,
+            udp_sender: None,
+            myroom_completions,
+            identity_instance,
+        };
+        let requester_world = handle.clone();
+        let requester = tokio::spawn(async move {
+            requester_world
+                .admitted(&operation)
+                .authorize_identity()
+                .await
+        });
+        time::timeout(Duration::from_secs(1), async {
+            while receiver.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the admitted command was not queued");
+        assert_eq!(receiver.len(), 1);
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(42_372).unwrap();
+        let now = Instant::now();
+        state
+            .identities
+            .begin_migration(source, channel, token, now)
+            .unwrap();
+        let destination = state
+            .register_session(SocketAddr::new(ip, 42_373), None, None)
+            .unwrap();
+        let preflight = state
+            .preflight_migration(
+                destination,
+                identity.user_no,
+                channel.channel_id,
+                token,
+                now,
+            )
+            .unwrap();
+        assert!(
+            !preflight.operations_drained(),
+            "the queued actor command must retain its own child lease"
+        );
+        let completion = handle.myroom_completions.reserve().await.unwrap();
+        let registered = RegisteredMigrationPreflight::new(preflight, completion);
+
+        let actor = tokio::spawn(async move {
+            super::run_world_actor(
+                state,
+                receiver,
+                completion_receiver,
+                None,
+                WorldSidecars::default(),
+                ServerClock::new(),
+            )
+            .await
+        });
+        time::timeout(
+            Duration::from_secs(1),
+            registered.wait_for_operations_drained(),
+        )
+        .await
+        .expect("the queued actor-owned operation did not retire")
+        .unwrap();
+
+        drop(registered);
+        handle.drain_myroom_completions().await.unwrap();
+        assert_eq!(handle.authorize_identity(source).await.unwrap(), identity);
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn force_shutdown_reports_abandoned_identity_operations() {
+        let (world, actor) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_374))
+            .await
+            .unwrap();
+        world
+            .claim_identity(session, "ForcedOperation")
+            .await
+            .unwrap();
+        let operation = world.admit_identity_operation(session).await.unwrap();
+
+        assert!(matches!(
+            world.shutdown().await,
+            Err(WorldError::IdentityOperationShutdownBlocked { active: 1 })
+        ));
+        let report = world.force_shutdown().await.unwrap();
+        assert_eq!(report.identity_operations, 1);
+        actor.await.unwrap().unwrap();
+        drop(operation);
+    }
+
+    #[test]
+    fn migration_acknowledgement_backpressure_preserves_the_source_owner() {
+        let mut world = World::default();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(ip, 42_420), None, None)
+            .unwrap();
+        let source_identity = world.claim_identity(source, "AckBackpressure").unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(4_242).unwrap();
+        let issued_at = Instant::now();
+        world
+            .identities
+            .begin_migration(source, channel, token, issued_at)
+            .unwrap();
+
+        let (outbound, mut destination_outbound) = mpsc::channel(1);
+        outbound
+            .try_send(OutboundBatch::single(vec![0xA5]))
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(ip, 42_421), None, Some(outbound))
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                source_identity.user_no,
+                channel.channel_id,
+                token,
+                issued_at,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            world.complete_preflighted_migration_with_acknowledgement(
+                preflight,
+                None,
+                MigrationAcknowledgement::Ordered(serialize_pr_channel_move_in(39_312, 39_313)),
+                None,
+                issued_at,
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MigrationAcknowledgementUnavailable { session }
+            )) if session == destination
+        ));
+        assert_eq!(
+            world.identities.authorize(source).unwrap(),
+            source_identity,
+            "failed ACK admission must reopen the exact source generation"
+        );
+        assert!(matches!(
+            world.identities.authorize(destination),
+            Err(IdentityError::UnauthenticatedSession(session)) if session == destination
+        ));
+        assert_eq!(
+            destination_outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xA5]]
+        );
+        assert!(
+            destination_outbound.try_recv().is_err(),
+            "backpressure failure must not enqueue a partial ACK"
+        );
+    }
+
+    #[test]
+    fn successful_migration_queues_one_acknowledgement_before_owner_publication() {
+        let mut world = World::default();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (source_cancellation, mut source_cancelled) = oneshot::channel();
+        let source = world
+            .register_session(SocketAddr::new(ip, 42_422), Some(source_cancellation), None)
+            .unwrap();
+        let source_identity = world.claim_identity(source, "AckOrdered").unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(4_243).unwrap();
+        let issued_at = Instant::now();
+        world
+            .identities
+            .begin_migration(source, channel, token, issued_at)
+            .unwrap();
+
+        let (destination, outbound_gate, mut destination_outbound) =
+            register_tracked_outbound_session(&mut world, 42_423, 1);
+        let preflight = world
+            .preflight_migration(
+                destination,
+                source_identity.user_no,
+                channel.channel_id,
+                token,
+                issued_at,
+            )
+            .unwrap();
+        let acknowledgement = serialize_pr_channel_move_in(39_312, 39_313);
+
+        let completion = world
+            .complete_preflighted_migration_with_acknowledgement(
+                preflight,
+                None,
+                MigrationAcknowledgement::Ordered(acknowledgement.clone()),
+                None,
+                issued_at,
+            )
+            .unwrap();
+
+        assert_eq!(
+            world.identities.authorize(destination).unwrap(),
+            completion.binding
+        );
+        assert_eq!(
+            outbound_gate.active_counts().outbound,
+            1,
+            "the already-published owner must still have its queued ACK write lease"
+        );
+        assert_eq!(
+            source_cancelled.try_recv(),
+            Ok(()),
+            "source cancellation is published only after ACK queue admission"
+        );
+        assert_eq!(
+            destination_outbound.try_recv().unwrap().into_packets(),
+            vec![acknowledgement]
+        );
+        assert!(
+            destination_outbound.try_recv().is_err(),
+            "migration completion must not duplicate PrChannelMoveIn"
+        );
+        assert_eq!(outbound_gate.active_counts().outbound, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_ingress_received_before_migration_cannot_bind_the_new_generation() {
+        let game_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let p2p_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let udp_runtime =
+            UdpRuntime::spawn(game_socket, p2p_socket, UdpRuntimeConfig::default()).unwrap();
+        let udp = udp_runtime.service();
+
+        let mut world = World::default();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(ip, 42_424), None, None)
+            .unwrap();
+        let source_identity = world.claim_identity(source, "UdpArrivalFence").unwrap();
+        let channel = ChannelBinding {
+            channel_id: 67,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(4_244).unwrap();
+        let received_at = Instant::now();
+        world
+            .identities
+            .begin_migration(source, channel, token, received_at)
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(ip, 42_425), None, None)
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                source_identity.user_no,
+                channel.channel_id,
+                token,
+                received_at,
+            )
+            .unwrap();
+        let stale_epoch = udp.advance_arrival_epoch();
+        let activated_at = received_at + Duration::from_secs(1);
+        let migrated = world
+            .complete_preflighted_migration_with_acknowledgement(
+                preflight,
+                None,
+                MigrationAcknowledgement::Omitted,
+                Some(&udp),
+                activated_at,
+            )
+            .unwrap()
+            .binding;
+        udp.advance_identity(migrated.clone()).await.unwrap();
+
+        let stale_endpoint = SocketAddr::new(ip, 58_424);
+        super::dispatch_udp_ingress(
+            &mut world,
+            &udp,
+            UdpIngress {
+                arrival_epoch: stale_epoch,
+                transport: UdpTransport::Game,
+                source: stale_endpoint,
+                iv: 0x5136_5136,
+                account_id: migrated.user_no.get(),
+                route_hash: 0xA5A5_0001,
+                body: UdpIngressBody::GameSlotPacket(Vec::new()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            udp.current_target(UdpTransport::Game, migrated.clone())
+                .await
+                .unwrap(),
+            None,
+            "a queued datagram from the old arrival epoch must not bind the new generation"
+        );
+
+        let fresh_endpoint = SocketAddr::new(ip, 58_425);
+        let fresh_epoch = udp.advance_arrival_epoch();
+        super::dispatch_udp_ingress(
+            &mut world,
+            &udp,
+            UdpIngress {
+                arrival_epoch: fresh_epoch,
+                transport: UdpTransport::Game,
+                source: fresh_endpoint,
+                iv: 0x5136_5136,
+                account_id: migrated.user_no.get(),
+                route_hash: 0xA5A5_0002,
+                body: UdpIngressBody::GameSlotPacket(Vec::new()),
+            },
+        )
+        .await
+        .unwrap();
+        let current = udp
+            .current_target(UdpTransport::Game, migrated)
+            .await
+            .unwrap()
+            .expect("a packet from the current arrival epoch should bind normally");
+        assert_eq!(current.endpoint.endpoint, fresh_endpoint);
+        assert_eq!(current.endpoint.route_hash, 0xA5A5_0002);
+
+        udp_runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn migration_preflight_handle_freezes_source_and_rechecks_destination_liveness() {
-        let (handle, actor) = WorldHandle::spawn(16);
+        let (handle, actor) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let source = handle
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_350))
             .await
@@ -12408,7 +13630,7 @@ mod tests {
         assert!(completion.binding.generation.get() > source_identity.generation.get());
 
         handle.shutdown().await.unwrap();
-        actor.await.unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -12452,6 +13674,7 @@ mod tests {
             .unwrap();
 
         let (sender, receiver) = mpsc::channel(8);
+        let identity_instance = state.identities.instance();
         let (myroom_completions, completion_receiver) =
             MyRoomCompletionBridge::channel(state.identity_capacity);
         let completion = myroom_completions.reserve().await.unwrap();
@@ -12470,6 +13693,7 @@ mod tests {
             sender,
             udp_sender: None,
             myroom_completions,
+            identity_instance,
         };
         let actor = tokio::spawn(async move {
             super::run_world_actor(
@@ -12905,12 +14129,14 @@ mod tests {
         let world = World::default();
         let (sender, receiver) = mpsc::channel(8);
         let (udp_sender, udp_receiver) = mpsc::channel(8);
+        let identity_instance = world.identities.instance();
         let (myroom_completions, completion_receiver) =
             MyRoomCompletionBridge::channel(world.identity_capacity);
         let handle = WorldHandle {
             sender,
             udp_sender: Some(udp_sender),
             myroom_completions,
+            identity_instance,
         };
         let actor = tokio::spawn(async move {
             super::run_world_actor(
@@ -12927,6 +14153,7 @@ mod tests {
         handle.quiesce().await.unwrap();
         handle
             .try_udp_ingress(UdpIngress {
+                arrival_epoch: 1,
                 transport: UdpTransport::Game,
                 source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_375),
                 iv: 0x5136_5136,
@@ -13788,7 +15015,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_joins_are_serialized_into_unique_slots() {
-        let (world, task) = WorldHandle::spawn(64);
+        let (world, task) = WorldHandle::spawn(64).expect("nonzero World mailbox capacity");
         let room = world.create_room().await.unwrap();
         let mut joins = tokio::task::JoinSet::new();
 
@@ -13816,12 +15043,12 @@ mod tests {
             ROOM_CAPACITY
         );
         world.shutdown().await.unwrap();
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn migration_cancels_old_owner_and_rejects_its_queued_mutation() {
-        let (world, task) = WorldHandle::spawn(64);
+        let (world, task) = WorldHandle::spawn(64).expect("nonzero World mailbox capacity");
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50_000);
         let (source, source_cancelled, _outbound) = world
             .register_login_session(peer, WireOperationGate::new())
@@ -13902,7 +15129,7 @@ mod tests {
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
-        task.await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[test]
@@ -14337,6 +15564,137 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the atomicity regression asserts every identity, room, queue, cancellation, and lifecycle side effect"
+    )]
+    fn cross_channel_peer_backpressure_aborts_before_ack_or_owner_publication() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "AtomicSwitch", 67, 47_500, 16);
+        let mut peer = register_channel_session(&mut world, "AtomicPeer", 67, 47_600, 1);
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Atomic Channel", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        world
+            .room_protocol(
+                peer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        drain_batches(&mut peer.outbound);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &peer.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        world.identity_lifecycle.clear();
+        let protocol_before = world.protocol_rooms[&room_id].clone();
+        let myroom_before = world
+            .myroom
+            .canonical_identity_if_tracked(owner.identity.user_no)
+            .unwrap();
+
+        let peer_sender = world.sessions[&peer.session].outbound.clone().unwrap();
+        peer_sender
+            .try_send(OutboundBatch::single(vec![0xFE]))
+            .unwrap();
+        let (source_cancel, mut source_cancelled) = oneshot::channel();
+        world.sessions.get_mut(&owner.session).unwrap().cancellation = Some(source_cancel);
+
+        let channel = ChannelBinding {
+            channel_id: 12,
+            game_type: 67,
+        };
+        let token = MigrationToken::new(47_700).unwrap();
+        let now = Instant::now();
+        world
+            .identities
+            .begin_migration(owner.session, channel, token, now)
+            .unwrap();
+        let (destination_sender, mut destination_outbound) = mpsc::channel(1);
+        let destination = world
+            .register_session(
+                SocketAddr::new(owner.identity.source_ip, 47_700),
+                None,
+                Some(destination_sender),
+            )
+            .unwrap();
+        let preflight = world
+            .preflight_migration(
+                destination,
+                owner.identity.user_no,
+                channel.channel_id,
+                token,
+                now,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            world.complete_preflighted_migration_with_acknowledgement(
+                preflight,
+                None,
+                MigrationAcknowledgement::Ordered(vec![0xAC]),
+                None,
+                now,
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MigrationPublicationUnavailable { session }
+            )) if session == peer.session
+        ));
+        assert_eq!(
+            world.identities.authorize(owner.session).unwrap(),
+            owner.identity
+        );
+        assert!(matches!(
+            world.identities.authorize(destination),
+            Err(IdentityError::UnauthenticatedSession(session)) if session == destination
+        ));
+        assert!(world.identities.admit_operation(owner.session).is_ok());
+        assert_eq!(
+            source_cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert!(destination_outbound.try_recv().is_err());
+        assert_eq!(
+            peer.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xFE]]
+        );
+        assert_eq!(world.protocol_rooms[&room_id], protocol_before);
+        assert_eq!(
+            world.protocol_room_by_user.get(&owner.identity.user_no),
+            Some(&room_id)
+        );
+        assert_eq!(
+            world
+                .myroom
+                .canonical_identity_if_tracked(owner.identity.user_no)
+                .unwrap(),
+            myroom_before
+        );
+        assert!(world.identity_lifecycle.is_empty());
+    }
+
+    #[test]
     fn deleted_room_ids_are_reused_and_invalid_profiles_do_not_commit() {
         let mut world = World::default();
         let mut first = register_channel_session(&mut world, "First", 67, 48_000, 16);
@@ -14571,7 +15929,7 @@ mod tests {
 
     #[tokio::test]
     async fn quiesce_permanently_closes_session_registration() {
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53_102);
 
         world.quiesce().await.unwrap();
@@ -14590,7 +15948,7 @@ mod tests {
         assert_eq!(world.session_count().await.unwrap(), 0);
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -15800,7 +17158,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_barriers_report_an_outstanding_migration_freeze() {
-        let (world, actor) = WorldHandle::spawn(8);
+        let (world, actor) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let source = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 56_096))
             .await
@@ -15847,7 +17205,7 @@ mod tests {
         assert_eq!(report.rider_equipment_user_indexes, 0);
         assert_eq!(report.migration_transfers, 1);
 
-        actor.await.unwrap();
+        actor.await.unwrap().unwrap();
         drop(preflight);
     }
 
@@ -16426,6 +17784,48 @@ mod tests {
         world.session_closed(first).await.unwrap();
         world.claim_identity(second, "Second").await.unwrap();
         assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+        messenger.shutdown().await.unwrap();
+        messenger_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_release_retains_capacity_until_its_operation_drains() {
+        let config = MessengerRuntimeConfig {
+            max_identities: 1,
+            ..MessengerRuntimeConfig::default()
+        };
+        let (messenger, messenger_task) = MessengerServiceHandle::spawn(config).unwrap();
+        let (world, world_task) = WorldHandle::spawn_with_messenger(8, messenger.clone());
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let first = world
+            .register_session(SocketAddr::new(ip, 55_010))
+            .await
+            .unwrap();
+        world.claim_identity(first, "DeferredFirst").await.unwrap();
+        let operation = world.admit_identity_operation(first).await.unwrap();
+        let second = world
+            .register_session(SocketAddr::new(ip, 55_011))
+            .await
+            .unwrap();
+
+        world.session_closed(first).await.unwrap();
+        assert!(matches!(
+            world.claim_identity(second, "DeferredSecond").await,
+            Err(WorldError::IdentityLimitReached { maximum: 1 })
+        ));
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+
+        // Claim dispatch first collects the now-drained tombstone and awaits its
+        // sidecar Release, then admits and publishes the replacement Announce.
+        drop(operation);
+        world
+            .claim_identity(second, "DeferredSecond")
+            .await
+            .unwrap();
+        assert_eq!(messenger.snapshot().await.unwrap().announced_identities, 1);
+
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
         messenger.shutdown().await.unwrap();

@@ -583,23 +583,55 @@ pub(crate) struct MyRoomTransition<T> {
     outcome: T,
 }
 
+/// Exclusive proof that a planned transition still targets the live hub
+/// revision.
+///
+/// The mutable borrow prevents any other transition from changing the revision
+/// between validation and [`commit`](Self::commit), so the irreversible phase
+/// is deliberately `Result`-free.
+pub(crate) struct MyRoomCommit<'a, T> {
+    live: &'a mut MyRoomHub,
+    transition: MyRoomTransition<T>,
+}
+
 impl<T> MyRoomTransition<T> {
     #[must_use]
     pub(crate) fn outcome(&self) -> &T {
         &self.outcome
     }
 
-    /// Applies a previously validated bounded delta. Revision validation occurs
-    /// before the first mutation, so a stale commit leaves `live` untouched.
-    pub(crate) fn commit(self, live: &mut MyRoomHub) -> Result<T, MyRoomCommitError> {
+    /// Locks a previously planned bounded delta to its exact live revision.
+    ///
+    /// Revision validation occurs before the first mutation, so a stale lock
+    /// leaves `live` untouched.
+    pub(crate) fn lock(
+        self,
+        live: &mut MyRoomHub,
+    ) -> Result<MyRoomCommit<'_, T>, MyRoomCommitError> {
         if live.revision != self.base_revision {
             return Err(MyRoomCommitError::StaleRevision {
                 planned: self.base_revision.get(),
                 current: live.revision.get(),
             });
         }
+        Ok(MyRoomCommit {
+            live,
+            transition: self,
+        })
+    }
 
-        for change in self.rooms {
+    /// Convenience path for callers that do not need to hold a validated commit
+    /// boundary across another subsystem's preparation.
+    pub(crate) fn commit(self, live: &mut MyRoomHub) -> Result<T, MyRoomCommitError> {
+        Ok(self.lock(live)?.commit())
+    }
+}
+
+impl<T> MyRoomCommit<'_, T> {
+    /// Applies the revision-locked delta without any remaining rejection path.
+    pub(crate) fn commit(self) -> T {
+        let Self { live, transition } = self;
+        for change in transition.rooms {
             match change.value {
                 Some(room) => {
                     live.rooms.insert(change.owner, room);
@@ -609,7 +641,7 @@ impl<T> MyRoomTransition<T> {
                 }
             }
         }
-        for change in self.memberships {
+        for change in transition.memberships {
             match change.value {
                 Some(membership) => {
                     live.memberships.insert(change.member, membership);
@@ -619,7 +651,7 @@ impl<T> MyRoomTransition<T> {
                 }
             }
         }
-        for change in self.generations {
+        for change in transition.generations {
             match change.value {
                 Some(identity) => {
                     live.generations.insert(change.user_no, identity);
@@ -629,8 +661,8 @@ impl<T> MyRoomTransition<T> {
                 }
             }
         }
-        live.revision = self.next_revision;
-        Ok(self.outcome)
+        live.revision = transition.next_revision;
+        transition.outcome
     }
 }
 

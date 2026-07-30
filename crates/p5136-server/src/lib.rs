@@ -52,6 +52,6 @@ pub use udp_state::{
 };
 pub use world::{
     OutstandingRewardLane, RaceFence, RewardDeadLetter, RewardDrainStatus, RewardLanePhase,
-    RewardTerminalReason, RoomError, RoomId, RoomSnapshot, SessionId, SlotId, WorldError,
-    WorldHandle,
+    RewardTerminalReason, RoomError, RoomId, RoomSnapshot, SessionId, SlotId, WorldActorError,
+    WorldError, WorldHandle, WorldSpawnError,
 };

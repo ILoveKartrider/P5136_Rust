@@ -80,19 +80,21 @@ use crate::{
         PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
         RiderEquipmentWriteError, catalog_grants, kart_is_owned,
     },
+    identity::IdentityOperationLease,
     myroom_hub::{MyRoomWirePlan, MyRoomWireProjection},
     myroom_persistence::{
         MYROOM_INFO_WRITE_OPERATION, MyRoomCompletionSlot, MyRoomInfoWriteError,
         MyRoomInfoWriteReceipt,
     },
-    operation_gate::WireOperationGate,
+    operation_gate::{WireOperationGate, WireOperationGuard},
     profile_io::{
         MyRoomProfileLease, ProfileIoError, ProfileIoHandle, ProfileJobAdmission,
         ProfileLanePermit, myroom_profile_presentation,
     },
     world::{
-        LobbyCommandPayload, LobbyError, MyRoomCommandPayload, MyRoomSessionRole, OutboundBatch,
-        RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
+        AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
+        MyRoomSessionRole, OutboundBatch, RaceCommandPayload, RoomCommandPayload, RoomParticipant,
+        StartRoomPlan,
     },
 };
 
@@ -108,6 +110,25 @@ const MAX_MYROOM_WIRE_PLAN_ATTEMPTS: usize = 3;
 enum SessionReadEvent {
     Outbound(Option<OutboundBatch>),
     Frame(Result<Vec<u8>, LoginSessionError>),
+}
+
+/// One decoded request owns both shutdown admission and, once authenticated,
+/// an exact identity-generation lease. Neither capability is cloneable.
+#[derive(Debug)]
+struct SessionFrameOperation {
+    #[expect(dead_code, reason = "drop retires global graceful-request admission")]
+    wire: WireOperationGuard,
+    identity: Option<IdentityOperationLease>,
+}
+
+impl SessionFrameOperation {
+    fn new(wire: WireOperationGuard, identity: Option<IdentityOperationLease>) -> Self {
+        Self { wire, identity }
+    }
+
+    fn identity(&self) -> Option<&IdentityOperationLease> {
+        self.identity.as_ref()
+    }
 }
 
 async fn select_session_read_event<F>(
@@ -468,6 +489,20 @@ impl ProfileCoordinator {
         Ok(self.io.admit(nickname, operation).await?)
     }
 
+    async fn admit_for_operation(
+        &self,
+        identity_operation: &IdentityOperationLease,
+        nickname: &str,
+        operation: &'static str,
+    ) -> Result<ProfileJobAdmission, LoginSessionError> {
+        let retained = identity_operation.try_retain().map_err(WorldError::from)?;
+        Ok(self
+            .io
+            .admit(nickname, operation)
+            .await?
+            .retain_identity_operation(retained))
+    }
+
     fn ensure_admitted_subject(
         admission: &ProfileJobAdmission,
         nickname: &str,
@@ -515,8 +550,9 @@ impl ProfileCoordinator {
     /// Reloads each occupied `MyRoom` slot through its own canonical profile
     /// lane. Lanes are released one at a time: holding several rider lanes
     /// together would permit an A-visits-B/B-visits-A deadlock.
-    async fn load_myroom_wire_projection(
+    async fn load_myroom_wire_projection_for_operation(
         &self,
+        operation: &IdentityOperationLease,
         plan: &MyRoomWirePlan,
     ) -> Result<MyRoomWireProjection, LoginSessionError> {
         let identities = plan
@@ -530,7 +566,11 @@ impl ProfileCoordinator {
                 continue;
             };
             let admission = self
-                .admit(&identity.nickname, "load live MyRoom wire profile")
+                .admit_for_operation(
+                    operation,
+                    &identity.nickname,
+                    "load live MyRoom wire profile",
+                )
                 .await?;
             let (profile, lane) = self
                 .load(identity.nickname.clone(), false, admission)
@@ -1117,7 +1157,7 @@ async fn run_registered_session(
             }
         };
 
-        let Some(operation) = wire_operations.try_begin_request() else {
+        let Some(wire_operation) = wire_operations.try_begin_request() else {
             return drain_outbound_until_cancelled(
                 &mut writer,
                 cancellation,
@@ -1127,6 +1167,16 @@ async fn run_registered_session(
             )
             .await;
         };
+        let identity_operation = if context.is_authenticated() {
+            Some(tokio::select! {
+                biased;
+                _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
+                result = services.world.admit_identity_operation(services.session_id) => result?,
+            })
+        } else {
+            None
+        };
+        let operation = SessionFrameOperation::new(wire_operation, identity_operation);
         trace_packet(peer, &packet)?;
         tokio::select! {
             biased;
@@ -1137,13 +1187,19 @@ async fn run_registered_session(
                 &packet,
                 &mut context,
                 &mut send_iv,
+                &operation,
             ) => result?,
         }
         // Actor-owned replies are enqueued before their command acknowledgement
-        // resolves. Flush every currently ready batch while the operation guard
-        // is still live so graceful shutdown cannot commit and then discard the
-        // corresponding wire result.
-        while let Ok(batch) = outbound.try_recv() {
+        // resolves. Snapshot the bounded FIFO depth at acknowledgement time and
+        // flush exactly that prefix while the operation guard remains live.
+        // Producers may keep appending behind it, but cannot turn one admitted
+        // request into an unbounded drain that blocks migration or shutdown.
+        let ready_batches = outbound.len();
+        for _ in 0..ready_batches {
+            let Ok(batch) = outbound.try_recv() else {
+                break;
+            };
             tokio::select! {
                 biased;
                 _ = &mut *cancellation => return Err(LoginSessionError::Superseded),
@@ -1191,11 +1247,13 @@ async fn process_and_write<W>(
     packet: &[u8],
     context: &mut SessionContext,
     send_iv: &mut u32,
+    operation: &SessionFrameOperation,
 ) -> Result<(), LoginSessionError>
 where
     W: AsyncWrite + Unpin,
 {
-    let responses = dispatch_packet(services, packet, context).await?;
+    let responses =
+        dispatch_packet_admitted(services, packet, context, operation.identity()).await?;
     for response in responses {
         write_logical_packet(writer, &response, send_iv, services.config).await?;
     }
@@ -1231,10 +1289,11 @@ where
     write_session_bytes(writer, &wire, config.session_write_timeout).await
 }
 
-async fn dispatch_packet(
+async fn dispatch_packet_admitted(
     services: &SessionServices<'_>,
     packet: &[u8],
     context: &mut SessionContext,
+    operation: Option<&IdentityOperationLease>,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let hash = packet_hash(packet)?;
     if hash == adler32::packet_hash("PqCnAuthenLogin") {
@@ -1253,11 +1312,6 @@ async fn dispatch_packet(
         .await;
     }
 
-    if hash == adler32::packet_hash("PqChannelSwitch") {
-        return handle_channel_switch(services.config, services.world, services.session_id, packet)
-            .await;
-    }
-
     if hash == adler32::packet_hash("PqChannelMovein") {
         return handle_channel_move_in(
             services.config,
@@ -1270,9 +1324,29 @@ async fn dispatch_packet(
         .await;
     }
 
+    // Every remaining packet is identity-bound. The normal session loop
+    // supplies this lease immediately after the global request guard; the
+    // fallback preserves a typed unauthenticated error for focused handler
+    // tests and defensive in-process callers.
+    let late_operation;
+    let operation = if let Some(operation) = operation {
+        operation
+    } else {
+        late_operation = services
+            .world
+            .admit_identity_operation(services.session_id)
+            .await?;
+        &late_operation
+    };
+    let world = services.world.admitted(operation);
+
+    if hash == adler32::packet_hash("PqChannelSwitch") {
+        return handle_channel_switch(services.config, &world, packet).await;
+    }
+
     if let Some(request) = classify_room_protocol_request(hash) {
-        return handle_room_request(
-            services.world,
+        return handle_room_request_admitted(
+            &world,
             services.profiles,
             services.session_id,
             request,
@@ -1283,16 +1357,16 @@ async fn dispatch_packet(
     }
 
     if let Some(request) = classify_lobby_request(hash) {
-        return handle_lobby_request(services.world, services.session_id, request, packet).await;
+        return handle_lobby_request_admitted(&world, request, packet).await;
     }
 
     if let Some(request) = classify_race_request(hash) {
-        return handle_race_request(services.world, services.session_id, request, packet).await;
+        return handle_race_request_admitted(&world, request, packet).await;
     }
 
     if let Some(request) = classify_myroom_request(hash) {
         return handle_myroom_request(
-            services.world,
+            &world,
             services.profiles,
             services.session_id,
             request,
@@ -1303,12 +1377,13 @@ async fn dispatch_packet(
     }
 
     if let Some(request) = classify_equipment_request(hash) {
-        return dispatch_equipment_request(services, request, packet, context).await;
+        return dispatch_equipment_request(&world, services.profiles, request, packet, context)
+            .await;
     }
 
     if let Some(request) = classify_startup_request(hash) {
         return handle_startup_request(
-            services.world,
+            &world,
             services.profiles,
             services.session_id,
             request,
@@ -1319,27 +1394,20 @@ async fn dispatch_packet(
     }
 
     if is_startup_noop(hash) {
-        let identity = services
-            .world
-            .authorize_identity(services.session_id)
-            .await?;
+        let identity = world.authorize_identity().await?;
         let _ = context.profile_for(&identity)?;
         return Ok(Vec::new());
     }
 
     // Identity-bound packets cannot be processed by a stale connection. Their
     // concrete handlers are ported incrementally on top of this fence.
-    let _ = services
-        .world
-        .authorize_identity(services.session_id)
-        .await?;
+    let _ = world.authorize_identity().await?;
     Ok(Vec::new())
 }
 
 async fn handle_channel_switch(
     config: &ServerConfig,
-    world: &WorldHandle,
-    session_id: SessionId,
+    world: &AdmittedWorldHandle<'_>,
     packet: &[u8],
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let request = parse_pq_channel_switch(packet)?;
@@ -1352,7 +1420,6 @@ async fn handle_channel_switch(
         )?;
     let permit = world
         .begin_migration(
-            session_id,
             ChannelBinding {
                 channel_id: selected_channel,
                 game_type: request.requested_game_type,
@@ -1428,6 +1495,7 @@ async fn handle_channel_move_in(
             Instant::now(),
         )
         .await?;
+    preflight.wait_for_operations_drained().await?;
     let admission = profiles
         .admit(preflight.nickname(), "load migrated profile")
         .await?;
@@ -1440,23 +1508,26 @@ async fn handle_channel_move_in(
         .await?;
     let presentation = myroom_profile_presentation(&profile.profile);
     let profile_lease = MyRoomProfileLease::new(presentation, lane);
+    let acknowledgement =
+        serialize_pr_channel_move_in(config.ports.game_udp(), config.ports.p2p_udp());
     let completion = world
-        .complete_preflighted_migration(preflight, profile_lease)
+        .complete_preflighted_migration_with_acknowledgement(
+            preflight,
+            profile_lease,
+            acknowledgement,
+        )
         .await?;
     let identity = world.authorize_identity(session_id).await?;
     ensure_identity_fence(&completion.binding, &identity)?;
     context.bind_profile(identity, profile);
 
-    Ok(vec![serialize_pr_channel_move_in(
-        config.ports.game_udp(),
-        config.ports.p2p_udp(),
-    )])
+    Ok(Vec::new())
 }
 
-async fn handle_room_request(
-    world: &WorldHandle,
+async fn handle_room_request_admitted(
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
-    session_id: SessionId,
+    _session_id: SessionId,
     request: RoomProtocolRequest,
     packet: &[u8],
     context: &SessionContext,
@@ -1467,7 +1538,7 @@ async fn handle_room_request(
         }
         RoomProtocolRequest::CreateRoom => {
             let request = parse_ch_create_room_request(packet)?;
-            let identity = world.authorize_identity(session_id).await?;
+            let identity = world.authorize_identity().await?;
             let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Create {
                 request,
@@ -1476,7 +1547,7 @@ async fn handle_room_request(
         }
         RoomProtocolRequest::JoinRoom => {
             let request = parse_ch_join_room_request(packet)?;
-            let identity = world.authorize_identity(session_id).await?;
+            let identity = world.authorize_identity().await?;
             let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Join {
                 request,
@@ -1492,13 +1563,12 @@ async fn handle_room_request(
             RoomCommandPayload::FirstState
         }
     };
-    world.room_protocol(session_id, payload).await?;
+    world.room_protocol(payload).await?;
     Ok(Vec::new())
 }
 
-async fn handle_lobby_request(
-    world: &WorldHandle,
-    session_id: SessionId,
+async fn handle_lobby_request_admitted(
+    world: &AdmittedWorldHandle<'_>,
     request: LobbyRequest,
     packet: &[u8],
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
@@ -1520,7 +1590,7 @@ async fn handle_lobby_request(
             ))
         }
     };
-    match world.lobby_command(session_id, payload).await {
+    match world.lobby_command(payload).await {
         Ok(_) => {}
         Err(WorldError::Lobby(
             error @ (LobbyError::NotInRoom
@@ -1540,7 +1610,7 @@ async fn handle_lobby_request(
         )) => {
             tracing::debug!(
                 %error,
-                session_id = session_id.get(),
+                session_id = world.session_id().get(),
                 "rejected a lobby command without terminating the session"
             );
         }
@@ -1549,9 +1619,8 @@ async fn handle_lobby_request(
     Ok(Vec::new())
 }
 
-async fn handle_race_request(
-    world: &WorldHandle,
-    session_id: SessionId,
+async fn handle_race_request_admitted(
+    world: &AdmittedWorldHandle<'_>,
     request: RaceRequest,
     packet: &[u8],
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
@@ -1564,12 +1633,12 @@ async fn handle_race_request(
             RaceCommandPayload::TeamBoosterGauge(parse_team_booster_request(packet)?)
         }
     };
-    match world.race_command(session_id, payload).await {
+    match world.race_command(payload).await {
         Ok(_) => {}
         Err(WorldError::Race(error)) if error.is_expected_rejection() => {
             tracing::debug!(
                 %error,
-                session_id = session_id.get(),
+                session_id = world.session_id().get(),
                 "rejected a race command without terminating the session"
             );
         }
@@ -1579,7 +1648,7 @@ async fn handle_race_request(
 }
 
 async fn handle_myroom_request(
-    world: &WorldHandle,
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     session_id: SessionId,
     request: MyRoomRequest,
@@ -1613,13 +1682,13 @@ async fn handle_myroom_request(
         }
         MyRoomRequest::UpdateInfo => {}
         _ => {
-            let identity = world.authorize_identity(session_id).await?;
+            let identity = world.authorize_identity().await?;
             let _ = context.profile_for(&identity)?;
             return Ok(Vec::new());
         }
     }
 
-    let Some(view) = world.myroom_session_view(session_id).await? else {
+    let Some(view) = world.myroom_session_view().await? else {
         return Ok(Vec::new());
     };
     if view.role() == MyRoomSessionRole::Visitor {
@@ -1627,16 +1696,20 @@ async fn handle_myroom_request(
     }
 
     let proposed = parse_update_info(packet)?;
-    let before = world.authorize_identity(session_id).await?;
+    let before = world.authorize_identity().await?;
     let _ = context.profile_for(&before)?;
     let admission = profiles
-        .admit(&before.nickname, MYROOM_INFO_WRITE_OPERATION)
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            MYROOM_INFO_WRITE_OPERATION,
+        )
         .await?;
     let receipt = world
-        .persist_myroom_owner_info(session_id, proposed, admission)
+        .persist_myroom_owner_info(proposed, admission)
         .await
         .map_err(myroom_info_write_error)?;
-    let after = world.authorize_identity(session_id).await?;
+    let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
     context.apply_myroom_info_write(&after, &receipt)?;
     tracing::trace!(
@@ -1649,21 +1722,25 @@ async fn handle_myroom_request(
 }
 
 async fn execute_live_myroom_command(
-    world: &WorldHandle,
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     session_id: SessionId,
     payload: MyRoomCommandPayload,
     context: &SessionContext,
 ) -> Result<(), LoginSessionError> {
     for attempt in 0..MAX_MYROOM_WIRE_PLAN_ATTEMPTS {
-        let plan = world.prepare_myroom_command(session_id).await?;
+        let plan = world.prepare_myroom_command().await?;
         let _ = context.profile_for(plan.expected_identity())?;
         let projection = match plan.wire_plan() {
-            Some(wire) => Some(profiles.load_myroom_wire_projection(wire).await?),
+            Some(wire) => Some(
+                profiles
+                    .load_myroom_wire_projection_for_operation(world.operation(), wire)
+                    .await?,
+            ),
             None => None,
         };
         let prepared = plan.complete(projection)?;
-        match world.myroom_command(session_id, payload, prepared).await {
+        match world.myroom_command(payload, prepared).await {
             Err(WorldError::MyRoomWirePlanStale { .. })
                 if attempt + 1 < MAX_MYROOM_WIRE_PLAN_ATTEMPTS =>
             {
@@ -1686,15 +1763,16 @@ fn myroom_info_write_error(source: MyRoomInfoWriteError) -> LoginSessionError {
 }
 
 async fn dispatch_equipment_request(
-    services: &SessionServices<'_>,
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
     request: EquipmentRequest,
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
-    handle_equipment_request(
-        services.world,
-        services.profiles,
-        services.session_id,
+    handle_equipment_request_admitted(
+        world,
+        profiles,
+        world.session_id(),
         request,
         packet,
         context,
@@ -1702,8 +1780,8 @@ async fn dispatch_equipment_request(
     .await
 }
 
-async fn handle_equipment_request(
-    world: &WorldHandle,
+async fn handle_equipment_request_admitted(
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     session_id: SessionId,
     request: EquipmentRequest,
@@ -1713,7 +1791,7 @@ async fn handle_equipment_request(
     match request {
         EquipmentRequest::SetRiderItems => {
             if packet.len() < size_of::<u32>() + RIDER_ITEM_SNAPSHOT_WIRE_LENGTH {
-                let identity = world.authorize_identity(session_id).await?;
+                let identity = world.authorize_identity().await?;
                 let _ = context.profile_for(&identity)?;
                 tracing::debug!(
                     body_length = packet.len().saturating_sub(size_of::<u32>()),
@@ -1731,7 +1809,7 @@ async fn handle_equipment_request(
                 Ok(request) => request,
                 Err(error) => {
                     tracing::debug!(%error, "rejected malformed P5136 plant-part request");
-                    let identity = world.authorize_identity(session_id).await?;
+                    let identity = world.authorize_identity().await?;
                     let _ = context.profile_for(&identity)?;
                     return Ok(vec![serialize_equip_tuning_failure()]);
                 }
@@ -1742,16 +1820,20 @@ async fn handle_equipment_request(
 }
 
 async fn update_rider_equipment(
-    world: &WorldHandle,
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
-    session_id: SessionId,
+    _session_id: SessionId,
     selection: RiderItemSelection,
     context: &mut SessionContext,
 ) -> Result<(), LoginSessionError> {
-    let before = world.authorize_identity(session_id).await?;
+    let before = world.authorize_identity().await?;
     let _ = context.profile_for(&before)?;
     let admission = profiles
-        .admit(&before.nickname, "update rider equipment")
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            "update rider equipment",
+        )
         .await?;
     let completion = world
         .reserve_rider_equipment_completion()
@@ -1759,7 +1841,7 @@ async fn update_rider_equipment(
         .map_err(rider_equipment_write_error)?;
     let prepared = profiles.prepare_rider_equipment_write(selection, admission, completion)?;
     let receipt = world
-        .persist_rider_equipment(session_id, prepared)
+        .persist_rider_equipment(prepared)
         .await
         .map_err(rider_equipment_write_error)?;
     tracing::trace!(
@@ -1769,7 +1851,11 @@ async fn update_rider_equipment(
         "reloading the full bound profile after a durable rider-equipment write"
     );
     let reload_admission = profiles
-        .admit(&before.nickname, "reload profile after rider equipment")
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            "reload profile after rider equipment",
+        )
         .await?;
     let (profile, lane) = profiles
         .load(before.nickname.clone(), false, reload_admission)
@@ -1786,7 +1872,7 @@ async fn update_rider_equipment(
             actual,
         });
     }
-    let after = world.authorize_identity(session_id).await?;
+    let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
     context.bind_profile(after, profile);
     drop(lane);
@@ -1794,15 +1880,17 @@ async fn update_rider_equipment(
 }
 
 async fn equip_plant_part(
-    world: &WorldHandle,
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
-    session_id: SessionId,
+    _session_id: SessionId,
     request: PlantPartEquipRequest,
     context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let nickname = context.bound_identity()?.nickname.clone();
-    let admission = profiles.admit(&nickname, "equip plant part").await?;
-    let before = world.authorize_identity(session_id).await?;
+    let admission = profiles
+        .admit_for_operation(world.operation(), &nickname, "equip plant part")
+        .await?;
+    let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
     let (equipped, lane) = match profiles.equip_plant_part(request, admission).await {
         Ok(result) => result,
@@ -1811,7 +1899,7 @@ async fn equip_plant_part(
             return Ok(vec![serialize_equip_tuning_failure()]);
         }
     };
-    let after_write = world.authorize_identity(session_id).await?;
+    let after_write = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after_write)?;
     let _ = context.profile_for(&after_write)?;
     drop(lane);
@@ -1983,7 +2071,7 @@ fn myroom_player_slot_from_profile(
 }
 
 async fn handle_startup_request(
-    world: &WorldHandle,
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     session_id: SessionId,
     request: StartupRequest,
@@ -1991,39 +2079,38 @@ async fn handle_startup_request(
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     if request == StartupRequest::GetRider {
-        return handle_get_rider(world, profiles, session_id, context).await;
+        return handle_get_rider_admitted(world, profiles, session_id, context).await;
     }
     if request == StartupRequest::UpdateGameOption {
-        update_game_options(world, profiles, session_id, packet, context).await?;
+        update_game_options_admitted(world, profiles, session_id, packet, context).await?;
         return Ok(Vec::new());
     }
 
-    let identity = world.authorize_identity(session_id).await?;
+    let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
     Ok(startup_response(request, profile).into_iter().collect())
 }
 
-async fn handle_get_rider(
-    world: &WorldHandle,
+async fn handle_get_rider_admitted(
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
-    session_id: SessionId,
+    _session_id: SessionId,
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let nickname = context.bound_identity()?.nickname.clone();
     let admission = profiles
-        .admit(&nickname, "load fresh rider inventory")
+        .admit_for_operation(world.operation(), &nickname, "load fresh rider inventory")
         .await?;
-    let before = world.authorize_identity(session_id).await?;
+    let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
     let (responses, profile, lane) = profiles
         .get_rider_sequence(before.nickname.clone(), admission)
         .await?;
-    let after = world.authorize_identity(session_id).await?;
+    let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
     let _ = context.profile_for(&after)?;
     world
         .refresh_myroom_presentation(
-            session_id,
             after.clone(),
             MyRoomProfileLease::new(myroom_profile_presentation(&profile.profile), lane),
         )
@@ -2032,22 +2119,24 @@ async fn handle_get_rider(
     Ok(responses)
 }
 
-async fn update_game_options(
-    world: &WorldHandle,
+async fn update_game_options_admitted(
+    world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
-    session_id: SessionId,
+    _session_id: SessionId,
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Result<(), LoginSessionError> {
     let request = parse_pq_update_game_option(packet)?;
     let nickname = context.bound_identity()?.nickname.clone();
-    let admission = profiles.admit(&nickname, "update game options").await?;
-    let before = world.authorize_identity(session_id).await?;
+    let admission = profiles
+        .admit_for_operation(world.operation(), &nickname, "update game options")
+        .await?;
+    let before = world.authorize_identity().await?;
     let _ = context.profile_for(&before)?;
     let (profile, lane) = profiles
         .update_game_options(before.nickname.clone(), request.options, admission)
         .await?;
-    let after = world.authorize_identity(session_id).await?;
+    let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
     let _ = context.profile_for(&after)?;
     context.bind_profile(after, profile);
@@ -2205,6 +2294,129 @@ fn trace_packet(peer: Option<SocketAddr>, packet: &[u8]) -> Result<(), LoginSess
 }
 
 #[cfg(test)]
+async fn dispatch_packet(
+    services: &SessionServices<'_>,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    dispatch_packet_admitted(services, packet, context, None).await
+}
+
+#[cfg(test)]
+async fn handle_room_request(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    request: RoomProtocolRequest,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // Focused parser tests intentionally use an unauthenticated sentinel
+    // session. Preserve the real handler's parse-before-mutation contract
+    // without letting the test-only admission adapter mask a wire error.
+    match request {
+        RoomProtocolRequest::RoomList => {
+            let _ = parse_ch_get_room_list_request(packet)?;
+        }
+        RoomProtocolRequest::CreateRoom => {
+            let _ = parse_ch_create_room_request(packet)?;
+        }
+        RoomProtocolRequest::JoinRoom => {
+            let _ = parse_ch_join_room_request(packet)?;
+        }
+        RoomProtocolRequest::LeaveRoom => {
+            let _ = parse_ch_leave_room_request(packet)?;
+        }
+        RoomProtocolRequest::FirstRoomState => {
+            parse_gr_first_request(packet)?;
+        }
+    }
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_room_request_admitted(
+        &world.admitted(&operation),
+        profiles,
+        session_id,
+        request,
+        packet,
+        context,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn handle_lobby_request(
+    world: &WorldHandle,
+    session_id: SessionId,
+    request: LobbyRequest,
+    packet: &[u8],
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_lobby_request_admitted(&world.admitted(&operation), request, packet).await
+}
+
+#[cfg(test)]
+async fn handle_race_request(
+    world: &WorldHandle,
+    session_id: SessionId,
+    request: RaceRequest,
+    packet: &[u8],
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_race_request_admitted(&world.admitted(&operation), request, packet).await
+}
+
+#[cfg(test)]
+async fn handle_equipment_request(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    request: EquipmentRequest,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_equipment_request_admitted(
+        &world.admitted(&operation),
+        profiles,
+        session_id,
+        request,
+        packet,
+        context,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn handle_get_rider(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_get_rider_admitted(&world.admitted(&operation), profiles, session_id, context).await
+}
+
+#[cfg(test)]
+async fn update_game_options(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<(), LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    update_game_options_admitted(
+        &world.admitted(&operation),
+        profiles,
+        session_id,
+        packet,
+        context,
+    )
+    .await
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         array,
@@ -2217,6 +2429,7 @@ mod tests {
 
     use p5136_core::{
         adler32,
+        channel::serialize_pr_channel_move_in,
         equipment_protocol::{
             EquipmentRequest, PlantPartEquipRequest, RiderItemSelection,
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
@@ -2741,7 +2954,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let (world, world_task) = WorldHandle::spawn(4);
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
         let context = SessionContext::default();
         let mut trailing = PacketWriter::named("ChGetRoomListRequestPacket");
         trailing.write_i32(0);
@@ -2783,7 +2996,7 @@ mod tests {
         ));
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2792,7 +3005,7 @@ mod tests {
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let config = ServerConfig::default();
-        let (world, world_task) = WorldHandle::spawn(4);
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
         let session_id = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_705))
             .await
@@ -2836,12 +3049,12 @@ mod tests {
         );
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn trailing_lobby_packet_cannot_mutate_actor_state() {
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let mut rider = register_lobby_session(&world, "TrailingLobby", 49_710).await;
         let profile = Profile::default();
         world
@@ -2874,12 +3087,12 @@ mod tests {
         ));
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn expected_lobby_rejection_does_not_terminate_the_session() {
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let session = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_720))
             .await
@@ -2903,12 +3116,12 @@ mod tests {
         assert_eq!(world.authorize_identity(session).await.unwrap(), identity);
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn rejected_start_keeps_session_alive_and_uses_actor_reply() {
-        let (world, world_task) = WorldHandle::spawn(32);
+        let (world, world_task) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
         let mut owner = register_lobby_session(&world, "StartOwner", 49_740).await;
         let mut guest = register_lobby_session(&world, "StartGuest", 49_750).await;
         let profile = Profile::default();
@@ -2963,12 +3176,12 @@ mod tests {
         );
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn stale_generation_is_rejected_before_lobby_mutation() {
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let rider = register_lobby_session(&world, "StaleLobby", 49_730).await;
         let packet = set_slot_state_packet(PlayerSlotState::Ready);
 
@@ -2990,7 +3203,7 @@ mod tests {
         );
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[test]
@@ -3113,7 +3326,7 @@ mod tests {
 
     #[tokio::test]
     async fn myroom_player_slot_uses_exact_identity_and_profile_presentation() {
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let rider = register_lobby_session(&world, "MyRoomRider", 49_736).await;
         let mut profile = Profile::default();
         profile.rider.p2p_port = 48_888;
@@ -3149,7 +3362,7 @@ mod tests {
         assert_eq!(ipv6_slot.p2p_port, 0);
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3759,7 +3972,7 @@ mod tests {
     #[tokio::test]
     async fn equipment_publish_does_not_refresh_admission_physics_snapshot() {
         let catalog = test_catalog();
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let mut rider = register_lobby_session(&world, "PhysicsSnapshot", 49_735).await;
         let mut profile = Profile::default();
         profile.rider_item.kart = 1_450;
@@ -3813,7 +4026,7 @@ mod tests {
 
         world.session_closed(rider.session).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -3822,7 +4035,7 @@ mod tests {
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let config = ServerConfig::default();
-        let (world, world_task) = WorldHandle::spawn(4);
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
         let session_id = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_760))
             .await
@@ -3857,12 +4070,12 @@ mod tests {
         );
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn malformed_race_packets_cannot_mutate_actor_state() {
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let mut rider = register_lobby_session(&world, "MalformedRace", 49_770).await;
         create_and_start_solo_loading(&world, &mut rider, "MalformedRace").await;
 
@@ -3933,12 +4146,12 @@ mod tests {
 
         world.session_closed(rider.session).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn game_control_state_zero_reaches_actor_without_direct_response() {
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let mut rider = register_lobby_session(&world, "RaceStateZero", 49_780).await;
         create_and_start_solo_loading(&world, &mut rider, "RaceStateZero").await;
         let packet = game_control_packet(0, 0x1234_5678);
@@ -3966,12 +4179,12 @@ mod tests {
 
         world.session_closed(rider.session).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn stale_generation_is_rejected_before_race_mutation() {
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let rider = register_lobby_session(&world, "StaleRace", 49_790).await;
         let packet = game_control_packet(0, 100);
 
@@ -3993,12 +4206,12 @@ mod tests {
         );
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn expected_race_rejections_do_not_terminate_the_session() {
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let mut rider = register_lobby_session(&world, "RaceRejection", 49_800).await;
         let profile = Profile::default();
         world
@@ -4036,7 +4249,7 @@ mod tests {
         );
 
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4044,7 +4257,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let source = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_700))
             .await
@@ -4132,7 +4345,7 @@ mod tests {
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4140,7 +4353,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let session = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_800))
             .await
@@ -4191,7 +4404,7 @@ mod tests {
 
         world.session_closed(session).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4199,7 +4412,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
-        let (world, world_task) = WorldHandle::spawn(8);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
         let session = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_900))
             .await
@@ -4288,7 +4501,7 @@ mod tests {
 
         world.session_closed(session).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4484,7 +4697,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let (world, world_task) = WorldHandle::spawn(32);
+        let (world, world_task) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
             .register_session(SocketAddr::new(address, 49_900))
@@ -4568,7 +4781,7 @@ mod tests {
 
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4580,14 +4793,17 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let (world, world_task) = WorldHandle::spawn(32);
+        let (world, world_task) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
             .register_session(SocketAddr::new(address, 49_902))
             .await
             .unwrap();
-        let destination = world
-            .register_session(SocketAddr::new(address, 49_903))
+        let (destination, _destination_cancelled, mut destination_outbound) = world
+            .register_login_session(
+                SocketAddr::new(address, 49_903),
+                crate::operation_gate::WireOperationGate::new(),
+            )
             .await
             .unwrap();
         let identity = world
@@ -4687,7 +4903,26 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(responses.len(), 1);
+        assert!(
+            responses.is_empty(),
+            "the migration acknowledgement is actor-ordered, not a direct response"
+        );
+        let acknowledgement = time::timeout(Duration::from_secs(1), destination_outbound.recv())
+            .await
+            .expect("the migration acknowledgement was not queued")
+            .expect("the destination outbound channel closed")
+            .into_packets();
+        assert_eq!(
+            acknowledgement,
+            vec![serialize_pr_channel_move_in(
+                ServerConfig::default().ports.game_udp(),
+                ServerConfig::default().ports.p2p_udp(),
+            )]
+        );
+        assert!(
+            destination_outbound.try_recv().is_err(),
+            "the migration acknowledgement must be queued exactly once"
+        );
         let migrated = world.authorize_identity(destination).await.unwrap();
         assert_eq!(migrated.user_no, identity.user_no);
         assert!(migrated.generation.get() > identity.generation.get());
@@ -4696,7 +4931,7 @@ mod tests {
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4704,7 +4939,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let (world, world_task) = WorldHandle::spawn(16);
+        let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
         let (source, mut source_cancelled, _source_outbound) = world
             .register_login_session(
@@ -4788,18 +5023,22 @@ mod tests {
         world.session_closed(destination).await.unwrap();
         world.session_closed(source).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
         profile_runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_update_keeps_ownership_gate_until_disk_save_finishes() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cancellation regression spans profile worker, identity drain, migration commit, and durable verification"
+    )]
+    async fn cancelled_update_retains_identity_child_until_disk_save_finishes() {
         let profile_root = tempfile::tempdir().unwrap();
         let hook = BlockingUpdateHook::new();
-        let (profiles, _profile_runtime) =
+        let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let profiles = profiles.with_blocking_update_hook(Arc::clone(&hook));
-        let (world, world_task) = WorldHandle::spawn(32);
+        let (world, world_task) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
             .register_session(SocketAddr::new(address, 50_000))
@@ -4836,9 +5075,14 @@ mod tests {
 
         let update_profiles = profiles.clone();
         let update_nickname = identity.nickname.clone();
+        let update_operation = world.admit_identity_operation(source).await.unwrap();
         let update = tokio::spawn(async move {
             let admission = update_profiles
-                .admit(&update_nickname, "test blocked game-option update")
+                .admit_for_operation(
+                    &update_operation,
+                    &update_nickname,
+                    "test blocked game-option update",
+                )
                 .await?;
             update_profiles
                 .update_game_options(
@@ -4865,16 +5109,25 @@ mod tests {
         let migration_nickname = identity.nickname.clone();
         let (attempting, attempted) = oneshot::channel();
         let mut migration = tokio::spawn(async move {
+            let preflight = migration_world
+                .preflight_migration(destination, user_no, 12, token, Instant::now())
+                .await
+                .unwrap();
             let _ = attempting.send(());
+            preflight.wait_for_operations_drained().await.unwrap();
             let admission = migration_profiles
                 .admit(&migration_nickname, "test migration handoff")
                 .await
                 .unwrap();
-            let completion = migration_world
-                .complete_migration(destination, user_no, 12, token, Instant::now())
-                .await;
-            drop(admission);
-            completion
+            let (profile, lane) = migration_profiles
+                .load(migration_nickname, false, admission)
+                .await
+                .unwrap();
+            let profile_lease =
+                MyRoomProfileLease::new(myroom_profile_presentation(&profile.profile), lane);
+            migration_world
+                .complete_preflighted_migration(preflight, profile_lease)
+                .await
         });
         attempted.await.unwrap();
         assert!(
@@ -4899,7 +5152,8 @@ mod tests {
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
+        profile_runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4962,7 +5216,7 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let (world, world_task) = WorldHandle::spawn(32);
+        let (world, world_task) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let source = world
             .register_session(SocketAddr::new(address, 50_000))
@@ -5030,6 +5284,6 @@ mod tests {
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();
         world.shutdown().await.unwrap();
-        world_task.await.unwrap();
+        world_task.await.unwrap().unwrap();
     }
 }

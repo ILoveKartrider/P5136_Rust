@@ -26,7 +26,10 @@ use tokio::{
     task::{JoinError, JoinHandle, JoinSet},
 };
 
-use crate::{myroom_hub::MyRoomProfilePresentation, world::RewardSettlementTask};
+use crate::{
+    identity::IdentityOperationLease, myroom_hub::MyRoomProfilePresentation,
+    world::RewardSettlementTask,
+};
 
 const MAX_BLOCKING_PROFILE_JOBS: usize = 32;
 const REWARD_PERSISTENCE_OPERATION: &str = "persist race reward";
@@ -454,7 +457,11 @@ impl ProfileLaneTable {
             }
         };
         let guard = lane.lock_owned().await;
-        Ok(ProfileLanePermit { subject, guard })
+        Ok(ProfileLanePermit {
+            subject,
+            guard,
+            identity_operation: None,
+        })
     }
 
     #[cfg(test)]
@@ -467,6 +474,10 @@ pub(crate) struct ProfileLanePermit {
     subject: ProfileSubject,
     #[expect(dead_code, reason = "the owned guard's drop releases the profile lane")]
     guard: OwnedMutexGuard<()>,
+    /// A profile operation admitted by an authenticated frame retains that
+    /// exact identity generation until the lane and all completion/publication
+    /// state derived from it are retired.
+    identity_operation: Option<IdentityOperationLease>,
 }
 
 impl fmt::Debug for ProfileLanePermit {
@@ -481,6 +492,10 @@ impl fmt::Debug for ProfileLanePermit {
 impl ProfileLanePermit {
     pub(crate) fn subject(&self) -> &ProfileSubject {
         &self.subject
+    }
+
+    fn retain_identity_operation(&mut self, operation: IdentityOperationLease) {
+        self.identity_operation = Some(operation);
     }
 }
 
@@ -709,6 +724,14 @@ impl fmt::Debug for ProfileJobAdmission {
 impl ProfileJobAdmission {
     pub(crate) fn subject(&self) -> &ProfileSubject {
         self.lane.subject()
+    }
+
+    /// Binds this already-reserved profile job and its lane to one exact
+    /// authenticated identity operation. The lease then follows the lane
+    /// through the worker completion and any actor-side publication.
+    pub(crate) fn retain_identity_operation(mut self, operation: IdentityOperationLease) -> Self {
+        self.lane.retain_identity_operation(operation);
+        self
     }
 
     pub(crate) async fn run<T, F>(
