@@ -208,6 +208,17 @@ disk, hexadecimal payload capture is limited to the first 4 KiB per record;
 the record remains present and says `truncated = true` with its full byte
 count.
 
+Each server start also records the effective endpoints, profile root,
+`KartCatalog.xml` and client-data paths, and whether each optional catalog was
+actually loaded. A failed login handler or response write records the request
+hash, byte count, authentication state, and both display and debug forms of
+its typed error; a non-cancelled login or Messenger TCP session error is also
+recorded. These session-failure diagnostics use an independent 64-records-per-
+second bounded budget and the existing lossy file target, so remote disconnects
+cannot flood the normal console. This makes a missing catalog, invalid profile
+state, or failed `PqGetRider` sequence visible in the normal per-run file
+without requiring `RUST_LOG=debug`.
+
 Normal client traffic records every packet. This is deliberately not an
 unbounded remote-disk-write capability: raw packet records are process-wide
 limited to 512 per second, and the file writer has a bounded asynchronous
