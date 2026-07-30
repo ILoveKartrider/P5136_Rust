@@ -27,20 +27,44 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`5dec4d9 Port bounded TCP GameSlot relay`
+`76387e8 Port legacy server time reply`
 
 ## Current Rust checkpoint
 
-The current checkpoint implements the previously missing bounded TCP
-`GameSlotPacket` path without copying the risky C# behavior. Korean P5136
-types 1, 2, 9, 10, 11, and 12 now pass through a bounded semantic codec before
-an actor-owned policy decision. Valid relay types preserve the exact original
-bytes but use the frozen race roster, exact identity generations, and
-all-recipient queue reservation. Item pickup and speculative server side
-effects remain explicitly deferred instead of copying the C# behaviors
-identified as risky by the stability audit. Malformed or expected gameplay
-rejections no longer terminate the authenticated session. C# remains
-unchanged.
+The current checkpoint closes one stateless authenticated packet-disposition
+gap. `PqServerTime` now returns the exact four-byte legacy clock body in
+`PrServerTime`, reusing the existing `LegacyTime` representation and writer.
+The inspected C# handlers do not consume a request body, and no producer or
+capture proves a stricter layout, so Rust deliberately does not invent one.
+The request still passes through the normal identity-operation and bound
+profile fences. Beyond those shared admission and authorization commands, the
+reply performs no ServerTime-specific actor mutation, persistence, or fanout.
+C# remains unchanged.
+
+### Authenticated legacy server time
+
+- `PqServerTime` is `0x1E9204C7`; `PrServerTime` is `0x1E9D04C8`. The reply is
+  exactly `days_since_1900:u16 | quarter_seconds:u16` after the packet hash,
+  for a total of eight bytes.
+- C# writes both values as signed `short`, but its unchecked date overflow has
+  the same little-endian bit pattern as Rust's `u16` day value reduced modulo
+  65,536. Quarter-seconds are floor-seconds divided by four and remain in
+  `0..21_600`.
+- Current, stock-era, and legacy C# evidence agrees on the reply shape. The
+  request handlers dispatch from the already-read hash without consuming a
+  body. No checked-in producer or capture proves hash-only exhaustion, so Rust
+  accepts an unused suffix only within the existing bounded login frame and
+  does not copy it.
+- The packet is identity-bound like every authenticated Rust request. Exact
+  generation authorization and the bound profile fence run before the direct
+  requester reply. The shared identity-operation admission and
+  `AuthorizeIdentity` actor commands are its only World interactions; there is
+  no ServerTime-specific command, shared-state mutation, profile-store I/O,
+  peer publication, or retry queue.
+- Tests pin both hashes, the exact little-endian body for fixed time values,
+  hash-only and unused-suffix dispatch, the eight-byte response shape, clock
+  range, and continued identity ownership. Stock-client request-body and E2E
+  evidence remain open rather than being inferred from C#'s non-consumption.
 
 ### Bounded TCP GameSlot relay
 
@@ -747,18 +771,21 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 727 regular tests and 2 opt-in proprietary-fixture tests passed
+# 729 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 727 regular passing tests comprise 9 CLI, 35 connector, 157 core, 85
-profile, 13 RHO5, 420 server unit, and 8 server integration tests. The two
+The 729 regular passing tests comprise 9 CLI, 35 connector, 158 core, 85
+profile, 13 RHO5, 421 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
+- exact `PqServerTime`/`PrServerTime` hashes and four-byte legacy clock body,
+  bounded unused request suffix, authenticated dispatch, and identity
+  continuity;
 - requester cancellation with a queued actor-owned identity child;
 - accepted profile work retaining its child through disk publication;
 - migration drain, exact abort, expiry wake-up, and shutdown reporting;
@@ -929,8 +956,12 @@ These items prevent a "port complete" claim.
 
 1. Continue the packet-disposition ledger: every known request must be
    implemented, an evidence-backed deliberate no-reply, explicitly
-   unsupported, or capture-blocked. The generic authenticated fallback now
-   returns `UnsupportedIdentityPacket`; it no longer reports silent success.
+   unsupported, or capture-blocked. `PqServerTime` is now explicit. The next
+   low-state candidates are the P5136 fail-closed shop reply and the terminal
+   web-event-complete reply; neither request body should be declared strict
+   until a producer or capture proves its layout. The generic authenticated
+   fallback returns `UnsupportedIdentityPacket`; it never reports silent
+   success.
 2. Keep the completed bounded TCP GameSlot slice frozen at its current
    evidence boundary. Collect stock-client type-1/type-2 request/reply,
    type-9/type-10, and generic type-12 fixtures before implementing pickup

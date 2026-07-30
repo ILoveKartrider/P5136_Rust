@@ -46,6 +46,7 @@ been demonstrated.
 - [x] ordered ACK plus result-free identity/MyRoom/protocol commit boundary
 - [x] deferred releases count toward capacity and shutdown barriers
 - [x] cross-World capability misuse is rejected
+- [x] authenticated `PqServerTime` / `PrServerTime` legacy clock reply
 
 ## World, Messenger, and UDP
 

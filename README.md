@@ -13,7 +13,8 @@ server. The implemented foundation provides:
 - P5136 TCP and UDP checksum/encryption with bounded frame decoders;
 - the Korean P5136 first-message payload;
 - authentication, login, identity fencing, and channel migration over real TCP;
-- request-driven startup replies plus catalog-backed rider inventory/equipment;
+- request-driven startup replies, legacy server time, and catalog-backed rider
+  inventory/equipment;
 - strict terminal empty protected-item list compatibility reply;
 - actor-owned channel rooms with create/list/join/leave, bounded fan-out, and
   stale-generation cancellation;
@@ -95,6 +96,14 @@ eight-byte terminal empty `PrLockedItemGet` to the authenticated requester.
 It performs no profile-store I/O or shared-state mutation. Nonempty protected
 items and `PqLockedItemUpdate` remain unimplemented because their
 P5136-specific wire and persistence policy lacks producer or capture proof.
+`PqServerTime` likewise has an explicit authenticated path and returns the
+exact eight-byte `PrServerTime`: reply hash, days since 1900 modulo 65,536,
+and quarter-seconds since local midnight. The corroborating C# handlers do not
+consume a request body, so Rust accepts an unused suffix only under the global
+frame bound instead of claiming an unproven hash-only schema. The reply is
+direct and read-only. It uses the shared identity-operation admission and
+authorization actor commands but creates no ServerTime-specific mutation,
+disk I/O, or fanout.
 
 TCP `GameSlotPacket` is handled separately from the opaque UDP packet that
 shares its name. Rust bounds the complete TCP packet at 1013 bytes and each
