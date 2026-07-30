@@ -27,13 +27,40 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Committed baseline before the current tranche:
-`c18d0ad Harden identity and migration generation fences`
+`a013945 Port bounded MyRoom RequestItems flow`
 
 ## Current Rust checkpoint
 
-The current worktree builds on the exact-generation operation and migration
-checkpoint and closes the MyRoom `RequestItems` vertical slice identified by
-the C# stability review.
+The current worktree builds on the bounded `RequestItems` checkpoint and closes
+the MyRoom `CharacterPosition` vertical slice identified by the C# stability
+review.
+
+### MyRoom CharacterPosition
+
+- `RmCharPosPacket` is now parsed explicitly and strictly before actor work.
+  The request must contain exactly one slot and six finite little-endian
+  `f32` values; truncated, trailing, out-of-range, NaN, and infinity inputs are
+  typed protocol errors and cannot fan out.
+- The admitted World command retains an exact-generation identity-operation
+  child while queued. The actor authorizes the source session and resolves the
+  current room audience in one actor turn, so migration cannot reinterpret a
+  stale source or recipient.
+- The client slot is treated only as an assertion. It must equal the
+  actor-owned membership slot, and the wire packet is serialized from that
+  canonical slot. A mismatch and an authenticated nonmember are silent drops;
+  the sender is excluded from the peer audience.
+- Every current peer binding is revalidated against the active identity
+  generation. All bounded recipient queue permits are reserved before any
+  packet is published. One full recipient queue drops the complete ephemeral
+  update without disconnecting the sender or leaking a partial fanout; the
+  request is immediately retryable after queues drain.
+- Position fanout is stateless: it does not change Hub topology or revision.
+  Dropping the requester-side ACK future does not cancel an actor-accepted
+  publication, and quiesce rejects new position production before publication.
+- `RiderTalk` deliberately remains unported in this tranche. The C# handler
+  ignores `TalkLock`, while the available source does not establish whether
+  zero or one means locked or whether the owner is exempt. Rust will not guess
+  that authorization policy merely to clone the unsafe C# behavior.
 
 ### MyRoom RequestItems
 
@@ -141,7 +168,8 @@ the C# stability review.
 - MyRoom actor state includes bounded entry topology and generation-aware
   migration/disconnect cleanup. Production dispatch currently integrates
   fresh FirstState projection, owner-info durability, bounded RequestItems,
-  and Secede; direct/random/re-enter are still missing.
+  exact-generation character-position fanout, and Secede;
+  direct/random/re-enter are still missing.
 - Rider equipment/plant persistence is cancellation-independent and refreshes
   the actor caches only after durable confirmation.
 - Graceful shutdown drains wire admission, accepted durable work, completion
@@ -181,6 +209,11 @@ these areas:
 - Visitor-facing integrated MyRoom info does not disclose stored room/item
   passwords. Protected owner-item reads are denied without disk access until a
   real password capability is implemented.
+- Character-position input cannot spoof another member's slot or forward
+  non-finite transforms. Rust resolves and revalidates the current-generation
+  audience inside the actor and reserves every bounded peer queue before
+  publishing, instead of using the C# lock-then-send snapshot with best-effort
+  per-peer unbounded enqueue and possible stale or partial delivery.
 
 ## Non-negotiable invariants
 
@@ -220,11 +253,11 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 598 passed, 0 failed
+# 606 passed, 0 failed
 git diff --check
 ```
 
-The 598 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 332 server
+The 606 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 340 server
 unit, and 8 server integration tests. Doc-tests also passed.
 
 Focused regressions cover:
@@ -246,6 +279,9 @@ Focused regressions cover:
   cancellation, dropped ACK, and atomic queue backpressure;
 - aggregate multi-packet write timeout, guard drain, exact packet order, and
   IV progression;
+- strict character-position input, canonical sender slots, nonmember and
+  self-echo suppression, stale-source migration fencing, exact peer packets,
+  atomic multi-peer backpressure/retry, dropped ACK, and quiesce rejection;
 - bounded ready-output flushing.
 
 Production Rust contains no `unsafe` syntax; the workspace also forbids it.
@@ -270,11 +306,11 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Finish direct/random/re-enter, character-position and chat fanout, the
-   actor-minted password capability and emblem flows, main-emblem persistence,
-   P2P-port profile writes, club create/rename refresh, and any request still
-   intentionally classified as a no-op. Finish kart tuning/upgrades and the
-   remaining quest/attendance/progression surface.
+   Finish direct/random/re-enter and chat fanout, the actor-minted password
+   capability and emblem flows, main-emblem persistence, P2P-port profile
+   writes, club create/rename refresh, and any request still intentionally
+   classified as a no-op. Finish kart tuning/upgrades and the remaining
+   quest/attendance/progression surface.
 
 4. **Evidence-dependent packet behavior**
 

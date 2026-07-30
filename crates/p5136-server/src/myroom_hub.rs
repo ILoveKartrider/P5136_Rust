@@ -1510,7 +1510,7 @@ impl MyRoomHub {
         })
     }
 
-    /// Exact-generation UDP query with a non-member fast path.
+    /// Exact-generation peer-audience query with a non-member fast path.
     pub(crate) fn peer_audience_if_member(
         &self,
         identity: &IdentityBinding,

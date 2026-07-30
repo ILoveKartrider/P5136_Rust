@@ -38,9 +38,9 @@ use p5136_core::{
     },
     myroom_protocol::{
         MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot, MyRoomProtocolError, MyRoomRequest,
-        classify_myroom_request, parse_first_request, parse_request_items, parse_secede_request,
-        parse_update_info, plan_owner_item_packets, serialize_myroom_info,
-        serialize_owner_item_enchants, serialize_owner_items,
+        classify_myroom_request, parse_character_position, parse_first_request,
+        parse_request_items, parse_secede_request, parse_update_info, plan_owner_item_packets,
+        serialize_myroom_info, serialize_owner_item_enchants, serialize_owner_items,
     },
     packet::PacketError,
     race_protocol::{
@@ -93,8 +93,8 @@ use crate::{
     },
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
-        MyRoomOwnerItemLoad, MyRoomSessionRole, OutboundBatch, RaceCommandPayload,
-        RoomCommandPayload, RoomParticipant, StartRoomPlan,
+        MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole, OutboundBatch,
+        RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -1683,6 +1683,14 @@ async fn handle_myroom_request(
             execute_myroom_owner_items(world, profiles, session_id, context).await?;
             return Ok(Vec::new());
         }
+        MyRoomRequest::CharacterPosition => {
+            execute_myroom_peer_command(
+                world,
+                MyRoomPeerCommandPayload::CharacterPosition(parse_character_position(packet)?),
+            )
+            .await?;
+            return Ok(Vec::new());
+        }
         MyRoomRequest::Secede => {
             parse_secede_request(packet)?;
             execute_live_myroom_command(
@@ -1782,6 +1790,24 @@ async fn execute_myroom_owner_items(
         }
     }
     unreachable!("the bounded MyRoom owner-item plan loop always returns on its final attempt")
+}
+
+async fn execute_myroom_peer_command(
+    world: &AdmittedWorldHandle<'_>,
+    payload: MyRoomPeerCommandPayload,
+) -> Result<(), LoginSessionError> {
+    match world.myroom_peer_command(payload).await {
+        Ok(()) => Ok(()),
+        Err(WorldError::MyRoomCommandOutboundUnavailable { session }) => {
+            tracing::debug!(
+                session_id = world.session_id().get(),
+                unavailable_session_id = session.get(),
+                "dropping an atomic MyRoom peer fanout because a recipient queue is full"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn execute_live_myroom_command(
@@ -2504,11 +2530,11 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart,
-            MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
-            REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_missing_owner_items,
-            serialize_myroom_info, serialize_owner_item_enchants, serialize_owner_items,
-            serialize_secede_reply, serialize_slot_data,
+            CHAR_POSITION_NAME, MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo,
+            MyRoomKart, MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
+            REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_character_position,
+            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
+            serialize_owner_items, serialize_secede_reply, serialize_slot_data,
         },
         packet::{PacketReader, PacketWriter},
         race_protocol::{
@@ -4000,6 +4026,247 @@ mod tests {
             "a public visitor must read the room owner's snapshot, not its own sidecars"
         );
         assert!(owner.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_character_position_relays_canonical_slots_without_sender_echo() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let (outsider_session, _cancelled, mut outsider_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_738),
+                crate::operation_gate::WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let outsider_identity = world
+            .claim_identity(outsider_session, "SessionMyRoomPositionOutsider")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let mut outsider_context = bind_test_profile(&profiles, &outsider_identity).await;
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let visitor_services = SessionServices {
+            session_id: visitor.session,
+            ..owner_services
+        };
+        let outsider_services = SessionServices {
+            session_id: outsider_session,
+            ..owner_services
+        };
+
+        let owner_transform = [1.25, -2.5, 3.75, 4.0, -5.0, 6.0];
+        let owner_position = serialize_character_position(0, owner_transform).unwrap();
+        assert!(
+            dispatch_packet(&owner_services, &owner_position, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![owner_position]
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        let visitor_transform = [-10.0, 20.0, -30.0, 40.0, -50.0, 60.0];
+        let visitor_position = serialize_character_position(1, visitor_transform).unwrap();
+        assert!(
+            dispatch_packet(&visitor_services, &visitor_position, &mut visitor_context,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![visitor_position]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let spoofed = serialize_character_position(0, visitor_transform).unwrap();
+        assert!(
+            dispatch_packet(&visitor_services, &spoofed, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a valid but non-canonical sender slot is a silent drop"
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let outsider_position = serialize_character_position(0, [7.0; 6]).unwrap();
+        assert!(
+            dispatch_packet(
+                &outsider_services,
+                &outsider_position,
+                &mut outsider_context,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "an authenticated nonmember cannot publish into a MyRoom"
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+        assert!(outsider_outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_character_position_strictly_rejects_malformed_input_before_fanout() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+
+        let valid = serialize_character_position(1, [1.0; 6]).unwrap();
+        let mut trailing = valid.clone();
+        trailing.push(0xa5);
+        assert!(matches!(
+            dispatch_packet(&services, &trailing, &mut visitor_context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::TrailingBytes {
+                    name: CHAR_POSITION_NAME,
+                    count: 1,
+                }
+            ))
+        ));
+        assert!(matches!(
+            dispatch_packet(&services, &valid[..valid.len() - 1], &mut visitor_context,).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::Packet(_)
+            ))
+        ));
+
+        let mut non_finite = PacketWriter::named(CHAR_POSITION_NAME);
+        non_finite.write_i32(1);
+        for value in [1.0, 2.0, f32::NAN, 4.0, 5.0, 6.0] {
+            non_finite.write_f32(value);
+        }
+        assert!(matches!(
+            dispatch_packet(&services, &non_finite.into_inner(), &mut visitor_context,).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::NonFiniteTransform { index: 2 }
+            ))
+        ));
+
+        let mut out_of_range = PacketWriter::named(CHAR_POSITION_NAME);
+        out_of_range.write_i32(8);
+        for value in [3.0; 6] {
+            out_of_range.write_f32(value);
+        }
+        assert!(matches!(
+            dispatch_packet(&services, &out_of_range.into_inner(), &mut visitor_context,).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::InvalidSlot(8)
+            ))
+        ));
+
+        let mut infinite = PacketWriter::named(CHAR_POSITION_NAME);
+        infinite.write_i32(1);
+        for value in [1.0, 2.0, 3.0, 4.0, f32::INFINITY, 6.0] {
+            infinite.write_f32(value);
+        }
+        assert!(matches!(
+            dispatch_packet(&services, &infinite.into_inner(), &mut visitor_context,).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::NonFiniteTransform { index: 4 }
+            ))
+        ));
+
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_character_position_backpressure_drops_the_whole_ephemeral_update() {
+        let fixture = spawn_myroom_world_with_outbound_capacity(MyRoomInfo::default(), 1);
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let first = serialize_character_position(0, [1.0; 6]).unwrap();
+        let second = serialize_character_position(0, [2.0; 6]).unwrap();
+
+        assert!(
+            dispatch_packet(&services, &first, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            dispatch_packet(&services, &second, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "ephemeral position backpressure drops the update without disconnecting its sender"
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![first],
+            "the failed fanout cannot replace or append to the already queued batch"
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+        assert!(owner.outbound.try_recv().is_err());
+
+        assert!(
+            dispatch_packet(&services, &second, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the same position is publishable after the bounded queue drains"
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![second]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
     }

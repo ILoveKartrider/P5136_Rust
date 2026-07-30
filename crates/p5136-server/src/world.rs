@@ -18,8 +18,9 @@ use p5136_core::{
         serialize_start_room_reply,
     },
     myroom_protocol::{
-        MyRoomInfo, MyRoomProtocolError, MyRoomSlot, serialize_missing_owner_items,
-        serialize_myroom_info, serialize_secede_reply, serialize_slot_data,
+        CharacterPositionRequest, MyRoomInfo, MyRoomProtocolError, MyRoomSlot,
+        serialize_character_position, serialize_missing_owner_items, serialize_myroom_info,
+        serialize_secede_reply, serialize_slot_data,
     },
     nickname::canonical_nickname_key,
     race_protocol::{
@@ -921,6 +922,11 @@ pub(crate) enum MyRoomCommandPayload {
     Secede,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MyRoomPeerCommandPayload {
+    CharacterPosition(CharacterPositionRequest),
+}
+
 /// Actor-minted topology fence for one profile-backed `MyRoom` command.
 ///
 /// A member plan is intentionally incomplete until the session profile runtime
@@ -1615,6 +1621,11 @@ enum WorldCommand {
         session: SessionId,
         payload: MyRoomCommandPayload,
         prepared: Box<MyRoomPreparedCommand>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    MyRoomPeer {
+        session: SessionId,
+        payload: MyRoomPeerCommandPayload,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     PublishMyRoomOwnerItems {
@@ -2583,6 +2594,20 @@ impl AdmittedWorldHandle<'_> {
             session: self.session_id(),
             payload,
             prepared: Box::new(prepared),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn myroom_peer_command(
+        &self,
+        payload: MyRoomPeerCommandPayload,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::MyRoomPeer {
+            session: self.session_id(),
+            payload,
             reply,
         })
         .await?;
@@ -4125,6 +4150,50 @@ impl World {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    fn myroom_peer_command(
+        &mut self,
+        session: SessionId,
+        payload: MyRoomPeerCommandPayload,
+    ) -> Result<(), WorldOperationError> {
+        let identity = self.authorize_session_operation(session)?;
+        let Some(audience) = self
+            .myroom
+            .peer_audience_if_member(&identity)
+            .map_err(|source| myroom_hub_error("peer fanout audience", source))?
+        else {
+            return Ok(());
+        };
+        let sender_slot = audience.sender_slot.get();
+        let packet = match payload {
+            MyRoomPeerCommandPayload::CharacterPosition(request) => {
+                if request.slot != sender_slot {
+                    tracing::debug!(
+                        session_id = session.get(),
+                        user_no = identity.user_no.get(),
+                        owner = audience.owner.get(),
+                        claimed_slot = request.slot,
+                        actual_slot = sender_slot,
+                        "dropping a MyRoom position update with a spoofed sender slot"
+                    );
+                    return Ok(());
+                }
+                serialize_character_position(i32::from(sender_slot), request.transform)
+            }
+        }
+        .map_err(MyRoomLifecycleError::from)?;
+        let deliveries = self.myroom_deliveries_from_serialized(
+            vec![(audience.peers.as_slice(), packet)],
+            &UnavailableReleaseIndex::default(),
+        )?;
+        let reserved = self
+            .try_reserve_myroom_outbound(deliveries)
+            .map_err(|error| WorldError::MyRoomCommandOutboundUnavailable {
+                session: error.session,
+            })?;
+        Self::publish_reserved(reserved);
         Ok(())
     }
 
@@ -9273,6 +9342,7 @@ async fn dispatch_unwrapped_command(
         | WorldCommand::PrepareMyRoom { .. }
         | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::MyRoom { .. }
+        | WorldCommand::MyRoomPeer { .. }
         | WorldCommand::PublishMyRoomOwnerItems { .. }
         | WorldCommand::DrainSessions { .. }) => {
             dispatch_guarded_world_command(world, sidecars, command).await?;
@@ -9317,6 +9387,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
         | WorldCommand::PublishRoomEquipment { reply, .. }
         | WorldCommand::LeaveRoom { reply, .. }
         | WorldCommand::MyRoom { reply, .. }
+        | WorldCommand::MyRoomPeer { reply, .. }
         | WorldCommand::PublishMyRoomOwnerItems { reply, .. }
         | WorldCommand::RetryRewardDeadLetter { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
@@ -9417,6 +9488,14 @@ async fn dispatch_guarded_world_command(
             reply,
         } => {
             let result = world.myroom_command(session, payload, *prepared);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        WorldCommand::MyRoomPeer {
+            session,
+            payload,
+            reply,
+        } => {
+            let result = world.myroom_peer_command(session, payload);
             reply_after_world_operation(world, sidecars, reply, result).await
         }
         WorldCommand::PublishMyRoomOwnerItems {
@@ -9653,6 +9732,7 @@ async fn dispatch_utility_command(
         | WorldCommand::PrepareMyRoom { .. }
         | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::MyRoom { .. }
+        | WorldCommand::MyRoomPeer { .. }
         | WorldCommand::PublishMyRoomOwnerItems { .. }
         | WorldCommand::RegisterMyRoomInfoWrite { .. }
         | WorldCommand::RegisterRiderEquipmentWrite { .. }
@@ -10019,9 +10099,9 @@ mod tests {
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
         },
         myroom_protocol::{
-            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot,
-            serialize_missing_owner_items, serialize_myroom_info, serialize_secede_reply,
-            serialize_slot_data,
+            CharacterPositionRequest, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPlayerSlot, MyRoomSlot,
+            serialize_character_position, serialize_missing_owner_items, serialize_myroom_info,
+            serialize_secede_reply, serialize_slot_data,
         },
         nickname::canonical_nickname_key,
         race_protocol::{
@@ -10050,12 +10130,12 @@ mod tests {
     use super::{
         GlobalRaceEpoch, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
         LobbyCommandPayload, LobbyError, MigrationAcknowledgement, MyRoomCommandPayload,
-        MyRoomLifecycleError, MyRoomPreparedCommand, MyRoomWireProjection, OutboundBatch,
-        ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload, RaceError,
-        RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
-        RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
-        WorldOperationError, WorldSidecarError, WorldSidecars, WorldSpawnError, dispatch_command,
-        source_ipv4,
+        MyRoomLifecycleError, MyRoomPeerCommandPayload, MyRoomPreparedCommand,
+        MyRoomWireProjection, OutboundBatch, ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload,
+        RaceError, RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId,
+        RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError,
+        WorldHandle, WorldOperationError, WorldSidecarError, WorldSidecars, WorldSpawnError,
+        dispatch_command, source_ipv4,
     };
     use crate::equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentWriteError,
@@ -16461,6 +16541,220 @@ mod tests {
     }
 
     #[test]
+    fn myroom_character_position_with_no_peers_is_a_stateless_success() {
+        let (mut world, mut owner) = prepare_myroom_owner("PositionSoloOwner", 56_060, 1);
+        let revision = world.myroom.revision();
+
+        world
+            .myroom_peer_command(
+                owner.session,
+                MyRoomPeerCommandPayload::CharacterPosition(CharacterPositionRequest {
+                    slot: 0,
+                    transform: [0.0; 6],
+                }),
+            )
+            .unwrap();
+
+        assert!(owner.outbound.try_recv().is_err());
+        assert_eq!(world.myroom.revision(), revision);
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one three-peer fixture proves normal relay, spoof rejection, nonmember silence, atomic backpressure, retry, and topology immutability together"
+    )]
+    fn myroom_character_position_uses_exact_slots_and_atomic_peer_backpressure() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "PositionOwner", 67, 56_061, 8);
+        let mut visitor = register_channel_session(&mut world, "PositionVisitor", 67, 56_063, 8);
+        let mut third = register_channel_session(&mut world, "PositionThird", 67, 56_065, 1);
+        let mut outsider = register_channel_session(&mut world, "PositionOutsider", 67, 56_067, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 22),
+            Ipv4Addr::new(192, 0, 2, 22),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 23),
+            Ipv4Addr::new(192, 0, 2, 22),
+        );
+        enter_myroom(
+            &mut world,
+            &third.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 24),
+            Ipv4Addr::new(192, 0, 2, 22),
+        );
+        let revision = world.myroom.revision();
+        let first = CharacterPositionRequest {
+            slot: 1,
+            transform: [1.0, -2.0, 3.0, -4.0, 5.0, -6.0],
+        };
+        let first_packet =
+            serialize_character_position(i32::from(first.slot), first.transform).unwrap();
+
+        world
+            .myroom_peer_command(
+                visitor.session,
+                MyRoomPeerCommandPayload::CharacterPosition(first),
+            )
+            .unwrap();
+        assert_eq!(take_single_packet(&mut owner.outbound), first_packet);
+        assert_eq!(take_single_packet(&mut third.outbound), first_packet);
+        assert!(visitor.outbound.try_recv().is_err());
+        assert_eq!(
+            world.myroom.revision(),
+            revision,
+            "an ephemeral position update cannot mutate MyRoom topology"
+        );
+
+        world
+            .myroom_peer_command(
+                visitor.session,
+                MyRoomPeerCommandPayload::CharacterPosition(CharacterPositionRequest {
+                    slot: 0,
+                    transform: [7.0; 6],
+                }),
+            )
+            .unwrap();
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(third.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        world
+            .myroom_peer_command(
+                outsider.session,
+                MyRoomPeerCommandPayload::CharacterPosition(CharacterPositionRequest {
+                    slot: 0,
+                    transform: [8.0; 6],
+                }),
+            )
+            .unwrap();
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(third.outbound.try_recv().is_err());
+        assert!(outsider.outbound.try_recv().is_err());
+
+        let sentinel = vec![0x51, 0x36];
+        world.sessions[&third.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(sentinel.clone()))
+            .unwrap();
+        let retry = CharacterPositionRequest {
+            slot: 1,
+            transform: [9.0; 6],
+        };
+        assert!(matches!(
+            world.myroom_peer_command(
+                visitor.session,
+                MyRoomPeerCommandPayload::CharacterPosition(retry),
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == third.session
+        ));
+        assert!(
+            owner.outbound.try_recv().is_err(),
+            "reserving an earlier peer cannot publish a partial fanout"
+        );
+        assert_eq!(take_single_packet(&mut third.outbound), sentinel);
+        assert!(third.outbound.try_recv().is_err());
+
+        world
+            .myroom_peer_command(
+                visitor.session,
+                MyRoomPeerCommandPayload::CharacterPosition(retry),
+            )
+            .unwrap();
+        let retry_packet =
+            serialize_character_position(i32::from(retry.slot), retry.transform).unwrap();
+        assert_eq!(take_single_packet(&mut owner.outbound), retry_packet);
+        assert_eq!(take_single_packet(&mut third.outbound), retry_packet);
+        assert!(visitor.outbound.try_recv().is_err());
+        assert_eq!(world.myroom.revision(), revision);
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_myroom_character_position_ack_still_publishes() {
+        let mut world = World::default();
+        let mut owner =
+            register_channel_session(&mut world, "DroppedPositionAckOwner", 67, 56_069, 8);
+        let mut visitor =
+            register_channel_session(&mut world, "DroppedPositionAckVisitor", 67, 56_071, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 25),
+            Ipv4Addr::new(192, 0, 2, 25),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 26),
+            Ipv4Addr::new(192, 0, 2, 25),
+        );
+        let request = CharacterPositionRequest {
+            slot: 1,
+            transform: [10.0; 6],
+        };
+        let (reply, response) = oneshot::channel();
+        drop(response);
+
+        assert!(
+            !dispatch_command(
+                &mut world,
+                WorldCommand::MyRoomPeer {
+                    session: visitor.session,
+                    payload: MyRoomPeerCommandPayload::CharacterPosition(request),
+                    reply,
+                },
+                &WorldSidecars::default(),
+                &ServerClock::new(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_character_position(i32::from(request.slot), request.transform).unwrap()
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[tokio::test]
+    async fn quiesce_rejects_myroom_character_position_before_publication() {
+        let request = CharacterPositionRequest {
+            slot: 0,
+            transform: [11.0; 6],
+        };
+        let (reply, response) = oneshot::channel();
+        assert!(
+            super::admit_command_during_quiesce(WorldCommand::MyRoomPeer {
+                session: SessionId::new(1),
+                payload: MyRoomPeerCommandPayload::CharacterPosition(request),
+                reply,
+            })
+            .is_none()
+        );
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(WorldError::OutboundProductionClosed)
+        ));
+    }
+
+    #[test]
     fn myroom_secede_backpressure_releases_prior_permits_and_rolls_back() {
         let mut world = World::default();
         let mut owner = register_channel_session(&mut world, "BackpressureOwner", 67, 56_070, 1);
@@ -16635,6 +16929,59 @@ mod tests {
             outsider.outbound.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn stale_myroom_session_cannot_publish_character_position_after_migration() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "PositionFenceOwner", 67, 56_106, 8);
+        let visitor = register_channel_session(&mut world, "PositionFenceVisitor", 67, 56_108, 8);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 48),
+            Ipv4Addr::new(192, 0, 2, 48),
+        );
+        enter_myroom(
+            &mut world,
+            &visitor.identity,
+            &owner.identity,
+            Ipv4Addr::new(192, 0, 2, 49),
+            Ipv4Addr::new(192, 0, 2, 48),
+        );
+        let mut migrated = migrate_channel_session(&mut world, &visitor, 56_109, 8);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut migrated.outbound);
+        let request = CharacterPositionRequest {
+            slot: 1,
+            transform: [12.0; 6],
+        };
+
+        assert!(matches!(
+            world.myroom_peer_command(
+                visitor.session,
+                MyRoomPeerCommandPayload::CharacterPosition(request),
+            ),
+            Err(WorldOperationError::Command(WorldError::Identity(
+                IdentityError::StaleSession(session)
+            ))) if session == visitor.session
+        ));
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(migrated.outbound.try_recv().is_err());
+
+        world
+            .myroom_peer_command(
+                migrated.session,
+                MyRoomPeerCommandPayload::CharacterPosition(request),
+            )
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_character_position(i32::from(request.slot), request.transform).unwrap()
+        );
+        assert!(migrated.outbound.try_recv().is_err());
+        world.myroom.audit_invariants().unwrap();
     }
 
     #[test]
