@@ -40,9 +40,9 @@ use p5136_core::{
         EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
         MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
         parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
-        parse_reenter_request, parse_request_items, parse_secede_request, parse_update_info,
-        plan_owner_item_packets, serialize_check_password_reply, serialize_myroom_info,
-        serialize_owner_item_enchants, serialize_owner_items,
+        parse_reenter_request, parse_request_items, parse_rider_talk, parse_secede_request,
+        parse_update_info, plan_owner_item_packets, serialize_check_password_reply,
+        serialize_myroom_info, serialize_owner_item_enchants, serialize_owner_items,
     },
     nickname::canonical_nickname_key,
     packet::PacketError,
@@ -1674,6 +1674,11 @@ async fn handle_myroom_request(
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    if let Some(payload) = parse_myroom_peer_payload(request, packet)? {
+        execute_myroom_peer_command(world, payload).await?;
+        return Ok(Vec::new());
+    }
+
     match request {
         MyRoomRequest::Enter => {
             execute_myroom_entry(
@@ -1709,14 +1714,6 @@ async fn handle_myroom_request(
         MyRoomRequest::RequestItems => {
             parse_request_items(packet)?;
             execute_myroom_owner_items(world, profiles, session_id, context).await?;
-            return Ok(Vec::new());
-        }
-        MyRoomRequest::CharacterPosition => {
-            execute_myroom_peer_command(
-                world,
-                MyRoomPeerCommandPayload::CharacterPosition(parse_character_position(packet)?),
-            )
-            .await?;
             return Ok(Vec::new());
         }
         MyRoomRequest::Secede => {
@@ -1773,6 +1770,21 @@ async fn handle_myroom_request(
         "applied durable MyRoom owner info to the bound session profile"
     );
     Ok(Vec::new())
+}
+
+fn parse_myroom_peer_payload(
+    request: MyRoomRequest,
+    packet: &[u8],
+) -> Result<Option<MyRoomPeerCommandPayload>, MyRoomProtocolError> {
+    Ok(match request {
+        MyRoomRequest::CharacterPosition => Some(MyRoomPeerCommandPayload::CharacterPosition(
+            parse_character_position(packet)?,
+        )),
+        MyRoomRequest::RiderTalk => Some(MyRoomPeerCommandPayload::RiderTalk(parse_rider_talk(
+            packet,
+        )?)),
+        _ => None,
+    })
 }
 
 async fn handle_myroom_check_password(
@@ -2621,15 +2633,16 @@ mod tests {
         myroom_protocol::{
             CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, CheckPasswordStatus,
             ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart,
-            MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
-            REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets,
-            serialize_character_position, serialize_check_password_reply, serialize_enter_error,
-            serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
-            serialize_owner_item_enchants, serialize_owner_items,
-            serialize_password_enter_myroom_command, serialize_secede_reply, serialize_slot_data,
+            MAX_MYROOM_PASSWORD_UTF16_UNITS, MAX_MYROOM_TALK_UTF16_UNITS, MYROOM_SLOT_COUNT,
+            MyRoomInfo, MyRoomKart, MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune,
+            OWNER_ITEM_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME,
+            RIDER_TALK_NAME, plan_owner_item_packets, serialize_character_position,
+            serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
+            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
+            serialize_owner_items, serialize_password_enter_myroom_command, serialize_rider_echo,
+            serialize_secede_reply, serialize_slot_data,
         },
-        packet::{PacketReader, PacketWriter},
+        packet::{PacketError, PacketReader, PacketWriter},
         race_protocol::{
             GameControlRequest, RaceProtocolError, RaceRequest, parse_game_control_request,
         },
@@ -2999,6 +3012,12 @@ mod tests {
         let mut packet = PacketWriter::named("GameTeamBoosterRequestAddGaugePacket");
         packet.write_u8(team);
         packet.write_f32(contribution);
+        packet.into_inner()
+    }
+
+    fn rider_talk_packet(message: &str) -> Vec<u8> {
+        let mut packet = PacketWriter::named(RIDER_TALK_NAME);
+        packet.write_utf16(message).unwrap();
         packet.into_inner()
     }
 
@@ -5199,6 +5218,219 @@ mod tests {
         assert_eq!(
             visitor.outbound.try_recv().unwrap().into_packets(),
             vec![second]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_rider_talk_dispatches_canonical_echo_without_sender_echo() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let visitor_services = SessionServices {
+            session_id: visitor.session,
+            ..owner_services
+        };
+
+        let owner_talk = rider_talk_packet("owner says hello");
+        assert!(
+            dispatch_packet(&owner_services, &owner_talk, &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_rider_echo(0, "owner says hello").unwrap()]
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        let maximum_message = "🏎".repeat(MAX_MYROOM_TALK_UTF16_UNITS / 2);
+        let visitor_talk = rider_talk_packet(&maximum_message);
+        assert!(
+            dispatch_packet(&visitor_services, &visitor_talk, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_rider_echo(1, &maximum_message).unwrap()]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let empty_talk = rider_talk_packet("");
+        assert!(
+            dispatch_packet(&visitor_services, &empty_talk, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_rider_echo(1, "").unwrap()]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_rider_talk_silently_drops_every_sender_when_talk_lock_is_zero() {
+        let fixture = spawn_myroom_world(MyRoomInfo {
+            talk_lock: 0,
+            ..MyRoomInfo::default()
+        });
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let visitor_services = SessionServices {
+            session_id: visitor.session,
+            ..owner_services
+        };
+
+        assert!(
+            dispatch_packet(
+                &owner_services,
+                &rider_talk_packet("owner bypass attempt"),
+                &mut owner_context,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            dispatch_packet(
+                &visitor_services,
+                &rider_talk_packet("visitor bypass attempt"),
+                &mut visitor_context,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_rider_talk_rejects_malformed_input_before_actor_fanout() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+
+        let valid = rider_talk_packet("still alive");
+        let mut trailing = valid.clone();
+        trailing.push(0xa5);
+        assert!(matches!(
+            dispatch_packet(&services, &trailing, &mut visitor_context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::TrailingBytes {
+                    name: RIDER_TALK_NAME,
+                    count: 1,
+                }
+            ))
+        ));
+        assert!(matches!(
+            dispatch_packet(&services, &valid[..valid.len() - 1], &mut visitor_context,).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::Packet(PacketError::Truncated { .. })
+            ))
+        ));
+
+        let mut negative = PacketWriter::named(RIDER_TALK_NAME);
+        negative.write_i32(-1);
+        assert!(matches!(
+            dispatch_packet(&services, negative.as_slice(), &mut visitor_context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::Packet(PacketError::NegativeStringLength(-1))
+            ))
+        ));
+
+        let mut invalid_utf16 = PacketWriter::named(RIDER_TALK_NAME);
+        invalid_utf16.write_i32(1);
+        invalid_utf16.write_u16(0xd800);
+        assert!(matches!(
+            dispatch_packet(&services, invalid_utf16.as_slice(), &mut visitor_context,).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::Packet(PacketError::InvalidUtf16(_))
+            ))
+        ));
+
+        let oversized_message = "x".repeat(MAX_MYROOM_TALK_UTF16_UNITS + 1);
+        let oversized = rider_talk_packet(&oversized_message);
+        assert!(matches!(
+            dispatch_packet(&services, &oversized, &mut visitor_context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::Packet(PacketError::StringLimitExceeded {
+                    length,
+                    maximum: MAX_MYROOM_TALK_UTF16_UNITS,
+                })
+            )) if length == MAX_MYROOM_TALK_UTF16_UNITS + 1
+        ));
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(visitor.outbound.try_recv().is_err());
+
+        assert!(
+            dispatch_packet(&services, &valid, &mut visitor_context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "typed malformed input must not stop the actor or poison the bound session"
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_rider_echo(1, "still alive").unwrap()]
         );
         assert!(visitor.outbound.try_recv().is_err());
 

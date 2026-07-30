@@ -27,14 +27,14 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Committed baseline before the current tranche:
-`52b35c9 Port strict MyRoom password kind reply`
+`dff997c Port protected MyRoom password flows`
 
 ## Current Rust checkpoint
 
-The current worktree corrects the committed placeholder password response from
-new stock-client static evidence, finishes direct protected-room entry, and
-connects an uncached protected item-password success to a single matching
-follow-up without retaining credential plaintext.
+The current worktree ports `RiderTalk` through the existing actor-owned
+exact-generation peer path. It enforces the authoritative owner's current
+`TalkLock` policy, derives the sender slot from membership, excludes the
+sender, and reserves every peer queue before publishing.
 
 ### MyRoom direct protected entry
 
@@ -225,12 +225,36 @@ follow-up without retaining credential plaintext.
 - Position fanout is stateless: it does not change Hub topology or revision.
   Dropping the requester-side ACK future does not cancel an actor-accepted
   publication, and quiesce rejects new position production before publication.
-- `RiderTalk` deliberately remains unported in this tranche. The C# handler
-  ignores `TalkLock`, but stock-client static analysis now establishes that
-  zero is chat-off and any nonzero value is chat-enabled. The next slice can
-  therefore enforce the authoritative owner policy, canonical sender slot,
-  sender exclusion, and all-peer queue reservation without guessing the flag
-  direction.
+
+### MyRoom RiderTalk
+
+- The stock request is exactly one UTF-16 message. The echo is the
+  authoritative signed `i32` room slot followed by that message. Runtime
+  traces and both client codecs agree on this shape. The client receive handler
+  indexes its roster directly from the slot, so Rust never accepts a
+  client-supplied author or slot.
+- Rust parses before actor admission side effects, requires exact packet
+  exhaustion, and caps input at 256 UTF-16 code units. Negative lengths,
+  truncation, invalid UTF-16, oversized messages, and trailing input are typed
+  protocol errors with no fanout. Empty messages remain wire-compatible. The
+  validated request field is private, move-only, and redacted from `Debug`.
+- Client send- and receive-side static analysis independently establish the
+  counterintuitive legacy flag direction: `TalkLock == 0` disables chat and
+  every nonzero value enables it, with no owner exemption. The Hub projects
+  this as a semantic boolean from the current room state; the World actor
+  checks it in the same turn as membership and audience resolution. A disabled
+  room or authenticated nonmember is a silent, non-disconnecting drop.
+- The C# server ignores `TalkLock` and sends to recipients one at a time after
+  releasing its room lock. Rust deliberately fixes both defects. It uses the
+  actor-owned canonical sender slot, excludes the sender, revalidates every
+  exact-generation peer, reserves all bounded queues, and only then publishes
+  the complete fanout.
+- Rider talk is ephemeral and never mutates Hub topology or revision. One full
+  peer queue drops the whole update and makes it retryable after drain.
+  Migration fences stale sources, dropping the requester ACK cannot cancel an
+  accepted publication, and quiesce rejects production before publication.
+  The 256-unit cap is an explicit Rust amplification bound; the C# parser has
+  no comparable chat-specific limit.
 
 ### MyRoom RequestItems
 
@@ -341,7 +365,7 @@ follow-up without retaining credential plaintext.
   entry, direct protected entry, strict item-password checks and one-shot
   protected owner-item grants, fresh FirstState projection, owner-info
   durability, bounded RequestItems, exact-generation character-position
-  fanout, and Secede.
+  and TalkLock-aware rider-talk fanout, and Secede.
 - Rider equipment/plant persistence is cancellation-independent and refreshes
   the actor caches only after durable confirmation.
 - Graceful shutdown drains wire admission, accepted durable work, completion
@@ -436,11 +460,11 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 637 passed, 0 failed
+# 644 passed, 0 failed
 git diff --check
 ```
 
-The 637 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 371 server
+The 644 tests comprise 9 CLI, 35 connector, 135 core, 80 profile, 377 server
 unit, and 8 server integration tests. Doc-tests also passed.
 
 Focused regressions cover:
@@ -481,6 +505,11 @@ Focused regressions cover:
 - strict character-position input, canonical sender slots, nonmember and
   self-echo suppression, stale-source migration fencing, exact peer packets,
   atomic multi-peer backpressure/retry, dropped ACK, and quiesce rejection;
+- strict bounded rider-talk input including UTF-16 surrogate boundaries,
+  canonical sender echo, empty-message compatibility, sender/nonmember
+  exclusion, live zero/nonzero `TalkLock` policy, stale-source fencing,
+  migrated-recipient routing, atomic multi-peer backpressure/retry, dropped
+  ACK, and quiesce rejection;
 - bounded ready-output flushing.
 
 Production Rust contains no `unsafe` syntax; the workspace also forbids it.
@@ -505,11 +534,11 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Finish TalkLock-aware chat fanout, consume the reserved kind-1/kind-2
-   one-shot grants in the emblem/career flows, add the bounded emblem catalog,
-   main-emblem persistence, P2P-port profile writes, club create/rename
-   refresh, and any request still intentionally classified as a no-op. Finish
-   kart tuning/upgrades and the remaining quest/attendance/progression surface.
+   Consume the reserved kind-1/kind-2 one-shot grants in the emblem/career
+   flows, add the bounded emblem catalog, main-emblem persistence, P2P-port
+   profile writes, club create/rename refresh, and any request still
+   intentionally classified as a no-op. Finish kart tuning/upgrades and the
+   remaining quest/attendance/progression surface.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
    fields; a later storage redesign should add zeroization/at-rest protection
@@ -546,7 +575,10 @@ These items prevent a "port complete" claim.
 
 1. Enumerate every classified request and mark it implemented, intentionally
    unsupported with a typed response, or capture-blocked. No silent fallthrough.
-2. Preserve the now-explicit separation between direct room-password entry and
+2. Implement the bounded `RequestEmblems` and durable `UpdateMainEmblem`
+   vertical slices next, consuming only the exact matching kind-1 grant for a
+   protected visitor catalog request. Preserve the now-explicit separation
+   between direct room-password entry and
    item-password UI checks. Keep one-shot grants move-only, plaintext-free, and
    scoped to exact requester/owner generations plus owner-info revision.
    Connect the reserved Emblem and Career resources only when their matching

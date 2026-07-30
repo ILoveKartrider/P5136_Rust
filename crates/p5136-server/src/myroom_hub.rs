@@ -560,6 +560,7 @@ pub(crate) enum MyRoomDisconnectOutcome {
 pub(crate) struct PeerAudience {
     pub(crate) owner: UserNo,
     pub(crate) sender_slot: MyRoomSlotIndex,
+    pub(crate) rider_talk_enabled: bool,
     pub(crate) peers: Vec<IdentityBinding>,
 }
 
@@ -1523,8 +1524,8 @@ impl MyRoomHub {
         identity: &IdentityBinding,
     ) -> Result<PeerAudience, MyRoomHubError> {
         let membership = self.membership_exact(identity)?;
-        let peers = self
-            .room(membership.owner)?
+        let room = self.room(membership.owner)?;
+        let peers = room
             .audience()
             .into_iter()
             .filter(|peer| peer.user_no != identity.user_no)
@@ -1532,6 +1533,7 @@ impl MyRoomHub {
         Ok(PeerAudience {
             owner: membership.owner.user_no(),
             sender_slot: membership.slot,
+            rider_talk_enabled: room.info.rider_talk_enabled(),
             peers,
         })
     }
@@ -1544,8 +1546,8 @@ impl MyRoomHub {
         let Some(membership) = self.membership_if_member(identity)? else {
             return Ok(None);
         };
-        let peers = self
-            .room(OwnerKey(membership.owner))?
+        let room = self.room(OwnerKey(membership.owner))?;
+        let peers = room
             .audience()
             .into_iter()
             .filter(|peer| peer.user_no != identity.user_no)
@@ -1553,6 +1555,7 @@ impl MyRoomHub {
         Ok(Some(PeerAudience {
             owner: membership.owner,
             sender_slot: membership.slot,
+            rider_talk_enabled: room.info.rider_talk_enabled(),
             peers,
         }))
     }
@@ -4314,10 +4317,26 @@ mod tests {
         enter(&mut hub, participant(&second), owner(&owner_id)).unwrap();
         let audience = hub.peer_audience(&first).unwrap();
         assert_eq!(audience.sender_slot.get(), 1);
+        assert!(audience.rider_talk_enabled);
         assert_eq!(
             user_numbers(&audience.peers),
             vec![owner_id.user_no.get(), second.user_no.get()]
         );
+
+        let mut info = hub.room_info(owner_id.user_no).unwrap().clone();
+        info.talk_lock = 0;
+        hub.update_owner_info(&owner_id, info.clone())
+            .unwrap()
+            .commit(&mut hub)
+            .unwrap();
+        assert!(!hub.peer_audience(&first).unwrap().rider_talk_enabled);
+
+        info.talk_lock = 2;
+        hub.update_owner_info(&owner_id, info)
+            .unwrap()
+            .commit(&mut hub)
+            .unwrap();
+        assert!(hub.peer_audience(&first).unwrap().rider_talk_enabled);
         hub.audit_invariants().unwrap();
     }
 

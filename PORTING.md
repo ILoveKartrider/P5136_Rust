@@ -78,6 +78,7 @@ been demonstrated.
 - [x] exact requester/owner-generation item authorization and stale-plan retry
 - [x] visitor secret redaction and one-shot protected owner-item authorization
 - [x] exact-generation MyRoom character-position peer fanout
+- [x] TalkLock-aware MyRoom rider-talk atomic peer fanout
 - [x] direct MyRoom self-bootstrap and actor-tracked public/protected entry
 - [x] current-membership Reenter and bounded random public-room entry
 - [x] strict MyRoom item-password status flow and one-shot owner-item grant
@@ -86,7 +87,7 @@ been demonstrated.
 - [x] finish, ranking, settlement, team booster, and DNF deadline
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
-- [ ] MyRoom talk, emblem-catalog, and main-emblem flows
+- [ ] MyRoom emblem-catalog and main-emblem flows
 - [ ] P2P-port and club-name profile mutation/refresh paths
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface
 - [ ] race-wide multi-profile reward journal/recovery

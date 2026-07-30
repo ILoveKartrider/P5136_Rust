@@ -119,6 +119,17 @@ pub struct MyRoomInfo {
     pub kart_2: i16,
 }
 
+impl MyRoomInfo {
+    /// Returns the stock client's effective room-chat policy.
+    ///
+    /// Despite the legacy `TalkLock` field name, client static analysis shows
+    /// that zero disables sending and every nonzero value enables it.
+    #[must_use]
+    pub const fn rider_talk_enabled(&self) -> bool {
+        self.talk_lock != 0
+    }
+}
+
 impl Default for MyRoomInfo {
     fn default() -> Self {
         Self {
@@ -141,9 +152,27 @@ pub struct CharacterPositionRequest {
     pub transform: [f32; 6],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct RiderTalkRequest {
-    pub message: String,
+    message: String,
+}
+
+impl RiderTalkRequest {
+    pub fn new(message: String) -> Result<Self, MyRoomProtocolError> {
+        validate_string("MyRoom talk message", &message, MAX_MYROOM_TALK_UTF16_UNITS)?;
+        Ok(Self { message })
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Debug for RiderTalkRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RiderTalkRequest([REDACTED])")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -424,7 +453,7 @@ pub fn parse_rider_talk(packet: &[u8]) -> Result<RiderTalkRequest, MyRoomProtoco
     expect_hash(&mut reader, RIDER_TALK_NAME)?;
     let message = reader.read_utf16_bounded(MAX_MYROOM_TALK_UTF16_UNITS)?;
     ensure_exhausted(&reader, RIDER_TALK_NAME)?;
-    Ok(RiderTalkRequest { message })
+    RiderTalkRequest::new(message)
 }
 
 pub fn parse_check_password(packet: &[u8]) -> Result<CheckPasswordRequest, MyRoomProtocolError> {
@@ -1297,6 +1326,10 @@ mod tests {
     #[test]
     fn parses_info_position_talk_password_and_emblem_updates() {
         let info = sample_info();
+        assert!(!info.rider_talk_enabled());
+        let mut chat_enabled = info.clone();
+        chat_enabled.talk_lock = 2;
+        assert!(chat_enabled.rider_talk_enabled());
         let mut update = PacketWriter::named(NOTIFY_MYROOM_INFO_NAME);
         info_body(&mut update, &info);
         assert_eq!(parse_update_info(update.as_slice()).unwrap(), info);
@@ -1319,7 +1352,9 @@ mod tests {
 
         let mut talk = PacketWriter::named(RIDER_TALK_NAME);
         talk.write_utf16("hello").unwrap();
-        assert_eq!(parse_rider_talk(talk.as_slice()).unwrap().message, "hello");
+        let parsed_talk = parse_rider_talk(talk.as_slice()).unwrap();
+        assert_eq!(parsed_talk.message(), "hello");
+        assert!(!format!("{parsed_talk:?}").contains("hello"));
 
         let mut password = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
         password.write_i32(1);
@@ -1836,11 +1871,81 @@ mod tests {
             serialize_myroom_info(&info),
             Err(MyRoomProtocolError::StringTooLong { .. })
         ));
+    }
 
+    #[test]
+    fn rider_talk_bounds_and_malformed_packets_are_rejected() {
         let oversized_message = "x".repeat(MAX_MYROOM_TALK_UTF16_UNITS + 1);
+        let mut oversized_talk = PacketWriter::named(RIDER_TALK_NAME);
+        oversized_talk.write_utf16(&oversized_message).unwrap();
+        assert!(matches!(
+            parse_rider_talk(oversized_talk.as_slice()),
+            Err(MyRoomProtocolError::Packet(
+                crate::packet::PacketError::StringLimitExceeded {
+                    length,
+                    maximum: MAX_MYROOM_TALK_UTF16_UNITS,
+                }
+            )) if length == MAX_MYROOM_TALK_UTF16_UNITS + 1
+        ));
         assert!(matches!(
             serialize_rider_echo(0, &oversized_message),
             Err(MyRoomProtocolError::StringTooLong { .. })
         ));
+
+        let mut talk = PacketWriter::named(RIDER_TALK_NAME);
+        talk.write_utf16("bounded talk").unwrap();
+        let mut trailing_talk = talk.as_slice().to_vec();
+        trailing_talk.push(0xa5);
+        assert!(matches!(
+            parse_rider_talk(&trailing_talk),
+            Err(MyRoomProtocolError::TrailingBytes {
+                name: RIDER_TALK_NAME,
+                count: 1,
+            })
+        ));
+        assert!(matches!(
+            parse_rider_talk(&talk.as_slice()[..talk.as_slice().len() - 1]),
+            Err(MyRoomProtocolError::Packet(_))
+        ));
+
+        let mut negative_talk = PacketWriter::named(RIDER_TALK_NAME);
+        negative_talk.write_i32(-1);
+        assert!(matches!(
+            parse_rider_talk(negative_talk.as_slice()),
+            Err(MyRoomProtocolError::Packet(
+                crate::packet::PacketError::NegativeStringLength(-1)
+            ))
+        ));
+
+        let mut invalid_utf16_talk = PacketWriter::named(RIDER_TALK_NAME);
+        invalid_utf16_talk.write_i32(1);
+        invalid_utf16_talk.write_u16(0xd800);
+        assert!(matches!(
+            parse_rider_talk(invalid_utf16_talk.as_slice()),
+            Err(MyRoomProtocolError::Packet(
+                crate::packet::PacketError::InvalidUtf16(_)
+            ))
+        ));
+
+        let exact_surrogate_pair_message = "🏎".repeat(MAX_MYROOM_TALK_UTF16_UNITS / 2);
+        let mut exact_surrogate_pair_talk = PacketWriter::named(RIDER_TALK_NAME);
+        exact_surrogate_pair_talk
+            .write_utf16(&exact_surrogate_pair_message)
+            .unwrap();
+        assert_eq!(
+            parse_rider_talk(exact_surrogate_pair_talk.as_slice())
+                .unwrap()
+                .message(),
+            exact_surrogate_pair_message
+        );
+
+        let mut empty_talk = PacketWriter::named(RIDER_TALK_NAME);
+        empty_talk.write_utf16("").unwrap();
+        assert!(
+            parse_rider_talk(empty_talk.as_slice())
+                .unwrap()
+                .message()
+                .is_empty()
+        );
     }
 }
