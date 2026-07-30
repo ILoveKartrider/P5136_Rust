@@ -74,11 +74,13 @@ use p5136_core::{
     },
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
-        classify_startup_request, is_startup_noop, parse_pq_get_rider_task_context,
-        parse_pq_locked_item_get, parse_pq_ranker_info, parse_pq_request_extradata,
-        parse_pq_rider_school_expired_check, parse_pq_start_rider_school,
-        parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
-        parse_pq_web_event_complete_check,
+        classify_startup_request, is_startup_noop, parse_pq_favorite_track_map_get,
+        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_ranker_info,
+        parse_pq_request_extradata, parse_pq_rider_school_expired_check,
+        parse_pq_start_rider_school, parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
+        parse_pq_web_event_complete_check, parse_sp_rq_get_cash_inventory,
+        parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance, parse_sp_rq_remain_cash,
+        parse_sp_rq_remain_tc_cash,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
@@ -3225,6 +3227,12 @@ async fn handle_startup_request(
             parse_pq_rider_school_expired_check(packet)?;
         }
         StartupRequest::RankerInfo => parse_pq_ranker_info(packet)?,
+        StartupRequest::GetMaxGiftId => parse_sp_rq_get_max_gift_id(packet)?,
+        StartupRequest::KoinBalance => parse_sp_rq_koin_balance(packet)?,
+        StartupRequest::FavoriteTrackMap => parse_pq_favorite_track_map_get(packet)?,
+        StartupRequest::GetCashInventory => parse_sp_rq_get_cash_inventory(packet)?,
+        StartupRequest::RemainCash => parse_sp_rq_remain_cash(packet)?,
+        StartupRequest::RemainTcCash => parse_sp_rq_remain_tc_cash(packet)?,
         StartupRequest::LockedItemList => parse_pq_locked_item_get(packet)?,
         StartupRequest::RequestExtradata => parse_pq_request_extradata(packet)?,
         StartupRequest::WebEventCompleteCheck => parse_pq_web_event_complete_check(packet)?,
@@ -3326,6 +3334,14 @@ fn startup_response(
             startup::serialize_pr_rider_school_expired_check()
         }
         StartupRequest::RankerInfo => startup::serialize_pr_ranker_info(profile.rider.ranker),
+        StartupRequest::GetMaxGiftId => startup::serialize_sp_rp_get_max_gift_id(),
+        StartupRequest::KoinBalance => startup::serialize_sp_rp_koin_balance(profile.rider.koin),
+        StartupRequest::FavoriteTrackMap => startup::serialize_empty_pr_favorite_track_map_get(),
+        StartupRequest::GetCashInventory => startup::serialize_empty_sp_rp_get_cash_inventory(),
+        StartupRequest::RemainCash => startup::serialize_sp_rp_remain_cash(profile.rider.cash),
+        StartupRequest::RemainTcCash => {
+            startup::serialize_sp_rp_remain_tc_cash(profile.rider.tc_cash)
+        }
         StartupRequest::ChannelStatic => startup::serialize_channel_static_reply(),
         StartupRequest::DynamicCommand => startup::serialize_pr_dynamic_command(),
         StartupRequest::PublicCommand => startup::serialize_pr_public_command(),
@@ -4623,6 +4639,89 @@ mod tests {
             Err(LoginSessionError::UnsupportedIdentityPacket { hash: actual })
                 if actual == hash
         ));
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_dispatch_replies_to_read_only_menu_store_initialization_queries() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_707))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "MenuStoreInitialization")
+            .await
+            .unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create(&identity.nickname).unwrap();
+        store
+            .update(&identity.nickname, |profile| {
+                profile.rider.koin = 0x1122_3344;
+                profile.rider.cash = 0x5566_7788;
+                profile.rider.tc_cash = 0x99AA_BBCC;
+            })
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let before_revision = store.load_or_create(&identity.nickname).unwrap().revision;
+
+        for (request_name, expected) in [
+            (
+                "SpRqGetMaxGiftIdPacket",
+                vec![0x5A, 0x08, 0xA1, 0x5E, 0, 0, 0, 0],
+            ),
+            (
+                "SpRqKoinBalance",
+                vec![0xBC, 0x05, 0x40, 0x2D, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0],
+            ),
+            (
+                "PqFavoriteTrackMapGet",
+                vec![0x35, 0x08, 0x52, 0x5A, 0, 0, 0, 0],
+            ),
+            (
+                "SpRqGetCashInventoryPacket",
+                vec![0x4A, 0x0A, 0x5C, 0x87, 0, 0, 0, 0, 0],
+            ),
+            (
+                "SpRqRemainCashPacket",
+                vec![0xB8, 0x07, 0xDB, 0x4F, 0, 0, 0, 0, 0x88, 0x77, 0x66, 0x55],
+            ),
+            (
+                "SpRqRemainTcCashPacket",
+                vec![0x6F, 0x08, 0xCE, 0x5F, 99, 0, 0, 0, 0xCC, 0xBB, 0xAA, 0x99],
+            ),
+        ] {
+            let request = PacketWriter::named(request_name).into_inner();
+            assert_eq!(
+                dispatch_packet(&services, &request, &mut context)
+                    .await
+                    .unwrap(),
+                vec![expected]
+            );
+        }
+
+        let after = store.load_or_create(&identity.nickname).unwrap();
+        assert_eq!(after.revision, before_revision);
+        assert_eq!(after.profile.rider.koin, 0x1122_3344);
+        assert_eq!(after.profile.rider.cash, 0x5566_7788);
+        assert_eq!(after.profile.rider.tc_cash, 0x99AA_BBCC);
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),
             identity

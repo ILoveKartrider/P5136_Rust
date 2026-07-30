@@ -46,6 +46,30 @@ pub const RANKER_INFO_REQUEST_NAME: &str = "PqRankerInfoPacket";
 pub const RANKER_INFO_REPLY_NAME: &str = "PrRankerInfoPacket";
 pub const RANKER_INFO_REQUEST_HASH: u32 = 0x41C6_0708;
 pub const RANKER_INFO_REPLY_HASH: u32 = 0x41D7_0709;
+pub const GET_MAX_GIFT_ID_REQUEST_NAME: &str = "SpRqGetMaxGiftIdPacket";
+pub const GET_MAX_GIFT_ID_REPLY_NAME: &str = "SpRpGetMaxGiftIdPacket";
+pub const GET_MAX_GIFT_ID_REQUEST_HASH: u32 = 0x5EB4_085B;
+pub const GET_MAX_GIFT_ID_REPLY_HASH: u32 = 0x5EA1_085A;
+pub const KOIN_BALANCE_REQUEST_NAME: &str = "SpRqKoinBalance";
+pub const KOIN_BALANCE_REPLY_NAME: &str = "SpRpKoinBalance";
+pub const KOIN_BALANCE_REQUEST_HASH: u32 = 0x2D4C_05BD;
+pub const KOIN_BALANCE_REPLY_HASH: u32 = 0x2D40_05BC;
+pub const FAVORITE_TRACK_MAP_REQUEST_NAME: &str = "PqFavoriteTrackMapGet";
+pub const FAVORITE_TRACK_MAP_REPLY_NAME: &str = "PrFavoriteTrackMapGet";
+pub const FAVORITE_TRACK_MAP_REQUEST_HASH: u32 = 0x5A3E_0834;
+pub const FAVORITE_TRACK_MAP_REPLY_HASH: u32 = 0x5A52_0835;
+pub const GET_CASH_INVENTORY_REQUEST_NAME: &str = "SpRqGetCashInventoryPacket";
+pub const GET_CASH_INVENTORY_REPLY_NAME: &str = "SpRpGetCashInventoryPacket";
+pub const GET_CASH_INVENTORY_REQUEST_HASH: u32 = 0x8773_0A4B;
+pub const GET_CASH_INVENTORY_REPLY_HASH: u32 = 0x875C_0A4A;
+pub const REMAIN_CASH_REQUEST_NAME: &str = "SpRqRemainCashPacket";
+pub const REMAIN_CASH_REPLY_NAME: &str = "SpRpRemainCashPacket";
+pub const REMAIN_CASH_REQUEST_HASH: u32 = 0x4FEC_07B9;
+pub const REMAIN_CASH_REPLY_HASH: u32 = 0x4FDB_07B8;
+pub const REMAIN_TC_CASH_REQUEST_NAME: &str = "SpRqRemainTcCashPacket";
+pub const REMAIN_TC_CASH_REPLY_NAME: &str = "SpRpRemainTcCashPacket";
+pub const REMAIN_TC_CASH_REQUEST_HASH: u32 = 0x5FE1_0870;
+pub const REMAIN_TC_CASH_REPLY_HASH: u32 = 0x5FCE_086F;
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -112,6 +136,12 @@ pub enum StartupRequest {
     RiderSchoolExpiredCheck,
     StartRiderSchool,
     RankerInfo,
+    GetMaxGiftId,
+    KoinBalance,
+    FavoriteTrackMap,
+    GetCashInventory,
+    RemainCash,
+    RemainTcCash,
     ChannelStatic,
     DynamicCommand,
     PublicCommand,
@@ -147,6 +177,12 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::RiderSchoolExpiredCheck,
     StartupRequest::StartRiderSchool,
     StartupRequest::RankerInfo,
+    StartupRequest::GetMaxGiftId,
+    StartupRequest::KoinBalance,
+    StartupRequest::FavoriteTrackMap,
+    StartupRequest::GetCashInventory,
+    StartupRequest::RemainCash,
+    StartupRequest::RemainTcCash,
     StartupRequest::ChannelStatic,
     StartupRequest::DynamicCommand,
     StartupRequest::PublicCommand,
@@ -185,6 +221,12 @@ impl StartupRequest {
             Self::RiderSchoolExpiredCheck => RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME,
             Self::StartRiderSchool => START_RIDER_SCHOOL_REQUEST_NAME,
             Self::RankerInfo => RANKER_INFO_REQUEST_NAME,
+            Self::GetMaxGiftId => GET_MAX_GIFT_ID_REQUEST_NAME,
+            Self::KoinBalance => KOIN_BALANCE_REQUEST_NAME,
+            Self::FavoriteTrackMap => FAVORITE_TRACK_MAP_REQUEST_NAME,
+            Self::GetCashInventory => GET_CASH_INVENTORY_REQUEST_NAME,
+            Self::RemainCash => REMAIN_CASH_REQUEST_NAME,
+            Self::RemainTcCash => REMAIN_TC_CASH_REQUEST_NAME,
             Self::ChannelStatic => "ChRequestChStaticRequestPacket",
             Self::DynamicCommand => "PqDynamicCommand",
             Self::PublicCommand => "PqPubCommandPacket",
@@ -223,6 +265,12 @@ impl StartupRequest {
             Self::RiderSchoolExpiredCheck => Some(RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME),
             Self::StartRiderSchool => Some(START_RIDER_SCHOOL_REPLY_NAME),
             Self::RankerInfo => Some(RANKER_INFO_REPLY_NAME),
+            Self::GetMaxGiftId => Some(GET_MAX_GIFT_ID_REPLY_NAME),
+            Self::KoinBalance => Some(KOIN_BALANCE_REPLY_NAME),
+            Self::FavoriteTrackMap => Some(FAVORITE_TRACK_MAP_REPLY_NAME),
+            Self::GetCashInventory => Some(GET_CASH_INVENTORY_REPLY_NAME),
+            Self::RemainCash => Some(REMAIN_CASH_REPLY_NAME),
+            Self::RemainTcCash => Some(REMAIN_TC_CASH_REPLY_NAME),
             Self::ChannelStatic => Some("ChRequestChStaticReplyPacket"),
             Self::DynamicCommand => Some("PrDynamicCommand"),
             Self::PublicCommand => Some("PrPubCommandPacket"),
@@ -402,6 +450,36 @@ pub fn parse_pq_rider_school_expired_check(packet: &[u8]) -> Result<(), StartupE
 /// Parses the stock client's exact hash-only ranker-info request.
 pub fn parse_pq_ranker_info(packet: &[u8]) -> Result<(), StartupError> {
     parse_hash_only_request(packet, RANKER_INFO_REQUEST_NAME)
+}
+
+/// Parses the exact hash-only gift sequence query observed in the startup log.
+pub fn parse_sp_rq_get_max_gift_id(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, GET_MAX_GIFT_ID_REQUEST_NAME)
+}
+
+/// Parses the exact hash-only KOIN balance query.
+pub fn parse_sp_rq_koin_balance(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, KOIN_BALANCE_REQUEST_NAME)
+}
+
+/// Parses the exact hash-only favorite-track projection query.
+pub fn parse_pq_favorite_track_map_get(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, FAVORITE_TRACK_MAP_REQUEST_NAME)
+}
+
+/// Parses the exact hash-only cash-inventory query.
+pub fn parse_sp_rq_get_cash_inventory(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, GET_CASH_INVENTORY_REQUEST_NAME)
+}
+
+/// Parses the exact hash-only Cash balance query.
+pub fn parse_sp_rq_remain_cash(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, REMAIN_CASH_REQUEST_NAME)
+}
+
+/// Parses the exact hash-only TC Cash balance query.
+pub fn parse_sp_rq_remain_tc_cash(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, REMAIN_TC_CASH_REQUEST_NAME)
 }
 
 /// Parses the stock client's exact hash-only extra-data request.
@@ -738,6 +816,65 @@ pub fn serialize_pr_ranker_info(ranker: u8) -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the terminal empty gift-sequence state used by a new profile.
+#[must_use]
+pub fn serialize_sp_rp_get_max_gift_id() -> Vec<u8> {
+    let mut packet = PacketWriter::named(GET_MAX_GIFT_ID_REPLY_NAME);
+    packet.write_i32(0);
+    packet.into_inner()
+}
+
+/// Serializes the profile-backed KOIN balance and the stock zero suffix.
+#[must_use]
+pub fn serialize_sp_rp_koin_balance(koin: u32) -> Vec<u8> {
+    let mut packet = PacketWriter::named(KOIN_BALANCE_REPLY_NAME);
+    packet.write_u32(koin);
+    packet.write_u32(0);
+    packet.into_inner()
+}
+
+/// Serializes an empty favorite-track projection.
+///
+/// Rust does not yet persist favorite tracks, so it exposes an honest empty
+/// theme list rather than reading the mutable C# sidecar without a lease.
+#[must_use]
+pub fn serialize_empty_pr_favorite_track_map_get() -> Vec<u8> {
+    let mut packet = PacketWriter::named(FAVORITE_TRACK_MAP_REPLY_NAME);
+    packet.write_i32(0);
+    packet.into_inner()
+}
+
+/// Serializes the stock terminal empty cash-inventory projection.
+#[must_use]
+pub fn serialize_empty_sp_rp_get_cash_inventory() -> Vec<u8> {
+    let mut packet = PacketWriter::named(GET_CASH_INVENTORY_REPLY_NAME);
+    packet.write_i32(0);
+    packet.write_u8(0);
+    packet.into_inner()
+}
+
+/// Serializes the profile-backed Cash balance and its stock zero prefix.
+#[must_use]
+pub fn serialize_sp_rp_remain_cash(cash: u32) -> Vec<u8> {
+    let mut packet = PacketWriter::named(REMAIN_CASH_REPLY_NAME);
+    packet.write_u32(0);
+    packet.write_u32(cash);
+    packet.into_inner()
+}
+
+/// Serializes the profile-backed TC Cash balance.
+///
+/// Both the stock-era and current C# handlers emit `99` as the leading
+/// protocol value. Its business meaning is unknown, so Rust preserves the
+/// established wire constant without treating it as profile state.
+#[must_use]
+pub fn serialize_sp_rp_remain_tc_cash(tc_cash: u32) -> Vec<u8> {
+    let mut packet = PacketWriter::named(REMAIN_TC_CASH_REPLY_NAME);
+    packet.write_u32(99);
+    packet.write_u32(tc_cash);
+    packet.into_inner()
+}
+
 /// Serializes the legacy four-byte server clock representation.
 #[must_use]
 pub fn serialize_pr_server_time(time: LegacyTime) -> Vec<u8> {
@@ -889,11 +1026,21 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        GET_RIDER_TASK_CONTEXT_REPLY_HASH, GET_RIDER_TASK_CONTEXT_REPLY_NAME,
-        GET_RIDER_TASK_CONTEXT_REQUEST_HASH, GET_RIDER_TASK_CONTEXT_REQUEST_NAME, GameOptions,
+        FAVORITE_TRACK_MAP_REPLY_HASH, FAVORITE_TRACK_MAP_REPLY_NAME,
+        FAVORITE_TRACK_MAP_REQUEST_HASH, FAVORITE_TRACK_MAP_REQUEST_NAME,
+        GET_CASH_INVENTORY_REPLY_HASH, GET_CASH_INVENTORY_REPLY_NAME,
+        GET_CASH_INVENTORY_REQUEST_HASH, GET_CASH_INVENTORY_REQUEST_NAME,
+        GET_MAX_GIFT_ID_REPLY_HASH, GET_MAX_GIFT_ID_REPLY_NAME, GET_MAX_GIFT_ID_REQUEST_HASH,
+        GET_MAX_GIFT_ID_REQUEST_NAME, GET_RIDER_TASK_CONTEXT_REPLY_HASH,
+        GET_RIDER_TASK_CONTEXT_REPLY_NAME, GET_RIDER_TASK_CONTEXT_REQUEST_HASH,
+        GET_RIDER_TASK_CONTEXT_REQUEST_NAME, GameOptions, KOIN_BALANCE_REPLY_HASH,
+        KOIN_BALANCE_REPLY_NAME, KOIN_BALANCE_REQUEST_HASH, KOIN_BALANCE_REQUEST_NAME,
         LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME, MAX_GAME_OPTION_TRAILING_BYTES,
         PrGetRiderFields, RANKER_INFO_REPLY_HASH, RANKER_INFO_REPLY_NAME, RANKER_INFO_REQUEST_HASH,
-        RANKER_INFO_REQUEST_NAME, REQUEST_EXTRADATA_REPLY_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
+        RANKER_INFO_REQUEST_NAME, REMAIN_CASH_REPLY_HASH, REMAIN_CASH_REPLY_NAME,
+        REMAIN_CASH_REQUEST_HASH, REMAIN_CASH_REQUEST_NAME, REMAIN_TC_CASH_REPLY_HASH,
+        REMAIN_TC_CASH_REPLY_NAME, REMAIN_TC_CASH_REQUEST_HASH, REMAIN_TC_CASH_REQUEST_NAME,
+        REQUEST_EXTRADATA_REPLY_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
         RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, RIDER_SCHOOL_EXPIRED_CHECK_REPLY_HASH,
         RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME, RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_HASH,
         RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME, START_RIDER_SCHOOL_REPLY_HASH,
@@ -903,11 +1050,14 @@ mod tests {
         VERSUS_MODE_RANK_ONE_REQUEST_HASH, VERSUS_MODE_RANK_ONE_REQUEST_NAME,
         WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_ranker_info,
-        parse_pq_request_extradata, parse_pq_rider_school_expired_check,
+        parse_pq_favorite_track_map_get, parse_pq_get_rider_task_context, parse_pq_locked_item_get,
+        parse_pq_ranker_info, parse_pq_request_extradata, parse_pq_rider_school_expired_check,
         parse_pq_start_rider_school, parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
-        parse_pq_web_event_complete_check, serialize_channel_static_reply,
-        serialize_empty_locked_item_list, serialize_lo_rp_add_racing_time,
+        parse_pq_web_event_complete_check, parse_sp_rq_get_cash_inventory,
+        parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance, parse_sp_rq_remain_cash,
+        parse_sp_rq_remain_tc_cash, serialize_channel_static_reply,
+        serialize_empty_locked_item_list, serialize_empty_pr_favorite_track_map_get,
+        serialize_empty_sp_rp_get_cash_inventory, serialize_lo_rp_add_racing_time,
         serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
@@ -920,6 +1070,8 @@ mod tests {
         serialize_pr_server_time, serialize_pr_set_playtime_event_tick,
         serialize_pr_start_rider_school, serialize_pr_sync_dictionary_info,
         serialize_pr_versus_mode_rank_one, serialize_pr_web_event_complete_check,
+        serialize_sp_rp_get_max_gift_id, serialize_sp_rp_koin_balance, serialize_sp_rp_remain_cash,
+        serialize_sp_rp_remain_tc_cash,
     };
     use crate::{
         adler32, encoded,
@@ -1016,6 +1168,93 @@ mod tests {
         assert_eq!(
             serialize_pr_ranker_info(7),
             [0x09, 0x07, 0xD7, 0x41, 0, 7, 0, 0, 0xC8, 0x42, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn menu_store_startup_queries_preserve_exact_pairs_and_replies() {
+        type HashOnlyParser = fn(&[u8]) -> Result<(), StartupError>;
+        let queries: &[(&str, u32, &str, u32, StartupRequest, HashOnlyParser)] = &[
+            (
+                GET_MAX_GIFT_ID_REQUEST_NAME,
+                GET_MAX_GIFT_ID_REQUEST_HASH,
+                GET_MAX_GIFT_ID_REPLY_NAME,
+                GET_MAX_GIFT_ID_REPLY_HASH,
+                StartupRequest::GetMaxGiftId,
+                parse_sp_rq_get_max_gift_id,
+            ),
+            (
+                KOIN_BALANCE_REQUEST_NAME,
+                KOIN_BALANCE_REQUEST_HASH,
+                KOIN_BALANCE_REPLY_NAME,
+                KOIN_BALANCE_REPLY_HASH,
+                StartupRequest::KoinBalance,
+                parse_sp_rq_koin_balance,
+            ),
+            (
+                FAVORITE_TRACK_MAP_REQUEST_NAME,
+                FAVORITE_TRACK_MAP_REQUEST_HASH,
+                FAVORITE_TRACK_MAP_REPLY_NAME,
+                FAVORITE_TRACK_MAP_REPLY_HASH,
+                StartupRequest::FavoriteTrackMap,
+                parse_pq_favorite_track_map_get,
+            ),
+            (
+                GET_CASH_INVENTORY_REQUEST_NAME,
+                GET_CASH_INVENTORY_REQUEST_HASH,
+                GET_CASH_INVENTORY_REPLY_NAME,
+                GET_CASH_INVENTORY_REPLY_HASH,
+                StartupRequest::GetCashInventory,
+                parse_sp_rq_get_cash_inventory,
+            ),
+            (
+                REMAIN_CASH_REQUEST_NAME,
+                REMAIN_CASH_REQUEST_HASH,
+                REMAIN_CASH_REPLY_NAME,
+                REMAIN_CASH_REPLY_HASH,
+                StartupRequest::RemainCash,
+                parse_sp_rq_remain_cash,
+            ),
+            (
+                REMAIN_TC_CASH_REQUEST_NAME,
+                REMAIN_TC_CASH_REQUEST_HASH,
+                REMAIN_TC_CASH_REPLY_NAME,
+                REMAIN_TC_CASH_REPLY_HASH,
+                StartupRequest::RemainTcCash,
+                parse_sp_rq_remain_tc_cash,
+            ),
+        ];
+        for &(request_name, request_hash, reply_name, reply_hash, request, parser) in queries {
+            assert_eq!(adler32::packet_hash(request_name), request_hash);
+            assert_eq!(adler32::packet_hash(reply_name), reply_hash);
+            assert_eq!(classify_startup_request(request_hash), Some(request));
+            assert_eq!(request.reply_name(), Some(reply_name));
+            assert_strict_hash_only_parser(parser, request_name);
+        }
+
+        assert_eq!(
+            serialize_sp_rp_get_max_gift_id(),
+            [0x5A, 0x08, 0xA1, 0x5E, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_sp_rp_koin_balance(0x1122_3344),
+            [0xBC, 0x05, 0x40, 0x2D, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_empty_pr_favorite_track_map_get(),
+            [0x35, 0x08, 0x52, 0x5A, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_empty_sp_rp_get_cash_inventory(),
+            [0x4A, 0x0A, 0x5C, 0x87, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            serialize_sp_rp_remain_cash(0x5566_7788),
+            [0xB8, 0x07, 0xDB, 0x4F, 0, 0, 0, 0, 0x88, 0x77, 0x66, 0x55]
+        );
+        assert_eq!(
+            serialize_sp_rp_remain_tc_cash(0x99AA_BBCC),
+            [0x6F, 0x08, 0xCE, 0x5F, 99, 0, 0, 0, 0xCC, 0xBB, 0xAA, 0x99]
         );
     }
 
