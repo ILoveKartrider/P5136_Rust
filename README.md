@@ -209,6 +209,24 @@ The server binds to `127.0.0.1` by default. To serve another machine, set both
 new profiles from non-loopback clients additionally requires the explicit
 `--allow-remote-profile-creation` option.
 
+### Two-client LAN smoke test
+
+The P5136 connector prepares and launches one client installation; it does not
+turn one game directory into concurrent client instances. Use two separately
+installed, connector-recognized P5136 clients on the same LAN. On the server
+host, bind to `0.0.0.0`, advertise that host's current LAN IPv4 address, and
+enable remote profile creation only when the remote nickname does not already
+exist. Both connector instances must use that advertised IPv4 address and the
+same configured base port.
+
+Allow the server host's inbound game UDP `base`, login TCP/P2P UDP `base + 1`,
+and messenger TCP `base + 2` through its host firewall for the LAN profile in
+use. Do not substitute virtual-adapter, VPN, or loopback addresses for the
+physical LAN address unless every test client deliberately uses that overlay.
+The server's optional `--client-data-dir` must refer to the exact stock client
+`Data` directory; a mismatched client-data copy fails closed during RHO5 emblem
+catalog discovery.
+
 ## Desktop GUI and connector
 
 With no arguments, `p5136` opens the desktop GUI. The Server tab exposes the

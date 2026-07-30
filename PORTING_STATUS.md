@@ -78,6 +78,53 @@ unchanged and is evidence only.
   `cargo clippy --workspace --all-targets -- -D warnings`, and release CLI
   build pass at this checkpoint (817 regular tests, 2 local opt-in ignored).
 
+### Correct stock P5136 and LAN E2E setup (2026-07-30)
+
+- The local stock P5136 installation is
+  `C:\Users\drash\Documents\kartrider\KartRider_5136`, not the
+  `HF_20051214_Factory` client copies. Its `KartRider.exe` SHA-256 is the
+  connector's exact supported P5136 hash:
+  `629F084E2A12C6FA1FF0EA603B90F8768454D13A1BC2DF6A8504F8AA06FD6194`.
+  The Factory client copies hash differently and are not valid P5136 E2E
+  targets.
+- The same installation supplies both required local runtime data paths:
+  `Profile\KartCatalog.xml` for `--catalog` and `Data` for
+  `--client-data-dir`. Release startup with both paths was smoke-tested on
+  `127.0.0.1:49311` through a real messenger probe. The copied Factory Data
+  path failed closed because it did not contain the required KR emblem entry.
+- One P5136 installation does not support concurrent multi-client launch.
+  The first real two-player test must use a second machine on the local LAN,
+  with its own supported P5136 installation and a copied release connector.
+  Do not race connector patching or launcher-profile writes inside a shared
+  game directory.
+- At this checkpoint the server host's physical LAN interface is Wi-Fi
+  `192.168.1.10/24` (the profile is currently Windows `Public`; re-check this
+  value immediately before testing). The current local client XML already
+  identifies login as `192.168.1.10:39312`, so use configured base port
+  `39311` unless another test requires a different port.
+- GUI LAN server values for the first test:
+
+  ```text
+  Bind address:                   0.0.0.0
+  Advertised IPv4:                 192.168.1.10
+  Configured port:                 39311
+  Profile root:                    <rust repo>\Profile
+  KartCatalog.xml:                 <KartRider_5136>\Profile\KartCatalog.xml
+  Client Data directory:           <KartRider_5136>\Data
+  Allow new remote nicknames:      checked
+  ```
+
+  This binds game UDP `39311`, login TCP and P2P UDP `39312`, and messenger
+  TCP `39313`. Before connecting the remote client, authorize those exact
+  inbound protocols/ports for the active Windows firewall network profile. No
+  firewall rule was created by this port checkpoint.
+- On the remote machine, run its release `p5136.exe` GUI only for the
+  Connector tab: point Game directory to that machine's P5136 installation,
+  set a unique nickname, Server IPv4 to `192.168.1.10`, configured port to
+  `39311`, and use its native runner. The remote server must create the new
+  profile, so the server-side remote-creation checkbox above is required for
+  a fresh remote nickname.
+
 ### Safe item-state checkpoint
 
 - Exact request hashes are `LoRqDeleteItemPacket` `0x4F4E07B8`,
