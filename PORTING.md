@@ -19,6 +19,9 @@ been demonstrated.
 - [x] bounded Messenger framing and logical packet codecs
 - [x] per-run bounded file logging at every transport packet boundary, server
   configuration validation, and typed TCP-session failure boundary
+- [x] GUI Windows Korean system-font fallback for localized OS errors
+- [x] stock-client/`Profile` path resolution for the C#-exported catalog and
+  sibling client `Data` directory
 - [x] workspace-wide `unsafe_code = "forbid"`
 
 ## Connector

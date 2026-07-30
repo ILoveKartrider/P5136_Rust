@@ -177,17 +177,23 @@ and stock-client end-to-end validation. See
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p p5136-cli
-cargo run -p p5136-cli -- server --catalog /path/to/KartCatalog.xml --client-data-dir /path/to/client/Data
+cargo run -p p5136-cli -- server --catalog /path/to/KartRider_5136
 ```
 
 The configured port follows the original topology: login TCP is base `+ 1`,
 game UDP is base `+ 0`, P2P UDP is base `+ 1`, and messenger TCP is base `+ 2`.
 
 `KartCatalog.xml` is runtime data exported from a client installation and is
-never committed. Without `--catalog`, login and channel startup remain
-available, but `PqGetRider` is deliberately rejected rather than serving an
-incomplete inventory. Profiles default to `./Profile`; use `--profile-root` to
-change that location.
+never committed. `--catalog` accepts the stock client directory, its `Profile`
+directory, or the XML file itself. For the first two forms, Rust resolves the
+C# server's existing `Profile/KartCatalog.xml` export and the sibling `Data`
+directory automatically. It does not need to write to the client installation.
+If the export is missing, run the C# server's **카트 데이터 XML 추출** once,
+then point Rust at the client or `Profile` directory—not at `KartCatalog.xml`
+manually. Without `--catalog`, login and channel startup remain available, but
+`PqGetRider` is deliberately rejected rather than serving an incomplete
+inventory. Profiles default to `./Profile`; use `--profile-root` to change that
+location.
 
 ### Runtime packet diagnostics
 
@@ -275,9 +281,12 @@ catalog discovery.
 
 With no arguments, `p5136` opens the desktop GUI. The Server tab exposes the
 same server options as the CLI: bind and advertised addresses, configured port,
-profile root, optional catalog and client-data paths, remote profile creation,
-and advanced session limits/timeouts. Starting and graceful stopping keep the
-supervisor on a dedicated worker; if retained reward recovery blocks graceful
+profile root, an optional stock-client/`Profile` path, remote profile creation,
+and advanced session limits/timeouts. The client path automatically resolves
+the C#-exported catalog and sibling `Data` directory. On Windows, the GUI loads
+the installed 맑은 고딕 system font so Korean operating-system errors render
+correctly. The advanced `Client Data override` field handles a non-standard
+client-data location. Starting and graceful stopping keep the supervisor on a dedicated worker; if retained reward recovery blocks graceful
 shutdown, the GUI reports that state and requires an explicit force-stop click.
 Closing a window with a live server cancels the close, requests graceful
 shutdown, waits for a bounded interval, then requests a force-stop and joins
