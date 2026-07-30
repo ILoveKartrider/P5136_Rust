@@ -1,6 +1,7 @@
 //! Cross-platform P5136 profile model and persistence.
 
 pub mod catalog;
+pub mod emblem_catalog;
 pub mod equipment;
 pub mod inventory;
 pub mod model;
@@ -10,8 +11,10 @@ pub mod store;
 
 pub use catalog::{
     CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogInventoryStats,
-    CatalogKartSpecStats, P5136KartSpecSnapshot, is_grant_category, is_grant_item,
+    CatalogKartSpecStats, MAX_CATALOG_EMBLEMS, P5136KartSpecSnapshot, is_grant_category,
+    is_grant_item,
 };
+pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
 pub use equipment::{EquipmentExceptions, EquipmentStateError};
 pub use inventory::{
     InventoryBuildError, apply_rider_item_selection, build_inventory_snapshot,

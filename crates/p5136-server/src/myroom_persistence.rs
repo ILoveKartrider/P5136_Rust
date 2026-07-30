@@ -21,6 +21,7 @@ use crate::{
     SessionId, WorldError,
     equipment_persistence::RiderEquipmentProfileCompletion,
     identity::{MigrationCompletion, MigrationPreflight, UserNo},
+    main_emblem_persistence::MainEmblemProfileCompletion,
     myroom_hub::{MyRoomCommitError, MyRoomHubError},
     profile_io::{MyRoomProfileLease, ProfileIoCompletion, ProfileIoError, ProfileJobAdmission},
 };
@@ -308,6 +309,7 @@ pub(crate) enum MyRoomProfileCompletion {
         result: Box<MyRoomProfileJobResult>,
     },
     RiderEquipment(RiderEquipmentProfileCompletion),
+    MainEmblem(MainEmblemProfileCompletion),
     Migration(MigrationProfileCompletion),
     DrainBarrier {
         reply: oneshot::Sender<Result<(), MyRoomCompletionDrainError>>,

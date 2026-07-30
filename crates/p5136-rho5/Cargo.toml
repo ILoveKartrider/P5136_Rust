@@ -1,0 +1,19 @@
+[package]
+name = "p5136-rho5"
+description = "Bounded read-only access to KartRider P5136 RHO5 archives"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flate2.workspace = true
+md-5.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints]
+workspace = true

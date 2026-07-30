@@ -3,6 +3,7 @@
 mod config;
 mod equipment_persistence;
 mod identity;
+mod main_emblem_persistence;
 mod messenger_hub;
 mod messenger_runtime;
 mod myroom_hub;

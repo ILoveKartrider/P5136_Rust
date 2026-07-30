@@ -63,6 +63,10 @@ struct ServerArgs {
     #[arg(long, value_name = "KartCatalog.xml")]
     catalog: Option<PathBuf>,
 
+    /// Stock-client Data directory containing the KR *.rho5 archives.
+    #[arg(long, value_name = "DATA_DIR")]
+    client_data_dir: Option<PathBuf>,
+
     #[arg(long, default_value_t = 250)]
     first_message_delay_ms: u64,
 
@@ -191,6 +195,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         ports,
         profile_root: args.profile_root,
         catalog_path: args.catalog,
+        client_data_dir: args.client_data_dir,
         first_message_delay: Duration::from_millis(args.first_message_delay_ms),
         login_timeout: Duration::from_secs(args.login_timeout_seconds),
         session_idle_timeout: Duration::from_secs(args.session_idle_timeout_seconds),
@@ -200,6 +205,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         ..ServerConfig::default()
     };
     let catalog_configured = config.catalog_path.is_some();
+    let emblem_catalog_configured = config.client_data_dir.is_some();
 
     let server = BoundServer::bind(config)
         .await
@@ -220,6 +226,14 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         tracing::warn!(
             "no inventory catalog is configured, so PqGetRider is unavailable; \
              race settlement, MyRoom, and progression handling remain in progress"
+        );
+    }
+    if emblem_catalog_configured {
+        tracing::info!("stock KR client emblem definitions are configured");
+    } else {
+        tracing::warn!(
+            "no client data directory is configured, so RequestEmblems uses only an optional \
+             KartCatalog.xml Emblems extension"
         );
     }
 
@@ -461,6 +475,7 @@ mod tests {
 
         assert_eq!(args.profile_root, Path::new("Profile"));
         assert_eq!(args.catalog, None);
+        assert_eq!(args.client_data_dir, None);
         assert_eq!(args.bind, std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(
             args.max_login_sessions,
@@ -470,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn server_accepts_explicit_profile_and_catalog_paths() {
+    fn server_accepts_explicit_profile_catalog_and_client_data_paths() {
         let cli = Cli::try_parse_from([
             "p5136",
             "server",
@@ -478,6 +493,8 @@ mod tests {
             "profiles",
             "--catalog",
             "KartCatalog.xml",
+            "--client-data-dir",
+            "client/Data",
         ])
         .unwrap();
         let Some(Command::Server(args)) = cli.command else {
@@ -486,6 +503,10 @@ mod tests {
 
         assert_eq!(args.profile_root, Path::new("profiles"));
         assert_eq!(args.catalog.as_deref(), Some(Path::new("KartCatalog.xml")));
+        assert_eq!(
+            args.client_data_dir.as_deref(),
+            Some(Path::new("client/Data"))
+        );
     }
 
     #[tokio::test]

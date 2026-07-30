@@ -231,6 +231,7 @@ pub enum CheckPasswordStatus {
 pub struct UpdateMainEmblemRequest {
     pub emblem_1: i16,
     pub emblem_2: i16,
+    pub emblem_3: i16,
 }
 
 /// The variable-length player form of one P5136 `RmSlotDataPacket` entry.
@@ -479,6 +480,7 @@ pub fn parse_update_main_emblem(
     let request = UpdateMainEmblemRequest {
         emblem_1: reader.read_i16()?,
         emblem_2: reader.read_i16()?,
+        emblem_3: reader.read_i16()?,
     };
     ensure_exhausted(&reader, UPDATE_MAIN_EMBLEM_REQUEST_NAME)?;
     Ok(request)
@@ -1085,7 +1087,7 @@ fn ensure_exhausted(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::{mem::size_of, net::Ipv4Addr};
 
     use sha2::{Digest, Sha256};
 
@@ -1099,13 +1101,14 @@ mod tests {
         NOTIFY_MYROOM_INFO_NAME, OWNER_ITEM_ENCHANT_NAME, OWNER_ITEM_NAME,
         PASSWORD_ENTER_MYROOM_COMMAND_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_EMBLEMS_NAME,
         REQUEST_MYROOM_ITEMS_NAME, RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME,
-        UPDATE_MAIN_EMBLEM_REQUEST_NAME, classify_myroom_request, parse_character_position,
-        parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
-        parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
-        parse_secede_request, parse_update_info, parse_update_main_emblem, plan_owner_item_packets,
-        serialize_character_position, serialize_check_password_reply, serialize_enter_error,
-        serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
-        serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
+        UPDATE_MAIN_EMBLEM_REQUEST_NAME, UpdateMainEmblemRequest, classify_myroom_request,
+        parse_character_position, parse_check_password, parse_enter_random_request,
+        parse_enter_request, parse_first_request, parse_reenter_request, parse_request_emblems,
+        parse_request_items, parse_rider_talk, parse_secede_request, parse_update_info,
+        parse_update_main_emblem, plan_owner_item_packets, serialize_character_position,
+        serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
+        serialize_missing_owner_items, serialize_myroom_info, serialize_owner_emblems,
+        serialize_owner_item_enchants, serialize_owner_items,
         serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
         serialize_slot_data, serialize_update_main_emblem_reply, validate_myroom_info,
         validate_myroom_player_slot, wire_count, wire_index,
@@ -1369,11 +1372,52 @@ mod tests {
         assert!(!format!("{parsed:?}").contains("item secret"));
 
         let mut emblem = PacketWriter::named(UPDATE_MAIN_EMBLEM_REQUEST_NAME);
-        emblem.write_i16(-7);
+        emblem.write_i16(i16::MIN);
         emblem.write_i16(5136);
+        emblem.write_i16(i16::MAX);
         let parsed = parse_update_main_emblem(emblem.as_slice()).unwrap();
-        assert_eq!(parsed.emblem_1, -7);
+        assert_eq!(parsed.emblem_1, i16::MIN);
         assert_eq!(parsed.emblem_2, 5136);
+        assert_eq!(parsed.emblem_3, i16::MAX);
+    }
+
+    #[test]
+    fn update_main_emblem_requires_exact_three_i16_body() {
+        let mut exact = PacketWriter::named(UPDATE_MAIN_EMBLEM_REQUEST_NAME);
+        exact.write_i16(i16::MIN);
+        exact.write_i16(5_136);
+        exact.write_i16(i16::MAX);
+        let exact = exact.into_inner();
+        assert_eq!(exact.len() - size_of::<u32>(), 6);
+        assert_eq!(
+            parse_update_main_emblem(&exact).unwrap(),
+            UpdateMainEmblemRequest {
+                emblem_1: i16::MIN,
+                emblem_2: 5_136,
+                emblem_3: i16::MAX,
+            }
+        );
+
+        let four_byte_body = &exact[..size_of::<u32>() + 4];
+        assert!(matches!(
+            parse_update_main_emblem(four_byte_body),
+            Err(MyRoomProtocolError::Packet(
+                crate::packet::PacketError::Truncated {
+                    offset: 8,
+                    needed: 2,
+                }
+            ))
+        ));
+
+        let mut eight_byte_body = exact;
+        eight_byte_body.extend_from_slice(&0x1357_i16.to_le_bytes());
+        assert!(matches!(
+            parse_update_main_emblem(&eight_byte_body),
+            Err(MyRoomProtocolError::TrailingBytes {
+                name: UPDATE_MAIN_EMBLEM_REQUEST_NAME,
+                count: 2,
+            })
+        ));
     }
 
     #[test]

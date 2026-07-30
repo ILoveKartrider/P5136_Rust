@@ -10,7 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use p5136_profile::{CatalogInventory, CatalogInventoryError, ProfileStoreError};
+use p5136_profile::{
+    CatalogInventory, CatalogInventoryError, EmblemCatalog, EmblemCatalogError,
+    MAX_EMBLEM_XML_BYTES, ProfileStoreError,
+};
+use p5136_rho5::{Rho5Directory, Rho5Error, Rho5Limits};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UdpSocket},
@@ -39,6 +43,8 @@ use crate::{
 
 const MAX_REWARD_PERSISTENCE_WORKERS: usize = 32;
 const REWARD_PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const KR_EMBLEM_PATH: &str = "etc_/emblem/emblem@kr.xml";
+const MAX_EMBLEM_COMPRESSED_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -69,6 +75,16 @@ pub enum ServerError {
 
     #[error("inventory catalog loader task failed")]
     CatalogTask(#[source] JoinError),
+
+    #[error("failed to load client emblem definitions from {path}")]
+    LoadEmblemCatalog {
+        path: PathBuf,
+        #[source]
+        source: EmblemCatalogLoadError,
+    },
+
+    #[error("client emblem catalog loader task failed")]
+    EmblemCatalogTask(#[source] JoinError),
 
     #[error(transparent)]
     ProfileIoConfig(#[from] ProfileIoConfigError),
@@ -152,6 +168,25 @@ pub enum ServerError {
 }
 
 #[derive(Debug, Error)]
+pub enum EmblemCatalogLoadError {
+    #[error(transparent)]
+    Rho5(#[from] Rho5Error),
+
+    #[error(
+        "client emblem payload is {actual} compressed bytes, exceeding the {maximum}-byte limit"
+    )]
+    CompressedTooLarge { actual: usize, maximum: usize },
+
+    #[error(
+        "client emblem payload is {actual} plaintext bytes, exceeding the {maximum}-byte limit"
+    )]
+    PlaintextTooLarge { actual: usize, maximum: usize },
+
+    #[error(transparent)]
+    Parse(#[from] EmblemCatalogError),
+}
+
+#[derive(Debug, Error)]
 pub enum RewardPersistenceRuntimeError {
     #[error("World reward scheduler failed")]
     World(#[source] WorldError),
@@ -225,6 +260,7 @@ pub enum RewardPersistenceRuntimeError {
 pub struct BoundServer {
     config: ServerConfig,
     catalog: Option<Arc<CatalogInventory>>,
+    emblems: Option<Arc<EmblemCatalog>>,
     profiles: ProfileIoBootstrap,
     game_udp: UdpSocket,
     login_tcp: TcpListener,
@@ -243,7 +279,10 @@ impl BoundServer {
             config.max_login_sessions,
             reward_persistence_worker_limit(config.max_login_sessions),
         )?;
-        let catalog = load_catalog(config.catalog_path.clone()).await?;
+        let (catalog, emblems) = tokio::try_join!(
+            load_catalog(config.catalog_path.clone()),
+            load_emblem_catalog(config.client_data_dir.clone()),
+        )?;
         let bind_address = config.bind_address;
         let game_udp = UdpSocket::bind(SocketAddr::new(bind_address, config.ports.game_udp()))
             .await
@@ -269,6 +308,7 @@ impl BoundServer {
         Ok(Self {
             config,
             catalog,
+            emblems,
             profiles,
             game_udp,
             login_tcp,
@@ -303,6 +343,7 @@ impl BoundServer {
         let BoundServer {
             config,
             catalog,
+            emblems,
             profiles,
             game_udp,
             login_tcp,
@@ -334,6 +375,7 @@ impl BoundServer {
                 SupervisorTransports {
                     config,
                     catalog,
+                    emblems,
                     profile_io,
                     profile_runtime,
                     login_tcp,
@@ -596,6 +638,58 @@ async fn load_catalog(path: Option<PathBuf>) -> Result<Option<Arc<CatalogInvento
         .map_err(ServerError::CatalogTask)?
         .map_err(|source| ServerError::LoadCatalog { path, source })?;
     Ok(Some(Arc::new(catalog)))
+}
+
+async fn load_emblem_catalog(
+    path: Option<PathBuf>,
+) -> Result<Option<Arc<EmblemCatalog>>, ServerError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let worker_path = path.clone();
+    let catalog = tokio::task::spawn_blocking(move || {
+        let directory = Rho5Directory::scan_kr(&worker_path, production_rho5_limits())?;
+        let entry = directory.unique_entry(KR_EMBLEM_PATH)?;
+        if entry.compressed_size() > MAX_EMBLEM_COMPRESSED_BYTES {
+            return Err(EmblemCatalogLoadError::CompressedTooLarge {
+                actual: entry.compressed_size(),
+                maximum: MAX_EMBLEM_COMPRESSED_BYTES,
+            });
+        }
+        if entry.plaintext_size() > MAX_EMBLEM_XML_BYTES {
+            return Err(EmblemCatalogLoadError::PlaintextTooLarge {
+                actual: entry.plaintext_size(),
+                maximum: MAX_EMBLEM_XML_BYTES,
+            });
+        }
+        let xml = directory.extract_exact(KR_EMBLEM_PATH)?;
+        EmblemCatalog::from_client_xml(&xml).map_err(EmblemCatalogLoadError::from)
+    })
+    .await
+    .map_err(ServerError::EmblemCatalogTask)?
+    .map_err(|source| ServerError::LoadEmblemCatalog { path, source })?;
+    Ok(Some(Arc::new(catalog)))
+}
+
+fn production_rho5_limits() -> Rho5Limits {
+    Rho5Limits {
+        // The stock Data directory also contains roughly 1,500 legacy
+        // non-RHO5 files; this limit covers them while the archive/path/file
+        // caps below bound everything retained by the index.
+        max_directory_entries: 4_096,
+        max_archives: 128,
+        max_archive_bytes: 64 * 1024 * 1024,
+        max_archive_name_bytes: 255,
+        max_files_per_archive: 4_096,
+        max_total_files: 30_000,
+        max_path_utf16_units: 512,
+        max_normalized_path_bytes: 2 * 1024,
+        max_table_bytes: 8 * 1024 * 1024,
+        max_compressed_bytes: 16 * 1024 * 1024,
+        max_plaintext_bytes: 32 * 1024 * 1024,
+        max_total_declared_compressed_bytes: 1024 * 1024 * 1024,
+        max_total_declared_plaintext_bytes: 2 * 1024 * 1024 * 1024,
+    }
 }
 
 #[derive(Clone)]
@@ -1192,6 +1286,7 @@ async fn run_reward_persistence(
 struct SupervisorTransports {
     config: ServerConfig,
     catalog: Option<Arc<CatalogInventory>>,
+    emblems: Option<Arc<EmblemCatalog>>,
     profile_io: ProfileIoHandle,
     profile_runtime: ProfileIoRuntime,
     login_tcp: TcpListener,
@@ -1816,6 +1911,9 @@ fn world_sidecar_error(error: WorldSidecarError) -> ServerError {
         WorldSidecarError::RiderEquipment(source) => ServerError::WorldActorMyRoom {
             source: Box::new(source),
         },
+        WorldSidecarError::MainEmblem(source) => ServerError::WorldActorMyRoom {
+            source: Box::new(source),
+        },
         WorldSidecarError::InvalidIdentityCapacity => {
             ServerError::WorldActorInvalidIdentityCapacity
         }
@@ -1880,6 +1978,7 @@ async fn run_supervisor(
     let SupervisorTransports {
         config,
         catalog,
+        emblems,
         profile_io,
         mut profile_runtime,
         login_tcp,
@@ -1892,7 +1991,7 @@ async fn run_supervisor(
         profile_io.clone(),
         reward_persistence_worker_limit(config.max_login_sessions),
     );
-    let profiles = ProfileCoordinator::new(profile_io, catalog);
+    let profiles = ProfileCoordinator::new_with_emblems(profile_io, catalog, emblems);
     let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let messenger_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let mut sessions = JoinSet::new();
@@ -2052,9 +2151,9 @@ mod tests {
         SupervisorTransports, close_and_drain_outbound_operations,
         close_and_drain_request_operations, is_expected_forced_reward_exit,
         is_expected_forced_world_exit, is_terminal_reward_scheduler_error, load_catalog,
-        messenger_runtime_config, request_world_shutdown, retain_cleanup_error, run_supervisor,
-        stop_reward_runtime, stop_world_runtime, udp_runtime_config, unexpected_profile_exit,
-        world_sidecar_error,
+        load_emblem_catalog, messenger_runtime_config, request_world_shutdown,
+        retain_cleanup_error, run_supervisor, stop_reward_runtime, stop_world_runtime,
+        udp_runtime_config, unexpected_profile_exit, world_sidecar_error,
     };
     use crate::{
         ChannelBinding, MessengerServiceHandle, MigrationToken, ProfileIoConfigError,
@@ -2286,6 +2385,7 @@ mod tests {
             SupervisorTransports {
                 config,
                 catalog: None,
+                emblems: None,
                 profile_io,
                 profile_runtime,
                 login_tcp,
@@ -2370,6 +2470,7 @@ mod tests {
                             nickname: "untrusted".to_owned(),
                             emblem_1: 0,
                             emblem_2: 0,
+                            emblem_3: 0,
                             rider_item_snapshot: [0; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
                             card: String::new(),
                             rp: 0,
@@ -3250,6 +3351,7 @@ mod tests {
         let bound = BoundServer {
             config,
             catalog: None,
+            emblems: None,
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -3444,6 +3546,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_client_emblem_entry_fails_before_any_listener_is_bound() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let client_data = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            profile_root: profile_root.path().to_owned(),
+            client_data_dir: Some(client_data.path().to_owned()),
+            ..ServerConfig::default()
+        };
+
+        let error = BoundServer::bind(config).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ServerError::LoadEmblemCatalog { path, .. } if path == client_data.path()
+            ),
+            "unexpected bind error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local proprietary P5136 installation via P5136_DATA_DIR"]
+    async fn local_client_data_extracts_and_parses_all_emblem_ids() {
+        let Some(directory) = std::env::var_os("P5136_DATA_DIR") else {
+            return;
+        };
+        let catalog = load_emblem_catalog(Some(directory.into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(catalog.ids().len(), 586);
+        assert_eq!(catalog.ids().iter().copied().min(), Some(1));
+        assert_eq!(catalog.ids().iter().copied().max(), Some(8_803));
+        assert!(catalog.ids().windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
     async fn zero_login_session_limit_is_rejected_before_binding() {
         let error = BoundServer::bind(ServerConfig {
             max_login_sessions: 0,
@@ -3490,6 +3628,7 @@ mod tests {
         let bound = BoundServer {
             config,
             catalog: None,
+            emblems: None,
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -3613,6 +3752,7 @@ mod tests {
             nickname: nickname.to_owned(),
             emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
             emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
+            emblem_3: u16::from_le_bytes(profile.rider.emblem3.to_le_bytes()),
             rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
             lucci: profile.rider.lucci,
             rp: i32::from_le_bytes(profile.rider.rp.to_le_bytes()),
@@ -3694,6 +3834,7 @@ mod tests {
         let bound = BoundServer {
             config,
             catalog: None,
+            emblems: None,
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -3997,6 +4138,7 @@ mod tests {
         let bound = BoundServer {
             config,
             catalog,
+            emblems: None,
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),

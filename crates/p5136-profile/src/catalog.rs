@@ -12,8 +12,8 @@ use std::{
     path::Path,
 };
 
-use p5136_core::dotnet_decimal::DotNetDecimal;
 pub use p5136_core::kart_physics::P5136KartSpecSnapshot;
+use p5136_core::{dotnet_decimal::DotNetDecimal, myroom_protocol::MAX_MYROOM_EMBLEMS};
 use quick_xml::{
     Reader, XmlVersion,
     events::{BytesStart, Event},
@@ -21,8 +21,11 @@ use quick_xml::{
 };
 use thiserror::Error;
 
+use crate::emblem_catalog::EmblemCatalog;
+
 pub const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_CATALOG_ITEMS: usize = 100_000;
+pub const MAX_CATALOG_EMBLEMS: usize = MAX_MYROOM_EMBLEMS;
 pub const MAX_ITEM_NAME_BYTES: usize = 1_024;
 pub const MAX_KART_NAMES: usize = 10_000;
 pub const MAX_KART_SPECS: usize = 10_000;
@@ -66,14 +69,20 @@ pub struct CatalogInventoryStats {
     pub karts: usize,
     pub grant_items: usize,
     pub grant_categories: usize,
+    pub emblems: usize,
 }
 
 impl fmt::Display for CatalogInventoryStats {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "items={}, categories={}, karts={}, grant={}/{} categories",
-            self.items, self.categories, self.karts, self.grant_items, self.grant_categories
+            "items={}, categories={}, karts={}, grant={}/{} categories, emblems={}",
+            self.items,
+            self.categories,
+            self.karts,
+            self.grant_items,
+            self.grant_categories,
+            self.emblems
         )
     }
 }
@@ -108,6 +117,7 @@ pub struct CatalogInventory {
     kart_names: BTreeMap<u16, String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
     kart_spec_stats: CatalogKartSpecStats,
+    emblem_catalog: Option<EmblemCatalog>,
 }
 
 // Catalog parsing rejects non-finite values, so the floating-point snapshots
@@ -182,6 +192,32 @@ impl CatalogInventory {
     #[must_use]
     pub const fn kart_spec_stats(&self) -> CatalogKartSpecStats {
         self.kart_spec_stats
+    }
+
+    /// Returns the optional, source-ordered `MyRoom` emblem catalog.
+    ///
+    /// Format-3 catalogs produced before the Rust port's `<Emblems>` extension
+    /// remain valid and expose an empty slice.
+    #[must_use]
+    pub fn emblems(&self) -> &[i16] {
+        self.emblem_catalog.as_ref().map_or(&[], EmblemCatalog::ids)
+    }
+
+    #[must_use]
+    pub fn emblem_catalog(&self) -> Option<&[i16]> {
+        self.emblem_catalog.as_ref().map(EmblemCatalog::ids)
+    }
+
+    #[must_use]
+    pub fn emblem_definitions(&self) -> Option<&EmblemCatalog> {
+        self.emblem_catalog.as_ref()
+    }
+
+    #[must_use]
+    pub fn contains_emblem(&self, emblem: i16) -> bool {
+        self.emblem_catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.contains(emblem))
     }
 
     pub fn category(&self, category: u16) -> impl Iterator<Item = &CatalogInventoryItem> {
@@ -283,6 +319,24 @@ pub enum CatalogInventoryError {
 
     #[error("kart catalog XML has more than one Specs element")]
     MultipleSpecs,
+
+    #[error("kart catalog XML has more than one Emblems element")]
+    MultipleEmblems,
+
+    #[error("kart catalog Emblems contains more than {maximum} entries")]
+    TooManyEmblems { maximum: usize },
+
+    #[error("kart catalog XML has an invalid Emblems total")]
+    InvalidEmblemCount,
+
+    #[error("kart catalog XML has an invalid Emblems/Emblem id")]
+    InvalidEmblemId,
+
+    #[error("kart catalog XML has duplicate emblem ID {id}")]
+    DuplicateEmblemId { id: i16 },
+
+    #[error("kart catalog emblem count mismatch ({declared} declared, {actual} read)")]
+    EmblemCountMismatch { declared: usize, actual: usize },
 
     #[error("kart catalog XML has incomplete kart metadata (names={names}, specs={specs})")]
     PartialKartMetadata { names: usize, specs: usize },
@@ -391,8 +445,11 @@ struct CatalogParser {
     depth: usize,
     declared_items: Option<usize>,
     declared_categories: Option<usize>,
+    declared_emblems: Option<usize>,
     keys: HashSet<(u16, u16)>,
     items: Vec<CatalogInventoryItem>,
+    emblem_keys: HashSet<i16>,
+    emblems: Vec<i16>,
     kart_names: BTreeMap<u16, String>,
     spec_keys: HashSet<String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
@@ -411,12 +468,14 @@ enum CatalogSection {
     Inventory,
     Names,
     Specs,
+    Emblems,
 }
 
 const ROOT_SEEN: u8 = 1 << 0;
 const INVENTORY_SEEN: u8 = 1 << 1;
 const NAMES_SEEN: u8 = 1 << 2;
 const SPECS_SEEN: u8 = 1 << 3;
+const EMBLEMS_SEEN: u8 = 1 << 4;
 
 impl CatalogParser {
     fn new(policy: ValidationPolicy) -> Self {
@@ -427,8 +486,11 @@ impl CatalogParser {
             depth: 0,
             declared_items: None,
             declared_categories: None,
+            declared_emblems: None,
             keys: HashSet::new(),
             items: Vec::new(),
+            emblem_keys: HashSet::new(),
+            emblems: Vec::new(),
             kart_names: BTreeMap::new(),
             spec_keys: HashSet::new(),
             kart_specs: BTreeMap::new(),
@@ -455,7 +517,10 @@ impl CatalogParser {
                 Event::End(element) => {
                     self.depth = self.depth.saturating_sub(1);
                     if self.depth == 1
-                        && matches!(element.name().as_ref(), b"Inventory" | b"Names" | b"Specs")
+                        && matches!(
+                            element.name().as_ref(),
+                            b"Inventory" | b"Names" | b"Specs" | b"Emblems"
+                        )
                     {
                         self.active_section = None;
                     } else if self.depth == 2 && element.name() == QName(b"Spec") {
@@ -490,6 +555,9 @@ impl CatalogParser {
         } else if self.depth == 1 && element.name() == QName(b"Specs") {
             self.read_specs_header()?;
             self.active_section = Some(CatalogSection::Specs);
+        } else if self.depth == 1 && element.name() == QName(b"Emblems") {
+            self.read_emblems_header(reader, element)?;
+            self.active_section = Some(CatalogSection::Emblems);
         } else if self.depth == 2
             && self.active_section == Some(CatalogSection::Inventory)
             && element.name() == QName(b"Item")
@@ -505,6 +573,11 @@ impl CatalogParser {
             && element.name() == QName(b"Spec")
         {
             self.start_spec(reader, element)?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Emblems)
+            && element.name() == QName(b"Emblem")
+        {
+            self.read_emblem(reader, element)?;
         } else if self.active_spec.is_some() && element.name() == QName(b"BodyParam") {
             self.read_body_param(reader, element)?;
         }
@@ -524,6 +597,8 @@ impl CatalogParser {
             self.read_names_header()?;
         } else if self.depth == 1 && element.name() == QName(b"Specs") {
             self.read_specs_header()?;
+        } else if self.depth == 1 && element.name() == QName(b"Emblems") {
+            self.read_emblems_header(reader, element)?;
         } else if self.depth == 2
             && self.active_section == Some(CatalogSection::Inventory)
             && element.name() == QName(b"Item")
@@ -540,6 +615,11 @@ impl CatalogParser {
         {
             self.start_spec(reader, element)?;
             self.finish_spec()?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Emblems)
+            && element.name() == QName(b"Emblem")
+        {
+            self.read_emblem(reader, element)?;
         } else if self.active_spec.is_some() && element.name() == QName(b"BodyParam") {
             self.read_body_param(reader, element)?;
         }
@@ -605,6 +685,53 @@ impl CatalogParser {
             return Err(CatalogInventoryError::MultipleSpecs);
         }
         self.sections_seen |= SPECS_SEEN;
+        Ok(())
+    }
+
+    fn read_emblems_header<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), CatalogInventoryError> {
+        if self.sections_seen & EMBLEMS_SEEN != 0 {
+            return Err(CatalogInventoryError::MultipleEmblems);
+        }
+        self.sections_seen |= EMBLEMS_SEEN;
+        self.declared_emblems = match attribute(reader, element, b"total")? {
+            Some(value) => {
+                let total = value
+                    .parse::<usize>()
+                    .map_err(|_| CatalogInventoryError::InvalidEmblemCount)?;
+                if total > MAX_CATALOG_EMBLEMS {
+                    return Err(CatalogInventoryError::TooManyEmblems {
+                        maximum: MAX_CATALOG_EMBLEMS,
+                    });
+                }
+                Some(total)
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    fn read_emblem<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), CatalogInventoryError> {
+        if self.emblems.len() >= MAX_CATALOG_EMBLEMS {
+            return Err(CatalogInventoryError::TooManyEmblems {
+                maximum: MAX_CATALOG_EMBLEMS,
+            });
+        }
+        let id = attribute(reader, element, b"id")?
+            .and_then(|value| value.parse::<i16>().ok())
+            .filter(|id| *id > 0)
+            .ok_or(CatalogInventoryError::InvalidEmblemId)?;
+        if !self.emblem_keys.insert(id) {
+            return Err(CatalogInventoryError::DuplicateEmblemId { id });
+        }
+        self.emblems.push(id);
         Ok(())
     }
 
@@ -756,6 +883,14 @@ impl CatalogParser {
                 specs: self.kart_specs.len(),
             });
         }
+        if let Some(declared) = self.declared_emblems
+            && declared != self.emblems.len()
+        {
+            return Err(CatalogInventoryError::EmblemCountMismatch {
+                declared,
+                actual: self.emblems.len(),
+            });
+        }
 
         let declared_items = self
             .declared_items
@@ -801,6 +936,7 @@ impl CatalogParser {
             karts,
             grant_items,
             grant_categories,
+            emblems: self.emblems.len(),
         };
         if stats.items < self.policy.minimum_items
             || stats.categories < self.policy.minimum_categories
@@ -844,12 +980,19 @@ impl CatalogParser {
                 .count(),
         };
 
+        let emblem_catalog = (self.sections_seen & EMBLEMS_SEEN != 0).then(|| {
+            EmblemCatalog::from_validated_parts(
+                std::mem::take(&mut self.emblems),
+                std::mem::take(&mut self.emblem_keys),
+            )
+        });
         Ok(CatalogInventory {
             items: std::mem::take(&mut self.items),
             stats,
             kart_names: std::mem::take(&mut self.kart_names),
             kart_specs: std::mem::take(&mut self.kart_specs),
             kart_spec_stats,
+            emblem_catalog,
         })
     }
 }
@@ -1576,8 +1719,9 @@ mod tests {
 
     use super::{
         CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogParser,
-        MAX_KART_NAME_BYTES, MAX_XML_ATTRIBUTE_VALUE_BYTES, MAX_XML_ATTRIBUTES_PER_ELEMENT,
-        MAX_XML_TEXT_BYTES, ValidationPolicy, is_grant_category, is_grant_item,
+        MAX_CATALOG_EMBLEMS, MAX_KART_NAME_BYTES, MAX_XML_ATTRIBUTE_VALUE_BYTES,
+        MAX_XML_ATTRIBUTES_PER_ELEMENT, MAX_XML_TEXT_BYTES, ValidationPolicy, is_grant_category,
+        is_grant_item,
     };
 
     fn parse_structural(xml: &str) -> Result<CatalogInventory, CatalogInventoryError> {
@@ -1645,6 +1789,78 @@ mod tests {
         assert_eq!(catalog.grant_items().count(), 2);
         assert_eq!(catalog.kart_spec_stats().names, 0);
         assert!(catalog.kart_spec(1450).is_none());
+        assert_eq!(catalog.emblem_catalog(), None);
+        assert!(catalog.emblems().is_empty());
+    }
+
+    #[test]
+    fn optional_emblem_catalog_is_bounded_unique_and_source_ordered() {
+        let catalog = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Emblems total="3">
+                    <Emblem id="7" />
+                    <Emblem id="8193" />
+                    <Emblem id="32767" />
+                </Emblems>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        )
+        .unwrap();
+        assert_eq!(catalog.emblem_catalog(), Some(&[7, 8_193, 32_767][..]));
+        assert_eq!(catalog.stats().emblems, 3);
+        assert!(catalog.contains_emblem(8_193));
+
+        for invalid in ["-3", "0"] {
+            let xml = format!(
+                r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                    <Emblems><Emblem id="{invalid}" /></Emblems>
+                    <Inventory total="0" categories="0" />
+                </KartCatalog>"#
+            );
+            assert!(matches!(
+                parse_structural(&xml),
+                Err(CatalogInventoryError::InvalidEmblemId)
+            ));
+        }
+
+        let duplicate = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Emblems><Emblem id="7" /><Emblem id="7" /></Emblems>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            duplicate,
+            CatalogInventoryError::DuplicateEmblemId { id: 7 }
+        ));
+
+        let mismatch = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Emblems total="2"><Emblem id="7" /></Emblems>
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            CatalogInventoryError::EmblemCountMismatch {
+                declared: 2,
+                actual: 1
+            }
+        ));
+
+        let excessive = format!(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Emblems total="{}" />
+                <Inventory total="0" categories="0" />
+            </KartCatalog>"#,
+            MAX_CATALOG_EMBLEMS + 1
+        );
+        assert!(matches!(
+            parse_structural(&excessive),
+            Err(CatalogInventoryError::TooManyEmblems { .. })
+        ));
     }
 
     #[test]

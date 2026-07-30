@@ -287,20 +287,20 @@ impl MyRoomWirePlan {
     }
 }
 
-/// Minimal actor-minted authorization for one owner-item response.
+/// Minimal actor-minted authorization for one owner-scoped protected response.
 ///
 /// Unrelated visitor churn is deliberately absent. Only the requester
 /// generation, membership owner, owner generation, and item-password policy
-/// can invalidate this plan while profile I/O runs.
+/// can invalidate this plan while work runs outside the actor.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct MyRoomOwnerItemPlan {
+pub(crate) struct MyRoomOwnerResourcePlan {
     requester: IdentityBinding,
     owner: IdentityBinding,
     policy_revision: MyRoomRevision,
     visible: bool,
 }
 
-impl MyRoomOwnerItemPlan {
+impl MyRoomOwnerResourcePlan {
     #[must_use]
     pub(crate) fn requester(&self) -> &IdentityBinding {
         &self.requester
@@ -319,6 +319,26 @@ impl MyRoomOwnerItemPlan {
     #[must_use]
     pub(crate) const fn visible(&self) -> bool {
         self.visible
+    }
+}
+
+pub(crate) type MyRoomOwnerItemPlan = MyRoomOwnerResourcePlan;
+
+/// Minimal actor-minted proof that one exact identity currently occupies the
+/// owner slot of its own tracked `MyRoom`.
+///
+/// The plan intentionally carries no unrelated room or profile state. It is
+/// move-only, and callers must revalidate it after work performed outside the
+/// actor.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MyRoomPresentOwnerPlan {
+    owner: IdentityBinding,
+}
+
+impl MyRoomPresentOwnerPlan {
+    #[must_use]
+    pub(crate) fn owner(&self) -> &IdentityBinding {
+        &self.owner
     }
 }
 
@@ -1426,11 +1446,11 @@ impl MyRoomHub {
     }
 
     /// Mints the smallest topology and policy stamp needed to authorize an
-    /// owner-item read outside the actor.
-    pub(crate) fn owner_item_plan_if_member(
+    /// owner-scoped protected read.
+    pub(crate) fn owner_resource_plan_if_member(
         &self,
         identity: &IdentityBinding,
-    ) -> Result<Option<MyRoomOwnerItemPlan>, MyRoomHubError> {
+    ) -> Result<Option<MyRoomOwnerResourcePlan>, MyRoomHubError> {
         let Some(membership) = self.membership_if_member(identity)? else {
             return Ok(None);
         };
@@ -1444,7 +1464,7 @@ impl MyRoomHub {
             .into());
         }
         self.require_canonical_identity(&room.owner.identity)?;
-        Ok(Some(MyRoomOwnerItemPlan {
+        Ok(Some(MyRoomOwnerResourcePlan {
             requester: identity.clone(),
             owner: room.owner.identity.clone(),
             policy_revision: room.info_revision,
@@ -1452,11 +1472,53 @@ impl MyRoomHub {
         }))
     }
 
-    /// Revalidates only state that can change the owner-item result.
-    pub(crate) fn revalidate_owner_item_plan(
+    pub(crate) fn owner_item_plan_if_member(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomOwnerItemPlan>, MyRoomHubError> {
+        self.owner_resource_plan_if_member(identity)
+    }
+
+    /// Mints a move-only proof only for the exact generation currently
+    /// occupying the owner slot of its own room.
+    pub(crate) fn present_owner_plan(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<Option<MyRoomPresentOwnerPlan>, MyRoomHubError> {
+        Ok(self
+            .present_owner_entry_input(identity)?
+            .map(|_| MyRoomPresentOwnerPlan {
+                owner: identity.clone(),
+            }))
+    }
+
+    /// Revalidates a present-owner proof after work outside the actor.
+    pub(crate) fn revalidate_present_owner_plan(
+        &self,
+        identity: &IdentityBinding,
+        plan: &MyRoomPresentOwnerPlan,
+    ) -> Result<(), MyRoomHubError> {
+        if identity != plan.owner() {
+            return Err(MyRoomHubError::WirePlanRequesterMismatch {
+                planned_user_no: plan.owner.user_no,
+                planned_generation: plan.owner.generation.get(),
+                supplied_user_no: identity.user_no,
+                supplied_generation: identity.generation.get(),
+            });
+        }
+        match self.present_owner_plan(identity)? {
+            Some(current) if current == *plan => Ok(()),
+            Some(_) | None => Err(MyRoomHubError::StaleWirePlan {
+                owner: plan.owner.user_no,
+            }),
+        }
+    }
+
+    /// Revalidates only state that can change an owner-scoped protected read.
+    pub(crate) fn revalidate_owner_resource_plan(
         &self,
         requester: &IdentityBinding,
-        plan: &MyRoomOwnerItemPlan,
+        plan: &MyRoomOwnerResourcePlan,
     ) -> Result<(), MyRoomHubError> {
         if requester != plan.requester() {
             return Err(MyRoomHubError::WirePlanRequesterMismatch {
@@ -1466,7 +1528,7 @@ impl MyRoomHub {
                 supplied_generation: requester.generation.get(),
             });
         }
-        let current = match self.owner_item_plan_if_member(requester) {
+        let current = match self.owner_resource_plan_if_member(requester) {
             Ok(Some(current)) => current,
             Ok(None) => {
                 return Err(MyRoomHubError::StaleWirePlan {
@@ -1482,6 +1544,15 @@ impl MyRoomHub {
                 owner: plan.owner.user_no,
             })
         }
+    }
+
+    /// Revalidates only state that can change the owner-item result.
+    pub(crate) fn revalidate_owner_item_plan(
+        &self,
+        requester: &IdentityBinding,
+        plan: &MyRoomOwnerItemPlan,
+    ) -> Result<(), MyRoomHubError> {
+        self.revalidate_owner_resource_plan(requester, plan)
     }
 
     /// Revalidates a returned wire plan after profile I/O. Expected requester
@@ -4072,6 +4143,32 @@ mod tests {
             MyRoomHubError::StaleGeneration { .. }
         ));
         assert!(!generation_error.is_wire_plan_stale());
+    }
+
+    #[test]
+    fn present_owner_plan_is_role_specific_and_revalidated_after_owner_leave() {
+        let mut registry = IdentityRegistry::new();
+        let owner_id = claim(&mut registry, 1, "Owner");
+        let visitor = claim(&mut registry, 2, "Visitor");
+        let mut hub = MyRoomHub::new();
+        enter(&mut hub, participant(&owner_id), owner(&owner_id)).unwrap();
+        enter(&mut hub, participant(&visitor), owner(&owner_id)).unwrap();
+
+        assert!(hub.present_owner_plan(&visitor).unwrap().is_none());
+        let plan = hub.present_owner_plan(&owner_id).unwrap().unwrap();
+        assert_eq!(plan.owner(), &owner_id);
+        hub.revalidate_present_owner_plan(&owner_id, &plan).unwrap();
+
+        leave(&mut hub, &owner_id).unwrap();
+        let error = hub
+            .revalidate_present_owner_plan(&owner_id, &plan)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MyRoomHubError::StaleWirePlan { owner } if owner == owner_id.user_no
+        ));
+        assert!(error.is_wire_plan_stale());
+        hub.audit_invariants().unwrap();
     }
 
     #[test]

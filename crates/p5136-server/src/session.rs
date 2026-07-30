@@ -40,9 +40,10 @@ use p5136_core::{
         EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
         MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
         parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
-        parse_reenter_request, parse_request_items, parse_rider_talk, parse_secede_request,
-        parse_update_info, plan_owner_item_packets, serialize_check_password_reply,
-        serialize_myroom_info, serialize_owner_item_enchants, serialize_owner_items,
+        parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
+        parse_secede_request, parse_update_info, parse_update_main_emblem, plan_owner_item_packets,
+        serialize_check_password_reply, serialize_myroom_info, serialize_owner_emblems,
+        serialize_owner_item_enchants, serialize_owner_items, serialize_update_main_emblem_reply,
     },
     nickname::canonical_nickname_key,
     packet::PacketError,
@@ -63,7 +64,7 @@ use p5136_core::{
     track::P5136_FALLBACK_TRACK_ID,
 };
 use p5136_profile::{
-    CatalogInventory, EquipmentExceptions, EquipmentStateError, InventoryBuildError,
+    CatalogInventory, EmblemCatalog, EquipmentExceptions, EquipmentStateError, InventoryBuildError,
     MAX_MYROOM_ITEM_RECORDS, MyRoomItemStateError, MyRoomOwnerInventory, Profile,
     ProfileStoreError, build_inventory_snapshot_with_equipment, rider_item_snapshot,
 };
@@ -84,6 +85,10 @@ use crate::{
         RiderEquipmentWriteError, catalog_grants, kart_is_owned,
     },
     identity::IdentityOperationLease,
+    main_emblem_persistence::{
+        MAIN_EMBLEM_WRITE_OPERATION, MainEmblemPublication, MainEmblemWriteError,
+        MainEmblemWriteReceipt, PreparedMainEmblemWrite, ValidatedMainEmblemSelection,
+    },
     myroom_hub::{MyRoomWirePlan, MyRoomWireProjection},
     myroom_persistence::{
         MYROOM_INFO_WRITE_OPERATION, MyRoomCompletionSlot, MyRoomInfoWriteError,
@@ -245,6 +250,12 @@ pub enum LoginSessionError {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    #[error("main-emblem persistence or publication failed")]
+    MainEmblemWrite {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     #[error(
         "rider-equipment reload for {nickname:?} returned revision {actual:?} behind durable revision {durable}"
     )]
@@ -355,6 +366,7 @@ pub enum LoginSessionError {
 pub(crate) struct ProfileCoordinator {
     io: ProfileIoHandle,
     catalog: Option<Arc<CatalogInventory>>,
+    emblems: Option<Arc<EmblemCatalog>>,
     #[cfg(test)]
     blocking_update_hook: Option<Arc<BlockingUpdateHook>>,
     #[cfg(test)]
@@ -455,10 +467,28 @@ impl BlockingUpdateHook {
 
 impl ProfileCoordinator {
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn new(io: ProfileIoHandle, catalog: Option<Arc<CatalogInventory>>) -> Self {
+        Self::new_with_emblems(io, catalog, None)
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_emblems(
+        io: ProfileIoHandle,
+        catalog: Option<Arc<CatalogInventory>>,
+        emblems: Option<Arc<EmblemCatalog>>,
+    ) -> Self {
+        let emblems = emblems.or_else(|| {
+            catalog
+                .as_deref()
+                .and_then(CatalogInventory::emblem_definitions)
+                .cloned()
+                .map(Arc::new)
+        });
         Self {
             io,
             catalog,
+            emblems,
             #[cfg(test)]
             blocking_update_hook: None,
             #[cfg(test)]
@@ -480,6 +510,10 @@ impl ProfileCoordinator {
 
     fn catalog(&self) -> Option<&CatalogInventory> {
         self.catalog.as_deref()
+    }
+
+    fn emblem_catalog(&self) -> Option<&EmblemCatalog> {
+        self.emblems.as_deref()
     }
 
     #[cfg(test)]
@@ -728,6 +762,42 @@ impl ProfileCoordinator {
         Ok(prepared)
     }
 
+    fn validate_main_emblems(
+        &self,
+        request: p5136_core::myroom_protocol::UpdateMainEmblemRequest,
+    ) -> Result<
+        ValidatedMainEmblemSelection,
+        crate::main_emblem_persistence::MainEmblemValidationError,
+    > {
+        ValidatedMainEmblemSelection::validate(request, self.emblem_catalog())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "test builds attach the shared blocking profile-write hook here"
+        )
+    )]
+    fn prepare_main_emblem_write(
+        &self,
+        selection: ValidatedMainEmblemSelection,
+        admission: ProfileJobAdmission,
+        completion: MyRoomCompletionSlot,
+    ) -> PreparedMainEmblemWrite {
+        let prepared = PreparedMainEmblemWrite::new(admission, selection, completion);
+        #[cfg(test)]
+        let prepared = if let Some(hook) = self.blocking_update_hook.clone() {
+            prepared.with_test_hook(Arc::new(move || {
+                hook.entered.wait();
+                hook.release.wait();
+            }))
+        } else {
+            prepared
+        };
+        prepared
+    }
+
     async fn equip_plant_part(
         &self,
         request: PlantPartEquipRequest,
@@ -908,6 +978,30 @@ impl SessionContext {
             .my_room
             .try_apply_protocol_info(receipt.info())?;
         bound.profile.revision = Some(receipt.revision());
+        Ok(())
+    }
+
+    fn apply_main_emblem_write(
+        &mut self,
+        identity: &IdentityBinding,
+        receipt: &MainEmblemWriteReceipt,
+    ) -> Result<(), LoginSessionError> {
+        let bound = self
+            .profile
+            .as_mut()
+            .filter(|bound| bound.identity.owner == identity.owner)
+            .filter(|bound| bound.identity.user_no == identity.user_no)
+            .filter(|bound| bound.identity.generation == identity.generation)
+            .ok_or(LoginSessionError::ProfileNotBound)?;
+        let [emblem_1, emblem_2, emblem_3] = receipt.selection().values();
+        bound
+            .profile
+            .profile
+            .rider
+            .set_main_emblems(emblem_1, emblem_2, emblem_3);
+        if let Some(revision) = receipt.revision() {
+            bound.profile.revision = Some(revision);
+        }
         Ok(())
     }
 }
@@ -1687,17 +1781,17 @@ async fn handle_myroom_request(
                 context,
             )
             .await?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
         MyRoomRequest::Reenter => {
             parse_reenter_request(packet)?;
             execute_myroom_entry(world, SessionMyRoomEntryIntent::Reenter, context).await?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
         MyRoomRequest::EnterRandom => {
             parse_enter_random_request(packet)?;
             execute_myroom_entry(world, SessionMyRoomEntryIntent::Random, context).await?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
         MyRoomRequest::FirstState => {
             parse_first_request(packet)?;
@@ -1709,12 +1803,12 @@ async fn handle_myroom_request(
                 context,
             )
             .await?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
         MyRoomRequest::RequestItems => {
             parse_request_items(packet)?;
             execute_myroom_owner_items(world, profiles, session_id, context).await?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
         MyRoomRequest::Secede => {
             parse_secede_request(packet)?;
@@ -1726,19 +1820,31 @@ async fn handle_myroom_request(
                 context,
             )
             .await?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
-        MyRoomRequest::CheckPassword => {
-            return handle_myroom_check_password(world, packet, context).await;
+        MyRoomRequest::CheckPassword => handle_myroom_check_password(world, packet, context).await,
+        MyRoomRequest::RequestEmblems => {
+            execute_myroom_owner_emblems(world, profiles, packet, context).await?;
+            Ok(Vec::new())
         }
-        MyRoomRequest::UpdateInfo => {}
+        MyRoomRequest::UpdateMainEmblem => {
+            update_main_emblems(world, profiles, packet, context).await
+        }
+        MyRoomRequest::UpdateInfo => update_myroom_info(world, profiles, packet, context).await,
         _ => {
             let identity = world.authorize_identity().await?;
             let _ = context.profile_for(&identity)?;
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
     }
+}
 
+async fn update_myroom_info(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let Some(view) = world.myroom_session_view().await? else {
         return Ok(Vec::new());
     };
@@ -1769,6 +1875,107 @@ async fn handle_myroom_request(
         publication = ?receipt.publication(),
         "applied durable MyRoom owner info to the bound session profile"
     );
+    Ok(Vec::new())
+}
+
+async fn execute_myroom_owner_emblems(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<(), LoginSessionError> {
+    parse_request_emblems(packet)?;
+    let Some(plan) = world.prepare_myroom_owner_emblems().await? else {
+        return Ok(());
+    };
+    let _ = context.profile_for(plan.expected_identity())?;
+    let emblems = profiles
+        .emblem_catalog()
+        .map(EmblemCatalog::ids)
+        .unwrap_or_default();
+    let packet = serialize_owner_emblems(emblems)?;
+    match world.publish_myroom_owner_emblems(plan, packet).await {
+        Ok(()) => Ok(()),
+        Err(WorldError::MyRoomCommandOutboundUnavailable { session }) => {
+            tracing::debug!(
+                session_id = session.get(),
+                "dropping a MyRoom owner-emblem response because its queue is full"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn update_main_emblems(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // Exact decoding happens before authorization, catalog lookup, completion
+    // reservation, or profile admission, so malformed bodies are side-effect
+    // free.
+    let request = parse_update_main_emblem(packet)?;
+    let Some(plan) = world.prepare_main_emblem_write().await? else {
+        return Ok(vec![serialize_update_main_emblem_reply(false)]);
+    };
+    let before = plan.expected_identity().clone();
+    let _ = context.profile_for(&before)?;
+    let selection = match profiles.validate_main_emblems(request) {
+        Ok(selection) => selection,
+        Err(error) => {
+            tracing::debug!(
+                nickname = %before.nickname,
+                %error,
+                "rejected a main-emblem selection outside the authoritative catalog"
+            );
+            return Ok(vec![serialize_update_main_emblem_reply(false)]);
+        }
+    };
+    let admission = profiles
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            MAIN_EMBLEM_WRITE_OPERATION,
+        )
+        .await?;
+    let completion = match world.reserve_main_emblem_completion().await {
+        Ok(completion) => completion,
+        Err(error) if error.is_request_rejection() => {
+            tracing::debug!(
+                %error,
+                "rejected a main-emblem write before persistence registration"
+            );
+            return Ok(vec![serialize_update_main_emblem_reply(false)]);
+        }
+        Err(error) => return Err(main_emblem_write_error(error)),
+    };
+    let prepared = profiles.prepare_main_emblem_write(selection, admission, completion);
+    let receipt = match world.persist_main_emblems(plan, prepared).await {
+        Ok(receipt) => receipt,
+        Err(error)
+            if error.is_request_rejection()
+                || matches!(&error, MainEmblemWriteError::Persistence(_)) =>
+        {
+            tracing::warn!(%error, "main-emblem write did not reach a durable success");
+            return Ok(vec![serialize_update_main_emblem_reply(false)]);
+        }
+        Err(error) => return Err(main_emblem_write_error(error)),
+    };
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    if receipt.publication() == MainEmblemPublication::ActiveOwnerCacheUpdated {
+        context.apply_main_emblem_write(&after, &receipt)?;
+        tracing::trace!(
+            nickname = %after.nickname,
+            revision = ?receipt.revision(),
+            selection = ?receipt.selection().values(),
+            "applied durable main emblems to the bound session profile"
+        );
+    }
+    // The actor publishes the pre-reserved success packet only after durable
+    // completion and exact owner-generation revalidation.
     Ok(Vec::new())
 }
 
@@ -1948,6 +2155,12 @@ async fn execute_live_myroom_command(
 
 fn myroom_info_write_error(source: MyRoomInfoWriteError) -> LoginSessionError {
     LoginSessionError::MyRoomInfoWrite {
+        source: Box::new(source),
+    }
+}
+
+fn main_emblem_write_error(source: MainEmblemWriteError) -> LoginSessionError {
+    LoginSessionError::MainEmblemWrite {
         source: Box::new(source),
     }
 }
@@ -2223,6 +2436,7 @@ fn room_participant_from_profile(
             nickname: identity.nickname.clone(),
             emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
             emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
+            emblem_3: u16::from_le_bytes(profile.rider.emblem3.to_le_bytes()),
             rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
             card: profile.rider.card.clone(),
             rp: profile.rider.rp,
@@ -2339,6 +2553,7 @@ fn profile_rider_fields(nickname: String, profile: &Profile) -> PrGetRiderFields
         nickname,
         emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
         emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
+        emblem_3: u16::from_le_bytes(profile.rider.emblem3.to_le_bytes()),
         rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
         lucci: profile.rider.lucci,
         rp: i32::from_le_bytes(profile.rider.rp.to_le_bytes()),
@@ -2638,9 +2853,10 @@ mod tests {
             OWNER_ITEM_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME,
             RIDER_TALK_NAME, plan_owner_item_packets, serialize_character_position,
             serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
-            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
-            serialize_owner_items, serialize_password_enter_myroom_command, serialize_rider_echo,
-            serialize_secede_reply, serialize_slot_data,
+            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_emblems,
+            serialize_owner_item_enchants, serialize_owner_items,
+            serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
+            serialize_slot_data, serialize_update_main_emblem_reply,
         },
         packet::{PacketError, PacketReader, PacketWriter},
         race_protocol::{
@@ -2774,6 +2990,11 @@ mod tests {
                     </Spec>
                 </Specs>
                 <Inventory total="{item_count}" categories="60">{items}</Inventory>
+                <Emblems total="3">
+                    <Emblem id="7" />
+                    <Emblem id="8" />
+                    <Emblem id="9" />
+                </Emblems>
             </KartCatalog>"#
         );
         Arc::new(CatalogInventory::from_xml(xml.as_bytes()).unwrap())
@@ -4860,6 +5081,231 @@ mod tests {
             .unwrap()
             .is_empty(),
             "a nonmember is ignored before its malformed body is parsed"
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture proves validation, visitor preflight before profile capacity, durable three-slot persistence, and actor-owned ACK publication"
+    )]
+    async fn main_emblem_dispatch_fails_closed_and_persists_all_three_owner_slots() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let limits = crate::profile_io::ProfileIoLimits::for_tests(1, 1);
+        let bootstrap =
+            crate::profile_io::ProfileIoBootstrap::acquire(profile_root.path().to_owned(), limits)
+                .unwrap();
+        let (profile_io, profile_runtime) = bootstrap.spawn();
+        let profiles = ProfileCoordinator::new(profile_io, Some(test_catalog()));
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+        let visitor_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+
+        let mut unknown = PacketWriter::named("RmRqUpdateMainEmblemPacket");
+        unknown.write_i16(7);
+        unknown.write_i16(10);
+        unknown.write_i16(9);
+        assert_eq!(
+            dispatch_packet(&owner_services, unknown.as_slice(), &mut owner_context)
+                .await
+                .unwrap(),
+            vec![serialize_update_main_emblem_reply(false)]
+        );
+        let unchanged = store.load_or_create(&owner.identity.nickname).unwrap();
+        assert_eq!(
+            [
+                unchanged.profile.rider.emblem1,
+                unchanged.profile.rider.emblem2,
+                unchanged.profile.rider.emblem3,
+            ],
+            [0, 0, 0]
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        let mut visitor_write = PacketWriter::named("RmRqUpdateMainEmblemPacket");
+        visitor_write.write_i16(7);
+        visitor_write.write_i16(8);
+        visitor_write.write_i16(9);
+        let held_profile_capacity = profiles
+            .admit("MainEmblemCapacitySentinel", "hold profile capacity")
+            .await
+            .unwrap();
+        assert_eq!(
+            time::timeout(
+                Duration::from_secs(1),
+                dispatch_packet(
+                    &visitor_services,
+                    visitor_write.as_slice(),
+                    &mut visitor_context,
+                ),
+            )
+            .await
+            .expect("a visitor must fail actor preflight before waiting for profile capacity")
+            .unwrap(),
+            vec![serialize_update_main_emblem_reply(false)]
+        );
+        drop(held_profile_capacity);
+        assert!(visitor.outbound.try_recv().is_err());
+
+        let mut valid = PacketWriter::named("RmRqUpdateMainEmblemPacket");
+        valid.write_i16(7);
+        valid.write_i16(8);
+        valid.write_i16(9);
+        assert!(
+            dispatch_packet(&owner_services, valid.as_slice(), &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_update_main_emblem_reply(true)]
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+        let persisted = store.load_or_create(&owner.identity.nickname).unwrap();
+        assert_eq!(
+            [
+                persisted.profile.rider.emblem1,
+                persisted.profile.rider.emblem2,
+                persisted.profile.rider.emblem3,
+            ],
+            [7, 8, 9]
+        );
+        let current = world.authorize_identity(owner.session).await.unwrap();
+        assert_eq!(
+            [
+                owner_context.profile_for(&current).unwrap().rider.emblem1,
+                owner_context.profile_for(&current).unwrap().rider.emblem2,
+                owner_context.profile_for(&current).unwrap().rider.emblem3,
+            ],
+            [7, 8, 9]
+        );
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_emblems_serializes_the_bounded_source_ordered_catalog() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let request = PacketWriter::named("RmRequestEmblemsPacket").into_inner();
+
+        for (session_id, context, outbound) in [
+            (owner.session, &mut owner_context, &mut owner.outbound),
+            (visitor.session, &mut visitor_context, &mut visitor.outbound),
+        ] {
+            let services = SessionServices {
+                config: &config,
+                world: &world,
+                profiles: &profiles,
+                session_id,
+            };
+            assert!(
+                dispatch_packet(&services, &request, context)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                outbound.try_recv().unwrap().into_packets(),
+                vec![serialize_owner_emblems(&[7, 8, 9]).unwrap()]
+            );
+        }
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_emblem_catalog_is_empty_and_allows_only_zero_selection() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            visitor: _visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &owner.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner.session,
+        };
+
+        let request = PacketWriter::named("RmRequestEmblemsPacket").into_inner();
+        assert!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_owner_emblems(&[]).unwrap()]
+        );
+
+        let mut unknown = PacketWriter::named("RmRqUpdateMainEmblemPacket");
+        unknown.write_i16(7);
+        unknown.write_i16(0);
+        unknown.write_i16(0);
+        assert_eq!(
+            dispatch_packet(&services, unknown.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_update_main_emblem_reply(false)]
+        );
+        assert!(owner.outbound.try_recv().is_err());
+
+        let mut empty = PacketWriter::named("RmRqUpdateMainEmblemPacket");
+        empty.write_i16(0);
+        empty.write_i16(0);
+        empty.write_i16(0);
+        assert!(
+            dispatch_packet(&services, empty.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            owner.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_update_main_emblem_reply(true)]
         );
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;

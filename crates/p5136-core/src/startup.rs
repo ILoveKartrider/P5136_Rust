@@ -221,6 +221,7 @@ pub struct PrGetRiderFields {
     pub nickname: String,
     pub emblem_1: u16,
     pub emblem_2: u16,
+    pub emblem_3: u16,
     pub rider_item_snapshot: [u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
     pub lucci: u32,
     pub rp: i32,
@@ -330,7 +331,7 @@ pub fn serialize_pr_get_rider(fields: &PrGetRiderFields) -> Result<Vec<u8>, Pack
     packet.write_u16(0);
     packet.write_u16(fields.emblem_1);
     packet.write_u16(fields.emblem_2);
-    packet.write_u16(0);
+    packet.write_u16(fields.emblem_3);
     packet.write_bytes(&fields.rider_item_snapshot);
     packet.write_utf16("")?;
     packet.write_u32(fields.lucci);
@@ -625,11 +626,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        GameOptions, MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields, StartupError,
-        StartupRequest, channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_pq_update_game_option, serialize_channel_static_reply,
-        serialize_lo_rp_add_racing_time, serialize_lo_rp_event_reward,
-        serialize_pr_add_time_event_init, serialize_pr_chapter_info,
+        GameOptions, MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest, channel_static_reply_body,
+        classify_startup_request, is_startup_noop, parse_pq_update_game_option,
+        serialize_channel_static_reply, serialize_lo_rp_add_racing_time,
+        serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
@@ -810,6 +811,7 @@ mod tests {
             nickname: "Rider".to_owned(),
             emblem_1: 0x1234,
             emblem_2: 0x5678,
+            emblem_3: 0,
             rider_item_snapshot: [0xa5; 65],
             lucci: 0x1020_3040,
             rp: -1234,
@@ -827,6 +829,39 @@ mod tests {
         assert_eq!(reader.read_u8().unwrap(), 0);
         assert_eq!(reader.read_utf16().unwrap(), "Rider");
         assert_eq!(reader.remaining().len(), 180);
+    }
+
+    #[test]
+    fn rider_snapshot_writes_nonzero_third_emblem_before_equipment() {
+        let rider_items = [0xa5; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH];
+        let rider = serialize_pr_get_rider(&PrGetRiderFields {
+            nickname: "ThirdEmblem".to_owned(),
+            emblem_1: 0x1234,
+            emblem_2: 0x5678,
+            emblem_3: 0x9abc,
+            rider_item_snapshot: rider_items,
+            lucci: 0,
+            rp: 0,
+        })
+        .unwrap();
+
+        let mut reader = PacketReader::new(&rider);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrGetRider")
+        );
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        assert_eq!(reader.read_u8().unwrap(), 0);
+        assert_eq!(reader.read_utf16().unwrap(), "ThirdEmblem");
+        assert_eq!(reader.read_u16().unwrap(), 0);
+        assert_eq!(reader.read_u16().unwrap(), 0);
+        assert_eq!(reader.read_u16().unwrap(), 0x1234);
+        assert_eq!(reader.read_u16().unwrap(), 0x5678);
+        assert_eq!(reader.read_u16().unwrap(), 0x9abc);
+        assert_eq!(
+            reader.read_bytes(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH).unwrap(),
+            rider_items.as_slice()
+        );
     }
 
     #[test]

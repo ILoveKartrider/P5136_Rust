@@ -723,6 +723,11 @@ pub(crate) mod tests {
                     </Spec>
                 </Specs>
                 <Inventory total="{item_count}" categories="60">{items}</Inventory>
+                <Emblems total="3">
+                    <Emblem id="7" />
+                    <Emblem id="8" />
+                    <Emblem id="9" />
+                </Emblems>
             </KartCatalog>"#
         );
         CatalogInventory::from_xml(xml.as_bytes()).unwrap()

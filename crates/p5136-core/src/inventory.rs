@@ -743,6 +743,7 @@ mod tests {
             nickname: "Rider".to_owned(),
             emblem_1: 0,
             emblem_2: 0,
+            emblem_3: 0,
             rider_item_snapshot: [0; 65],
             lucci: 0,
             rp: 0,

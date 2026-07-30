@@ -51,6 +51,7 @@ pub struct Rider {
     pub card: String,
     pub emblem1: i16,
     pub emblem2: i16,
+    pub emblem3: i16,
     pub lucci: u32,
     #[serde(rename = "RP")]
     pub rp: u32,
@@ -91,6 +92,7 @@ impl Default for Rider {
             card: String::new(),
             emblem1: 0,
             emblem2: 0,
+            emblem3: 0,
             lucci: 1_000_000,
             rp: 20_000_000,
             koin: 10_000,
@@ -116,11 +118,12 @@ impl Default for Rider {
 }
 
 impl Rider {
-    /// Replaces the two persisted main-emblem selections without disturbing
+    /// Replaces the three persisted main-emblem selections without disturbing
     /// forward-compatible rider fields.
-    pub fn set_main_emblems(&mut self, emblem_1: i16, emblem_2: i16) {
+    pub fn set_main_emblems(&mut self, emblem_1: i16, emblem_2: i16, emblem_3: i16) {
         self.emblem1 = emblem_1;
         self.emblem2 = emblem_2;
+        self.emblem3 = emblem_3;
     }
 }
 
@@ -611,9 +614,22 @@ mod tests {
             .extra
             .insert("FutureRiderField".to_owned(), json!({"keep": true}));
 
-        rider.set_main_emblems(11, 12);
+        rider.set_main_emblems(11, 12, 13);
 
-        assert_eq!((rider.emblem1, rider.emblem2), (11, 12));
+        assert_eq!((rider.emblem1, rider.emblem2, rider.emblem3), (11, 12, 13));
+        assert_eq!(rider.extra["FutureRiderField"]["keep"], true);
+    }
+
+    #[test]
+    fn legacy_rider_without_third_emblem_defaults_only_that_slot() {
+        let rider: Rider = serde_json::from_value(json!({
+            "Emblem1": 7,
+            "Emblem2": 8,
+            "FutureRiderField": {"keep": true}
+        }))
+        .unwrap();
+
+        assert_eq!((rider.emblem1, rider.emblem2, rider.emblem3), (7, 8, 0));
         assert_eq!(rider.extra["FutureRiderField"]["keep"], true);
     }
 }

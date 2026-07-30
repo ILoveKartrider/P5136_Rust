@@ -392,6 +392,7 @@ mod tests {
             nickname: "Master".into(),
             emblem_1: 0,
             emblem_2: 0,
+            emblem_3: 0,
             rider_item_snapshot: [0; 65],
             card: String::new(),
             rp: 20_000_000,

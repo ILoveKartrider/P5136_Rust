@@ -4,6 +4,7 @@ members = [
     "crates/p5136-connector",
     "crates/p5136-core",
     "crates/p5136-profile",
+    "crates/p5136-rho5",
     "crates/p5136-server",
 ]
 resolver = "2"
@@ -19,6 +20,8 @@ anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
+flate2 = "1.1"
+md-5 = "0.10"
 rand = "0.9"
 quick-xml = "0.41"
 serde = { version = "1.0", features = ["derive"] }

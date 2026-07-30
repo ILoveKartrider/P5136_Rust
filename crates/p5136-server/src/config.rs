@@ -15,6 +15,9 @@ pub struct ServerConfig {
     pub ports: PortTopology,
     pub profile_root: PathBuf,
     pub catalog_path: Option<PathBuf>,
+    /// Optional stock-client `Data` directory containing the KR `*.rho5`
+    /// archives used to load authoritative emblem definitions.
+    pub client_data_dir: Option<PathBuf>,
     pub first_message_delay: Duration,
     pub login_timeout: Duration,
     pub session_idle_timeout: Duration,
@@ -37,6 +40,7 @@ impl Default for ServerConfig {
             ports: PortTopology::default(),
             profile_root: PathBuf::from("Profile"),
             catalog_path: None,
+            client_data_dir: None,
             first_message_delay: Duration::from_millis(250),
             login_timeout: Duration::from_secs(12),
             session_idle_timeout: Duration::from_secs(5 * 60),

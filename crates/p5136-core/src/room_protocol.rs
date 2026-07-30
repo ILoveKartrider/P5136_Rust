@@ -169,6 +169,7 @@ pub struct RoomPlayer {
     pub nickname: String,
     pub emblem_1: u16,
     pub emblem_2: u16,
+    pub emblem_3: u16,
     pub rider_item_snapshot: [u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
     pub card: String,
     pub rp: u32,
@@ -611,7 +612,7 @@ fn write_room_player(
     packet.write_utf16(&player.nickname)?;
     packet.write_u16(player.emblem_1);
     packet.write_u16(player.emblem_2);
-    packet.write_u16(0);
+    packet.write_u16(player.emblem_3);
     packet.write_bytes(&player.rider_item_snapshot);
     packet.write_utf16(&player.card)?;
     packet.write_u32(player.rp);
@@ -752,16 +753,20 @@ mod tests {
 
     use super::{
         ChCreateRoomRequest, CreateRoomOutcome, InitialRoomStatePacketKind, JoinRoomStatus,
-        MAX_ROOM_AI_COUNT, MAX_ROOM_LIST_ENTRIES, MAX_ROOM_NAME_UTF16_UNITS, ROOM_DATA_LENGTH,
-        RoomAi, RoomListEntry, RoomMember, RoomObserver, RoomObserverSlot, RoomPlayer,
-        RoomProtocolError, RoomProtocolRequest, RoomSessionData, RoomSlotData,
-        classify_room_protocol_request, parse_ch_create_room_request,
-        parse_ch_get_room_list_request, parse_ch_join_room_request, parse_ch_leave_room_request,
-        parse_gr_first_request, serialize_ch_create_room_reply, serialize_ch_get_room_list_reply,
-        serialize_ch_join_room_reply, serialize_ch_leave_room_reply, serialize_gr_session_data,
-        serialize_gr_slot_data, serialize_initial_room_state,
+        MAX_ROOM_AI_COUNT, MAX_ROOM_LIST_ENTRIES, MAX_ROOM_NAME_UTF16_UNITS,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, ROOM_DATA_LENGTH, RoomAi, RoomListEntry, RoomMember,
+        RoomObserver, RoomObserverSlot, RoomPlayer, RoomProtocolError, RoomProtocolRequest,
+        RoomSessionData, RoomSlotData, classify_room_protocol_request,
+        parse_ch_create_room_request, parse_ch_get_room_list_request, parse_ch_join_room_request,
+        parse_ch_leave_room_request, parse_gr_first_request, serialize_ch_create_room_reply,
+        serialize_ch_get_room_list_reply, serialize_ch_join_room_reply,
+        serialize_ch_leave_room_reply, serialize_gr_session_data, serialize_gr_slot_data,
+        serialize_initial_room_state,
     };
-    use crate::{adler32, packet::PacketError};
+    use crate::{
+        adler32,
+        packet::{PacketError, PacketReader},
+    };
 
     #[test]
     fn dispatch_table_uses_the_exact_csharp_packet_names_and_hashes() {
@@ -1003,6 +1008,46 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_room_player_writes_nonzero_third_emblem_before_equipment() {
+        let mut slots = fixture_slots();
+        let RoomMember::Player(player) = &mut slots.members_by_id[0] else {
+            panic!("fixture slot zero must contain an ordinary player");
+        };
+        player.emblem_3 = 0x9abc;
+        let packet = serialize_gr_slot_data(&slots).unwrap();
+
+        let mut reader = PacketReader::new(&packet);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("GrSlotDataPacket")
+        );
+        assert_eq!(reader.read_u32().unwrap(), slots.track);
+        assert_eq!(reader.read_u32().unwrap(), slots.room_data_header);
+        assert_eq!(
+            reader.read_bytes(ROOM_DATA_LENGTH).unwrap(),
+            slots.room_data
+        );
+        assert_eq!(reader.read_i32().unwrap(), slots.room_master);
+        reader.read_bytes(11).unwrap();
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_bytes(1).unwrap(), &[7]);
+        reader.read_bytes(16).unwrap();
+
+        assert_eq!(reader.read_i32().unwrap(), 2);
+        assert_eq!(reader.read_u32().unwrap(), 0x0102_0304);
+        reader.read_bytes(6).unwrap();
+        reader.read_bytes(6).unwrap();
+        assert_eq!(reader.read_utf16().unwrap(), "Rider");
+        assert_eq!(reader.read_u16().unwrap(), 0x1234);
+        assert_eq!(reader.read_u16().unwrap(), 0x5678);
+        assert_eq!(reader.read_u16().unwrap(), 0x9abc);
+        assert_eq!(
+            reader.read_bytes(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH).unwrap(),
+            array_from_range::<RIDER_ITEM_SNAPSHOT_WIRE_LENGTH>(0).as_slice()
+        );
+    }
+
+    #[test]
     fn response_serializers_bound_strings_counts_and_slot_indices() {
         let entry = RoomListEntry {
             room_id: 1,
@@ -1103,6 +1148,7 @@ mod tests {
             nickname: "Rider".to_owned(),
             emblem_1: 0x1234,
             emblem_2: 0x5678,
+            emblem_3: 0,
             rider_item_snapshot: array_from_range::<65>(0),
             card: "C".to_owned(),
             rp: 123_456,
