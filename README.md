@@ -63,6 +63,11 @@ Migration freezes and drains exact generation-bound operation
 leases, then crosses a pre-reserved ACK and result-free
 identity/MyRoom/protocol commit boundary. Messenger frames are rechecked across
 generation changes.
+Authenticated packet dispatch is fail-closed: explicitly catalogued
+compatibility no-reply packets remain no-reply, while an unclassified hash
+returns a typed session error instead of being mistaken for a successful
+handler. MyRoom dispatch is exhaustive so new protocol variants cannot
+silently fall through.
 
 The remaining compatibility work is concentrated in the unported MyRoom and
 economy requests, capture-derived movement sequencing and UDP first-bind

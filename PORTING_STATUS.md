@@ -635,9 +635,20 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Consume the remaining kind-2 Career grant. Add P2P-port profile writes,
-   club create/rename refresh, and any request still intentionally classified
-   as a no-op. Finish kart tuning/upgrades and the remaining
+   The identity-bound dispatcher now rejects an unclassified hash explicitly;
+   the MyRoom match is exhaustive, so adding a classified request without a
+   handler is a compile error. Complete the evidence ledger for the existing
+   deliberate no-reply list.
+
+   Add generation-bound P2P-port admission, durable persistence, and ordinary
+   room/MyRoom cache refresh. Do not trust the client-reported IP address and
+   do not advertise an old persisted port as a new connection's observed UDP
+   endpoint. Capture the exact MyRoom Career request/reply layouts before
+   consuming the remaining kind-2 Career grant: the bundled C# code contains
+   only the four packet-name hashes and silently drops the requests, so it
+   cannot specify their bodies. Club rename requires a global membership/name
+   namespace; club creation is a separate system-design slice rather than a
+   per-profile string write. Finish kart tuning/upgrades and the remaining
    quest/attendance/progression surface.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
@@ -673,24 +684,29 @@ These items prevent a "port complete" claim.
 
 ## Exact resume plan
 
-1. Enumerate every classified request and mark it implemented, intentionally
-   unsupported with a typed response, or capture-blocked. No silent fallthrough.
-2. Port the Career request using only its exact kind-2 grant and continue
-   remaining MyRoom requests in small vertical slices with malformed-input,
-   stale-generation, cancellation/backpressure, and exact-packet tests. Keep
+1. Continue the packet-disposition ledger: every known request must be
+   implemented, an evidence-backed deliberate no-reply, explicitly
+   unsupported, or capture-blocked. The generic authenticated fallback now
+   returns `UnsupportedIdentityPacket`; it no longer reports silent success.
+2. Port `ChClientP2pAddrPacket` as an exact-body, generation-bound report. Use
+   the authenticated TCP source IP, persist only the reported port through a
+   cancellation-safe profile completion, and refresh ordinary room/MyRoom
+   caches only for the exact live generation.
+3. Capture the two MyRoom Career request/reply pairs, including empty-list
+   behavior and request order, before consuming the exact kind-2 grant. Keep
    the completed RHO5 reader narrowly scoped and read-only, and keep every
    proprietary archive/XML fixture outside Git.
-3. Add TCP-issued UDP bind capabilities without weakening the existing
+4. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
-4. Capture and implement movement sequence/tick behavior per sender and exact
+5. Capture and implement movement sequence/tick behavior per sender and exact
    race generation; never copy the broken C# recipient-global predicate.
-5. Close remaining economy and packet-fixture gaps, then design race-wide
+6. Close remaining economy and packet-fixture gaps, then design race-wide
    reward recovery.
-6. Run the existing three-desktop CI matrix to green, record the run, and
+7. Run the existing three-desktop CI matrix to green, record the run, and
    exercise the connector on Wine/CrossOver.
-7. Run the stock two-client end-to-end flow and record its exact environment,
+8. Run the stock two-client end-to-end flow and record its exact environment,
    packets, persistence outcome, and shutdown result.
-8. Before every checkpoint run:
+9. Before every checkpoint run:
 
    ```text
    cargo fmt --all -- --check

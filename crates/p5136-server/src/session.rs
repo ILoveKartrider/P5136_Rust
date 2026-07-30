@@ -280,6 +280,9 @@ pub enum LoginSessionError {
     #[error("logical login packet is shorter than its four-byte name hash")]
     MissingPacketHash,
 
+    #[error("unsupported identity-bound packet hash 0x{hash:08X}")]
+    UnsupportedIdentityPacket { hash: u32 },
+
     #[error(
         "P5136 static channel catalog has no record for game type {game_type} and preferred channel {preferred_channel}"
     )]
@@ -1512,10 +1515,13 @@ async fn dispatch_packet_admitted(
         return Ok(Vec::new());
     }
 
-    // Identity-bound packets cannot be processed by a stale connection. Their
-    // concrete handlers are ported incrementally on top of this fence.
-    let _ = world.authorize_identity().await?;
-    Ok(Vec::new())
+    // Identity-bound packets cannot be processed by a stale connection.
+    // Unknown packets fail explicitly instead of impersonating a successful
+    // no-reply handler. Deliberate compatibility no-ops remain classified by
+    // `is_startup_noop` above.
+    let identity = world.authorize_identity().await?;
+    let _ = context.profile_for(&identity)?;
+    Err(LoginSessionError::UnsupportedIdentityPacket { hash })
 }
 
 async fn handle_channel_switch(
@@ -1768,12 +1774,13 @@ async fn handle_myroom_request(
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
-    if let Some(payload) = parse_myroom_peer_payload(request, packet)? {
-        execute_myroom_peer_command(world, payload).await?;
-        return Ok(Vec::new());
-    }
-
     match request {
+        MyRoomRequest::CharacterPosition | MyRoomRequest::RiderTalk => {
+            let payload = parse_myroom_peer_payload(request, packet)?
+                .expect("peer MyRoom variants always produce a peer command payload");
+            execute_myroom_peer_command(world, payload).await?;
+            Ok(Vec::new())
+        }
         MyRoomRequest::Enter => {
             execute_myroom_entry(
                 world,
@@ -1831,11 +1838,6 @@ async fn handle_myroom_request(
             update_main_emblems(world, profiles, packet, context).await
         }
         MyRoomRequest::UpdateInfo => update_myroom_info(world, profiles, packet, context).await,
-        _ => {
-            let identity = world.authorize_identity().await?;
-            let _ = context.profile_for(&identity)?;
-            Ok(Vec::new())
-        }
     }
 }
 
@@ -3600,6 +3602,55 @@ mod tests {
             identity
         );
 
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_dispatch_rejects_an_unclassified_packet_explicitly() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_706))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "UnknownPacketClassifier")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let hash = 0xDEAD_BEEF_u32;
+
+        assert!(
+            dispatch_packet(
+                &services,
+                PacketWriter::named("LoRqGetRiderItemPacket").as_slice(),
+                &mut context,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(matches!(
+            dispatch_packet(&services, &hash.to_le_bytes(), &mut context).await,
+            Err(LoginSessionError::UnsupportedIdentityPacket { hash: actual })
+                if actual == hash
+        ));
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
     }
