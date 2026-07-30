@@ -28,7 +28,8 @@ been demonstrated.
 - [x] immutable backup, process lock, and atomic replacement
 - [x] native Windows UAC launch specification
 - [x] Wine and CrossOver launch specifications
-- [x] no-argument desktop GUI and equivalent CLI
+- [x] no-argument Server/Connector GUI and equivalent CLI
+- [x] GUI-configurable server lifecycle with explicit graceful/forced shutdown
 - [ ] verified launch of a stock client on Windows
 - [ ] verified launch of the same client through Wine or CrossOver
 

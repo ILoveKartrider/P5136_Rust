@@ -34,7 +34,8 @@ server. The implemented foundation provides:
 - executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
 - versioned JSON profile persistence compatible with legacy `Launcher.json`;
 - bounded read-only KR RHO5 emblem loading with authenticated decompression;
-- a no-argument desktop connector GUI and an equivalent headless CLI.
+- a no-argument desktop GUI with separate Server and Connector tabs, plus an
+  equivalent headless CLI.
 
 Room admission, first-state, messenger, and UDP/P2P runtime flows are
 integrated. UDP authorization and room audience selection run inside the world
@@ -208,16 +209,28 @@ The server binds to `127.0.0.1` by default. To serve another machine, set both
 new profiles from non-loopback clients additionally requires the explicit
 `--allow-remote-profile-creation` option.
 
-## Connector
+## Desktop GUI and connector
 
-The connector itself is a native Rust application on each host. With no
-arguments it opens the desktop GUI. On macOS/Linux it launches only
-`KartRider.exe` through Wine or CrossOver; on Windows, `auto` uses a UAC-backed
-native launch and refuses elevation unless the executable still has the known
-stock P5136 SHA-256. Use `p5136 connect --help` for the headless equivalent and
-`--dry-run` to inspect the complete plan without touching files, sockets, or
-processes. Closing the GUI cancels any uncommitted probe or launch; an atomic
-file preparation already in progress is allowed to finish safely.
+With no arguments, `p5136` opens the desktop GUI. The Server tab exposes the
+same server options as the CLI: bind and advertised addresses, configured port,
+profile root, optional catalog and client-data paths, remote profile creation,
+and advanced session limits/timeouts. Starting and graceful stopping keep the
+supervisor on a dedicated worker; if retained reward recovery blocks graceful
+shutdown, the GUI reports that state and requires an explicit force-stop click.
+Closing a window with a live server cancels the close, requests graceful
+shutdown, waits for a bounded interval, then requests a force-stop and joins
+the worker before allowing process exit.
+The Server tab can copy its advertised address and configured port into the
+Connector tab. GUI edits apply to the next server start and are intentionally
+not persisted.
+
+The Connector tab is a native Rust application on each host. On macOS/Linux it
+launches only `KartRider.exe` through Wine or CrossOver; on Windows, `auto` uses
+a UAC-backed native launch and refuses elevation unless the executable still
+has the known stock P5136 SHA-256. Use `p5136 connect --help` for the headless
+equivalent and `--dry-run` to inspect the complete plan without touching files,
+sockets, or processes. Closing the GUI cancels any uncommitted probe or launch;
+an atomic file preparation already in progress is allowed to finish safely.
 
 ## Provenance
 

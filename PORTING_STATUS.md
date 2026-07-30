@@ -26,13 +26,14 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
-State: paused at a clean, reviewed checkpoint. Resume with item 1 under
-**Exact resume plan**; do not reopen the completed favorite-item migration
-without a new compatibility/security finding.
+State: clean, reviewed GUI/E2E checkpoint. The protocol resume order remains
+item 1 under **Exact resume plan**; do not reopen the completed favorite-item
+migration without a new compatibility/security finding.
 
 Current implementation checkpoint:
 `533df45 Port lease-bound favorite sidecar migration` +
-`bb84027 Harden favorite sidecar import bounds`
+`bb84027 Harden favorite sidecar import bounds` +
+`9b26159 Add GUI server controls`
 
 ## Current Rust checkpoint
 
@@ -46,6 +47,36 @@ unlock remain explicit, authenticated, read-only no-reply outcomes: Rust does
 not clone C# success acknowledgements that would claim deletion or unlock
 without an authoritative durable transition. The C# repository remains
 unchanged and is evidence only.
+
+### Desktop server and connector GUI
+
+- `p5136` remains one native binary by design. `p5136 server` and
+  `p5136 connect` remain the scriptable CLI surfaces; launching with no
+  arguments opens the desktop Server/Connector GUI.
+- The Server tab maps directly to the public CLI server configuration: bind
+  address, advertised IPv4 address, configured base port, profile root,
+  optional `KartCatalog.xml`, optional client `Data` directory, remote profile
+  creation, and the advanced first-message/session timeout and login-limit
+  values. Inputs are validated before a bind and apply only to the next start;
+  the GUI deliberately persists no machine-specific paths or endpoints.
+- Server ownership never crosses into the GUI thread. A named worker owns the
+  `ServerHandle`; it reports the four bound endpoints, receives explicit
+  graceful/force commands, and is joined after it reports a terminal result.
+  Graceful shutdown remains interruptible by Force while the runtime drains
+  wire/profile work. A retained reward recovery error is shown as a blocked
+  state and requires a deliberate force-stop click.
+- Closing a live-server window is an operator shutdown: the GUI cancels the
+  immediate close, requests graceful shutdown, waits five seconds, requests
+  force shutdown if still live, joins the worker, and only then permits the
+  process to exit. The `Drop` fallback also force-signals and joins the worker;
+  it does not silently detach a live `ServerHandle`.
+- The Server tab can copy the advertised endpoint and base port into Connector
+  settings. Connector preparation/launch retains its existing cancellation
+  and atomic-file behavior.
+- The GUI layer adds no `unsafe`: the workspace remains
+  `unsafe_code = "forbid"`. `cargo test --workspace -q`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and release CLI
+  build pass at this checkpoint (817 regular tests, 2 local opt-in ignored).
 
 ### Safe item-state checkpoint
 
