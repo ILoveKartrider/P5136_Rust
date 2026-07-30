@@ -36,11 +36,13 @@ RequestItems, character-position, and Secede paths are also actor-integrated.
 Reenter restores an exact current membership before falling back to the
 rider's own room. Random entry selects only actor-tracked, owner-present,
 non-full public rooms; protected rooms fail closed until a password capability
-exists, and every visitor reply redacts stored secrets. RequestItems loads a
-bounded owner snapshot under the canonical profile lane and publishes its
-complete ordered response as one actor-owned queue batch. Character positions
-use actor-derived sender slots and exact-generation peer audiences with
-all-recipient atomic queue reservation.
+exists, and every visitor reply redacts stored secrets. The legacy
+password-kind probe returns its exact compatibility ACK after strict parsing,
+but does not grant protected-room authority. RequestItems loads a bounded owner
+snapshot under the canonical profile lane and publishes its complete ordered
+response as one actor-owned queue batch. Character positions use actor-derived
+sender slots and exact-generation peer audiences with all-recipient atomic
+queue reservation.
 Migration freezes and drains exact generation-bound operation
 leases, then crosses a pre-reserved ACK and result-free
 identity/MyRoom/protocol commit boundary. Messenger frames are rechecked across

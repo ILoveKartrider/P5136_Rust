@@ -39,10 +39,10 @@ use p5136_core::{
     myroom_protocol::{
         EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
         MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
-        parse_enter_random_request, parse_enter_request, parse_first_request,
+        parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
         parse_reenter_request, parse_request_items, parse_secede_request, parse_update_info,
-        plan_owner_item_packets, serialize_myroom_info, serialize_owner_item_enchants,
-        serialize_owner_items,
+        plan_owner_item_packets, serialize_check_password_reply, serialize_myroom_info,
+        serialize_owner_item_enchants, serialize_owner_items,
     },
     nickname::canonical_nickname_key,
     packet::PacketError,
@@ -1731,6 +1731,9 @@ async fn handle_myroom_request(
             .await?;
             return Ok(Vec::new());
         }
+        MyRoomRequest::CheckPassword => {
+            return handle_myroom_check_password(world, packet, context).await;
+        }
         MyRoomRequest::UpdateInfo => {}
         _ => {
             let identity = world.authorize_identity().await?;
@@ -1770,6 +1773,17 @@ async fn handle_myroom_request(
         "applied durable MyRoom owner info to the bound session profile"
     );
     Ok(Vec::new())
+}
+
+async fn handle_myroom_check_password(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let request = parse_check_password(packet)?;
+    let identity = world.authorize_identity().await?;
+    let _ = context.profile_for(&identity)?;
+    Ok(vec![serialize_check_password_reply(request.password_kind)])
 }
 
 enum SessionMyRoomEntryIntent {
@@ -2597,11 +2611,12 @@ mod tests {
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
-            CHAR_POSITION_NAME, ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME,
-            EnterMyRoomStatus, MAX_MYROOM_PASSWORD_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo,
-            MyRoomKart, MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
-            REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets,
-            serialize_character_position, serialize_enter_error, serialize_enter_reply,
+            CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, ENTER_MYROOM_REQUEST_NAME,
+            ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus, MAX_MYROOM_PASSWORD_UTF16_UNITS,
+            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart, MyRoomParts, MyRoomProtocolError,
+            MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME, REENTER_MYROOM_REQUEST_NAME,
+            REQUEST_MYROOM_ITEMS_NAME, plan_owner_item_packets, serialize_character_position,
+            serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
             serialize_missing_owner_items, serialize_myroom_info, serialize_owner_item_enchants,
             serialize_owner_items, serialize_secede_reply, serialize_slot_data,
         },
@@ -4077,6 +4092,62 @@ mod tests {
             vec![serialize_enter_error(EnterMyRoomStatus::NoAvailableRoom).unwrap()]
         );
         assert_eq!(world.myroom_session_view(session).await.unwrap(), None);
+
+        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myroom_check_password_dispatch_is_strict_and_preserves_p5136_status() {
+        let (world, actor) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_744),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "CheckPasswordDispatch")
+            .await
+            .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+
+        for password_kind in [0, 1, -7] {
+            let mut request = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+            request.write_i32(password_kind);
+            assert_eq!(
+                dispatch_packet(&services, request.as_slice(), &mut context)
+                    .await
+                    .unwrap(),
+                vec![serialize_check_password_reply(password_kind)]
+            );
+            assert!(outbound.try_recv().is_err());
+        }
+
+        let mut malformed = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+        malformed.write_i32(0);
+        malformed.write_u8(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, malformed.as_slice(), &mut context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::TrailingBytes {
+                    name: CHECK_PASSWORD_REQUEST_NAME,
+                    count: 1,
+                }
+            ))
+        ));
+        assert!(outbound.try_recv().is_err());
+        assert_eq!(world.authorize_identity(session).await.unwrap(), identity);
 
         shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
     }

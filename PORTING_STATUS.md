@@ -27,13 +27,26 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Committed baseline before the current tranche:
-`90e57a7 Port safe direct MyRoom entry`
+`f84282e Port safe MyRoom reentry and random entry`
 
 ## Current Rust checkpoint
 
-The current worktree builds on the direct-entry checkpoint and closes the
-strict `Reenter` and safe random-public-room entry vertical slices without
-copying the C# handler's conflated random-online-player fallback.
+The current worktree builds on the Reenter/random-entry checkpoint and closes
+the bounded `CheckPassword` compatibility-response slice without treating it
+as a protected-room password proof.
+
+### MyRoom password-kind compatibility response
+
+- `ChRqMyroomCheckPassEtcPacket` is now an explicit session path. Its sole
+  signed 32-bit password-kind field is parsed strictly; truncated or trailing
+  input fails before actor authorization, bound-profile lookup, or response.
+- For a current generation with its matching bound profile, Rust preserves the
+  C# wire response exactly: `ChRpMyroomCheckPassEtcPacket` contains the
+  requested kind followed by `1` only for kind `0`, otherwise `0`.
+- This packet contains no password or credential and mints no World/Hub
+  capability, membership, or session flag. In particular, its success-looking
+  kind-0 ACK cannot authorize protected-room entry. That flow remains
+  capture-blocked until the actual credential-bearing exchange is known.
 
 ### MyRoom Reenter and random public entry
 
@@ -132,9 +145,10 @@ copying the C# handler's conflated random-online-player fallback.
   members receive only the post-move old-room snapshot. A dropped ACK receiver
   cannot cancel accepted actor work, while quiesce rejects the command before
   publication.
-- Protected-room password proof and `CheckPassword` remain separate unported
-  slices. Rust does not copy the C# bug that ignores room passwords or leaks
-  both stored plaintext passwords to visitors.
+- Protected-room password proof remains unported. The separately implemented
+  password-kind compatibility ACK is not accepted as proof. Rust does not copy
+  the C# bug that ignores room passwords or leaks both stored plaintext
+  passwords to visitors.
 
 ### MyRoom CharacterPosition
 
@@ -269,9 +283,10 @@ copying the C# handler's conflated random-online-player fallback.
 - MyRoom actor state includes bounded entry topology and generation-aware
   migration/disconnect cleanup. Production dispatch currently integrates
   direct self/public entry, current-membership Reenter, bounded random public
-  entry, fresh FirstState projection, owner-info durability, bounded
-  RequestItems, exact-generation character-position fanout, and Secede;
-  protected password entry is still missing.
+  entry, the strict password-kind compatibility ACK, fresh FirstState
+  projection, owner-info durability, bounded RequestItems, exact-generation
+  character-position fanout, and Secede; protected password entry is still
+  missing.
 - Rider equipment/plant persistence is cancellation-independent and refreshes
   the actor caches only after durable confirmation.
 - Graceful shutdown drains wire admission, accepted durable work, completion
@@ -365,11 +380,11 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 630 passed, 0 failed
+# 631 passed, 0 failed
 git diff --check
 ```
 
-The 630 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 364 server
+The 631 tests comprise 9 CLI, 35 connector, 134 core, 80 profile, 365 server
 unit, and 8 server integration tests. Doc-tests also passed.
 
 Focused regressions cover:
@@ -401,6 +416,8 @@ Focused regressions cover:
   eligible-owner filtering, no-candidate status, bounded-choice invariant
   failure, deferred invalid-self fallback, secret redaction, and atomic
   random-entry backpressure/retry;
+- strict password-kind parsing, exact kind-0/nonzero compatibility replies,
+  and no protected-entry capability or actor mutation;
 - strict character-position input, canonical sender slots, nonmember and
   self-echo suppression, stale-source migration fencing, exact peer packets,
   atomic multi-peer backpressure/retry, dropped ACK, and quiesce rejection;
@@ -464,14 +481,14 @@ These items prevent a "port complete" claim.
 
 1. Enumerate every classified request and mark it implemented, intentionally
    unsupported with a typed response, or capture-blocked. No silent fallthrough.
-2. Map `CheckPassword` explicitly and capture the missing credential-bearing
-   exchange before enabling protected entry: the known P5136 packet carries
-   only a password-kind integer, not a password. If evidence establishes a
-   proof step, represent it as an actor-minted exact-generation capability;
-   never place plaintext credentials in a reusable session-global flag.
-   Continue the remaining MyRoom requests in small vertical slices with
-   malformed-input, stale-generation, cancellation/backpressure, and
-   exact-packet tests.
+2. Keep the explicit `CheckPassword` compatibility ACK separate from entry
+   authority and capture the missing credential-bearing exchange before
+   enabling protected entry: the known P5136 packet carries only a
+   password-kind integer, not a password. If evidence establishes a proof step,
+   represent it as an actor-minted exact-generation capability; never place
+   plaintext credentials in a reusable session-global flag. Continue the
+   remaining MyRoom requests in small vertical slices with malformed-input,
+   stale-generation, cancellation/backpressure, and exact-packet tests.
 3. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
 4. Capture and implement movement sequence/tick behavior per sender and exact
