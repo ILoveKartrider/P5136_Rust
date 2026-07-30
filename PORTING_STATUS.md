@@ -124,6 +124,13 @@ unchanged and is evidence only.
   `PrGetRiderTaskContext | i32(0)` reply (`0x58840850`) without mutating the
   profile; repeat the stock-client startup test before treating later traffic
   as a new compatibility issue.
+- The next stock-client run passed that response and terminated at the exact
+  four-byte `PqRankerInfoPacket` request (`0x41C60708`). Rust now returns the
+  profile-backed `PrRankerInfoPacket` body (`status 0 | ranker:u8 | f32 100.0 |
+  u32 0`). The adjacent C# startup queries `PqVersusModeRankOnePacket` and
+  `PqRiderSchoolExpiredCheck` are also implemented as strict hash-only,
+  read-only queries with their exact default replies so the next run does not
+  have to discover those two omissions one at a time.
 
 ### Correct stock P5136 and LAN E2E setup (2026-07-30)
 

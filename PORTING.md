@@ -24,6 +24,8 @@ been demonstrated.
   sibling client `Data` directory
 - [x] exact `PqGetRiderTaskContext` startup reply from the stock-client crash
   log (`PrGetRiderTaskContext | i32(0)`)
+- [x] strict post-rider startup query replies for ranker info, versus rank-one,
+  and rider-school expiration state
 - [x] workspace-wide `unsafe_code = "forbid"`
 
 ## Connector
