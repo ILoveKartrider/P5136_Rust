@@ -20,8 +20,11 @@ use std::{
 /// becoming a 2 MiB log line.
 pub(crate) const MAX_PACKET_LOG_BYTES: usize = 4 * 1_024;
 const MAX_PACKET_LOG_RECORDS_PER_SECOND: usize = 512;
+const MAX_SESSION_FAILURE_LOG_RECORDS_PER_SECOND: usize = 64;
 
 static PACKET_LOG_BUDGET: LazyLock<Mutex<PacketLogBudget>> =
+    LazyLock::new(|| Mutex::new(PacketLogBudget::new(Instant::now())));
+static SESSION_FAILURE_LOG_BUDGET: LazyLock<Mutex<PacketLogBudget>> =
     LazyLock::new(|| Mutex::new(PacketLogBudget::new(Instant::now())));
 
 struct PacketLogBudget {
@@ -41,14 +44,14 @@ impl PacketLogBudget {
 
     /// Returns whether a raw record can be emitted plus a prior-window loss
     /// count that should be reported before the next successful record.
-    fn take_slot(&mut self, now: Instant) -> (bool, usize) {
+    fn take_slot(&mut self, now: Instant, maximum_records: usize) -> (bool, usize) {
         let mut prior_suppressed = 0;
         if now.duration_since(self.window_started).as_secs() >= 1 {
             self.window_started = now;
             self.records = 0;
             prior_suppressed = std::mem::take(&mut self.suppressed);
         }
-        if self.records < MAX_PACKET_LOG_RECORDS_PER_SECOND {
+        if self.records < maximum_records {
             self.records += 1;
             (true, prior_suppressed)
         } else {
@@ -89,7 +92,7 @@ pub(crate) fn trace_packet(
     let (permitted, prior_suppressed) = PACKET_LOG_BUDGET
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take_slot(Instant::now());
+        .take_slot(Instant::now(), MAX_PACKET_LOG_RECORDS_PER_SECOND);
     if prior_suppressed != 0 {
         tracing::warn!(
             target: "p5136_packet",
@@ -117,6 +120,75 @@ pub(crate) fn trace_packet(
         first_word_le = ?first_word_le.map(Hash),
         raw_hex = %HexPreview(&bytes[..captured]),
         "P5136 packet"
+    );
+}
+
+/// Context for a bounded typed TCP session-failure diagnostic.
+///
+/// These records share the packet diagnostic file target, rather than the
+/// normal console target. A remote peer can provoke TCP errors cheaply, so the
+/// independent budget keeps useful failure context without turning warnings
+/// into a console or disk-write flood.
+#[derive(Clone, Copy)]
+pub(crate) struct SessionFailure<'a> {
+    pub(crate) transport: &'static str,
+    pub(crate) peer: Option<SocketAddr>,
+    pub(crate) stage: &'static str,
+    pub(crate) request_hash: Option<&'a str>,
+    pub(crate) request_bytes: Option<usize>,
+    pub(crate) response_count: Option<usize>,
+    pub(crate) authenticated: Option<bool>,
+}
+
+impl SessionFailure<'_> {
+    pub(crate) const fn terminal(transport: &'static str, peer: Option<SocketAddr>) -> Self {
+        Self {
+            transport,
+            peer,
+            stage: "session terminal error",
+            request_hash: None,
+            request_bytes: None,
+            response_count: None,
+            authenticated: None,
+        }
+    }
+}
+
+/// Emits a bounded typed TCP session-failure record to the packet diagnostic
+/// file without promoting remote-controlled failures to the normal console.
+pub(crate) fn trace_session_failure<E>(failure: SessionFailure<'_>, error: &E)
+where
+    E: std::error::Error + ?Sized,
+{
+    let (permitted, prior_suppressed) = SESSION_FAILURE_LOG_BUDGET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take_slot(Instant::now(), MAX_SESSION_FAILURE_LOG_RECORDS_PER_SECOND);
+    if prior_suppressed != 0 {
+        tracing::debug!(
+            target: "p5136_packet",
+            kind = "session-failure",
+            dropped_records = prior_suppressed,
+            maximum_records_per_second = MAX_SESSION_FAILURE_LOG_RECORDS_PER_SECOND,
+            "session-failure diagnostics were rate-limited"
+        );
+    }
+    if !permitted {
+        return;
+    }
+    tracing::debug!(
+        target: "p5136_packet",
+        transport = failure.transport,
+        kind = "session-failure",
+        peer = ?failure.peer,
+        stage = failure.stage,
+        request_hash = ?failure.request_hash,
+        request_bytes = ?failure.request_bytes,
+        response_count = ?failure.response_count,
+        authenticated = ?failure.authenticated,
+        error = %error,
+        error_debug = ?error,
+        "P5136 TCP session failure"
     );
 }
 
@@ -158,9 +230,21 @@ mod tests {
         let start = Instant::now();
         let mut budget = PacketLogBudget::new(start);
         for _ in 0..MAX_PACKET_LOG_RECORDS_PER_SECOND {
-            assert_eq!(budget.take_slot(start), (true, 0));
+            assert_eq!(
+                budget.take_slot(start, MAX_PACKET_LOG_RECORDS_PER_SECOND),
+                (true, 0)
+            );
         }
-        assert_eq!(budget.take_slot(start), (false, 0));
-        assert_eq!(budget.take_slot(start + Duration::from_secs(1)), (true, 1));
+        assert_eq!(
+            budget.take_slot(start, MAX_PACKET_LOG_RECORDS_PER_SECOND),
+            (false, 0)
+        );
+        assert_eq!(
+            budget.take_slot(
+                start + Duration::from_secs(1),
+                MAX_PACKET_LOG_RECORDS_PER_SECOND
+            ),
+            (true, 1)
+        );
     }
 }

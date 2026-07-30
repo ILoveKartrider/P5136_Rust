@@ -1014,6 +1014,15 @@ fn run_server_worker(
     mut controls: tokio::sync::mpsc::UnboundedReceiver<ServerControl>,
     notifier: &GuiNotifier,
 ) -> Result<()> {
+    tracing::info!(
+        bind_address = %config.bind_address,
+        advertised_address = %config.advertised_address,
+        profile_root = %config.profile_root.display(),
+        catalog_path = ?config.catalog_path,
+        client_data_dir = ?config.client_data_dir,
+        remote_profile_creation = config.allow_remote_profile_creation,
+        "GUI requested P5136 server startup"
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

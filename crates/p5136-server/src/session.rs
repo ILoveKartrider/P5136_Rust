@@ -116,7 +116,7 @@ use crate::{
         MyRoomInfoWriteReceipt,
     },
     operation_gate::{WireOperationGate, WireOperationGuard},
-    packet_log::{PacketDirection, trace_packet},
+    packet_log::{PacketDirection, SessionFailure, trace_packet, trace_session_failure},
     profile_io::{
         MyRoomProfileLease, ProfileIoError, ProfileIoHandle, ProfileJobAdmission,
         ProfileLanePermit, myroom_profile_presentation,
@@ -1636,9 +1636,49 @@ async fn process_and_write<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    // The raw packet has already been recorded at the transport boundary. Keep
+    // the request hash beside a typed handler error so a stock-client failure
+    // can be diagnosed without enabling a global debug filter.
+    let request_hash =
+        packet_hash(packet).map_or_else(|_| "<missing>".to_owned(), |hash| format!("0x{hash:08X}"));
     let responses =
-        dispatch_packet_admitted(services, packet, context, operation.identity()).await?;
-    write_logical_packets(writer, &responses, send_iv, services.config, peer).await
+        match dispatch_packet_admitted(services, packet, context, operation.identity()).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                trace_session_failure(
+                    SessionFailure {
+                        transport: "login-tcp",
+                        peer,
+                        stage: "request handler",
+                        request_hash: Some(&request_hash),
+                        request_bytes: Some(packet.len()),
+                        response_count: None,
+                        authenticated: Some(context.is_authenticated()),
+                    },
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+    let response_count = responses.len();
+    if let Err(error) =
+        write_logical_packets(writer, &responses, send_iv, services.config, peer).await
+    {
+        trace_session_failure(
+            SessionFailure {
+                transport: "login-tcp",
+                peer,
+                stage: "response write",
+                request_hash: Some(&request_hash),
+                request_bytes: Some(packet.len()),
+                response_count: Some(response_count),
+                authenticated: Some(context.is_authenticated()),
+            },
+            &error,
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn write_outbound_batch<W>(

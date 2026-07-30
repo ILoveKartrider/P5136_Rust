@@ -1618,7 +1618,8 @@ where
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the connection owner passes the independently linear session, generation, cancellation, and bounded outbound capabilities explicitly"
+    clippy::too_many_lines,
+    reason = "the connection owner retains the independently linear session, generation, cancellation, bounded outbound capabilities, and complete lifecycle boundary together"
 )]
 async fn run_registered_connection<S>(
     stream: S,
@@ -2176,7 +2177,7 @@ mod tests {
         let (mut writer, mut reader) = duplex(16);
         let frame = encode_frame(&[1, 2, 3, 4], MAXIMUM).unwrap();
         writer
-            .write_all(&frame[..MESSENGER_FRAME_HEADER_LENGTH + 1])
+            .write_all(&frame[..=MESSENGER_FRAME_HEADER_LENGTH])
             .await
             .unwrap();
         writer.shutdown().await.unwrap();

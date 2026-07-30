@@ -352,6 +352,14 @@ impl BoundServer {
         } = self;
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let force_shutdown_requested = Arc::new(AtomicBool::new(false));
+        let bind_address = config.bind_address;
+        let advertised_address = config.advertised_address;
+        let profile_root = config.profile_root.clone();
+        let catalog_path = config.catalog_path.clone();
+        let client_data_dir = config.client_data_dir.clone();
+        let remote_profile_creation = config.allow_remote_profile_creation;
+        let catalog_loaded = catalog.is_some();
+        let emblem_catalog_loaded = emblems.is_some();
         let messenger_config = messenger_runtime_config(&config);
         let udp_config = udp_runtime_config(&config);
         let udp_mailbox_capacity = udp_config.admission_capacity;
@@ -393,14 +401,30 @@ impl BoundServer {
             .await
         });
 
-        Ok(ServerHandle {
+        let server = ServerHandle {
             endpoints,
             shutdown,
             world,
             force_shutdown_requested,
             wire_operations,
             supervisor: AsyncMutex::new(SupervisorJoin::Running(task)),
-        })
+        };
+        tracing::info!(
+            %bind_address,
+            %advertised_address,
+            game_udp = %server.endpoints.game_udp,
+            login_tcp = %server.endpoints.login_tcp,
+            p2p_udp = %server.endpoints.p2p_udp,
+            messenger_tcp = %server.endpoints.messenger_tcp,
+            profile_root = %profile_root.display(),
+            catalog_path = ?catalog_path,
+            catalog_loaded,
+            client_data_dir = ?client_data_dir,
+            emblem_catalog_loaded,
+            remote_profile_creation,
+            "P5136 server configuration validated and transports started"
+        );
+        Ok(server)
     }
 }
 
@@ -720,7 +744,10 @@ fn spawn_login_session(
         )
         .await
         {
-            tracing::debug!(%peer, %error, "login session closed");
+            crate::packet_log::trace_session_failure(
+                crate::packet_log::SessionFailure::terminal("login-tcp", Some(peer)),
+                &error,
+            );
         }
     });
 }
@@ -739,7 +766,10 @@ fn spawn_messenger_session(
             if let MessengerConnectionError::Cancelled(_) = error {
                 tracing::trace!(%peer, %error, "messenger session cancelled");
             } else {
-                tracing::debug!(%peer, %error, "messenger session closed");
+                crate::packet_log::trace_session_failure(
+                    crate::packet_log::SessionFailure::terminal("messenger-tcp", Some(peer)),
+                    &error,
+                );
             }
         }
     });
