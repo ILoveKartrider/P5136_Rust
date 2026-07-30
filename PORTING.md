@@ -26,6 +26,10 @@ been demonstrated.
   log (`PrGetRiderTaskContext | i32(0)`)
 - [x] strict post-rider startup query replies for ranker info, versus rank-one,
   and rider-school expiration state
+- [x] C# login/identity/rider/menu initialization path audit, including the
+  captured `SpRqGetMaxGiftIdPacket` failure
+- [x] strict read-only startup replies for gift sequence, KOIN, favorite-track
+  projection, cash inventory, Cash, and TC Cash
 - [x] workspace-wide `unsafe_code = "forbid"`
 
 ## Connector

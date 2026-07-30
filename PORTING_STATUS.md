@@ -26,11 +26,14 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
-State: clean, reviewed packet-diagnostics checkpoint. The protocol resume order
-remains item 1 under **Exact resume plan**; do not reopen the completed
+State: clean, reviewed login-initialization checkpoint. The next live action is
+to rerun the stock client with the release named below and verify that traffic
+progresses beyond `SpRqGetMaxGiftIdPacket`; do not reopen the completed
 favorite-item migration without a new compatibility/security finding.
 
 Current implementation checkpoint:
+`1cdb3aa Complete login initialization query coverage` +
+`4c806af Complete post-rider startup query replies` +
 `533df45 Port lease-bound favorite sidecar migration` +
 `bb84027 Harden favorite sidecar import bounds` +
 `9b26159 Add GUI server controls` +
@@ -131,6 +134,80 @@ unchanged and is evidence only.
   `PqRiderSchoolExpiredCheck` are also implemented as strict hash-only,
   read-only queries with their exact default replies so the next run does not
   have to discover those two omissions one at a time.
+
+### Audited login and menu initialization path (2026-07-30)
+
+- The next retained run is
+  `target\p5136-startup-queries\release\logs\p5136-1785435892564-5036.log`.
+  It proves that login, the complete catalog inventory stream, rider
+  completion, endpoint reports, and the earlier post-rider replies all
+  succeeded. The terminal request was the exact four-byte
+  `SpRqGetMaxGiftIdPacket` (`0x5EB4085B`), rejected as an unsupported
+  identity-bound packet.
+- The C# receive path was audited from `ClientSession.OnPacket` rather than
+  treating source order as client order. It reads the hash under the session
+  lock, establishes or acquires the identity-generation operation, invokes
+  `Korean5136Protocol.TryHandle` first, then the general packet dispatcher,
+  and only then its large fallback handler. The P5136 path is therefore:
+  server `PcFirstMessage`; client `PqLogin` and server `PrLogin`; client
+  `PqGetRider`; complete `LoRpGetRiderItemPacket` inventory stream followed by
+  `PrGetRider`; then client-driven post-rider/menu queries. `PqCnAuthenLogin`
+  and `PqChannelMovein` are supported identity-establishing alternatives, but
+  this retained local run did not emit either one.
+- The actual post-rider request order in that run was:
+  endpoint reports; `LoPingRequestPacket`; `PqGetRiderTaskContext`;
+  `PqGetRiderQuestUX2ndData`; `PqAddTimeEventInitPacket`; countdown/preset
+  no-ops; `PqGetGameOption`; `PqRiderSchoolDataPacket`;
+  `LoRqGetRiderItemPacket`; time-shop/countdown no-ops;
+  `PqRankerInfoPacket`; preset no-op; `ChRequestChStaticRequestPacket`;
+  `PqRequestExtradata`; `PqDynamicCommand`; and finally
+  `SpRqGetMaxGiftIdPacket`. This order comes from the encrypted-TCP logical
+  log, not from the order of C# `if` statements.
+- Rust now answers `SpRqGetMaxGiftIdPacket` with the C#-evidenced
+  `SpRpGetMaxGiftIdPacket | i32(0)` response (`0x5EA1085A`). The request is
+  strict hash-only and remains behind the authenticated identity/profile
+  boundary.
+- To avoid repeating the same one-packet discovery cycle, the adjacent
+  read-only menu/store queries in the C# fallback were audited and implemented
+  together:
+
+  | Request | Reply body | Rust state source |
+  | --- | --- | --- |
+  | `SpRqKoinBalance` | `koin:u32 | 0:u32` | bound profile |
+  | `PqFavoriteTrackMapGet` | `theme_count:i32 = 0` | honest empty projection |
+  | `SpRqGetCashInventoryPacket` | `count:i32 = 0 | terminal:u8 = 0` | terminal empty |
+  | `SpRqRemainCashPacket` | `0:u32 | cash:u32` | bound profile |
+  | `SpRqRemainTcCashPacket` | `99:u32 | tc_cash:u32` | bound profile |
+
+  The TC Cash prefix `99` appears in both the stock-era and current C#
+  handlers, so it is retained as an established wire constant rather than
+  interpreted as mutable state. Favorite tracks are deliberately empty:
+  importing the mutable C# favorite-track sidecar without a lease would copy
+  the same race that the favorite-item importer was designed to remove.
+- All six requests reject truncation, wrong hashes, and trailing bytes. Their
+  exact hashes and response bytes have codec goldens, authenticated dispatch
+  coverage, and a no-profile-revision assertion. No mutation or economy
+  success is implied.
+- Evidence boundary: the C# server is a request dispatcher and does not encode
+  one deterministic client send order. The retained runtime log is
+  authoritative for the sequence above; C# establishes the response shapes
+  and the wider set of possible on-demand queries. Gift actions, purchases,
+  coupon/exchange pages, and competitive-mode requests remain separate
+  feature paths and still fail closed unless already implemented. The next
+  stock-client run must prove progress beyond `SpRqGetMaxGiftIdPacket`; this
+  audit does not claim that every later UI path is complete.
+- Independent reviewer audit found no P1/P2 issue in the C# wire comparison,
+  Rust abstraction boundary, authentication/identity fencing, read-only
+  behavior, error propagation, tests, or `unsafe` policy. Workspace
+  all-feature validation passes with 819 regular tests and 2 local-data
+  opt-in tests ignored; formatting, `git diff --check`, and workspace
+  all-target/all-feature Clippy with `-D warnings` also pass.
+- The fresh release is
+  `target\p5136-initialization\release\p5136.exe` (15,473,152 bytes, SHA-256
+  `C01B47262FE5FC258EE7B1B063FD57EE6331A2D084E62647A5349A046E083745`).
+  It was built in a distinct target directory so a running older executable
+  could not mask the new implementation.
+- The C# repository remains unmodified.
 
 ### Correct stock P5136 and LAN E2E setup (2026-07-30)
 
