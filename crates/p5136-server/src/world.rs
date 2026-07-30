@@ -20,10 +20,10 @@ use p5136_core::{
     myroom_protocol::{
         CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus, EnterMyRoomStatus,
         MyRoomInfo, MyRoomPassword, MyRoomProtectedFeature, MyRoomProtocolError, MyRoomSlot,
-        RiderTalkRequest, serialize_character_position, serialize_enter_error,
-        serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
-        serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
-        serialize_slot_data, serialize_update_main_emblem_reply,
+        RiderTalkRequest, serialize_character_position, serialize_empty_owner_career_list,
+        serialize_enter_error, serialize_enter_reply, serialize_missing_owner_items,
+        serialize_myroom_info, serialize_password_enter_myroom_command, serialize_rider_echo,
+        serialize_secede_reply, serialize_slot_data, serialize_update_main_emblem_reply,
     },
     nickname::canonical_nickname_key,
     race_protocol::{
@@ -1178,20 +1178,42 @@ impl MyRoomPasswordGrant {
     }
 }
 
+/// Shared actor-minted authorization for one owner-scoped resource response.
+///
+/// The resource-specific wrapper types below keep an emblem capability from
+/// being used as a Career capability while this shared representation keeps
+/// authorization and publication invariants in one place.
+#[derive(Debug, PartialEq, Eq)]
+struct MyRoomOwnerResourceResponsePlan {
+    expected: IdentityBinding,
+    owner: MyRoomOwnerResourcePlan,
+}
+
 /// Move-only authorization for one owner-emblem response.
 ///
 /// Protected-room grants are consumed while this plan is minted, before the
 /// potentially large catalog packet is allocated outside the actor.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct MyRoomOwnerEmblemsPlan {
-    expected: IdentityBinding,
-    owner: MyRoomOwnerResourcePlan,
-}
+pub(crate) struct MyRoomOwnerEmblemsPlan(MyRoomOwnerResourceResponsePlan);
 
 impl MyRoomOwnerEmblemsPlan {
     #[must_use]
     pub(crate) fn expected_identity(&self) -> &IdentityBinding {
-        &self.expected
+        &self.0.expected
+    }
+}
+
+/// Move-only authorization for one terminal owner-Career-list response.
+///
+/// Keeping this distinct from [`MyRoomOwnerEmblemsPlan`] prevents a
+/// resource-specific one-shot grant from crossing publication paths.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MyRoomOwnerCareerListPlan(MyRoomOwnerResourceResponsePlan);
+
+impl MyRoomOwnerCareerListPlan {
+    #[must_use]
+    pub(crate) fn expected_identity(&self) -> &IdentityBinding {
+        &self.0.expected
     }
 }
 
@@ -1934,6 +1956,10 @@ enum WorldCommand {
         session: SessionId,
         reply: oneshot::Sender<Result<Option<MyRoomOwnerEmblemsPlan>, WorldError>>,
     },
+    PrepareMyRoomOwnerCareerList {
+        session: SessionId,
+        reply: oneshot::Sender<Result<Option<MyRoomOwnerCareerListPlan>, WorldError>>,
+    },
     PrepareMainEmblemWrite {
         session: SessionId,
         reply: oneshot::Sender<Result<Option<MainEmblemWritePlan>, WorldError>>,
@@ -1963,6 +1989,11 @@ enum WorldCommand {
         session: SessionId,
         plan: MyRoomOwnerEmblemsPlan,
         packet: Vec<u8>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    PublishMyRoomOwnerCareerList {
+        session: SessionId,
+        plan: MyRoomOwnerCareerListPlan,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     PublishMyRoomOwnerItems {
@@ -3001,6 +3032,18 @@ impl AdmittedWorldHandle<'_> {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn prepare_myroom_owner_career_list(
+        &self,
+    ) -> Result<Option<MyRoomOwnerCareerListPlan>, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::PrepareMyRoomOwnerCareerList {
+            session: self.session_id(),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub(crate) async fn prepare_main_emblem_write(
         &self,
     ) -> Result<Option<MainEmblemWritePlan>, WorldError> {
@@ -3078,6 +3121,20 @@ impl AdmittedWorldHandle<'_> {
             session: self.session_id(),
             plan,
             packet,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    pub(crate) async fn publish_myroom_owner_career_list(
+        &self,
+        plan: MyRoomOwnerCareerListPlan,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::PublishMyRoomOwnerCareerList {
+            session: self.session_id(),
+            plan,
             reply,
         })
         .await?;
@@ -4683,26 +4740,43 @@ impl World {
         &mut self,
         session: SessionId,
     ) -> Result<Option<MyRoomOwnerEmblemsPlan>, WorldOperationError> {
+        self.prepare_myroom_owner_resource(session, MyRoomProtectedResource::OwnerEmblems)
+            .map(|plan| plan.map(MyRoomOwnerEmblemsPlan))
+    }
+
+    fn prepare_myroom_owner_career_list(
+        &mut self,
+        session: SessionId,
+    ) -> Result<Option<MyRoomOwnerCareerListPlan>, WorldOperationError> {
+        self.prepare_myroom_owner_resource(session, MyRoomProtectedResource::Career)
+            .map(|plan| plan.map(MyRoomOwnerCareerListPlan))
+    }
+
+    fn prepare_myroom_owner_resource(
+        &mut self,
+        session: SessionId,
+        resource: MyRoomProtectedResource,
+    ) -> Result<Option<MyRoomOwnerResourceResponsePlan>, WorldOperationError> {
         let expected = self.authorize_session_operation(session)?;
         let Some(owner) = self
             .myroom
             .owner_resource_plan_if_member(&expected)
-            .map_err(|source| myroom_hub_error("owner-emblem plan query", source))?
+            .map_err(|source| myroom_hub_error("owner-resource plan query", source))?
         else {
             return Ok(None);
         };
         if owner.visible() {
-            return Ok(Some(MyRoomOwnerEmblemsPlan { expected, owner }));
+            return Ok(Some(MyRoomOwnerResourceResponsePlan { expected, owner }));
         }
 
-        // Only a matching emblem grant is consumed. A grant for another
+        // Only a matching resource grant is consumed. A grant for another
         // protected resource remains available to the stock client's matching
         // one-shot follow-up.
         let candidate = match self
             .pending_myroom_password_grants
             .remove(&expected.user_no)
         {
-            Some(grant) if grant.resource == MyRoomProtectedResource::OwnerEmblems => Some(grant),
+            Some(grant) if grant.resource == resource => Some(grant),
             Some(grant) => {
                 self.pending_myroom_password_grants
                     .insert(expected.user_no, grant);
@@ -4710,14 +4784,13 @@ impl World {
             }
             None => None,
         };
-        let authorized = candidate.is_some_and(|grant| {
-            grant.matches_resource(MyRoomProtectedResource::OwnerEmblems, &owner)
-        }) && self
-            .myroom
-            .present_owner_entry_input(owner.owner())
-            .map_err(|source| myroom_hub_error("owner-emblem grant present owner", source))?
-            .is_some();
-        Ok(authorized.then_some(MyRoomOwnerEmblemsPlan { expected, owner }))
+        let authorized = candidate.is_some_and(|grant| grant.matches_resource(resource, &owner))
+            && self
+                .myroom
+                .present_owner_entry_input(owner.owner())
+                .map_err(|source| myroom_hub_error("owner-resource grant present owner", source))?
+                .is_some();
+        Ok(authorized.then_some(MyRoomOwnerResourceResponsePlan { expected, owner }))
     }
 
     fn prepare_main_emblem_write(
@@ -5207,7 +5280,24 @@ impl World {
         prepared: MyRoomOwnerEmblemsPlan,
         packet: Vec<u8>,
     ) -> Result<(), WorldOperationError> {
-        let MyRoomOwnerEmblemsPlan { expected, owner } = prepared;
+        self.publish_myroom_owner_resource(session, prepared.0, packet)
+    }
+
+    fn publish_myroom_owner_career_list(
+        &mut self,
+        session: SessionId,
+        prepared: MyRoomOwnerCareerListPlan,
+    ) -> Result<(), WorldOperationError> {
+        self.publish_myroom_owner_resource(session, prepared.0, serialize_empty_owner_career_list())
+    }
+
+    fn publish_myroom_owner_resource(
+        &mut self,
+        session: SessionId,
+        prepared: MyRoomOwnerResourceResponsePlan,
+        packet: Vec<u8>,
+    ) -> Result<(), WorldOperationError> {
+        let MyRoomOwnerResourceResponsePlan { expected, owner } = prepared;
         let identity = self.authorize_session_operation(session)?;
         if identity != expected {
             return Ok(());
@@ -5219,14 +5309,14 @@ impl World {
             if source.is_wire_plan_stale() {
                 return Ok(());
             }
-            return Err(myroom_hub_error("owner-emblem plan revalidation", source).into());
+            return Err(myroom_hub_error("owner-resource plan revalidation", source).into());
         }
         if !owner.visible()
             && self
                 .myroom
                 .present_owner_entry_input(owner.owner())
                 .map_err(|source| {
-                    myroom_hub_error("owner-emblem present owner revalidation", source)
+                    myroom_hub_error("owner-resource present owner revalidation", source)
                 })?
                 .is_none()
         {
@@ -10929,12 +11019,14 @@ async fn dispatch_unwrapped_command(
         | WorldCommand::PrepareMyRoom { .. }
         | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::PrepareMyRoomOwnerEmblems { .. }
+        | WorldCommand::PrepareMyRoomOwnerCareerList { .. }
         | WorldCommand::PrepareMainEmblemWrite { .. }
         | WorldCommand::MyRoomEntry { .. }
         | WorldCommand::MyRoom { .. }
         | WorldCommand::MyRoomPeer { .. }
         | WorldCommand::MyRoomCheckPassword { .. }
         | WorldCommand::PublishMyRoomOwnerEmblems { .. }
+        | WorldCommand::PublishMyRoomOwnerCareerList { .. }
         | WorldCommand::PublishMyRoomOwnerItems { .. }
         | WorldCommand::DrainSessions { .. }) => {
             dispatch_guarded_world_command(world, sidecars, command).await?;
@@ -10983,11 +11075,19 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
+        WorldCommand::PrepareMyRoomOwnerCareerList { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
         WorldCommand::PrepareMainEmblemWrite { reply, .. } => {
             let _ = reply.send(Ok(None));
             None
         }
         WorldCommand::PublishMyRoomOwnerEmblems { reply, .. } => {
+            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+            None
+        }
+        WorldCommand::PublishMyRoomOwnerCareerList { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
@@ -11095,6 +11195,10 @@ async fn dispatch_guarded_world_command(
             let result = world.prepare_myroom_owner_emblems(session);
             reply_after_world_operation(world, sidecars, reply, result).await
         }
+        WorldCommand::PrepareMyRoomOwnerCareerList { session, reply } => {
+            let result = world.prepare_myroom_owner_career_list(session);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
         WorldCommand::PrepareMainEmblemWrite { session, reply } => {
             let result = world.prepare_main_emblem_write(session);
             reply_after_world_operation(world, sidecars, reply, result).await
@@ -11139,6 +11243,14 @@ async fn dispatch_guarded_world_command(
             reply,
         } => {
             let result = world.publish_myroom_owner_emblems(session, plan, packet);
+            reply_after_world_operation(world, sidecars, reply, result).await
+        }
+        WorldCommand::PublishMyRoomOwnerCareerList {
+            session,
+            plan,
+            reply,
+        } => {
+            let result = world.publish_myroom_owner_career_list(session, plan);
             reply_after_world_operation(world, sidecars, reply, result).await
         }
         WorldCommand::PublishMyRoomOwnerItems {
@@ -11405,12 +11517,14 @@ async fn dispatch_utility_command(
         | WorldCommand::PrepareMyRoom { .. }
         | WorldCommand::PrepareMyRoomOwnerItems { .. }
         | WorldCommand::PrepareMyRoomOwnerEmblems { .. }
+        | WorldCommand::PrepareMyRoomOwnerCareerList { .. }
         | WorldCommand::PrepareMainEmblemWrite { .. }
         | WorldCommand::MyRoomEntry { .. }
         | WorldCommand::MyRoom { .. }
         | WorldCommand::MyRoomPeer { .. }
         | WorldCommand::MyRoomCheckPassword { .. }
         | WorldCommand::PublishMyRoomOwnerEmblems { .. }
+        | WorldCommand::PublishMyRoomOwnerCareerList { .. }
         | WorldCommand::PublishMyRoomOwnerItems { .. }
         | WorldCommand::RegisterMyRoomInfoWrite { .. }
         | WorldCommand::RegisterRiderEquipmentWrite { .. }
@@ -11782,9 +11896,10 @@ mod tests {
             CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus, EnterMyRoomStatus,
             MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPassword, MyRoomPlayerSlot, MyRoomSlot,
             RiderTalkRequest, UpdateMainEmblemRequest, serialize_character_position,
-            serialize_enter_error, serialize_enter_reply, serialize_missing_owner_items,
-            serialize_myroom_info, serialize_password_enter_myroom_command, serialize_rider_echo,
-            serialize_secede_reply, serialize_slot_data, serialize_update_main_emblem_reply,
+            serialize_empty_owner_career_list, serialize_enter_error, serialize_enter_reply,
+            serialize_missing_owner_items, serialize_myroom_info,
+            serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
+            serialize_slot_data, serialize_update_main_emblem_reply,
         },
         nickname::canonical_nickname_key,
         race_protocol::{
@@ -19262,6 +19377,328 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one Career fixture covers typed grant separation, one-shot and queue-full consumption, stale-plan suppression, public/owner access, outsiders, and both owner-tombstone policies"
+    )]
+    fn terminal_owner_career_list_consumes_only_exact_kind_two_grant() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "CareerOwner", 67, 56_052, 4);
+        let mut visitor = register_channel_session(&mut world, "CareerVisitor", 67, 56_054, 1);
+        let mut outsider = register_channel_session(&mut world, "CareerOutsider", 67, 56_056, 2);
+        let protected_owner = MyRoomOwner::new(
+            myroom_participant(&owner.identity, Ipv4Addr::LOCALHOST, 100),
+            MyRoomInfo {
+                use_item_password: 1,
+                item_password: "career secret".to_owned(),
+                ..MyRoomInfo::default()
+            },
+        )
+        .unwrap();
+        enter_myroom_with_owner(
+            &mut world,
+            &owner.identity,
+            &protected_owner,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom_with_owner(
+            &mut world,
+            &visitor.identity,
+            &protected_owner,
+            Ipv4Addr::LOCALHOST,
+        );
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut visitor.outbound);
+        let terminal = serialize_empty_owner_career_list();
+
+        assert!(
+            world
+                .prepare_myroom_owner_career_list(visitor.session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        for (password_kind, expected_resource) in [
+            (0, MyRoomProtectedResource::OwnerItems),
+            (1, MyRoomProtectedResource::OwnerEmblems),
+        ] {
+            assert_eq!(
+                world
+                    .myroom_check_password(
+                        visitor.session,
+                        &test_check_password_request(password_kind, "career secret"),
+                    )
+                    .unwrap(),
+                CheckPasswordStatus::Success
+            );
+            assert!(
+                world
+                    .prepare_myroom_owner_career_list(visitor.session)
+                    .unwrap()
+                    .is_none(),
+                "a non-Career grant must not cross into the Career capability"
+            );
+            assert_eq!(
+                world.pending_myroom_password_grants[&visitor.identity.user_no].resource,
+                expected_resource
+            );
+        }
+
+        assert_eq!(
+            world
+                .myroom_check_password(
+                    visitor.session,
+                    &test_check_password_request(2, "career secret"),
+                )
+                .unwrap(),
+            CheckPasswordStatus::Success
+        );
+        let plan = world
+            .prepare_myroom_owner_career_list(visitor.session)
+            .unwrap()
+            .unwrap();
+        world
+            .publish_myroom_owner_career_list(visitor.session, plan)
+            .unwrap();
+        assert_eq!(take_single_packet(&mut visitor.outbound), terminal);
+        assert!(
+            !world
+                .pending_myroom_password_grants
+                .contains_key(&visitor.identity.user_no)
+        );
+        assert!(
+            world
+                .prepare_myroom_owner_career_list(visitor.session)
+                .unwrap()
+                .is_none(),
+            "an exact kind-two grant must authorize only one response"
+        );
+
+        assert_eq!(
+            world
+                .myroom_check_password(
+                    visitor.session,
+                    &test_check_password_request(2, "career secret"),
+                )
+                .unwrap(),
+            CheckPasswordStatus::Success
+        );
+        world.sessions[&visitor.session]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .try_send(OutboundBatch::single(vec![0xAA]))
+            .unwrap();
+        let plan = world
+            .prepare_myroom_owner_career_list(visitor.session)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            world.publish_myroom_owner_career_list(visitor.session, plan),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == visitor.session
+        ));
+        assert!(
+            !world
+                .pending_myroom_password_grants
+                .contains_key(&visitor.identity.user_no),
+            "queue saturation must not restore a consumed kind-two grant"
+        );
+        assert_eq!(take_single_packet(&mut visitor.outbound), vec![0xAA]);
+        assert!(
+            world
+                .prepare_myroom_owner_career_list(visitor.session)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            world
+                .myroom_check_password(
+                    visitor.session,
+                    &test_check_password_request(2, "career secret"),
+                )
+                .unwrap(),
+            CheckPasswordStatus::Success
+        );
+        let stale_plan = world
+            .prepare_myroom_owner_career_list(visitor.session)
+            .unwrap()
+            .unwrap();
+        let mut rotated = world
+            .myroom
+            .room_info(owner.identity.user_no)
+            .unwrap()
+            .clone();
+        rotated.item_password = "rotated career secret".to_owned();
+        world
+            .myroom
+            .update_owner_info(&owner.identity, rotated)
+            .unwrap()
+            .commit(&mut world.myroom)
+            .unwrap();
+        world
+            .publish_myroom_owner_career_list(visitor.session, stale_plan)
+            .unwrap();
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "a policy-stale Career plan must publish nothing"
+        );
+
+        assert_eq!(
+            world
+                .myroom_check_password(
+                    visitor.session,
+                    &test_check_password_request(2, "rotated career secret"),
+                )
+                .unwrap(),
+            CheckPasswordStatus::Success
+        );
+        let owner_generation_stale_plan = world
+            .prepare_myroom_owner_career_list(visitor.session)
+            .unwrap()
+            .unwrap();
+        let mut replacement_owner = migrate_channel_session(&mut world, &owner, 56_070, 4);
+        drain_batches(&mut replacement_owner.outbound);
+        drain_batches(&mut visitor.outbound);
+        world
+            .publish_myroom_owner_career_list(visitor.session, owner_generation_stale_plan)
+            .unwrap();
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "a replaced owner generation must invalidate a Career plan"
+        );
+        owner = replacement_owner;
+
+        assert_eq!(
+            world
+                .myroom_check_password(
+                    visitor.session,
+                    &test_check_password_request(2, "rotated career secret"),
+                )
+                .unwrap(),
+            CheckPasswordStatus::Success
+        );
+        let requester_generation_stale_plan = world
+            .prepare_myroom_owner_career_list(visitor.session)
+            .unwrap()
+            .unwrap();
+        let mut replacement_visitor = migrate_channel_session(&mut world, &visitor, 56_072, 4);
+        drain_batches(&mut replacement_visitor.outbound);
+        drain_batches(&mut owner.outbound);
+        world
+            .publish_myroom_owner_career_list(
+                replacement_visitor.session,
+                requester_generation_stale_plan,
+            )
+            .unwrap();
+        assert!(
+            replacement_visitor.outbound.try_recv().is_err(),
+            "a replacement requester generation must not use its predecessor's Career plan"
+        );
+        assert!(
+            !world
+                .pending_myroom_password_grants
+                .contains_key(&replacement_visitor.identity.user_no),
+            "requester replacement must not recreate the already-consumed grant"
+        );
+        visitor = replacement_visitor;
+
+        let owner_plan = world
+            .prepare_myroom_owner_career_list(owner.session)
+            .unwrap()
+            .unwrap();
+        world
+            .publish_myroom_owner_career_list(owner.session, owner_plan)
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            serialize_empty_owner_career_list()
+        );
+        assert!(
+            world
+                .prepare_myroom_owner_career_list(outsider.session)
+                .unwrap()
+                .is_none()
+        );
+        assert!(outsider.outbound.try_recv().is_err());
+
+        assert_eq!(
+            world
+                .myroom_check_password(
+                    visitor.session,
+                    &test_check_password_request(2, "rotated career secret"),
+                )
+                .unwrap(),
+            CheckPasswordStatus::Success
+        );
+        let (owner_secede, _) = prepare_test_myroom_command(&world, owner.session);
+        world
+            .myroom_command(owner.session, MyRoomCommandPayload::Secede, owner_secede)
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut visitor.outbound);
+        assert!(
+            world
+                .prepare_myroom_owner_career_list(visitor.session)
+                .unwrap()
+                .is_none(),
+            "a protected owner tombstone must not expose its Career surface"
+        );
+        assert!(
+            !world
+                .pending_myroom_password_grants
+                .contains_key(&visitor.identity.user_no),
+            "owner Secede must revoke the requester's exact grant"
+        );
+
+        let mut public_owner =
+            register_channel_session(&mut world, "PublicCareerOwner", 67, 56_058, 4);
+        let mut public_visitor =
+            register_channel_session(&mut world, "PublicCareerVisitor", 67, 56_060, 2);
+        let public_room = myroom_owner(&public_owner.identity, Ipv4Addr::LOCALHOST);
+        enter_myroom_with_owner(
+            &mut world,
+            &public_owner.identity,
+            &public_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom_with_owner(
+            &mut world,
+            &public_visitor.identity,
+            &public_room,
+            Ipv4Addr::LOCALHOST,
+        );
+        drain_batches(&mut public_owner.outbound);
+        drain_batches(&mut public_visitor.outbound);
+        let (public_owner_secede, _) = prepare_test_myroom_command(&world, public_owner.session);
+        world
+            .myroom_command(
+                public_owner.session,
+                MyRoomCommandPayload::Secede,
+                public_owner_secede,
+            )
+            .unwrap();
+        drain_batches(&mut public_owner.outbound);
+        drain_batches(&mut public_visitor.outbound);
+        let public_tombstone_plan = world
+            .prepare_myroom_owner_career_list(public_visitor.session)
+            .unwrap()
+            .unwrap();
+        world
+            .publish_myroom_owner_career_list(public_visitor.session, public_tombstone_plan)
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut public_visitor.outbound),
+            serialize_empty_owner_career_list()
+        );
+
+        world.myroom.audit_invariants().unwrap();
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the lifecycle fixture keeps entry, reentry, identity advance, and Secede grant revocation on one exact requester generation chain"
@@ -20267,6 +20704,54 @@ mod tests {
             Err(WorldError::OutboundProductionClosed)
         ));
         assert_eq!(world.myroom.revision().get(), 0);
+    }
+
+    #[tokio::test]
+    async fn quiesce_rejects_career_prepare_and_prepared_publication() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "QuiesceCareerOwner", 67, 56_028, 2);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        let prepared = world
+            .prepare_myroom_owner_career_list(owner.session)
+            .unwrap()
+            .unwrap();
+        let revision = world.myroom.revision();
+
+        let (prepare_reply, prepare_response) = oneshot::channel();
+        assert!(
+            super::admit_command_during_quiesce(WorldCommand::PrepareMyRoomOwnerCareerList {
+                session: owner.session,
+                reply: prepare_reply,
+            })
+            .is_none()
+        );
+        assert!(matches!(
+            prepare_response.await.unwrap(),
+            Err(WorldError::OutboundProductionClosed)
+        ));
+
+        let (publish_reply, publish_response) = oneshot::channel();
+        assert!(
+            super::admit_command_during_quiesce(WorldCommand::PublishMyRoomOwnerCareerList {
+                session: owner.session,
+                plan: prepared,
+                reply: publish_reply,
+            })
+            .is_none()
+        );
+        assert!(matches!(
+            publish_response.await.unwrap(),
+            Err(WorldError::OutboundProductionClosed)
+        ));
+        assert!(owner.outbound.try_recv().is_err());
+        assert_eq!(world.myroom.revision(), revision);
+        world.myroom.audit_invariants().unwrap();
     }
 
     #[test]

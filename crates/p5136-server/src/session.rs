@@ -34,10 +34,11 @@ use p5136_core::{
         EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
         MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
         parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
-        parse_reenter_request, parse_request_emblems, parse_request_items, parse_rider_talk,
-        parse_secede_request, parse_update_info, parse_update_main_emblem, plan_owner_item_packets,
-        serialize_check_password_reply, serialize_myroom_info, serialize_owner_emblems,
-        serialize_owner_item_enchants, serialize_owner_items, serialize_update_main_emblem_reply,
+        parse_reenter_request, parse_request_career_list, parse_request_emblems,
+        parse_request_items, parse_rider_talk, parse_secede_request, parse_update_info,
+        parse_update_main_emblem, plan_owner_item_packets, serialize_check_password_reply,
+        serialize_myroom_info, serialize_owner_emblems, serialize_owner_item_enchants,
+        serialize_owner_items, serialize_update_main_emblem_reply,
     },
     nickname::canonical_nickname_key,
     packet::PacketError,
@@ -1970,6 +1971,10 @@ async fn handle_myroom_request(
             execute_myroom_owner_emblems(world, profiles, packet, context).await?;
             Ok(Vec::new())
         }
+        MyRoomRequest::RequestCareerList => {
+            execute_myroom_owner_career_list(world, packet, context).await?;
+            Ok(Vec::new())
+        }
         MyRoomRequest::UpdateMainEmblem => {
             update_main_emblems(world, profiles, packet, context).await
         }
@@ -2038,6 +2043,29 @@ async fn execute_myroom_owner_emblems(
             tracing::debug!(
                 session_id = session.get(),
                 "dropping a MyRoom owner-emblem response because its queue is full"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn execute_myroom_owner_career_list(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<(), LoginSessionError> {
+    parse_request_career_list(packet)?;
+    let Some(plan) = world.prepare_myroom_owner_career_list().await? else {
+        return Ok(());
+    };
+    let _ = context.profile_for(plan.expected_identity())?;
+    match world.publish_myroom_owner_career_list(plan).await {
+        Ok(()) => Ok(()),
+        Err(WorldError::MyRoomCommandOutboundUnavailable { session }) => {
+            tracing::debug!(
+                session_id = session.get(),
+                "dropping a terminal MyRoom owner-Career response because its queue is full"
             );
             Ok(())
         }
@@ -2997,15 +3025,16 @@ mod tests {
         myroom_protocol::{
             CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, CheckPasswordStatus,
             ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
-            MAX_MYROOM_PASSWORD_UTF16_UNITS, MAX_MYROOM_TALK_UTF16_UNITS, MYROOM_SLOT_COUNT,
-            MyRoomInfo, MyRoomKart, MyRoomParts, MyRoomProtocolError, MyRoomSlot, MyRoomTune,
-            OWNER_ITEM_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_MYROOM_ITEMS_NAME,
+            FIRST_MYROOM_REQUEST_NAME, MAX_MYROOM_PASSWORD_UTF16_UNITS,
+            MAX_MYROOM_TALK_UTF16_UNITS, MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart, MyRoomParts,
+            MyRoomProtocolError, MyRoomSlot, MyRoomTune, OWNER_ITEM_NAME,
+            REENTER_MYROOM_REQUEST_NAME, REQUEST_CAREER_LIST_NAME, REQUEST_MYROOM_ITEMS_NAME,
             RIDER_TALK_NAME, plan_owner_item_packets, serialize_character_position,
-            serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
-            serialize_missing_owner_items, serialize_myroom_info, serialize_owner_emblems,
-            serialize_owner_item_enchants, serialize_owner_items,
-            serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
-            serialize_slot_data, serialize_update_main_emblem_reply,
+            serialize_check_password_reply, serialize_empty_owner_career_list,
+            serialize_enter_error, serialize_enter_reply, serialize_missing_owner_items,
+            serialize_myroom_info, serialize_owner_emblems, serialize_owner_item_enchants,
+            serialize_owner_items, serialize_password_enter_myroom_command, serialize_rider_echo,
+            serialize_secede_reply, serialize_slot_data, serialize_update_main_emblem_reply,
         },
         packet::{PacketError, PacketReader, PacketWriter},
         race_protocol::{
@@ -5607,6 +5636,170 @@ mod tests {
                 vec![serialize_owner_emblems(&[7, 8, 9]).unwrap()]
             );
         }
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_career_list_dispatches_only_the_terminal_empty_packet() {
+        let fixture = spawn_myroom_world(MyRoomInfo::default());
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let mut owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut visitor_context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let request = PacketWriter::named(REQUEST_CAREER_LIST_NAME).into_inner();
+
+        for (session_id, context, outbound) in [
+            (owner.session, &mut owner_context, &mut owner.outbound),
+            (visitor.session, &mut visitor_context, &mut visitor.outbound),
+        ] {
+            let services = SessionServices {
+                config: &config,
+                world: &world,
+                profiles: &profiles,
+                session_id,
+            };
+            assert!(
+                dispatch_packet(&services, &request, context)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                outbound.try_recv().unwrap().into_packets(),
+                vec![serialize_empty_owner_career_list()]
+            );
+        }
+
+        shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture proves malformed input preserves the kind-two grant while successful and queue-full publications consume it exactly once"
+    )]
+    async fn protected_career_dispatch_is_strict_one_shot_and_burns_on_queue_full() {
+        let fixture = spawn_myroom_world_with_outbound_capacity(
+            MyRoomInfo {
+                use_item_password: 1,
+                item_password: "career dispatch secret".to_owned(),
+                ..MyRoomInfo::default()
+            },
+            1,
+        );
+        let crate::world::test_support::MyRoomWorld {
+            handle: world,
+            actor,
+            mut owner,
+            mut visitor,
+        } = fixture;
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let _owner_context = bind_test_profile(&profiles, &owner.identity).await;
+        let mut context = bind_test_profile(&profiles, &visitor.identity).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: visitor.session,
+        };
+        let career = PacketWriter::named(REQUEST_CAREER_LIST_NAME).into_inner();
+
+        let mut password = PacketWriter::named(CHECK_PASSWORD_REQUEST_NAME);
+        password.write_i32(2);
+        password.write_utf16("career dispatch secret").unwrap();
+        assert_eq!(
+            dispatch_packet(&services, password.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_check_password_reply(
+                2,
+                CheckPasswordStatus::Success,
+            )]
+        );
+
+        let mut malformed = career.clone();
+        malformed.push(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::MyRoomProtocol(
+                MyRoomProtocolError::TrailingBytes {
+                    name: REQUEST_CAREER_LIST_NAME,
+                    count: 1,
+                }
+            ))
+        ));
+        assert!(visitor.outbound.try_recv().is_err());
+
+        assert!(
+            dispatch_packet(&services, &career, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            visitor.outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_empty_owner_career_list()]
+        );
+        assert!(
+            dispatch_packet(&services, &career, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(visitor.outbound.try_recv().is_err());
+
+        assert_eq!(
+            dispatch_packet(&services, password.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_check_password_reply(
+                2,
+                CheckPasswordStatus::Success,
+            )]
+        );
+        let first = PacketWriter::named(FIRST_MYROOM_REQUEST_NAME).into_inner();
+        assert!(
+            dispatch_packet(&services, &first, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            dispatch_packet(&services, &career, &mut context)
+                .await
+                .unwrap()
+                .is_empty(),
+            "Career queue saturation is a logged packet drop, not a session failure"
+        );
+        let queued = visitor.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            u32::from_le_bytes(queued[0][..4].try_into().unwrap()),
+            adler32::packet_hash("RmSlotDataPacket")
+        );
+        assert!(
+            dispatch_packet(&services, &career, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            visitor.outbound.try_recv().is_err(),
+            "queue-full publication must not restore the consumed kind-two grant"
+        );
+        assert!(owner.outbound.try_recv().is_err());
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
     }

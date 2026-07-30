@@ -34,6 +34,8 @@ pub const REQUEST_EMBLEMS_NAME: &str = "RmRequestEmblemsPacket";
 pub const OWNER_EMBLEMS_NAME: &str = "RmOwnerEmblemPacket";
 pub const UPDATE_MAIN_EMBLEM_REQUEST_NAME: &str = "RmRqUpdateMainEmblemPacket";
 pub const UPDATE_MAIN_EMBLEM_REPLY_NAME: &str = "RmRpUpdateMainEmblemPacket";
+pub const REQUEST_CAREER_LIST_NAME: &str = "RmRequestCareerListPacket";
+pub const OWNER_CAREER_LIST_NAME: &str = "RmOwnerCareerListPacket";
 pub const SLOT_DATA_NAME: &str = "RmSlotDataPacket";
 pub const OWNER_ITEM_ENCHANT_NAME: &str = "RmOwnerItemEnchantPacket";
 pub const OWNER_ITEM_NAME: &str = "RmOwnerItemPacket";
@@ -70,6 +72,7 @@ pub enum MyRoomRequest {
     CheckPassword,
     RequestEmblems,
     UpdateMainEmblem,
+    RequestCareerList,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -387,6 +390,7 @@ pub fn classify_myroom_request(hash: u32) -> Option<MyRoomRequest> {
             UPDATE_MAIN_EMBLEM_REQUEST_NAME,
             MyRoomRequest::UpdateMainEmblem,
         ),
+        (REQUEST_CAREER_LIST_NAME, MyRoomRequest::RequestCareerList),
     ]
     .into_iter()
     .find_map(|(name, request)| (adler32::packet_hash(name) == hash).then_some(request))
@@ -484,6 +488,10 @@ pub fn parse_update_main_emblem(
     };
     ensure_exhausted(&reader, UPDATE_MAIN_EMBLEM_REQUEST_NAME)?;
     Ok(request)
+}
+
+pub fn parse_request_career_list(packet: &[u8]) -> Result<(), MyRoomProtocolError> {
+    parse_empty_request(packet, REQUEST_CAREER_LIST_NAME)
 }
 
 pub fn serialize_enter_reply(
@@ -585,6 +593,21 @@ pub fn serialize_owner_emblems(emblems: &[i16]) -> Result<Vec<u8>, MyRoomProtoco
         packet.write_i16(*emblem);
     }
     Ok(packet.into_inner())
+}
+
+/// Serializes the terminal empty P5136 owner-career list.
+///
+/// The marker-equality terminal rule comes from stock-client static analysis,
+/// not the incomplete C# server or a runtime capture. Non-empty entry
+/// semantics remain outside this codec until their ownership and marker
+/// behavior are established.
+#[must_use]
+pub fn serialize_empty_owner_career_list() -> Vec<u8> {
+    let mut packet = PacketWriter::named(OWNER_CAREER_LIST_NAME);
+    packet.write_i32(0);
+    packet.write_i32(0);
+    packet.write_i32(0);
+    packet.into_inner()
 }
 
 /// Serializes the exact Korean P5136 eight-slot `MyRoom` snapshot.
@@ -1098,17 +1121,18 @@ mod tests {
         MAX_MYROOM_TALK_UTF16_UNITS, MYROOM_EMPTY_SLOT_WIRE_LENGTH, MYROOM_ITEM_CHUNK_SIZE,
         MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomKart, MyRoomParts, MyRoomPassword, MyRoomPlayerSlot,
         MyRoomProtectedFeature, MyRoomProtocolError, MyRoomRequest, MyRoomSlot, MyRoomTune,
-        NOTIFY_MYROOM_INFO_NAME, OWNER_ITEM_ENCHANT_NAME, OWNER_ITEM_NAME,
-        PASSWORD_ENTER_MYROOM_COMMAND_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_EMBLEMS_NAME,
-        REQUEST_MYROOM_ITEMS_NAME, RIDER_TALK_NAME, SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME,
-        UPDATE_MAIN_EMBLEM_REQUEST_NAME, UpdateMainEmblemRequest, classify_myroom_request,
-        parse_character_position, parse_check_password, parse_enter_random_request,
-        parse_enter_request, parse_first_request, parse_reenter_request, parse_request_emblems,
+        NOTIFY_MYROOM_INFO_NAME, OWNER_CAREER_LIST_NAME, OWNER_ITEM_ENCHANT_NAME, OWNER_ITEM_NAME,
+        PASSWORD_ENTER_MYROOM_COMMAND_NAME, REENTER_MYROOM_REQUEST_NAME, REQUEST_CAREER_LIST_NAME,
+        REQUEST_EMBLEMS_NAME, REQUEST_MYROOM_ITEMS_NAME, RIDER_TALK_NAME,
+        SECEDE_MYROOM_REQUEST_NAME, SLOT_DATA_NAME, UPDATE_MAIN_EMBLEM_REQUEST_NAME,
+        UpdateMainEmblemRequest, classify_myroom_request, parse_character_position,
+        parse_check_password, parse_enter_random_request, parse_enter_request, parse_first_request,
+        parse_reenter_request, parse_request_career_list, parse_request_emblems,
         parse_request_items, parse_rider_talk, parse_secede_request, parse_update_info,
         parse_update_main_emblem, plan_owner_item_packets, serialize_character_position,
-        serialize_check_password_reply, serialize_enter_error, serialize_enter_reply,
-        serialize_missing_owner_items, serialize_myroom_info, serialize_owner_emblems,
-        serialize_owner_item_enchants, serialize_owner_items,
+        serialize_check_password_reply, serialize_empty_owner_career_list, serialize_enter_error,
+        serialize_enter_reply, serialize_missing_owner_items, serialize_myroom_info,
+        serialize_owner_emblems, serialize_owner_item_enchants, serialize_owner_items,
         serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
         serialize_slot_data, serialize_update_main_emblem_reply, validate_myroom_info,
         validate_myroom_player_slot, wire_count, wire_index,
@@ -1148,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_covers_the_exact_twelve_p5136_request_hashes() {
+    fn classifier_covers_the_exact_thirteen_p5136_request_hashes() {
         let fixtures = [
             (
                 REENTER_MYROOM_REQUEST_NAME,
@@ -1206,6 +1230,11 @@ mod tests {
                 2_256_472_596,
                 MyRoomRequest::UpdateMainEmblem,
             ),
+            (
+                REQUEST_CAREER_LIST_NAME,
+                0x8013_09EE,
+                MyRoomRequest::RequestCareerList,
+            ),
         ];
         for (name, hash, request) in fixtures {
             assert_eq!(adler32::packet_hash(name), hash);
@@ -1224,6 +1253,7 @@ mod tests {
             (ENTER_RANDOM_MYROOM_REQUEST_NAME, parse_enter_random_request),
             (REQUEST_MYROOM_ITEMS_NAME, parse_request_items),
             (REQUEST_EMBLEMS_NAME, parse_request_emblems),
+            (REQUEST_CAREER_LIST_NAME, parse_request_career_list),
         ] {
             let packet = PacketWriter::named(name).into_inner();
             assert!(parser(&packet).is_ok());
@@ -1237,6 +1267,22 @@ mod tests {
                 }) if actual_name == name
             ));
         }
+    }
+
+    #[test]
+    fn empty_owner_career_list_is_the_exact_terminal_frame() {
+        assert_eq!(adler32::packet_hash(OWNER_CAREER_LIST_NAME), 0x6B74_0910);
+
+        let packet = serialize_empty_owner_career_list();
+        assert_eq!(
+            packet,
+            [
+                0x10, 0x09, 0x74, 0x6B, // RmOwnerCareerListPacket
+                0x00, 0x00, 0x00, 0x00, // marker_b
+                0x00, 0x00, 0x00, 0x00, // marker_a
+                0x00, 0x00, 0x00, 0x00, // count
+            ]
+        );
     }
 
     #[test]
