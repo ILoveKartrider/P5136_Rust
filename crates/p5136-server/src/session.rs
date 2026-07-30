@@ -74,9 +74,9 @@ use p5136_core::{
     },
     startup::{
         self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
-        classify_startup_request, is_startup_noop, parse_pq_locked_item_get,
-        parse_pq_request_extradata, parse_pq_start_rider_school, parse_pq_update_game_option,
-        parse_pq_web_event_complete_check,
+        classify_startup_request, is_startup_noop, parse_pq_get_rider_task_context,
+        parse_pq_locked_item_get, parse_pq_request_extradata, parse_pq_start_rider_school,
+        parse_pq_update_game_option, parse_pq_web_event_complete_check,
     },
     track::P5136_FALLBACK_TRACK_ID,
 };
@@ -3217,6 +3217,7 @@ async fn handle_startup_request(
         return Ok(Vec::new());
     }
     match request {
+        StartupRequest::GetRiderTaskContext => parse_pq_get_rider_task_context(packet)?,
         StartupRequest::LockedItemList => parse_pq_locked_item_get(packet)?,
         StartupRequest::RequestExtradata => parse_pq_request_extradata(packet)?,
         StartupRequest::WebEventCompleteCheck => parse_pq_web_event_complete_check(packet)?,
@@ -3325,6 +3326,7 @@ fn startup_response(
         StartupRequest::SyncDictionaryInfo => startup::serialize_pr_sync_dictionary_info(),
         StartupRequest::AddTimeEventInit => startup::serialize_pr_add_time_event_init(time),
         StartupRequest::ServerTime => startup::serialize_pr_server_time(time),
+        StartupRequest::GetRiderTaskContext => startup::serialize_pr_get_rider_task_context(),
         StartupRequest::LockedItemList => startup::serialize_empty_locked_item_list(),
         StartupRequest::RequestExtradata => startup::serialize_pr_request_extradata(),
         StartupRequest::WebEventCompleteCheck => startup::serialize_pr_web_event_complete_check(),
@@ -4538,7 +4540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_dispatch_rejects_an_unclassified_packet_explicitly() {
+    async fn authenticated_dispatch_replies_to_task_context_and_rejects_unknown_packets() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -4561,6 +4563,13 @@ mod tests {
         let mut context = bind_test_profile(&profiles, &identity).await;
         let hash = 0xDEAD_BEEF_u32;
 
+        let task_context = PacketWriter::named("PqGetRiderTaskContext").into_inner();
+        assert_eq!(
+            dispatch_packet(&services, &task_context, &mut context)
+                .await
+                .unwrap(),
+            vec![vec![0x50, 0x08, 0x84, 0x58, 0, 0, 0, 0]]
+        );
         assert!(
             dispatch_packet(
                 &services,

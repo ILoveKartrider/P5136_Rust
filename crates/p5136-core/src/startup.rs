@@ -30,6 +30,10 @@ pub const START_RIDER_SCHOOL_REQUEST_NAME: &str = "PqStartRiderSchool";
 pub const START_RIDER_SCHOOL_REPLY_NAME: &str = "PrStartRiderSchool";
 pub const START_RIDER_SCHOOL_REQUEST_HASH: u32 = 0x4327_072D;
 pub const START_RIDER_SCHOOL_REPLY_HASH: u32 = 0x4338_072E;
+pub const GET_RIDER_TASK_CONTEXT_REQUEST_NAME: &str = "PqGetRiderTaskContext";
+pub const GET_RIDER_TASK_CONTEXT_REPLY_NAME: &str = "PrGetRiderTaskContext";
+pub const GET_RIDER_TASK_CONTEXT_REQUEST_HASH: u32 = 0x5870_084F;
+pub const GET_RIDER_TASK_CONTEXT_REPLY_HASH: u32 = 0x5884_0850;
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -84,6 +88,7 @@ pub enum StartupRequest {
     AddRacingTime,
     EquipTuning,
     GetRider,
+    GetRiderTaskContext,
     UpdateGameOption,
     GetGameOption,
     SetPlaytimeEventTick,
@@ -115,6 +120,7 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::AddRacingTime,
     StartupRequest::EquipTuning,
     StartupRequest::GetRider,
+    StartupRequest::GetRiderTaskContext,
     StartupRequest::UpdateGameOption,
     StartupRequest::GetGameOption,
     StartupRequest::SetPlaytimeEventTick,
@@ -149,6 +155,7 @@ impl StartupRequest {
             Self::AddRacingTime => "LoRqAddRacingTimePacket",
             Self::EquipTuning => "PqEquipTuningPacket",
             Self::GetRider => "PqGetRider",
+            Self::GetRiderTaskContext => GET_RIDER_TASK_CONTEXT_REQUEST_NAME,
             Self::UpdateGameOption => "PqUpdateGameOption",
             Self::GetGameOption => "PqGetGameOption",
             Self::SetPlaytimeEventTick => "PqSetPlaytimeEventTick",
@@ -183,6 +190,7 @@ impl StartupRequest {
             Self::AddRacingTime => Some("LoRpAddRacingTimePacket"),
             Self::EquipTuning => Some("PrEquipTuningPacket"),
             Self::GetRider => Some("PrGetRider"),
+            Self::GetRiderTaskContext => Some(GET_RIDER_TASK_CONTEXT_REPLY_NAME),
             Self::UpdateGameOption => None,
             Self::GetGameOption => Some("PrGetGameOption"),
             Self::SetPlaytimeEventTick => Some("PrSetPlaytimeEventTick"),
@@ -346,6 +354,15 @@ pub fn parse_pq_update_game_option(packet: &[u8]) -> Result<PqUpdateGameOption, 
 /// terminal empty list.
 pub fn parse_pq_locked_item_get(packet: &[u8]) -> Result<(), StartupError> {
     parse_hash_only_request(packet, LOCKED_ITEM_LIST_REQUEST_NAME)
+}
+
+/// Parses the stock client's exact hash-only rider task-context request.
+///
+/// The available C# handler does not consume a body, and the crashing P5136
+/// client sent exactly the four-byte hash. Rust therefore keeps this read-only
+/// compatibility boundary strict instead of accepting unproven trailing data.
+pub fn parse_pq_get_rider_task_context(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, GET_RIDER_TASK_CONTEXT_REQUEST_NAME)
 }
 
 /// Parses the stock client's exact hash-only extra-data request.
@@ -646,6 +663,14 @@ pub fn serialize_empty_locked_item_list() -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the empty task-context response expected after rider startup.
+#[must_use]
+pub fn serialize_pr_get_rider_task_context() -> Vec<u8> {
+    let mut packet = PacketWriter::named(GET_RIDER_TASK_CONTEXT_REPLY_NAME);
+    packet.write_i32(0);
+    packet.into_inner()
+}
+
 /// Serializes the legacy four-byte server clock representation.
 #[must_use]
 pub fn serialize_pr_server_time(time: LegacyTime) -> Vec<u8> {
@@ -797,24 +822,26 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        GameOptions, LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME,
-        MAX_GAME_OPTION_TRAILING_BYTES, PrGetRiderFields, REQUEST_EXTRADATA_REPLY_NAME,
-        REQUEST_EXTRADATA_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
-        START_RIDER_SCHOOL_REPLY_HASH, START_RIDER_SCHOOL_REPLY_NAME,
-        START_RIDER_SCHOOL_REQUEST_HASH, START_RIDER_SCHOOL_REQUEST_NAME, StartupError,
-        StartupRequest, WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+        GET_RIDER_TASK_CONTEXT_REPLY_HASH, GET_RIDER_TASK_CONTEXT_REPLY_NAME,
+        GET_RIDER_TASK_CONTEXT_REQUEST_HASH, GET_RIDER_TASK_CONTEXT_REQUEST_NAME, GameOptions,
+        LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME, MAX_GAME_OPTION_TRAILING_BYTES,
+        PrGetRiderFields, REQUEST_EXTRADATA_REPLY_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, START_RIDER_SCHOOL_REPLY_HASH,
+        START_RIDER_SCHOOL_REPLY_NAME, START_RIDER_SCHOOL_REQUEST_HASH,
+        START_RIDER_SCHOOL_REQUEST_NAME, StartupError, StartupRequest,
+        WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_pq_locked_item_get, parse_pq_request_extradata, parse_pq_start_rider_school,
-        parse_pq_update_game_option, parse_pq_web_event_complete_check,
-        serialize_channel_static_reply, serialize_empty_locked_item_list,
-        serialize_lo_rp_add_racing_time, serialize_lo_rp_event_reward,
-        serialize_pr_add_time_event_init, serialize_pr_chapter_info,
+        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_request_extradata,
+        parse_pq_start_rider_school, parse_pq_update_game_option,
+        parse_pq_web_event_complete_check, serialize_channel_static_reply,
+        serialize_empty_locked_item_list, serialize_lo_rp_add_racing_time,
+        serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
-        serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_kart_pass_init,
-        serialize_pr_kart_pass_reward, serialize_pr_login_vip_info, serialize_pr_public_command,
-        serialize_pr_quest_ux_second, serialize_pr_request_extradata,
+        serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_get_rider_task_context,
+        serialize_pr_kart_pass_init, serialize_pr_kart_pass_reward, serialize_pr_login_vip_info,
+        serialize_pr_public_command, serialize_pr_quest_ux_second, serialize_pr_request_extradata,
         serialize_pr_rider_school_data, serialize_pr_rider_school_progress,
         serialize_pr_server_time, serialize_pr_set_playtime_event_tick,
         serialize_pr_start_rider_school, serialize_pr_sync_dictionary_info,
@@ -854,8 +881,24 @@ mod tests {
     #[test]
     fn strict_stock_hash_only_requests_preserve_exact_pairs_and_replies() {
         assert_eq!(
+            adler32::packet_hash(GET_RIDER_TASK_CONTEXT_REQUEST_NAME),
+            GET_RIDER_TASK_CONTEXT_REQUEST_HASH
+        );
+        assert_eq!(
+            adler32::packet_hash(GET_RIDER_TASK_CONTEXT_REPLY_NAME),
+            GET_RIDER_TASK_CONTEXT_REPLY_HASH
+        );
+        assert_eq!(
             adler32::packet_hash(REQUEST_EXTRADATA_REQUEST_NAME),
             0x4466_0748
+        );
+        assert_eq!(
+            classify_startup_request(GET_RIDER_TASK_CONTEXT_REQUEST_HASH),
+            Some(StartupRequest::GetRiderTaskContext)
+        );
+        assert_eq!(
+            StartupRequest::GetRiderTaskContext.reply_name(),
+            Some(GET_RIDER_TASK_CONTEXT_REPLY_NAME)
         );
         assert_eq!(
             adler32::packet_hash(REQUEST_EXTRADATA_REPLY_NAME),
@@ -889,12 +932,20 @@ mod tests {
         assert!(!is_startup_noop(0x4466_0748));
         assert!(!is_startup_noop(0xA814_0B50));
 
+        assert_strict_hash_only_parser(
+            parse_pq_get_rider_task_context,
+            GET_RIDER_TASK_CONTEXT_REQUEST_NAME,
+        );
         assert_strict_hash_only_parser(parse_pq_request_extradata, REQUEST_EXTRADATA_REQUEST_NAME);
         assert_strict_hash_only_parser(
             parse_pq_web_event_complete_check,
             WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         );
 
+        assert_eq!(
+            serialize_pr_get_rider_task_context(),
+            [0x50, 0x08, 0x84, 0x58, 0, 0, 0, 0]
+        );
         assert_eq!(
             serialize_pr_request_extradata(),
             [0x49, 0x07, 0x77, 0x44, 0, 0]
