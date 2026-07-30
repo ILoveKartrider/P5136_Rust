@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     num::NonZeroU16,
     sync::{
         Arc,
@@ -84,6 +84,50 @@ pub struct IdentityBinding {
     pub owner: SessionId,
     pub source_ip: IpAddr,
     pub channel: Option<ChannelBinding>,
+}
+
+/// A P5136 wire endpoint derived only from the authenticated TCP peer.
+///
+/// The legacy room codecs can carry only IPv4. IPv4-mapped IPv6 peers retain
+/// their embedded address, while a native IPv6 peer remains unadvertised:
+/// exposing `0.0.0.0` with a nonzero port would falsely grant endpoint
+/// authority that the wire format cannot represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyIpv4Endpoint {
+    address: Ipv4Addr,
+    port: u16,
+}
+
+impl LegacyIpv4Endpoint {
+    #[must_use]
+    pub(crate) const fn address(self) -> Ipv4Addr {
+        self.address
+    }
+
+    #[must_use]
+    pub(crate) const fn port(self) -> u16 {
+        self.port
+    }
+}
+
+#[must_use]
+pub(crate) fn legacy_p2p_endpoint(source_ip: IpAddr, reported_port: u16) -> LegacyIpv4Endpoint {
+    match source_ip {
+        IpAddr::V4(address) => LegacyIpv4Endpoint {
+            address,
+            port: reported_port,
+        },
+        IpAddr::V6(address) => address.to_ipv4_mapped().map_or(
+            LegacyIpv4Endpoint {
+                address: Ipv4Addr::UNSPECIFIED,
+                port: 0,
+            },
+            |address| LegacyIpv4Endpoint {
+                address,
+                port: reported_port,
+            },
+        ),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1671,14 +1715,14 @@ fn identity_binding(active: &ActiveIdentity, owner: SessionId) -> IdentityBindin
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
         sync::{Arc, atomic::Ordering},
         time::{Duration, Instant},
     };
 
     use super::{
         ChannelBinding, DisconnectOutcome, IdentityError, IdentityRegistry, MIGRATION_TTL,
-        MigrationToken, ReleasedIdentity, UserNo,
+        MigrationToken, ReleasedIdentity, UserNo, legacy_p2p_endpoint,
     };
     use crate::SessionId;
     use p5136_core::nickname::{NicknameError, canonical_nickname_key};
@@ -1696,6 +1740,24 @@ mod tests {
 
     fn token(value: u16) -> MigrationToken {
         MigrationToken::new(value).unwrap()
+    }
+
+    #[test]
+    fn legacy_p2p_endpoint_preserves_ipv4_and_mapped_peers_but_revokes_native_ipv6() {
+        let ipv4 = Ipv4Addr::new(203, 0, 113, 51);
+        let native_ipv6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 51);
+
+        let direct = legacy_p2p_endpoint(IpAddr::V4(ipv4), 45_136);
+        assert_eq!(direct.address(), ipv4);
+        assert_eq!(direct.port(), 45_136);
+
+        let mapped = legacy_p2p_endpoint(IpAddr::V6(ipv4.to_ipv6_mapped()), u16::MAX);
+        assert_eq!(mapped.address(), ipv4);
+        assert_eq!(mapped.port(), u16::MAX);
+
+        let unsupported = legacy_p2p_endpoint(IpAddr::V6(native_ipv6), 45_136);
+        assert_eq!(unsupported.address(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(unsupported.port(), 0);
     }
 
     #[test]

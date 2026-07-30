@@ -8,7 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr},
+    net::Ipv4Addr,
     num::NonZeroUsize,
 };
 
@@ -22,7 +22,7 @@ use p5136_core::{
 };
 use thiserror::Error;
 
-use crate::{IdentityBinding, ReleasedIdentity, UserNo};
+use crate::{IdentityBinding, ReleasedIdentity, UserNo, identity::legacy_p2p_endpoint};
 
 #[cfg(test)]
 pub(crate) const MAX_MYROOM_IDENTITIES: usize = 256;
@@ -110,6 +110,18 @@ impl MyRoomProfilePresentation {
         }
     }
 
+    /// Replaces only the generation-bound P2P port.
+    ///
+    /// Profile snapshots may contain a port reported by an older connection.
+    /// Session and migration boundaries use this method to clear that stale
+    /// endpoint without rebuilding or exposing the remaining presentation
+    /// fields.
+    #[must_use]
+    pub(crate) fn with_p2p_port(mut self, p2p_port: u16) -> Self {
+        self.p2p_port = p2p_port;
+        self
+    }
+
     /// Binds profile-owned presentation to one actor-authoritative identity.
     ///
     /// The source address, user number, and nickname can never be supplied by
@@ -117,10 +129,11 @@ impl MyRoomProfilePresentation {
     /// projection is sealed.
     #[must_use]
     pub(crate) fn player_for(&self, identity: &IdentityBinding) -> MyRoomPlayerSlot {
+        let endpoint = legacy_p2p_endpoint(identity.source_ip, self.p2p_port);
         MyRoomPlayerSlot {
             user_no: identity.user_no.get(),
-            p2p_address: identity_wire_address(identity),
-            p2p_port: self.p2p_port,
+            p2p_address: endpoint.address(),
+            p2p_port: endpoint.port(),
             nickname: identity.nickname.clone(),
             rider_item_snapshot: self.rider_item_snapshot,
             rp: self.rp,
@@ -243,14 +256,15 @@ pub(crate) struct RoomPublication {
 /// Actor-minted, bounded room topology used to load fresh wire presentation.
 ///
 /// Slot zero deliberately retains the owner's exact identity after the owner
-/// leaves while visitors remain. The cached [`MyRoomPlayerSlot`] values held by
-/// the hub are not part of this capability and therefore cannot accidentally
-/// become the source of a freshly requested wire snapshot.
+/// leaves while visitors remain. The capability carries only that identity
+/// topology plus each role's generation-bound P2P port stamp; profile-owned
+/// presentation fields are reloaded separately before projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MyRoomWirePlan {
     requester: IdentityBinding,
     owner: OwnerKey,
     slots: [Option<IdentityBinding>; MYROOM_SLOT_COUNT],
+    p2p_ports: [Option<u16>; MYROOM_SLOT_COUNT],
 }
 
 impl MyRoomWirePlan {
@@ -275,9 +289,30 @@ impl MyRoomWirePlan {
     /// topology and seals it into an opaque projection.
     pub(crate) fn project(
         &self,
-        slots: [Option<MyRoomPlayerSlot>; MYROOM_SLOT_COUNT],
+        mut slots: [Option<MyRoomPlayerSlot>; MYROOM_SLOT_COUNT],
     ) -> Result<MyRoomWireProjection, MyRoomWireProjectionError> {
-        for (index, (identity, player)) in self.slots.iter().zip(&slots).enumerate() {
+        for (index, ((identity, p2p_port), player)) in self
+            .slots
+            .iter()
+            .zip(&self.p2p_ports)
+            .zip(&mut slots)
+            .enumerate()
+        {
+            match (identity, p2p_port, player.as_mut()) {
+                (Some(_), Some(p2p_port), Some(player)) => player.p2p_port = *p2p_port,
+                (Some(identity), None, _) => {
+                    return Err(MyRoomWireProjectionError::MissingCachedP2pPort {
+                        slot: slot_number(index),
+                        expected: identity.user_no,
+                    });
+                }
+                (None, Some(_), _) => {
+                    return Err(MyRoomWireProjectionError::UnexpectedCachedP2pPort {
+                        slot: slot_number(index),
+                    });
+                }
+                _ => {}
+            }
             validate_projected_slot(index, identity.as_ref(), player.as_ref())?;
         }
         Ok(MyRoomWireProjection {
@@ -399,7 +434,13 @@ impl MyRoomWireProjection {
                     expected: identity.user_no,
                 },
             )?;
-            slots[index] = MyRoomSlot::Player(projected.clone());
+            let mut projected = projected.clone();
+            // Profile I/O owns the remaining presentation fields, but the
+            // post-transition Hub publication owns the live endpoint stamp.
+            // In particular, owner Secede turns slot zero into an absent-owner
+            // tombstone whose port must remain revoked.
+            projected.p2p_port = cached.p2p_port;
+            slots[index] = MyRoomSlot::Player(projected);
         }
         validate_publication_audience(&self.plan, publication)?;
 
@@ -416,6 +457,12 @@ impl MyRoomWireProjection {
 
 #[derive(Debug, Error)]
 pub(crate) enum MyRoomWireProjectionError {
+    #[error("MyRoom wire plan slot {slot} for {expected:?} lacks a cached P2P port")]
+    MissingCachedP2pPort { slot: u8, expected: UserNo },
+
+    #[error("empty MyRoom wire plan slot {slot} unexpectedly carries a cached P2P port")]
+    UnexpectedCachedP2pPort { slot: u8 },
+
     #[error("MyRoom wire plan slot {slot} expects {expected:?}, but no player was projected")]
     MissingPlayer { slot: u8, expected: UserNo },
 
@@ -454,6 +501,13 @@ pub(crate) enum MyRoomWireProjectionError {
         slot: u8,
         expected: Ipv4Addr,
         actual: Ipv4Addr,
+    },
+
+    #[error("projected MyRoom player in slot {slot} has P2P port {actual}; expected {expected}")]
+    PlayerPortMismatch {
+        slot: u8,
+        expected: u16,
+        actual: u16,
     },
 
     #[error("MyRoom publication owner {actual:?} does not match wire plan owner {expected:?}")]
@@ -857,6 +911,9 @@ pub(crate) enum MyRoomInvariantViolation {
     #[error("room {owner:?} owner presentation belongs to {actual:?}")]
     WrongOwnerPresentation { owner: UserNo, actual: UserNo },
 
+    #[error("room {owner:?} advertises P2P port {port} for an absent owner tombstone")]
+    AbsentOwnerAdvertisesP2pPort { owner: UserNo, port: u16 },
+
     #[error("room {owner:?} slot {slot} has an invalid player snapshot")]
     InvalidPlayerSnapshot { owner: UserNo, slot: u8 },
 
@@ -925,7 +982,11 @@ struct RoomState {
     )
 )]
 impl RoomState {
-    fn new(owner: MyRoomOwner, info_revision: MyRoomRevision) -> Self {
+    fn new(mut owner: MyRoomOwner, info_revision: MyRoomRevision) -> Self {
+        // The owner slot begins as an identity/profile tombstone. It becomes
+        // endpoint-bearing only when that exact owner generation is admitted
+        // into slot zero.
+        owner.participant.player.p2p_port = 0;
         Self {
             owner: owner.participant,
             info: owner.info,
@@ -973,6 +1034,7 @@ impl RoomState {
                     actual: participant.identity.generation.get(),
                 });
             }
+            self.owner.player.p2p_port = participant.player.p2p_port;
             self.owner_present = true;
             return Ok(());
         }
@@ -1028,13 +1090,16 @@ impl RoomState {
 
     fn replace_owner_presentation(
         &mut self,
-        participant: MyRoomParticipant,
+        mut participant: MyRoomParticipant,
     ) -> Result<(), MyRoomInvariantViolation> {
         if participant.identity.user_no != self.owner.identity.user_no {
             return Err(MyRoomInvariantViolation::WrongOwnerPresentation {
                 owner: self.owner.identity.user_no,
                 actual: participant.identity.user_no,
             });
+        }
+        if !self.owner_present {
+            participant.player.p2p_port = 0;
         }
         self.owner = participant;
         Ok(())
@@ -1053,6 +1118,7 @@ impl RoomState {
                 });
             }
             self.owner_present = false;
+            self.owner.player.p2p_port = 0;
             return Ok(());
         }
         let Some(index) = slot.visitor_index() else {
@@ -1788,10 +1854,13 @@ impl MyRoomHub {
         )
     }
 
-    /// Silently refreshes every cached role held by one exact generation.
+    /// Silently refreshes the non-endpoint profile fields in every cached role
+    /// held by one exact generation.
     ///
-    /// A profile mutation alone does not cause a C# `RmSlotData` fan-out, so
-    /// the opaque outcome deliberately exposes no publication payload.
+    /// The P2P port is generation-bound report state rather than ordinary
+    /// profile presentation and is preserved per role. A profile mutation
+    /// alone does not cause a C# `RmSlotData` fan-out, so the opaque outcome
+    /// deliberately exposes no publication payload.
     pub(crate) fn refresh_profile_if_tracked(
         &self,
         identity: &IdentityBinding,
@@ -1800,10 +1869,39 @@ impl MyRoomHub {
         if !self.has_role(identity.user_no)? {
             return Ok(None);
         }
-        let participant = presentation.bind(identity.clone())?;
         self.require_canonical_identity(identity)?;
         let next_revision = self.next_revision()?;
-        let (rooms, _) = self.replacement_rooms(identity.user_no, &participant)?;
+        let rooms = self.profile_replacement_rooms(identity.user_no, identity, presentation)?;
+        self.transition(
+            next_revision,
+            rooms,
+            Vec::new(),
+            Vec::new(),
+            MyRoomSilentRefresh,
+        )
+        .map(Some)
+    }
+
+    /// Silently patches the actor-authoritative P2P endpoint in every live
+    /// role held by one exact generation.
+    ///
+    /// Keeping this as a partial presentation update prevents an unrelated
+    /// profile field from invalidating or overwriting already-admitted cached
+    /// state after the port itself has become durable.
+    pub(crate) fn refresh_p2p_endpoint_if_tracked(
+        &self,
+        identity: &IdentityBinding,
+        port: u16,
+    ) -> Result<Option<MyRoomTransition<MyRoomSilentRefresh>>, MyRoomHubError> {
+        if !self.has_role(identity.user_no)? {
+            return Ok(None);
+        }
+        self.require_canonical_identity(identity)?;
+        let rooms = self.p2p_endpoint_replacement_rooms(identity, port)?;
+        if rooms.is_empty() {
+            return Ok(None);
+        }
+        let next_revision = self.next_revision()?;
         self.transition(
             next_revision,
             rooms,
@@ -1856,6 +1954,10 @@ impl MyRoomHub {
 
     /// Atomically advances an exact migrated generation and installs the
     /// profile snapshot loaded under the migration's canonical profile lane.
+    ///
+    /// The durable snapshot may contain a port reported by the previous
+    /// connection. The hub clears it at this boundary so callers cannot
+    /// accidentally grant endpoint authority to a new generation.
     pub(crate) fn advance_profiled_identity_if_tracked(
         &self,
         previous: &IdentityBinding,
@@ -1865,17 +1967,22 @@ impl MyRoomHub {
         if !self.has_role(previous.user_no)? {
             return Ok(None);
         }
-        let participant = presentation.bind(replacement.clone())?;
+        let participant = presentation
+            .clone()
+            .with_p2p_port(0)
+            .bind(replacement.clone())?;
         self.advance_identity(previous, participant).map(Some)
     }
 
     /// Advances a migrated generation without requiring profile I/O.
     ///
-    /// Every role retains its own presentation fields. Only fields controlled
-    /// by the actor-minted identity are replaced: user number, nickname,
-    /// generation/owner/channel binding, and the source IPv4 address encoded
-    /// by the legacy `MyRoom` wire format. IPv6 sources intentionally map to the
-    /// unspecified IPv4 address, matching the login-session projection.
+    /// Every role retains its non-endpoint presentation fields. Fields
+    /// controlled by the actor-minted identity are replaced: user number,
+    /// nickname, generation/owner/channel binding, and the source IPv4 address
+    /// encoded by the legacy `MyRoom` wire format. The P2P port is cleared
+    /// because a replacement generation must report its own endpoint. IPv6
+    /// sources intentionally map to the unspecified IPv4 address, matching
+    /// the login-session projection.
     pub(crate) fn advance_migrated_identity_if_tracked(
         &self,
         previous: &IdentityBinding,
@@ -2190,6 +2297,96 @@ impl MyRoomHub {
         Ok((changes, publications))
     }
 
+    fn p2p_endpoint_replacement_rooms(
+        &self,
+        identity: &IdentityBinding,
+        port: u16,
+    ) -> Result<Vec<RoomChange>, MyRoomHubError> {
+        let user_no = identity.user_no;
+        let membership = self.memberships.get(&user_no).copied();
+        let owned_key = OwnerKey(user_no);
+        let owns_room = self.rooms.contains_key(&owned_key);
+        if membership.is_none() && !owns_room {
+            return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration { user_no }.into());
+        }
+
+        let mut changes = Vec::with_capacity(MAX_TRANSITION_ROOMS);
+        if let Some(membership) = membership {
+            let current_room = self.room(membership.owner)?;
+            let current = current_room.participant(membership.slot).ok_or(
+                MyRoomInvariantViolation::MembershipSlotMismatch {
+                    member: user_no,
+                    slot: membership.slot.get(),
+                },
+            )?;
+            let patched = participant_with_p2p_endpoint(current, identity, port)?;
+            if &patched != current {
+                let mut room = current_room.clone();
+                room.replace_participant(membership.slot, patched)?;
+                changes.push(RoomChange {
+                    owner: membership.owner,
+                    value: Some(room),
+                });
+            }
+        }
+        if owns_room && membership.is_none_or(|mapped| mapped.owner != owned_key) {
+            let current_room = self.room(owned_key)?;
+            if current_room.owner_present {
+                let patched = participant_with_p2p_endpoint(&current_room.owner, identity, port)?;
+                if patched != current_room.owner {
+                    let mut room = current_room.clone();
+                    room.replace_owner_presentation(patched)?;
+                    changes.push(RoomChange {
+                        owner: owned_key,
+                        value: Some(room),
+                    });
+                }
+            }
+        }
+        Ok(changes)
+    }
+
+    fn profile_replacement_rooms(
+        &self,
+        user_no: UserNo,
+        identity: &IdentityBinding,
+        presentation: &MyRoomProfilePresentation,
+    ) -> Result<Vec<RoomChange>, MyRoomHubError> {
+        let membership = self.memberships.get(&user_no).copied();
+        let owned_key = OwnerKey(user_no);
+        let owns_room = self.rooms.contains_key(&owned_key);
+        if membership.is_none() && !owns_room {
+            return Err(MyRoomInvariantViolation::OrphanCanonicalGeneration { user_no }.into());
+        }
+
+        let mut changes = Vec::with_capacity(MAX_TRANSITION_ROOMS);
+        if let Some(membership) = membership {
+            let mut room = self.room(membership.owner)?.clone();
+            let current = room.participant(membership.slot).ok_or(
+                MyRoomInvariantViolation::MembershipSlotMismatch {
+                    member: user_no,
+                    slot: membership.slot.get(),
+                },
+            )?;
+            let replacement = participant_with_profile(current, identity, presentation)?;
+            room.replace_participant(membership.slot, replacement)?;
+            changes.push(RoomChange {
+                owner: membership.owner,
+                value: Some(room),
+            });
+        }
+        if owns_room && membership.is_none_or(|mapped| mapped.owner != owned_key) {
+            let mut room = self.room(owned_key)?.clone();
+            let replacement = participant_with_profile(&room.owner, identity, presentation)?;
+            room.replace_owner_presentation(replacement)?;
+            changes.push(RoomChange {
+                owner: owned_key,
+                value: Some(room),
+            });
+        }
+        Ok(changes)
+    }
+
     fn migrated_replacement_rooms(
         &self,
         user_no: UserNo,
@@ -2256,6 +2453,15 @@ impl MyRoomHub {
                     .map(|participant| participant.identity.clone())
             }
         });
+        let p2p_ports = std::array::from_fn(|index| {
+            if index == 0 {
+                Some(room.owner.player.p2p_port)
+            } else {
+                room.visitors[index - 1]
+                    .as_ref()
+                    .map(|participant| participant.player.p2p_port)
+            }
+        });
         for (index, identity) in slots
             .iter()
             .enumerate()
@@ -2288,6 +2494,7 @@ impl MyRoomHub {
             requester: requester.clone(),
             owner,
             slots,
+            p2p_ports,
         })
     }
 
@@ -2491,6 +2698,12 @@ impl MyRoomHub {
                     actual: room.owner.identity.user_no,
                 });
             }
+            if !room.owner_present && room.owner.player.p2p_port != 0 {
+                return Err(MyRoomInvariantViolation::AbsentOwnerAdvertisesP2pPort {
+                    owner: owner.user_no(),
+                    port: room.owner.player.p2p_port,
+                });
+            }
             if validate_myroom_info(&room.info).is_err() {
                 return Err(MyRoomInvariantViolation::InvalidRoomInfo {
                     owner: owner.user_no(),
@@ -2640,12 +2853,19 @@ fn validate_projected_slot(
             actual: player.nickname.clone(),
         });
     }
-    let expected_address = identity_wire_address(identity);
-    if player.p2p_address != expected_address {
+    let expected_endpoint = legacy_p2p_endpoint(identity.source_ip, player.p2p_port);
+    if player.p2p_address != expected_endpoint.address() {
         return Err(MyRoomWireProjectionError::PlayerAddressMismatch {
             slot: slot_number(index),
-            expected: expected_address,
+            expected: expected_endpoint.address(),
             actual: player.p2p_address,
+        });
+    }
+    if player.p2p_port != expected_endpoint.port() {
+        return Err(MyRoomWireProjectionError::PlayerPortMismatch {
+            slot: slot_number(index),
+            expected: expected_endpoint.port(),
+            actual: player.p2p_port,
         });
     }
     Ok(())
@@ -2739,13 +2959,6 @@ fn validate_publication_audience(
         }
     }
     Ok(())
-}
-
-const fn identity_wire_address(identity: &IdentityBinding) -> Ipv4Addr {
-    match identity.source_ip {
-        IpAddr::V4(address) => address,
-        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-    }
 }
 
 fn slot_number(index: usize) -> u8 {
@@ -2852,6 +3065,30 @@ fn validate_identity_advance(
     Ok(())
 }
 
+fn participant_with_p2p_endpoint(
+    current: &MyRoomParticipant,
+    identity: &IdentityBinding,
+    port: u16,
+) -> Result<MyRoomParticipant, MyRoomHubError> {
+    let mut player = current.player.clone();
+    let endpoint = legacy_p2p_endpoint(identity.source_ip, port);
+    player.p2p_address = endpoint.address();
+    player.p2p_port = endpoint.port();
+    MyRoomParticipant::new(current.identity.clone(), player)
+}
+
+fn participant_with_profile(
+    current: &MyRoomParticipant,
+    identity: &IdentityBinding,
+    presentation: &MyRoomProfilePresentation,
+) -> Result<MyRoomParticipant, MyRoomHubError> {
+    let mut player = presentation.player_for(identity);
+    let endpoint = legacy_p2p_endpoint(identity.source_ip, current.player.p2p_port);
+    player.p2p_address = endpoint.address();
+    player.p2p_port = endpoint.port();
+    MyRoomParticipant::new(identity.clone(), player)
+}
+
 fn migrated_participant(
     current: &MyRoomParticipant,
     replacement: &IdentityBinding,
@@ -2859,10 +3096,9 @@ fn migrated_participant(
     let mut player = current.player.clone();
     player.user_no = replacement.user_no.get();
     player.nickname.clone_from(&replacement.nickname);
-    player.p2p_address = match replacement.source_ip {
-        IpAddr::V4(address) => address,
-        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-    };
+    let endpoint = legacy_p2p_endpoint(replacement.source_ip, 0);
+    player.p2p_address = endpoint.address();
+    player.p2p_port = endpoint.port();
     MyRoomParticipant::new(replacement.clone(), player)
 }
 
@@ -2949,7 +3185,10 @@ mod tests {
         MyRoomWirePlan, MyRoomWireProjection, MyRoomWireProjectionError, OwnerKey,
         ParticipantRefreshEffects, RoomChange, RoomEffect, RoomState, VISITOR_CAPACITY,
     };
-    use crate::{IdentityBinding, IdentityRegistry, ReleasedIdentity, SessionId};
+    use crate::{
+        IdentityBinding, IdentityRegistry, ReleasedIdentity, SessionId,
+        identity::legacy_p2p_endpoint,
+    };
 
     fn claim(registry: &mut IdentityRegistry, session: u64, nickname: &str) -> IdentityBinding {
         registry
@@ -3005,12 +3244,17 @@ mod tests {
         MyRoomParticipant::new(identity.clone(), player).unwrap()
     }
 
+    fn participant_with_p2p_port(identity: &IdentityBinding, port: u16) -> MyRoomParticipant {
+        let mut player = participant(identity).player().clone();
+        player.p2p_port = port;
+        MyRoomParticipant::new(identity.clone(), player).unwrap()
+    }
+
     fn projected_player(identity: &IdentityBinding, rp: u32) -> MyRoomPlayerSlot {
         let mut player = participant_with_rp(identity, rp).player().clone();
-        player.p2p_address = match identity.source_ip {
-            IpAddr::V4(address) => address,
-            IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-        };
+        let endpoint = legacy_p2p_endpoint(identity.source_ip, player.p2p_port);
+        player.p2p_address = endpoint.address();
+        player.p2p_port = endpoint.port();
         player
     }
 
@@ -3051,6 +3295,11 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn absent_owner(mut owner: MyRoomOwner) -> MyRoomOwner {
+        owner.participant.player.p2p_port = 0;
+        owner
     }
 
     fn commit<T>(hub: &mut MyRoomHub, transition: MyRoomTransition<T>) -> T {
@@ -3169,7 +3418,7 @@ mod tests {
         leave(&mut hub, &owner_id).unwrap();
         assert_eq!(
             hub.tracked_owner_entry_input(&owner_id).unwrap(),
-            Some(owner_input),
+            Some(absent_owner(owner_input)),
             "the owned-room tombstone remains available for owner self-entry"
         );
         assert_eq!(
@@ -3222,7 +3471,7 @@ mod tests {
         leave(&mut hub, &owner_id).unwrap();
         assert_eq!(
             hub.membership_owner_entry_input(&visitor_id).unwrap(),
-            Some(protected_owner),
+            Some(absent_owner(protected_owner)),
             "owner absence must not revoke an existing member's re-entry input"
         );
 
@@ -3540,10 +3789,27 @@ mod tests {
         assert!(transition.generations.is_empty());
         let _silent = transition.commit(&mut hub).unwrap();
 
-        let expected = presentation.player_for(&profiled);
+        let mut expected_owned = presentation.player_for(&profiled);
+        let MyRoomSlot::Player(previous_owner) = &owned_before.slots[0] else {
+            panic!("the owned room retains its owner tombstone");
+        };
+        expected_owned.p2p_port = previous_owner.p2p_port;
+        let previous_visited = visited_before
+            .slots
+            .iter()
+            .find_map(|slot| match slot {
+                MyRoomSlot::Player(player) if player.user_no == profiled.user_no.get() => {
+                    Some(player)
+                }
+                _ => None,
+            })
+            .expect("the visited room retains the profiled visitor");
+        let mut expected_visited = presentation.player_for(&profiled);
+        expected_visited.p2p_port = previous_visited.p2p_port;
         let owned = &hub.rooms[&OwnerKey(profiled.user_no)];
         assert!(!owned.owner_present);
-        assert_eq!(owned.owner.player, expected);
+        assert_eq!(owned.owner.player, expected_owned);
+        assert_eq!(owned.owner.player.p2p_port, 0);
         let visited = &hub.rooms[&OwnerKey(visited_owner.user_no)];
         let visited_profile = visited
             .visitors
@@ -3551,14 +3817,14 @@ mod tests {
             .flatten()
             .find(|participant| participant.identity.user_no == profiled.user_no)
             .unwrap();
-        assert_eq!(visited_profile.player, expected);
-        assert_eq!(expected.user_no, profiled.user_no.get());
-        assert_eq!(expected.nickname, profiled.nickname);
-        assert_eq!(expected.p2p_address, Ipv4Addr::LOCALHOST);
-        assert_eq!(expected.p2p_port, 45_137);
-        assert_eq!(expected.rider_item_snapshot, items);
-        assert_eq!(expected.rp, 515_137);
-        assert_eq!(expected.club_name, "FreshProfile");
+        assert_eq!(visited_profile.player, expected_visited);
+        assert_eq!(expected_visited.user_no, profiled.user_no.get());
+        assert_eq!(expected_visited.nickname, profiled.nickname);
+        assert_eq!(expected_visited.p2p_address, Ipv4Addr::LOCALHOST);
+        assert_eq!(expected_visited.p2p_port, 30_001);
+        assert_eq!(expected_visited.rider_item_snapshot, items);
+        assert_eq!(expected_visited.rp, 515_137);
+        assert_eq!(expected_visited.club_name, "FreshProfile");
 
         let refreshed_revision = hub.revision();
         assert!(
@@ -3573,6 +3839,87 @@ mod tests {
             Err(MyRoomHubError::StaleGeneration { .. })
         ));
         assert_eq!(hub.revision(), refreshed_revision);
+        hub.audit_invariants().unwrap();
+    }
+
+    #[test]
+    fn p2p_port_refresh_is_generation_bound_and_preserves_each_roles_other_fields() {
+        let mut registry = IdentityRegistry::new();
+        let profiled = claim(&mut registry, 1, "PortProfiled");
+        let owned_visitor = claim(&mut registry, 2, "PortOwnedVisitor");
+        let visited_owner = claim(&mut registry, 3, "PortVisitedOwner");
+        let outsider = claim(&mut registry, 4, "PortOutsider");
+        let mut hub = MyRoomHub::new();
+        enter(
+            &mut hub,
+            participant_with_rp(&profiled, 111),
+            owner(&profiled),
+        )
+        .unwrap();
+        enter(&mut hub, participant(&owned_visitor), owner(&profiled)).unwrap();
+        enter(&mut hub, participant(&visited_owner), owner(&visited_owner)).unwrap();
+        enter(
+            &mut hub,
+            participant_with_rp(&profiled, 222),
+            owner(&visited_owner),
+        )
+        .unwrap();
+
+        let owned_before = hub.rooms[&OwnerKey(profiled.user_no)].owner.player.clone();
+        let visited_before = hub.rooms[&OwnerKey(visited_owner.user_no)]
+            .visitors
+            .iter()
+            .flatten()
+            .find(|participant| participant.identity.user_no == profiled.user_no)
+            .unwrap()
+            .player
+            .clone();
+        assert_ne!(owned_before.rp, visited_before.rp);
+
+        let transition = hub
+            .refresh_p2p_endpoint_if_tracked(&profiled, 45_136)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transition.rooms.len(), 1);
+        assert!(transition.memberships.is_empty());
+        assert!(transition.generations.is_empty());
+        let _silent = transition.commit(&mut hub).unwrap();
+
+        let owned_after = &hub.rooms[&OwnerKey(profiled.user_no)].owner.player;
+        let visited_after = &hub.rooms[&OwnerKey(visited_owner.user_no)]
+            .visitors
+            .iter()
+            .flatten()
+            .find(|participant| participant.identity.user_no == profiled.user_no)
+            .unwrap()
+            .player;
+        let expected_owned = owned_before;
+        let mut expected_visited = visited_before;
+        expected_visited.p2p_address = Ipv4Addr::LOCALHOST;
+        expected_visited.p2p_port = 45_136;
+        assert_eq!(owned_after, &expected_owned);
+        assert_eq!(visited_after, &expected_visited);
+
+        let revision = hub.revision();
+        assert!(
+            hub.refresh_p2p_endpoint_if_tracked(&profiled, 45_136)
+                .unwrap()
+                .is_none(),
+            "an exact duplicate endpoint report must not churn the Hub revision"
+        );
+        assert_eq!(hub.revision(), revision);
+        assert!(
+            hub.refresh_p2p_endpoint_if_tracked(&outsider, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(hub.revision(), revision);
+        let profiled_g2 = replacement_identity(&mut registry, 1, 5, "PortProfiled");
+        assert!(matches!(
+            hub.refresh_p2p_endpoint_if_tracked(&profiled_g2, 2),
+            Err(MyRoomHubError::StaleGeneration { .. })
+        ));
+        assert_eq!(hub.revision(), revision);
         hub.audit_invariants().unwrap();
     }
 
@@ -3622,6 +3969,7 @@ mod tests {
             visited_presentation.p2p_address,
             Ipv4Addr::new(203, 0, 113, 44)
         );
+        assert_eq!(visited_presentation.p2p_port, 0);
 
         let owned = hub.first_snapshot(&owned_visitor).unwrap();
         let MyRoomSlot::Player(owned_presentation) = &owned.slots[0] else {
@@ -3632,6 +3980,7 @@ mod tests {
             owned_presentation.p2p_address,
             Ipv4Addr::new(203, 0, 113, 44)
         );
+        assert_eq!(owned_presentation.p2p_port, 0);
         hub.audit_invariants().unwrap();
     }
 
@@ -3676,7 +4025,38 @@ mod tests {
             user_numbers(&previous.audience),
             vec![visitor.user_no.get()]
         );
-        assert!(matches!(&previous.snapshot.slots[0], MyRoomSlot::Player(_)));
+        assert!(matches!(
+            &previous.snapshot.slots[0],
+            MyRoomSlot::Player(player) if player.p2p_port == 0
+        ));
+
+        let transition = hub
+            .refresh_p2p_endpoint_if_tracked(&owner_id, 45_136)
+            .unwrap()
+            .unwrap();
+        let _ = transition.commit(&mut hub).unwrap();
+        let owned_while_absent = hub.first_snapshot(&visitor).unwrap();
+        assert!(matches!(
+            &owned_while_absent.slots[0],
+            MyRoomSlot::Player(player) if player.p2p_port == 0
+        ));
+        let visited = hub.first_snapshot(&owner_id).unwrap();
+        assert!(matches!(
+            &visited.slots[1],
+            MyRoomSlot::Player(player) if player.p2p_port == 45_136
+        ));
+
+        let _ = enter(
+            &mut hub,
+            participant_with_p2p_port(&owner_id, 45_136),
+            owner(&owner_id),
+        )
+        .unwrap();
+        let reentered = hub.first_snapshot(&owner_id).unwrap();
+        assert!(matches!(
+            &reentered.slots[0],
+            MyRoomSlot::Player(player) if player.p2p_port == 45_136
+        ));
         hub.audit_invariants().unwrap();
     }
 
@@ -3997,6 +4377,7 @@ mod tests {
             visitor_plan.slot_identities().nth(1).flatten(),
             Some(&visitor)
         );
+        assert_eq!(visitor_plan.p2p_ports[0], Some(0));
         hub.audit_invariants().unwrap();
     }
 
@@ -4074,17 +4455,25 @@ mod tests {
             Err(MyRoomWireProjectionError::PlayerAddressMismatch { slot: 1, .. })
         ));
 
-        let projection = project_with_fresh_rp(&plan);
+        let mut fresh = projected_players(&plan);
+        fresh.iter_mut().flatten().for_each(|player| {
+            player.p2p_port = 1;
+        });
+        let projection = plan.project(fresh).unwrap();
         let snapshot = projection.snapshot();
         assert!(matches!(
             &snapshot.slots[0],
             MyRoomSlot::Player(player)
-                if player.rp == 10_000 && player.p2p_address == Ipv4Addr::LOCALHOST
+                if player.rp == 10_000
+                    && player.p2p_address == Ipv4Addr::LOCALHOST
+                    && player.p2p_port == 30_001
         ));
         assert!(matches!(
             &snapshot.slots[1],
             MyRoomSlot::Player(player)
-                if player.rp == 10_001 && player.p2p_address == Ipv4Addr::LOCALHOST
+                if player.rp == 10_001
+                    && player.p2p_address == Ipv4Addr::LOCALHOST
+                    && player.p2p_port == 30_002
         ));
         hub.audit_invariants().unwrap();
     }
@@ -4364,7 +4753,9 @@ mod tests {
         assert!(matches!(
             &owner_overlay.snapshot.slots[0],
             MyRoomSlot::Player(player)
-                if player.user_no == owner_id.user_no.get() && player.rp == 10_000
+                if player.user_no == owner_id.user_no.get()
+                    && player.rp == 10_000
+                    && player.p2p_port == 0
         ));
         assert_eq!(
             user_numbers(&owner_overlay.audience),

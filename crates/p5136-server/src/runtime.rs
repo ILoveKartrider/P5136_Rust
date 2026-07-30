@@ -1914,6 +1914,9 @@ fn world_sidecar_error(error: WorldSidecarError) -> ServerError {
         WorldSidecarError::MainEmblem(source) => ServerError::WorldActorMyRoom {
             source: Box::new(source),
         },
+        WorldSidecarError::ProfilePresentation(source) => ServerError::WorldActorMyRoom {
+            source: Box::new(source),
+        },
         WorldSidecarError::InvalidIdentityCapacity => {
             ServerError::WorldActorInvalidIdentityCapacity
         }

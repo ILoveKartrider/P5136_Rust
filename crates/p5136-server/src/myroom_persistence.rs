@@ -23,6 +23,7 @@ use crate::{
     myroom_hub::{MyRoomCommitError, MyRoomHubError},
     profile_durability::{ExactDurabilityError, ExactProfileTransaction},
     profile_io::{MyRoomProfileLease, ProfileIoCompletion, ProfileIoError, ProfileJobAdmission},
+    profile_presentation_persistence::ProfilePresentationCompletion,
 };
 
 pub(crate) const MYROOM_INFO_WRITE_OPERATION: &str = "persist MyRoom owner info";
@@ -330,6 +331,7 @@ pub(crate) enum MyRoomProfileCompletion {
     },
     RiderEquipment(RiderEquipmentProfileCompletion),
     MainEmblem(MainEmblemProfileCompletion),
+    ProfilePresentation(ProfilePresentationCompletion),
     Migration(MigrationProfileCompletion),
     DrainBarrier {
         reply: oneshot::Sender<Result<(), MyRoomCompletionDrainError>>,

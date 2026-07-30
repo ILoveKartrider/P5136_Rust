@@ -366,7 +366,13 @@ mod tests {
                 ..
             })
         ));
-        assert!(parse_client_endpoint_report(ClientEndpointReportKind::P2p, &exact[..9]).is_err());
+        for length in 0..exact.len() {
+            assert!(
+                parse_client_endpoint_report(ClientEndpointReportKind::P2p, &exact[..length])
+                    .is_err(),
+                "truncated endpoint length {length} must be rejected"
+            );
+        }
 
         let mut trailing = exact.to_vec();
         trailing.push(0xff);
@@ -377,6 +383,23 @@ mod tests {
                 count: 1
             })
         ));
+
+        let mut maximum_port = exact;
+        maximum_port[8..].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            parse_client_endpoint_report(ClientEndpointReportKind::P2p, &maximum_port)
+                .unwrap()
+                .port(),
+            u16::MAX
+        );
+        maximum_port[4..8].copy_from_slice(&[203, 0, 113, 250]);
+        assert_eq!(
+            parse_client_endpoint_report(ClientEndpointReportKind::P2p, &maximum_port)
+                .unwrap()
+                .port(),
+            u16::MAX,
+            "claimed address bytes must not affect the trusted result"
+        );
     }
 
     #[test]

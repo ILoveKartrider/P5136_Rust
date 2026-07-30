@@ -1,12 +1,5 @@
 use std::{
-    array,
-    future::Future,
-    io,
-    mem::size_of,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    pin::Pin,
-    sync::Arc,
+    array, future::Future, io, mem::size_of, net::SocketAddr, path::PathBuf, pin::Pin, sync::Arc,
     time::Instant,
 };
 
@@ -14,8 +7,9 @@ use chrono::{Local, NaiveDate, Timelike};
 use p5136_core::{
     adler32,
     channel::{
-        ChannelError, parse_pq_channel_movein, parse_pq_channel_switch, resolve_channel_id,
-        serialize_pr_channel_move_in, serialize_pr_channel_switch,
+        ChannelError, ClientEndpointReportKind, classify_client_endpoint_report,
+        parse_client_endpoint_report, parse_pq_channel_movein, parse_pq_channel_switch,
+        resolve_channel_id, serialize_pr_channel_move_in, serialize_pr_channel_switch,
     },
     equipment_protocol::{
         EquipmentProtocolError, EquipmentRequest, PlantPartEquipRequest, RiderItemSelection,
@@ -84,7 +78,7 @@ use crate::{
         PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
         RiderEquipmentWriteError, catalog_grants, kart_is_owned,
     },
-    identity::IdentityOperationLease,
+    identity::{IdentityOperationLease, legacy_p2p_endpoint},
     main_emblem_persistence::{
         MAIN_EMBLEM_WRITE_OPERATION, MainEmblemPublication, MainEmblemWriteError,
         MainEmblemWriteReceipt, PreparedMainEmblemWrite, ValidatedMainEmblemSelection,
@@ -98,6 +92,11 @@ use crate::{
     profile_io::{
         MyRoomProfileLease, ProfileIoError, ProfileIoHandle, ProfileJobAdmission,
         ProfileLanePermit, myroom_profile_presentation,
+    },
+    profile_presentation_persistence::{
+        PROFILE_PRESENTATION_WRITE_OPERATION, PreparedProfilePresentationWrite,
+        ProfilePresentationMutation, ProfilePresentationWriteError,
+        ProfilePresentationWriteReceipt,
     },
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
@@ -252,6 +251,12 @@ pub enum LoginSessionError {
 
     #[error("main-emblem persistence or publication failed")]
     MainEmblemWrite {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    #[error("profile-presentation persistence or publication failed")]
+    ProfilePresentationWrite {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
@@ -931,13 +936,28 @@ impl SessionContext {
     }
 
     fn bind_profile(&mut self, identity: IdentityBinding, profile: ProfileSnapshot) {
+        // A persisted P2P port is historical profile data, not proof that this
+        // exact TCP generation owns the same reachable endpoint. Preserve a
+        // port only across reloads of the exact binding; every newly claimed
+        // or migrated generation starts unadvertised until its own report is
+        // durably accepted.
+        let reported_p2p_port = self
+            .profile
+            .as_ref()
+            .filter(|bound| bound.identity == identity)
+            .map_or(0, |bound| bound.reported_p2p_port);
         tracing::trace!(
             nickname = %identity.nickname,
             revision = ?profile.revision,
             source_path = %profile.source_path.display(),
+            reported_p2p_port,
             "binding profile snapshot to session generation"
         );
-        self.profile = Some(BoundProfile { identity, profile });
+        self.profile = Some(BoundProfile {
+            identity,
+            profile,
+            reported_p2p_port,
+        });
     }
 
     fn bound_identity(&self) -> Result<&IdentityBinding, LoginSessionError> {
@@ -961,6 +981,33 @@ impl SessionContext {
             .filter(|bound| bound.identity.user_no == identity.user_no)
             .filter(|bound| bound.identity.generation == identity.generation)
             .ok_or(LoginSessionError::ProfileNotBound)
+    }
+
+    fn reported_p2p_port_for(&self, identity: &IdentityBinding) -> Result<u16, LoginSessionError> {
+        Ok(self.bound_profile_for(identity)?.reported_p2p_port)
+    }
+
+    fn myroom_presentation_for(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<crate::myroom_hub::MyRoomProfilePresentation, LoginSessionError> {
+        let bound = self.bound_profile_for(identity)?;
+        Ok(myroom_profile_presentation(&bound.profile.profile)
+            .with_p2p_port(bound.reported_p2p_port))
+    }
+
+    fn room_participant_for(
+        &self,
+        identity: &IdentityBinding,
+        catalog: Option<&CatalogInventory>,
+    ) -> Result<RoomParticipant, LoginSessionError> {
+        let bound = self.bound_profile_for(identity)?;
+        room_participant_from_profile_with_p2p_port(
+            identity,
+            &bound.profile.profile,
+            bound.reported_p2p_port,
+            catalog,
+        )
     }
 
     fn apply_myroom_info_write(
@@ -1007,6 +1054,26 @@ impl SessionContext {
         }
         Ok(())
     }
+
+    fn apply_profile_presentation_write(
+        &mut self,
+        identity: &IdentityBinding,
+        receipt: &ProfilePresentationWriteReceipt,
+    ) -> Result<(), LoginSessionError> {
+        let bound = self
+            .profile
+            .as_mut()
+            .filter(|bound| &bound.identity == identity)
+            .ok_or(LoginSessionError::ProfileNotBound)?;
+        match receipt.mutation() {
+            ProfilePresentationMutation::SetP2pPort(port) => {
+                bound.reported_p2p_port = port;
+                bound.profile.profile.rider.p2p_port = i32::from(port);
+            }
+        }
+        bound.profile.revision = Some(receipt.revision());
+        Ok(())
+    }
 }
 
 fn ensure_identity_fence(
@@ -1044,6 +1111,7 @@ fn rider_equipment_write_error(source: RiderEquipmentWriteError) -> LoginSession
 struct BoundProfile {
     identity: IdentityBinding,
     profile: ProfileSnapshot,
+    reported_p2p_port: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1460,6 +1528,11 @@ async fn dispatch_packet_admitted(
         return handle_channel_switch(services.config, &world, packet).await;
     }
 
+    if let Some(kind) = classify_client_endpoint_report(hash) {
+        return handle_client_endpoint_report(&world, services.profiles, kind, packet, context)
+            .await;
+    }
+
     if let Some(request) = classify_room_protocol_request(hash) {
         return handle_room_request_admitted(
             &world,
@@ -1555,6 +1628,71 @@ async fn handle_channel_switch(
     )])
 }
 
+async fn handle_client_endpoint_report(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    kind: ClientEndpointReportKind,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // Exact framing and cross-kind hash validation happen before profile
+    // admission or actor mutation. The claimed address bytes never leave the
+    // codec; only the port is available here.
+    let report = parse_client_endpoint_report(kind, packet)?;
+    let before = world.authorize_identity().await?;
+    let _ = context.profile_for(&before)?;
+
+    if kind == ClientEndpointReportKind::GameUdp {
+        tracing::trace!(
+            nickname = %before.nickname,
+            port = report.port(),
+            "validated client game-UDP report without changing actor endpoint authority"
+        );
+        return Ok(Vec::new());
+    }
+
+    let admission = profiles
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            PROFILE_PRESENTATION_WRITE_OPERATION,
+        )
+        .await?;
+    let completion = world
+        .reserve_profile_presentation_completion()
+        .await
+        .map_err(profile_presentation_write_error)?;
+    let (prepared, response) = PreparedProfilePresentationWrite::new(
+        admission,
+        before.clone(),
+        ProfilePresentationMutation::SetP2pPort(report.port()),
+        completion,
+    );
+    prepared.submit();
+    let receipt = response
+        .await
+        .map_err(|_| profile_presentation_write_error(ProfilePresentationWriteError::WorldStopped))?
+        .map_err(profile_presentation_write_error)?;
+
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    if !receipt.publication().updates_runtime_caches() {
+        return Err(profile_presentation_write_error(
+            ProfilePresentationWriteError::UnexpectedPublication {
+                publication: receipt.publication(),
+            },
+        ));
+    }
+    context.apply_profile_presentation_write(&after, &receipt)?;
+    tracing::trace!(
+        nickname = %after.nickname,
+        port = report.port(),
+        revision = receipt.revision(),
+        "installed durable P2P port for the exact session generation"
+    );
+    Ok(Vec::new())
+}
+
 async fn handle_login(
     config: &ServerConfig,
     world: &WorldHandle,
@@ -1625,7 +1763,7 @@ async fn handle_channel_move_in(
             admission,
         )
         .await?;
-    let presentation = myroom_profile_presentation(&profile.profile);
+    let presentation = myroom_profile_presentation(&profile.profile).with_p2p_port(0);
     let profile_lease = MyRoomProfileLease::new(presentation, lane);
     let acknowledgement =
         serialize_pr_channel_move_in(config.ports.game_udp(), config.ports.p2p_udp());
@@ -1658,19 +1796,17 @@ async fn handle_room_request_admitted(
         RoomProtocolRequest::CreateRoom => {
             let request = parse_ch_create_room_request(packet)?;
             let identity = world.authorize_identity().await?;
-            let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Create {
                 request,
-                participant: room_participant_from_profile(&identity, profile, profiles.catalog())?,
+                participant: context.room_participant_for(&identity, profiles.catalog())?,
             }
         }
         RoomProtocolRequest::JoinRoom => {
             let request = parse_ch_join_room_request(packet)?;
             let identity = world.authorize_identity().await?;
-            let profile = context.profile_for(&identity)?;
             RoomCommandPayload::Join {
                 request,
-                participant: room_participant_from_profile(&identity, profile, profiles.catalog())?,
+                participant: context.room_participant_for(&identity, profiles.catalog())?,
             }
         }
         RoomProtocolRequest::LeaveRoom => {
@@ -2022,7 +2158,7 @@ async fn execute_myroom_entry(
 ) -> Result<(), LoginSessionError> {
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
-    let presentation = myroom_profile_presentation(profile);
+    let presentation = context.myroom_presentation_for(&identity)?;
     let input = match intent {
         SessionMyRoomEntryIntent::Direct(request) => {
             let self_info = if canonical_nickname_key(&request.owner_nickname)
@@ -2163,6 +2299,12 @@ fn myroom_info_write_error(source: MyRoomInfoWriteError) -> LoginSessionError {
 
 fn main_emblem_write_error(source: MainEmblemWriteError) -> LoginSessionError {
     LoginSessionError::MainEmblemWrite {
+        source: Box::new(source),
+    }
+}
+
+fn profile_presentation_write_error(source: ProfilePresentationWriteError) -> LoginSessionError {
+    LoginSessionError::ProfilePresentationWrite {
         source: Box::new(source),
     }
 }
@@ -2406,9 +2548,10 @@ fn room_physics_metadata(
     })
 }
 
-fn room_participant_from_profile(
+fn room_participant_from_profile_with_p2p_port(
     identity: &IdentityBinding,
     profile: &Profile,
+    reported_p2p_port: u16,
     catalog: Option<&CatalogInventory>,
 ) -> Result<RoomParticipant, LoginSessionError> {
     let physics = room_physics_metadata(profile, catalog)?;
@@ -2423,7 +2566,7 @@ fn room_participant_from_profile(
         );
     }
     let observer = matches!(profile.rider.pmap, 590 | 718);
-    let (p2p_address, p2p_port) = profile_p2p_endpoint(identity.source_ip, profile);
+    let endpoint = legacy_p2p_endpoint(identity.source_ip, reported_p2p_port);
     let club_name = if profile.rider.club_mark_logo == 0 {
         String::new()
     } else {
@@ -2433,8 +2576,8 @@ fn room_participant_from_profile(
         player: RoomPlayer {
             player_type: if observer { 4 } else { 2 },
             user_no: identity.user_no.get(),
-            p2p_address,
-            p2p_port,
+            p2p_address: endpoint.address(),
+            p2p_port: endpoint.port(),
             nickname: identity.nickname.clone(),
             emblem_1: u16::from_le_bytes(profile.rider.emblem1.to_le_bytes()),
             emblem_2: u16::from_le_bytes(profile.rider.emblem2.to_le_bytes()),
@@ -2453,13 +2596,18 @@ fn room_participant_from_profile(
     })
 }
 
-fn profile_p2p_endpoint(source_ip: IpAddr, profile: &Profile) -> (Ipv4Addr, u16) {
-    let address = match source_ip {
-        IpAddr::V4(address) => address,
-        IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-    };
-    let port = u16::try_from(profile.rider.p2p_port).unwrap_or_default();
-    (address, port)
+#[cfg(test)]
+fn room_participant_from_profile(
+    identity: &IdentityBinding,
+    profile: &Profile,
+    catalog: Option<&CatalogInventory>,
+) -> Result<RoomParticipant, LoginSessionError> {
+    room_participant_from_profile_with_p2p_port(
+        identity,
+        profile,
+        u16::try_from(profile.rider.p2p_port).unwrap_or_default(),
+        catalog,
+    )
 }
 
 /// Builds the profile-owned portion of a `MyRoom` player slot and binds its
@@ -2515,11 +2663,10 @@ async fn handle_get_rider_admitted(
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
     let _ = context.profile_for(&after)?;
+    let presentation = myroom_profile_presentation(&profile.profile)
+        .with_p2p_port(context.reported_p2p_port_for(&after)?);
     world
-        .refresh_myroom_presentation(
-            after.clone(),
-            MyRoomProfileLease::new(myroom_profile_presentation(&profile.profile), lane),
-        )
+        .refresh_myroom_presentation(after.clone(), MyRoomProfileLease::new(presentation, lane))
         .await?;
     context.bind_profile(after, profile);
     Ok(responses)
@@ -3655,6 +3802,110 @@ mod tests {
         world_task.await.unwrap().unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_reports_persist_only_p2p_port_and_keep_game_udp_isolated() {
+        fn endpoint_packet(name: &str, claimed_ip: [u8; 4], port: u16) -> Vec<u8> {
+            let mut packet = PacketWriter::named(name);
+            packet.write_bytes(&claimed_ip);
+            packet.write_u16(port);
+            packet.into_inner()
+        }
+
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_707))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "EndpointReporter")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        assert_eq!(context.reported_p2p_port_for(&identity).unwrap(), 0);
+
+        let first = endpoint_packet("ChClientP2pAddrPacket", [203, 0, 113, 200], 45_136);
+        assert!(
+            dispatch_packet(&services, &first, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(context.reported_p2p_port_for(&identity).unwrap(), 45_136);
+        let stored = ProfileStore::new(profile_root.path())
+            .reload(&identity.nickname)
+            .unwrap();
+        assert_eq!(stored.profile.rider.p2p_port, 45_136);
+        let first_revision = stored.revision.unwrap();
+
+        let idempotent = endpoint_packet("ChClientP2pAddrPacket", [198, 51, 100, 99], 45_136);
+        dispatch_packet(&services, &idempotent, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(
+            ProfileStore::new(profile_root.path())
+                .reload(&identity.nickname)
+                .unwrap()
+                .revision,
+            Some(first_revision),
+            "a fresh same-port report installs generation authority without inventing a revision"
+        );
+
+        let game_udp = endpoint_packet("ChClientUdpAddrPacket", [192, 0, 2, 88], 49_999);
+        dispatch_packet(&services, &game_udp, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(context.reported_p2p_port_for(&identity).unwrap(), 45_136);
+        assert_eq!(
+            ProfileStore::new(profile_root.path())
+                .reload(&identity.nickname)
+                .unwrap()
+                .revision,
+            Some(first_revision)
+        );
+
+        let mut malformed = first.clone();
+        malformed.push(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::ChannelProtocol(
+                p5136_core::channel::ChannelError::TrailingBytes { .. }
+            ))
+        ));
+        assert_eq!(
+            ProfileStore::new(profile_root.path())
+                .reload(&identity.nickname)
+                .unwrap()
+                .revision,
+            Some(first_revision)
+        );
+
+        let clear = endpoint_packet("ChClientP2pAddrPacket", [10, 0, 0, 1], 0);
+        dispatch_packet(&services, &clear, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(context.reported_p2p_port_for(&identity).unwrap(), 0);
+        let cleared = ProfileStore::new(profile_root.path())
+            .reload(&identity.nickname)
+            .unwrap();
+        assert_eq!(cleared.profile.rider.p2p_port, 0);
+        assert!(cleared.revision.unwrap() > first_revision);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.drain_myroom_completions().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn trailing_lobby_packet_cannot_mutate_actor_state() {
         let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
@@ -3959,10 +4210,66 @@ mod tests {
             source_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
             ..rider.identity.clone()
         };
-        profile.rider.p2p_port = 70_000;
+        profile.rider.p2p_port = 48_888;
         let ipv6_slot = myroom_player_slot_from_profile(&ipv6_identity, &profile);
         assert_eq!(ipv6_slot.p2p_address, Ipv4Addr::UNSPECIFIED);
         assert_eq!(ipv6_slot.p2p_port, 0);
+
+        let mapped_address = Ipv4Addr::new(203, 0, 113, 88);
+        let mapped_identity = IdentityBinding {
+            source_ip: IpAddr::V6(mapped_address.to_ipv6_mapped()),
+            ..rider.identity.clone()
+        };
+        let mapped_slot = myroom_player_slot_from_profile(&mapped_identity, &profile);
+        assert_eq!(mapped_slot.p2p_address, mapped_address);
+        assert_eq!(mapped_slot.p2p_port, 48_888);
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_binding_preserves_p2p_port_only_for_the_exact_generation() {
+        fn snapshot(port: i32, revision: u64) -> super::ProfileSnapshot {
+            let mut profile = Profile::default();
+            profile.rider.p2p_port = port;
+            super::ProfileSnapshot {
+                profile,
+                revision: Some(revision),
+                source_path: std::path::PathBuf::from(format!("Rider.v{revision}.json")),
+            }
+        }
+
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let rider = register_lobby_session(&world, "GenerationPort", 49_737).await;
+        let identity = rider.identity;
+        let mut context = SessionContext::default();
+
+        context.bind_profile(identity.clone(), snapshot(45_000, 1));
+        assert_eq!(
+            context.profile_for(&identity).unwrap().rider.p2p_port,
+            45_000
+        );
+        assert_eq!(context.reported_p2p_port_for(&identity).unwrap(), 0);
+
+        context.profile.as_mut().unwrap().reported_p2p_port = 45_136;
+        context.bind_profile(identity.clone(), snapshot(46_000, 2));
+        assert_eq!(
+            context.profile_for(&identity).unwrap().rider.p2p_port,
+            46_000
+        );
+        assert_eq!(context.reported_p2p_port_for(&identity).unwrap(), 45_136);
+
+        let replacement = IdentityBinding {
+            owner: SessionId::new(identity.owner.get() + 10),
+            ..identity
+        };
+        context.bind_profile(replacement.clone(), snapshot(47_000, 3));
+        assert_eq!(
+            context.profile_for(&replacement).unwrap().rider.p2p_port,
+            47_000
+        );
+        assert_eq!(context.reported_p2p_port_for(&replacement).unwrap(), 0);
 
         world.shutdown().await.unwrap();
         world_task.await.unwrap().unwrap();
@@ -4057,10 +4364,11 @@ mod tests {
         let owner_info = owner_profile.my_room.try_to_protocol_info().unwrap();
         let mut owner_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] =
             array::from_fn(|_| MyRoomSlot::Empty);
-        owner_slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(
-            &direct_owner,
-            &owner_profile,
-        ));
+        owner_slots[0] = MyRoomSlot::Player(
+            myroom_profile_presentation(&owner_profile)
+                .with_p2p_port(0)
+                .player_for(&direct_owner),
+        );
         assert_eq!(
             direct_owner_outbound.try_recv().unwrap().into_packets(),
             vec![
@@ -4844,14 +5152,16 @@ mod tests {
             .unwrap();
         let mut expected_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] =
             std::array::from_fn(|_| MyRoomSlot::Empty);
-        expected_slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(
-            &owner.identity,
-            &owner_profile,
-        ));
-        expected_slots[1] = MyRoomSlot::Player(myroom_player_slot_from_profile(
-            &visitor.identity,
-            &visitor_profile,
-        ));
+        expected_slots[0] = MyRoomSlot::Player(
+            myroom_profile_presentation(&owner_profile)
+                .with_p2p_port(39_312)
+                .player_for(&owner.identity),
+        );
+        expected_slots[1] = MyRoomSlot::Player(
+            myroom_profile_presentation(&visitor_profile)
+                .with_p2p_port(39_312)
+                .player_for(&visitor.identity),
+        );
         let expected_member_packet = serialize_slot_data(&expected_slots).unwrap();
         let mut request = PacketWriter::named("RmFirstRequestPacket").into_inner();
         request.extend_from_slice(&[0x00, 0xff, 0x51, 0x36, 0xaa]);
@@ -5026,14 +5336,16 @@ mod tests {
             .profile;
         let mut expected_slots: [MyRoomSlot; MYROOM_SLOT_COUNT] =
             std::array::from_fn(|_| MyRoomSlot::Empty);
-        expected_slots[0] = MyRoomSlot::Player(myroom_player_slot_from_profile(
-            &owner.identity,
-            &owner_profile,
-        ));
-        expected_slots[1] = MyRoomSlot::Player(myroom_player_slot_from_profile(
-            &visitor.identity,
-            &visitor_profile,
-        ));
+        expected_slots[0] = MyRoomSlot::Player(
+            myroom_profile_presentation(&owner_profile)
+                .with_p2p_port(0)
+                .player_for(&owner.identity),
+        );
+        expected_slots[1] = MyRoomSlot::Player(
+            myroom_profile_presentation(&visitor_profile)
+                .with_p2p_port(39_312)
+                .player_for(&visitor.identity),
+        );
 
         let services = SessionServices {
             config: &config,
@@ -7189,6 +7501,11 @@ mod tests {
         let current_profile = context.profile_for(&current).unwrap();
         assert_eq!(current_profile.rider.premium, 42);
         assert_eq!(current_profile.rider.p2p_port, 45_137);
+        assert_eq!(
+            context.reported_p2p_port_for(&current).unwrap(),
+            0,
+            "a disk-side historical port must not replace this generation's runtime endpoint"
+        );
         assert_eq!(current_profile.rider.rp, 515_137);
         assert_eq!(current_profile.rider.club_name, "FreshGetRider");
         assert_eq!(current_profile.rider_item.kart, 1);
@@ -7220,7 +7537,9 @@ mod tests {
             visitor.outbound.try_recv().is_err(),
             "GetRider must not immediately publish a MyRoom snapshot to a visitor"
         );
-        let cached_owner = myroom_profile_presentation(current_profile).player_for(&identity);
+        let cached_owner = myroom_profile_presentation(current_profile)
+            .with_p2p_port(39_312)
+            .player_for(&identity);
 
         let invalid_club_name = "x".repeat(MAX_CLUB_NAME_UTF16_UNITS + 1);
         ProfileStore::new(profile_root.path())
@@ -7457,6 +7776,11 @@ mod tests {
             .await
             .unwrap();
         drop(lane);
+        ProfileStore::new(profile_root.path())
+            .update(&identity.nickname, |profile| {
+                profile.rider.p2p_port = 45_136;
+            })
+            .unwrap();
 
         let token = MigrationToken::new(0x5137).unwrap();
         world
@@ -7565,6 +7889,34 @@ mod tests {
         assert_eq!(migrated.user_no, identity.user_no);
         assert!(migrated.generation.get() > identity.generation.get());
         assert!(retry_context.bound_profile_for(&migrated).is_ok());
+        assert_eq!(
+            retry_context.profile_for(&migrated).unwrap().rider.p2p_port,
+            45_136,
+            "the historical durable value remains available in the profile snapshot"
+        );
+        assert_eq!(
+            retry_context.reported_p2p_port_for(&migrated).unwrap(),
+            0,
+            "a migrated generation must begin without a live endpoint capability"
+        );
+        assert_eq!(
+            retry_context
+                .myroom_presentation_for(&migrated)
+                .unwrap()
+                .player_for(&migrated)
+                .p2p_port,
+            0,
+            "MyRoom projection must use the generation-bound runtime port"
+        );
+        assert_eq!(
+            retry_context
+                .room_participant_for(&migrated, None)
+                .unwrap()
+                .player
+                .p2p_port,
+            0,
+            "ordinary-room projection must use the generation-bound runtime port"
+        );
 
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();

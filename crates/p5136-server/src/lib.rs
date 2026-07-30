@@ -11,6 +11,7 @@ mod myroom_persistence;
 mod operation_gate;
 mod profile_durability;
 mod profile_io;
+mod profile_presentation_persistence;
 mod runtime;
 mod session;
 mod udp_runtime;
