@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::{
     adler32,
+    game_slot_protocol::GAME_SLOT_PACKET_NAME,
     packet::{PacketError, PacketReader, PacketWriter},
 };
 
@@ -27,6 +28,7 @@ pub enum RaceRequest {
     GameControl,
     AiGoalIn,
     TeamBoosterGauge,
+    GameSlot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +114,7 @@ pub fn classify_race_request(hash: u32) -> Option<RaceRequest> {
         (GAME_CONTROL_PACKET_NAME, RaceRequest::GameControl),
         (GAME_AI_GOAL_IN_PACKET_NAME, RaceRequest::AiGoalIn),
         (TEAM_BOOSTER_REQUEST_NAME, RaceRequest::TeamBoosterGauge),
+        (GAME_SLOT_PACKET_NAME, RaceRequest::GameSlot),
     ]
     .into_iter()
     .find_map(|(name, request)| (adler32::packet_hash(name) == hash).then_some(request))
@@ -276,7 +279,9 @@ mod tests {
         parse_team_booster_request, serialize_ai_master_notice, serialize_game_control,
         serialize_game_next_stage, serialize_race_time, serialize_team_booster_gauge,
     };
-    use crate::{adler32, encoded, packet::PacketWriter};
+    use crate::{
+        adler32, encoded, game_slot_protocol::GAME_SLOT_PACKET_NAME, packet::PacketWriter,
+    };
 
     #[test]
     fn dispatch_hashes_match_the_p5136_packet_table() {
@@ -296,6 +301,7 @@ mod tests {
                 0x0269_0E12,
                 RaceRequest::TeamBoosterGauge,
             ),
+            (GAME_SLOT_PACKET_NAME, 0x27C0_0574, RaceRequest::GameSlot),
         ];
         for (name, hash, request) in fixtures {
             assert_eq!(adler32::packet_hash(name), hash);

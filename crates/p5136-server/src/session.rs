@@ -17,6 +17,7 @@ use p5136_core::{
         serialize_equip_tuning_failure, serialize_equip_tuning_success,
     },
     frame::{self, FrameError},
+    game_slot_protocol::parse_game_slot_packet,
     handshake,
     inventory::{InventoryError, serialize_get_rider_sequence},
     kart_physics::{
@@ -103,7 +104,8 @@ use crate::{
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
         MyRoomEntryInput, MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole,
-        OutboundBatch, RaceCommandPayload, RoomCommandPayload, RoomParticipant, StartRoomPlan,
+        OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload, RoomParticipant,
+        StartRoomPlan,
     },
 };
 
@@ -274,6 +276,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     World(#[from] WorldError),
+
+    #[error("the World actor returned a non-GameSlot outcome for a TCP GameSlot command")]
+    UnexpectedGameSlotOutcome,
 
     #[error("client did not complete login before the login timeout")]
     LoginTimeout,
@@ -1889,6 +1894,7 @@ async fn handle_race_request_admitted(
         RaceRequest::TeamBoosterGauge => {
             RaceCommandPayload::TeamBoosterGauge(parse_team_booster_request(packet)?)
         }
+        RaceRequest::GameSlot => return handle_game_slot_request_admitted(world, packet).await,
     };
     match world.race_command(payload).await {
         Ok(_) => {}
@@ -1897,6 +1903,89 @@ async fn handle_race_request_admitted(
                 %error,
                 session_id = world.session_id().get(),
                 "rejected a race command without terminating the session"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Vec::new())
+}
+
+async fn handle_game_slot_request_admitted(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let parsed = match parse_game_slot_packet(packet) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            tracing::debug!(
+                session_id = world.session_id().get(),
+                packet_length = packet.len(),
+                reason = %reason,
+                "dropping a malformed or unsupported TCP GameSlot packet"
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let player_id = parsed.player_id();
+    let packet_type = parsed.body().packet_type();
+    let item_or_recipient_mask = parsed.item_or_recipient_mask();
+
+    match world
+        .race_command(RaceCommandPayload::GameSlot(parsed))
+        .await
+    {
+        Ok(RaceCommandOutcome::GameSlotPickupDeferred {
+            room_id,
+            race_epoch,
+            ..
+        }) => {
+            tracing::debug!(
+                session_id = world.session_id().get(),
+                room_id = room_id.0,
+                race_epoch,
+                packet_length = packet.len(),
+                player_id,
+                packet_type,
+                item_or_recipient_mask,
+                "dropping a validated TCP GameSlot pickup until authoritative item synthesis is implemented"
+            );
+        }
+        Ok(RaceCommandOutcome::GameSlotRelayed {
+            room_id,
+            race_epoch,
+            recipients,
+        }) => {
+            tracing::trace!(
+                session_id = world.session_id().get(),
+                room_id = room_id.0,
+                race_epoch,
+                recipients,
+                packet_length = packet.len(),
+                player_id,
+                packet_type,
+                item_or_recipient_mask,
+                "relayed a validated TCP GameSlot packet through the World actor"
+            );
+        }
+        Ok(outcome) => {
+            tracing::error!(
+                ?outcome,
+                session_id = world.session_id().get(),
+                player_id,
+                packet_type,
+                "the World actor returned an invalid outcome for a TCP GameSlot command"
+            );
+            return Err(LoginSessionError::UnexpectedGameSlotOutcome);
+        }
+        Err(WorldError::Race(error)) if error.is_expected_rejection() => {
+            tracing::debug!(
+                %error,
+                session_id = world.session_id().get(),
+                packet_length = packet.len(),
+                player_id,
+                packet_type,
+                item_or_recipient_mask,
+                "dropped a TCP GameSlot packet without terminating the session"
             );
         }
         Err(error) => return Err(error.into()),
@@ -3025,6 +3114,9 @@ mod tests {
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
         },
         frame::{DEFAULT_MAX_PAYLOAD, encode_encrypted},
+        game_slot_protocol::{
+            GAME_KART_ITEM_INFO_HASH, GAME_SLOT_PACKET_NAME, GO_ITEM_CUBE_HASH, GOP_CUBE_HASH,
+        },
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
@@ -3405,6 +3497,43 @@ mod tests {
         packet.write_i32(state);
         packet.write_u8(0);
         packet.write_u32(value0);
+        packet.into_inner()
+    }
+
+    fn unsupported_game_slot_packet(packet_type: u8) -> Vec<u8> {
+        let mut packet = PacketWriter::named(GAME_SLOT_PACKET_NAME);
+        packet.write_i32(0);
+        packet.write_u32(1);
+        packet.write_u8(packet_type);
+        packet.into_inner()
+    }
+
+    fn item_vector_game_slot_packet() -> Vec<u8> {
+        let mut packet = PacketWriter::named(GAME_SLOT_PACKET_NAME);
+        packet.write_i32(0);
+        packet.write_u32(1);
+        packet.write_u8(9);
+        packet.write_bytes(&[0; 3]);
+        packet.write_u32(8);
+        packet.write_u32(GAME_KART_ITEM_INFO_HASH);
+        packet.write_u32(0);
+        packet.into_inner()
+    }
+
+    fn item_pickup_game_slot_packet(packet_type: u8) -> Vec<u8> {
+        assert!(matches!(packet_type, 1 | 2));
+        let mut packet = PacketWriter::named(GAME_SLOT_PACKET_NAME);
+        packet.write_i32(0);
+        packet.write_u32(u32::MAX);
+        packet.write_u8(packet_type);
+        packet.write_bytes(&[0; 25]);
+        packet.write_i16(0);
+        packet.write_u8(0);
+        packet.write_bytes(&[0; 4]);
+        packet.write_u32(24);
+        packet.write_u32(GOP_CUBE_HASH);
+        packet.write_u32(GO_ITEM_CUBE_HASH);
+        packet.write_bytes(&[0; 16]);
         packet.into_inner()
     }
 
@@ -7267,6 +7396,101 @@ mod tests {
                 dispatch_packet(&services, &packet, &mut context).await,
                 Err(LoginSessionError::RaceProtocol(_))
             ));
+        }
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn game_slot_drops_are_nonfatal_and_preserve_followup_race_dispatch() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_765))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "GameSlotDrops")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = SessionContext::default();
+
+        let truncated = PacketWriter::named(GAME_SLOT_PACKET_NAME).into_inner();
+        let unsupported = unsupported_game_slot_packet(5);
+        for packet in [truncated, unsupported] {
+            assert_eq!(
+                dispatch_packet(&services, &packet, &mut context)
+                    .await
+                    .unwrap(),
+                Vec::<Vec<u8>>::new()
+            );
+        }
+
+        assert_eq!(
+            dispatch_packet(&services, &game_control_packet(0, 100), &mut context,)
+                .await
+                .unwrap(),
+            Vec::<Vec<u8>>::new(),
+            "a malformed GameSlot must not terminate the identity-bound session"
+        );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_game_slot_no_room_and_pickups_have_no_direct_response() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_766))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "GameSlotNoRoom")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = SessionContext::default();
+
+        for packet in [
+            item_vector_game_slot_packet(),
+            item_pickup_game_slot_packet(1),
+            item_pickup_game_slot_packet(2),
+        ] {
+            assert_eq!(
+                dispatch_packet(&services, &packet, &mut context)
+                    .await
+                    .unwrap(),
+                Vec::<Vec<u8>>::new(),
+                "TCP GameSlot relay and deferred pickup paths never return a direct packet"
+            );
         }
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),

@@ -9,6 +9,7 @@ pub mod dotnet_decimal;
 pub mod encoded;
 pub mod equipment_protocol;
 pub mod frame;
+pub mod game_slot_protocol;
 pub mod handshake;
 pub mod inventory;
 pub mod kart_physics;
