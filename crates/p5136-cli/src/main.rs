@@ -21,6 +21,7 @@ use p5136_server::{
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod client_paths;
 mod gui;
 
 #[derive(Debug, Parser)]
@@ -64,7 +65,8 @@ struct ServerArgs {
     #[arg(long, default_value = "Profile", value_name = "PATH")]
     profile_root: PathBuf,
 
-    #[arg(long, value_name = "KartCatalog.xml")]
+    /// Stock-client directory, its Profile directory, or an exported KartCatalog.xml.
+    #[arg(long, value_name = "CLIENT_DIR_OR_CATALOG")]
     catalog: Option<PathBuf>,
 
     /// Stock-client Data directory containing the KR *.rho5 archives.
@@ -271,13 +273,15 @@ fn default_log_directory() -> Result<PathBuf> {
 async fn run_server(args: ServerArgs) -> Result<()> {
     let ports = PortTopology::new(args.configured_port)
         .context("configured port cannot provide all P5136 service offsets")?;
+    let client_paths =
+        client_paths::resolve_client_runtime_paths(args.catalog, args.client_data_dir)?;
     let config = ServerConfig {
         bind_address: args.bind,
         advertised_address: args.advertise,
         ports,
         profile_root: args.profile_root,
-        catalog_path: args.catalog,
-        client_data_dir: args.client_data_dir,
+        catalog_path: client_paths.catalog_path,
+        client_data_dir: client_paths.client_data_dir,
         first_message_delay: Duration::from_millis(args.first_message_delay_ms),
         login_timeout: Duration::from_secs(args.login_timeout_seconds),
         session_idle_timeout: Duration::from_secs(args.session_idle_timeout_seconds),

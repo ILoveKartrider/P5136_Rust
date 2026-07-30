@@ -15,7 +15,7 @@ use p5136_connector::{
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
 use p5136_server::{BoundServer, ServerConfig, ServerEndpoints};
 
-use crate::LoggingRuntime;
+use crate::{LoggingRuntime, client_paths};
 
 const WINDOW_TITLE: &str = "KartRider P5136";
 const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -32,9 +32,50 @@ pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         options,
-        Box::new(move |_creation_context| Ok(Box::new(P5136GuiApp::new(log_path)))),
+        Box::new(move |creation_context| {
+            configure_platform_fonts(&creation_context.egui_ctx);
+            Ok(Box::new(P5136GuiApp::new(log_path)))
+        }),
     )
     .map_err(|error| anyhow!("failed to run desktop connector: {error}"))
+}
+
+fn configure_platform_fonts(context: &egui::Context) {
+    #[cfg(target_os = "windows")]
+    {
+        let windows_root =
+            std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let candidates = [
+            windows_root.join("Fonts").join("malgun.ttf"),
+            windows_root.join("Fonts").join("malgunbd.ttf"),
+        ];
+        let Some((font_path, font_bytes)) = candidates
+            .into_iter()
+            .find_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+        else {
+            tracing::warn!(
+                "Windows Korean UI font was unavailable; localized operating-system errors may not render correctly"
+            );
+            return;
+        };
+
+        let font_name = "windows-korean-ui".to_owned();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            font_name.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            if let Some(family_fonts) = fonts.families.get_mut(&family) {
+                family_fonts.insert(0, font_name.clone());
+            }
+        }
+        context.set_fonts(fonts);
+        tracing::info!(font_path = %font_path.display(), "loaded Windows Korean UI font");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = context;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +191,7 @@ struct ServerInputs {
     advertised_address: String,
     configured_port: String,
     profile_root: String,
-    catalog_path: String,
+    client_path: String,
     client_data_dir: String,
     allow_remote_profile_creation: bool,
     first_message_delay_ms: String,
@@ -167,7 +208,7 @@ impl Default for ServerInputs {
             advertised_address: Ipv4Addr::LOCALHOST.to_string(),
             configured_port: DEFAULT_CONFIGURED_PORT.to_string(),
             profile_root: "Profile".to_owned(),
-            catalog_path: String::new(),
+            client_path: String::new(),
             client_data_dir: String::new(),
             allow_remote_profile_creation: false,
             first_message_delay_ms: "250".to_owned(),
@@ -202,14 +243,18 @@ impl ServerInputs {
         if max_login_sessions == 0 {
             return Err(anyhow!("maximum login sessions must be at least 1"));
         }
+        let client_paths = client_paths::resolve_client_runtime_paths(
+            optional_path(&self.client_path),
+            optional_path(&self.client_data_dir),
+        )?;
 
         Ok(ServerConfig {
             bind_address,
             advertised_address,
             ports,
             profile_root: required_path(&self.profile_root, "profile root")?,
-            catalog_path: optional_path(&self.catalog_path),
-            client_data_dir: optional_path(&self.client_data_dir),
+            catalog_path: client_paths.catalog_path,
+            client_data_dir: client_paths.client_data_dir,
             first_message_delay: Duration::from_millis(parse_u64(
                 &self.first_message_delay_ms,
                 "first-message delay",
@@ -735,16 +780,9 @@ impl P5136GuiApp {
                 );
                 ui.end_row();
 
-                ui.label("KartCatalog.xml (optional)");
+                ui.label("Client directory or Profile (optional)");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.server_inputs.catalog_path)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.end_row();
-
-                ui.label("Client Data directory (optional)");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.server_inputs.client_data_dir)
+                    egui::TextEdit::singleline(&mut self.server_inputs.client_path)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
@@ -762,6 +800,13 @@ impl P5136GuiApp {
                 .num_columns(2)
                 .spacing([14.0, 10.0])
                 .show(ui, |ui| {
+                    ui.label("Client Data override (optional)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.server_inputs.client_data_dir)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+
                     ui.label("First-message delay (ms)");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.server_inputs.first_message_delay_ms)
@@ -805,6 +850,10 @@ impl P5136GuiApp {
 
         ui.weak(
             "Port offsets: game UDP = base, login TCP/P2P UDP = base + 1, messenger TCP = base + 2.",
+        );
+        ui.weak(
+            "Select the stock client directory or its Profile folder; the C#-exported \
+             Profile/KartCatalog.xml and sibling Data directory are detected automatically.",
         );
         ui.weak("Settings apply only when the server starts and are not persisted by the GUI.");
     }
@@ -1161,8 +1210,8 @@ mod tests {
             advertised_address: "192.0.2.20".to_owned(),
             configured_port: "49311".to_owned(),
             profile_root: "runtime/Profiles".to_owned(),
-            catalog_path: "runtime/KartCatalog.xml".to_owned(),
-            client_data_dir: "runtime/Data".to_owned(),
+            client_path: String::new(),
+            client_data_dir: String::new(),
             allow_remote_profile_creation: true,
             first_message_delay_ms: "500".to_owned(),
             login_timeout_seconds: "10".to_owned(),
@@ -1178,14 +1227,8 @@ mod tests {
         assert_eq!(config.ports.game_udp(), 49_311);
         assert_eq!(config.ports.login_tcp(), 49_312);
         assert_eq!(config.profile_root, Path::new("runtime/Profiles"));
-        assert_eq!(
-            config.catalog_path.as_deref(),
-            Some(Path::new("runtime/KartCatalog.xml"))
-        );
-        assert_eq!(
-            config.client_data_dir.as_deref(),
-            Some(Path::new("runtime/Data"))
-        );
+        assert_eq!(config.catalog_path, None);
+        assert_eq!(config.client_data_dir, None);
         assert!(config.allow_remote_profile_creation);
         assert_eq!(config.first_message_delay, Duration::from_millis(500));
         assert_eq!(config.login_timeout, Duration::from_secs(10));
