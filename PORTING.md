@@ -50,6 +50,7 @@ been demonstrated.
 - [x] strict stock `PqRequestExtradata` and web-event completion replies
 - [x] strict fail-closed cross-profile `PqGetRiderInfo` boundary
 - [x] strict `PqStartRiderSchool` and canonical 240-byte physics reply
+- [x] strict read-only club state/join/create/list/capacity query boundaries
 
 ## World, Messenger, and UDP
 
@@ -102,7 +103,7 @@ been demonstrated.
 - [x] exact normal/preset shop-buy parsing and fail-closed failure reply
 - [ ] authoritative type-1/type-2 item pickup award and synthesis
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
-- [ ] club rename after global membership/namespace invariants are specified
+- [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow
 - [x] exact MyRoom Career empty-list reply and kind-2 grant consumption
 - [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
 - [ ] evidence ledger for every deliberate no-reply/unsupported packet

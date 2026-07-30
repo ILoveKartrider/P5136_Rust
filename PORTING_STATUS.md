@@ -27,20 +27,96 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`b5ef015 Port strict rider lookup and school start`
+`8f6fbe5 Port strict read-only club queries`
 
 ## Current Rust checkpoint
 
-The current checkpoint closes two direct authenticated requests:
-`PqGetRiderInfo` and `PqStartRiderSchool`. Rust accepts only the exact
-stock-producer request layouts, preserves global generation/quiesce admission
-as the outermost fence, and then applies strict parsing before packet-specific
-identity/profile authorization. Rider lookup remains fail-closed until its
-cross-profile privacy and projection policy is designed. Rider-school start
-uses the canonical validated physics builder instead of cloning two anomalous
-C# shortcut constants or process-global mutable tuning state. Both paths are
-direct and profile read-only. The C# repository remains unchanged and is
-evidence only.
+The current checkpoint closes the five remaining read-only club queries:
+`PqCheckMyClubStatePacket`, `PqGetUserWaitingJoinClubPacket`,
+`PqCheckCreateClubConditionPacket`, `PqGetClubListCountPacket`, and
+`PqGetClubWaitingCrewCountPacket`. Rust accepts only the exact stock-producer
+layouts, preserves global generation/quiesce admission as the outermost fence,
+and then applies strict parsing before packet-specific identity/profile
+authorization. Because no authoritative club repository exists yet, every
+reply is an evidence-backed empty or unavailable state. The handlers perform
+no request-specific World command, profile I/O, persistence, mutation, retry,
+or peer fanout. The C# repository remains unchanged and is evidence only.
+
+### Strict read-only club-query boundary
+
+- The exact request/reply name-hash pairs are:
+  `PqCheckMyClubStatePacket` `0x71740944` /
+  `PrCheckMyClubStatePacket` `0x718B0945`;
+  `PqGetUserWaitingJoinClubPacket` `0xB4C50BC1` /
+  `PrGetUserWaitingJoinClubPacket` `0xB4E20BC2`;
+  `PqCheckCreateClubConditionPacket` `0xC9790C78` /
+  `PrCheckCreateClubConditionPacket` `0xC9980C79`;
+  `PqGetClubListCountPacket` `0x72C90964` /
+  `PrGetClubListCountPacket` `0x72E00965`; and
+  `PqGetClubWaitingCrewCountPacket` `0xBF5E0C2C` /
+  `PrGetClubWaitingCrewCountPacket` `0xBF7C0C2D`.
+- The first three requests are exactly hash-only. Club-list count is
+  `hash | club-name-filter UTF-16 | club-master-filter UTF-16`, for
+  `12 + 2 * (name_units + master_units)` bytes. Waiting-crew count is exactly
+  `hash | club_code:u32`, for eight bytes. Rust rejects club code zero because
+  the stock producer does not send the request without a selected club, while
+  preserving every nonzero 32-bit bit pattern with `NonZeroU32`.
+- Club-list filters are bounded before allocation at 64 club-name UTF-16 units
+  and 32 master-nickname UTF-16 units. Those values reuse existing Rust domain
+  invariants as a conservative resource policy; they are not presented as a
+  static stock serializer limit. Parsed fields and constructors remain
+  private, and the parsed request omits `Debug` so user-entered filters are not
+  accidentally logged.
+- `PrCheckMyClubStatePacket` is the complete 31-byte
+  `club_code:u32 | club_name UTF-16 | logo:u32 | line:u32 | grade:u16 |
+  nickname UTF-16 | member:u32 | level:u8` layout. Rust emits code zero and
+  correctly typed empty/default trailing fields. The stock consumer treats
+  code zero as no membership and ignores or resets the remaining fields.
+- `PrGetUserWaitingJoinClubPacket` is
+  `lookup_success:u32 | pending_club_code:u32 | club_name UTF-16`. Rust emits
+  `(1, 0, "")`: the query succeeded and there is no pending join. Emitting
+  status zero would instead report a lookup failure and prematurely stop the
+  client flow. The empty final value is modeled as a UTF-16 string even though
+  its zero length is byte-identical to the C# handler's integer zero.
+- Create-condition emits status 3. Status zero would enter creation, one and
+  two claim specific RP/Lucci shortages, and four follows a refresh path;
+  status 3 is the consumer-evidenced generic unavailable result. Club-list
+  count emits `(0, 0)` rather than C#'s fabricated total. The stock client
+  applies a local page-count fallback when the first count is zero, so this is
+  safe but does not yet prove a literal zero-club UI; the future empty
+  `PqSearchClubListPacket` flow and stock E2E remain validation gaps.
+  Waiting-crew count emits `(0, 0)`, making `current < capacity` false and
+  preventing a join without inventing a pseudo-capacity.
+- Full reply SHA-256 values are
+  `30ff57e681453da377357a5f9012f12bd956546224299e7e101927b7c38eeaf1`
+  (no club),
+  `1c405d2e5e0488e12e76810dc28755cbd3a2121e9e13757f5fb945fabf779263`
+  (no pending join),
+  `156e6d86242ad83c166b934584a40a977785e90c6372450ed836be0c657c2615`
+  (create unavailable),
+  `4803dd15f50145a10f181d859e9d60074c56374f84a1bea4f265eb4d0983780d`
+  (empty list count), and
+  `7d6833ca5f580bbc6c1796a4e066782ed44822dd72d8be1d1c24a5cdfb188b39`
+  (waiting capacity unavailable).
+- The C# handlers ignore bodies and trailing data, fabricate default club
+  membership and list/capacity counts, report create success without a club
+  subsystem, and can mutate/persist `ClubMark_LOGO` during a waiting-state
+  query. None of those behaviors are cloned. The stability audit has no
+  packet-specific club finding, but its state-ownership, validation, and
+  failure-handling rules support this stricter Rust boundary.
+- Tests pin all ten hashes, complete request and reply bytes/digests, every
+  truncated prefix, wrong and cross-kind hashes, negative string lengths,
+  trailing data, UTF-16 unit limits including surrogate pairs, zero and full
+  nonzero club-code domains, unbound-profile error ordering, in-memory and
+  durable profile immutability, identity/session continuity, a live follow-up
+  request, stale migration ownership, and quiesce priority. Two independent
+  read-only reviews found no P0-P3 issue in the protocol, abstraction,
+  ordering, error propagation, or `unsafe` policy.
+- The direct P5136 request-disposition ledger is now 37 of 40 explicit, with
+  three remaining. The deliberate compatibility no-op table remains 25 of 25
+  explicit. Successful club membership, creation, join, search, and rename
+  remain deferred until an actor-owned repository and atomic namespace,
+  membership, authorization, and durability rules are designed.
 
 ### Fail-closed rider-info lookup
 
@@ -107,8 +183,8 @@ evidence only.
   fields/digest, unbound-profile ordering, authenticated direct dispatch,
   profile immutability, follow-up liveness, stale migration ownership, and
   quiesce.
-- The direct P5136 request-disposition ledger is now 32 of 40 explicit, with
-  eight remaining. The deliberate compatibility no-op table remains 25 of 25
+- The direct P5136 request-disposition ledger is now 37 of 40 explicit, with
+  three remaining. The deliberate compatibility no-op table remains 25 of 25
   explicit. Stock-client school-start E2E remains an open validation gate.
 
 ### Strict stateless compatibility replies
@@ -147,8 +223,8 @@ evidence only.
 - These were tracked as additional shared startup-handler gaps rather than
   members of the 40 direct P5136 request-disposition set. That direct ledger
   was therefore unchanged by this slice. After the later rider-info and
-  rider-school work, the current ledger is 32 of 40 explicit with eight
-  missing; the deliberate no-op table remains 25 of 25 explicit.
+  rider-school and club-query work, the current ledger is 37 of 40 explicit
+  with three missing; the deliberate no-op table remains 25 of 25 explicit.
 - Stock analysis artifacts remain outside this repository. Stock-client E2E
   behavior and the successful extra-data value policy remain open evidence
   gaps.
@@ -187,13 +263,11 @@ evidence only.
   quiesce rejection. Stock-client purchase UI/E2E behavior and the meanings of
   the unknown fields remain open evidence gaps.
 - These two aliases contributed to the earlier 30-of-40 checkpoint. The
-  current direct P5136 request-disposition audit is 32 of 40 explicit after
-  rider-info and rider-school integration. The separate deliberate
+  current direct P5136 request-disposition audit is 37 of 40 explicit after
+  rider-info, rider-school, and club-query integration. The separate deliberate
   compatibility no-op table remains 25 of 25 explicit.
 - The remaining direct-request names are `LoRqDeleteItemPacket`,
-  `PqUnLockedItem`, `PqFavoriteItemUpdate`, `PqCheckMyClubStatePacket`,
-  `PqGetUserWaitingJoinClubPacket`, `PqCheckCreateClubConditionPacket`,
-  `PqGetClubListCountPacket`, and `PqGetClubWaitingCrewCountPacket`.
+  `PqUnLockedItem`, and `PqFavoriteItemUpdate`.
   `LoRqDeleteItemPacket` must not copy the C# success-without-deletion
   behavior. A future `PqFavoriteItemUpdate` must fully parse and validate
   before one atomic durable mutation instead of reproducing C# partial-update
@@ -939,18 +1013,23 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 757 regular tests and 2 opt-in proprietary-fixture tests passed
+# 772 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 757 regular passing tests comprise 9 CLI, 35 connector, 179 core, 85
-profile, 13 RHO5, 428 server unit, and 8 server integration tests. The two
+The 772 regular passing tests comprise 9 CLI, 35 connector, 192 core, 85
+profile, 13 RHO5, 430 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
+- exact five-request club-query classification and producer shapes, complete
+  reply layouts and digests, fail-closed consumer meanings, private
+  parser-minted fields, pre-allocation UTF-16 bounds, complete consumption,
+  `NonZeroU32` club codes, authenticated read-only dispatch, profile/revision
+  immutability, session continuity, and unbound/stale/quiesce ordering;
 - exact ordinary rider-info scalar/reserved/target/mode parsing, private
   parser-minted representation, UTF-16 and complete-consumption bounds, exact
   five-byte non-disclosing failure, authenticated direct dispatch without
@@ -1092,10 +1171,15 @@ These items prevent a "port complete" claim.
    marker/pagination semantics beyond equality, and owner-info
    lookup/authorization/data policy still need stronger evidence. The bundled
    C# code contains only the four packet-name hashes and silently drops the
-   requests, so it is not a behavioral specification. Club rename requires a
-   global membership/name namespace; club creation is a separate system-design
-   slice rather than a per-profile string write. Finish kart tuning/upgrades
-   and the remaining quest/attendance/progression surface.
+   requests, so it is not a behavioral specification. The five read-only club
+   queries now have strict producer-derived parsing and honest
+   empty/unavailable replies, but the list-count zero case still needs the
+   empty search flow and stock-client E2E. Successful club membership,
+   creation, join, search, and rename require an actor-owned repository,
+   global membership/name namespace, authorization, atomic persistence, and
+   replay policy; they are a system-design slice rather than per-profile
+   string writes. Finish kart tuning/upgrades and the remaining
+   quest/attendance/progression surface.
    The terminal empty protected-item list is implemented. Nonempty
    protected-item ownership and `PqLockedItemUpdate` remain blocked by
    unproven P5136 wire semantics and durable-state policy.
@@ -1156,16 +1240,18 @@ These items prevent a "port complete" claim.
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. `PqServerTime` and both fail-closed shop
    aliases, strict fail-closed `PqGetRiderInfo`, and canonical
-   `PqStartRiderSchool` are now explicit; 32 of 40 direct P5136 requests are
-   classified, leaving eight. The additional shared `PqRequestExtradata` and
+   `PqStartRiderSchool` plus all five strict read-only club queries are now
+   explicit; 37 of 40 direct P5136 requests are classified, leaving
+   `LoRqDeleteItemPacket`, `PqUnLockedItem`, and `PqFavoriteItemUpdate`. The
+   additional shared `PqRequestExtradata` and
    `PqWebEventCompleteCheckPacket` paths are also explicit and strict from
-   stock producer evidence. Next inspect the five club-query requests as one
-   read-only evidence group, then `LoRqDeleteItemPacket`,
-   `PqUnLockedItem`, and `PqFavoriteItemUpdate`. Do not copy C# ACK-without-
-   deletion behavior, and require a fully parsed, validated, atomic durable
-   transition before any favorite-item update. Do not implement a request or
-   success policy before its producer, consumer, and serializer boundaries
-   are established. The generic authenticated fallback returns
+   stock producer evidence. Next establish the producer, consumer, and
+   serializer boundaries for those three item requests. Do not copy C#
+   ACK-without-deletion behavior, and require a fully parsed, validated,
+   authorized, atomic durable transition before any deletion, unlock, or
+   favorite-item update. If safe client-visible failure/no-op semantics are
+   not evidenced, keep the request explicitly unsupported rather than
+   inventing success. The generic authenticated fallback returns
    `UnsupportedIdentityPacket`; it never reports silent success.
 2. Keep the completed bounded TCP GameSlot slice frozen at its current
    evidence boundary. Collect stock-client type-1/type-2 request/reply,
