@@ -26,6 +26,11 @@ use p5136_core::{
     game_slot_protocol::parse_game_slot_packet,
     handshake,
     inventory::{InventoryError, serialize_get_rider_sequence},
+    item_state_protocol::{
+        DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS, ItemStateProtocolError, ItemStateRequest,
+        classify_item_state_request, favorite_item_list_capacity, parse_item_state_request,
+        serialize_favorite_item_list,
+    },
     kart_physics::{
         KartPhysicsBuildError, P5136KartPhysicsSnapshot, build_p5136_kart_physics_block,
     },
@@ -95,6 +100,10 @@ use crate::{
     equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
         RiderEquipmentWriteError, catalog_grants, kart_is_owned,
+    },
+    favorite_persistence::{
+        DurableFavoriteItems, FAVORITE_ITEM_UPDATE_OPERATION, FavoriteItemPersistError,
+        persist_favorite_item_changes,
     },
     identity::{IdentityOperationLease, legacy_p2p_endpoint},
     main_emblem_persistence::{
@@ -248,6 +257,9 @@ pub enum LoginSessionError {
     ClubQueryProtocol(#[from] ClubQueryProtocolError),
 
     #[error(transparent)]
+    ItemStateProtocol(#[from] ItemStateProtocolError),
+
+    #[error(transparent)]
     MyRoomItemState(#[from] MyRoomItemStateError),
 
     #[error("live MyRoom wire projection failed")]
@@ -288,6 +300,9 @@ pub enum LoginSessionError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+
+    #[error(transparent)]
+    FavoriteItemPersistence(#[from] FavoriteItemPersistError),
 
     #[error(
         "rider-equipment reload for {nickname:?} returned revision {actual:?} behind durable revision {durable}"
@@ -778,6 +793,30 @@ impl ProfileCoordinator {
         ))
     }
 
+    async fn update_favorite_items(
+        &self,
+        nickname: String,
+        changes: Vec<p5136_core::item_state_protocol::FavoriteItemChange>,
+        maximum_records: usize,
+        admission: ProfileJobAdmission,
+    ) -> Result<(DurableFavoriteItems, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        #[cfg(test)]
+        let blocking_update_hook = self.blocking_update_hook.clone();
+        let completed = admission
+            .run(FAVORITE_ITEM_UPDATE_OPERATION, move |store, _, subject| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_update_hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
+                persist_favorite_item_changes(store, subject.nickname(), &changes, maximum_records)
+            })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        Ok((updated?, lane))
+    }
+
     fn prepare_rider_equipment_write(
         &self,
         selection: RiderItemSelection,
@@ -1102,6 +1141,21 @@ impl SessionContext {
                 bound.profile.profile.rider.p2p_port = i32::from(port);
             }
         }
+        bound.profile.revision = Some(receipt.revision());
+        Ok(())
+    }
+
+    fn apply_favorite_item_write(
+        &mut self,
+        identity: &IdentityBinding,
+        receipt: &DurableFavoriteItems,
+    ) -> Result<(), LoginSessionError> {
+        let bound = self
+            .profile
+            .as_mut()
+            .filter(|bound| &bound.identity == identity)
+            .ok_or(LoginSessionError::ProfileNotBound)?;
+        bound.profile.profile.favorite_items = Some(receipt.items().clone());
         bound.profile.revision = Some(receipt.revision());
         Ok(())
     }
@@ -1600,21 +1654,10 @@ async fn dispatch_packet_admitted(
         .await;
     }
 
-    if let Some(request) = classify_equipment_request(hash) {
-        return dispatch_equipment_request(&world, services.profiles, request, packet, context)
-            .await;
-    }
-
-    if let Some(request) = classify_startup_request(hash) {
-        return handle_startup_request(
-            &world,
-            services.profiles,
-            services.session_id,
-            request,
-            packet,
-            context,
-        )
-        .await;
+    if let Some(result) =
+        dispatch_profile_bound_request(services, &world, hash, packet, context).await
+    {
+        return result;
     }
 
     if is_startup_noop(hash) {
@@ -1630,6 +1673,40 @@ async fn dispatch_packet_admitted(
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
     Err(LoginSessionError::UnsupportedIdentityPacket { hash })
+}
+
+async fn dispatch_profile_bound_request(
+    services: &SessionServices<'_>,
+    world: &AdmittedWorldHandle<'_>,
+    hash: u32,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Option<Result<Vec<Vec<u8>>, LoginSessionError>> {
+    if let Some(request) = classify_equipment_request(hash) {
+        return Some(
+            dispatch_equipment_request(world, services.profiles, request, packet, context).await,
+        );
+    }
+    if classify_item_state_request(hash).is_some() {
+        return Some(
+            handle_item_state_request(services.config, world, services.profiles, packet, context)
+                .await,
+        );
+    }
+    if let Some(request) = classify_startup_request(hash) {
+        return Some(
+            handle_startup_request(
+                world,
+                services.profiles,
+                services.session_id,
+                request,
+                packet,
+                context,
+            )
+            .await,
+        );
+    }
+    None
 }
 
 async fn dispatch_fail_closed_request(
@@ -1693,6 +1770,99 @@ async fn handle_club_query(
         }
     };
     Ok(vec![response])
+}
+
+enum ItemStateDisposition {
+    UnsupportedNoReply,
+    FavoriteUpdateApplied,
+    FavoriteSnapshot(Vec<u8>),
+}
+
+impl ItemStateDisposition {
+    fn into_packets(self) -> Vec<Vec<u8>> {
+        match self {
+            Self::UnsupportedNoReply | Self::FavoriteUpdateApplied => Vec::new(),
+            Self::FavoriteSnapshot(packet) => vec![packet],
+        }
+    }
+}
+
+async fn handle_item_state_request(
+    config: &ServerConfig,
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // Validate the complete producer shape before packet-specific identity or
+    // profile work. The outer dispatch has already retained global shutdown
+    // and exact-generation admission.
+    let request = parse_item_state_request(packet)?;
+    let kind = request.kind();
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+
+    let disposition = match kind {
+        ItemStateRequest::DeleteItem | ItemStateRequest::UnlockItem => {
+            // Both stock reply objects are consumer-side success
+            // capabilities, even when the unlock byte is zero. Until an
+            // authoritative mutation/authentication domain exists, a
+            // well-formed request is explicitly unsupported with no reply.
+            tracing::debug!(
+                request_kind = kind.request_name(),
+                packet_length = packet.len(),
+                "leaving unsupported item-state request unanswered"
+            );
+            ItemStateDisposition::UnsupportedNoReply
+        }
+        ItemStateRequest::FavoriteItemGet => {
+            let maximum_records = favorite_item_list_capacity(config.max_login_payload)
+                .min(DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS);
+            let admission = profiles
+                .admit_for_operation(
+                    world.operation(),
+                    &before.nickname,
+                    "load favorite-item snapshot",
+                )
+                .await?;
+            let (receipt, lane) = profiles
+                .update_favorite_items(
+                    before.nickname.clone(),
+                    Vec::new(),
+                    maximum_records,
+                    admission,
+                )
+                .await?;
+            let after = world.authorize_identity().await?;
+            ensure_identity_fence(&before, &after)?;
+            context.apply_favorite_item_write(&after, &receipt)?;
+            let response =
+                serialize_favorite_item_list(receipt.items().as_slice(), config.max_login_payload)?;
+            drop(lane);
+            ItemStateDisposition::FavoriteSnapshot(response)
+        }
+        ItemStateRequest::FavoriteItemUpdate => {
+            let changes = request.into_favorite_changes()?;
+            let maximum_records = favorite_item_list_capacity(config.max_login_payload)
+                .min(DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS);
+            let admission = profiles
+                .admit_for_operation(
+                    world.operation(),
+                    &before.nickname,
+                    FAVORITE_ITEM_UPDATE_OPERATION,
+                )
+                .await?;
+            let (receipt, lane) = profiles
+                .update_favorite_items(before.nickname.clone(), changes, maximum_records, admission)
+                .await?;
+            let after = world.authorize_identity().await?;
+            ensure_identity_fence(&before, &after)?;
+            context.apply_favorite_item_write(&after, &receipt)?;
+            drop(lane);
+            ItemStateDisposition::FavoriteUpdateApplied
+        }
+    };
+    Ok(disposition.into_packets())
 }
 
 async fn handle_shop_buy_failure(
@@ -3261,6 +3431,12 @@ mod tests {
         game_slot_protocol::{
             GAME_KART_ITEM_INFO_HASH, GAME_SLOT_PACKET_NAME, GO_ITEM_CUBE_HASH, GOP_CUBE_HASH,
         },
+        item_state_protocol::{
+            DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS, DELETE_ITEM_REQUEST_NAME,
+            FAVORITE_ITEM_GET_REQUEST_NAME, FAVORITE_ITEM_UPDATE_REQUEST_NAME, FavoriteItemChange,
+            FavoriteItemKey, FavoriteItemOperation, ItemStateProtocolError,
+            UNLOCK_ITEM_REQUEST_NAME, serialize_favorite_item_list,
+        },
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
         myroom_protocol::{
@@ -3299,30 +3475,31 @@ mod tests {
         },
     };
     use p5136_profile::{
-        CatalogInventory, EquipmentExceptions, GrantedKart, MyRoomItemStateError, Profile,
-        ProfileStore, rider_item_snapshot,
+        CatalogInventory, EquipmentExceptions, FavoriteItemStateError, FavoriteItems, GrantedKart,
+        MyRoomItemStateError, Profile, ProfileStore, favorite_item_snapshot, rider_item_snapshot,
     };
     use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
     use tokio::sync::{mpsc, oneshot};
     use tokio::time;
 
     use super::{
-        BlockingUpdateHook, LoginSessionError, MAX_MYROOM_ITEM_RECORDS,
-        MAX_MYROOM_OWNER_ITEM_BYTES, MAX_MYROOM_OWNER_ITEM_PACKETS, MAX_OUTBOUND_BATCH_BURST,
-        MyRoomOwnerItemPacketBatch, ProfileCoordinator, RiderEquipmentValidationError,
-        RoomKartBaseResolution, RoomPhysicsFallbackReason, SessionContext, SessionReadEvent,
-        SessionServices, dispatch_packet, handle_channel_move_in, handle_equipment_request,
-        handle_get_rider, handle_lobby_request, handle_race_request, handle_room_request,
-        myroom_player_slot_from_profile, myroom_profile_presentation, read_encrypted_frame,
-        read_session_frame, room_participant_from_profile, room_physics_metadata,
-        select_session_read_event, update_game_options, write_outbound_batch, write_session_bytes,
+        BlockingUpdateHook, FAVORITE_ITEM_UPDATE_OPERATION, LoginSessionError,
+        MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_OWNER_ITEM_BYTES, MAX_MYROOM_OWNER_ITEM_PACKETS,
+        MAX_OUTBOUND_BATCH_BURST, MyRoomOwnerItemPacketBatch, ProfileCoordinator,
+        RiderEquipmentValidationError, RoomKartBaseResolution, RoomPhysicsFallbackReason,
+        SessionContext, SessionReadEvent, SessionServices, dispatch_packet, handle_channel_move_in,
+        handle_equipment_request, handle_get_rider, handle_lobby_request, handle_race_request,
+        handle_room_request, myroom_player_slot_from_profile, myroom_profile_presentation,
+        read_encrypted_frame, read_session_frame, room_participant_from_profile,
+        room_physics_metadata, select_session_read_event, update_game_options,
+        write_outbound_batch, write_session_bytes,
     };
     use crate::equipment_persistence::validate_rider_item_selection;
     use crate::operation_gate::WireOperationGate;
     use crate::profile_io::MyRoomProfileLease;
     use crate::{
-        ChannelBinding, IdentityBinding, IdentityError, MigrationToken, ServerConfig, SessionId,
-        WorldError, WorldHandle,
+        ChannelBinding, FavoriteItemPersistError, IdentityBinding, IdentityError, MigrationToken,
+        ServerConfig, SessionId, WorldError, WorldHandle,
         world::test_support::{spawn_myroom_world, spawn_myroom_world_with_outbound_capacity},
         world::{OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload},
     };
@@ -3492,6 +3669,52 @@ mod tests {
                 serialize_unavailable_waiting_crew_count_reply()
             }
         }
+    }
+
+    fn exact_delete_item_request(item: FavoriteItemKey, quantity_or_mode: u16) -> Vec<u8> {
+        let mut packet = PacketWriter::named(DELETE_ITEM_REQUEST_NAME);
+        packet.write_u32(0);
+        packet.write_u32(0);
+        packet.write_u16(item.category());
+        packet.write_u16(item.item_id());
+        packet.write_u16(item.serial());
+        packet.write_u16(quantity_or_mode);
+        packet.into_inner()
+    }
+
+    fn exact_unlock_item_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named(UNLOCK_ITEM_REQUEST_NAME);
+        packet.write_u32(0);
+        packet.write_u32(0);
+        packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    fn exact_favorite_item_update(records: &[(FavoriteItemKey, u8)]) -> Vec<u8> {
+        let mut packet = PacketWriter::named(FAVORITE_ITEM_UPDATE_REQUEST_NAME);
+        packet.write_u8(1);
+        packet.write_u32(u32::try_from(records.len()).expect("test count fits"));
+        for (item, operation) in records {
+            packet.write_u16(item.category());
+            packet.write_u16(item.item_id());
+            packet.write_u16(item.serial());
+            packet.write_u8(*operation);
+        }
+        packet.into_inner()
+    }
+
+    fn exact_favorite_item_get() -> Vec<u8> {
+        PacketWriter::named(FAVORITE_ITEM_GET_REQUEST_NAME).into_inner()
+    }
+
+    fn seed_canonical_favorite_profile(profile_root: &std::path::Path, nickname: &str) {
+        let store = ProfileStore::new(profile_root);
+        store.load_or_create(nickname).unwrap();
+        store
+            .update(nickname, |profile| {
+                profile.favorite_items = Some(FavoriteItems::default());
+            })
+            .unwrap();
     }
 
     async fn bind_test_profile(
@@ -4694,7 +4917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn club_query_global_fences_precede_packet_specific_parsing() {
+    async fn club_and_item_state_global_fences_precede_packet_specific_parsing() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -4723,6 +4946,9 @@ mod tests {
         let request = exact_club_query_request(ClubQueryRequest::GetClubListCount);
         let mut malformed = request.clone();
         malformed.push(0x51);
+        let item_request = exact_favorite_item_get();
+        let mut malformed_item = item_request.clone();
+        malformed_item.push(0x51);
 
         let token = MigrationToken::new(0x5A15).unwrap();
         world
@@ -4748,7 +4974,7 @@ mod tests {
             .await
             .unwrap();
 
-        for packet in [&request, &malformed] {
+        for packet in [&request, &malformed, &item_request, &malformed_item] {
             assert!(matches!(
                 dispatch_packet(&source_services, packet, &mut source_context).await,
                 Err(LoginSessionError::World(WorldError::Identity(
@@ -4765,7 +4991,7 @@ mod tests {
         };
         let mut destination_context = bind_test_profile(&profiles, &completion.binding).await;
         world.quiesce().await.unwrap();
-        for packet in [&request, &malformed] {
+        for packet in [&request, &malformed, &item_request, &malformed_item] {
             assert!(matches!(
                 dispatch_packet(&destination_services, packet, &mut destination_context).await,
                 Err(LoginSessionError::World(
@@ -4881,6 +5107,289 @@ mod tests {
         let durable_after = store.reload(&identity.nickname).unwrap();
         assert_eq!(durable_after.revision, durable_before.revision);
         assert_eq!(durable_after.profile, durable_before.profile);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_and_unlock_are_strict_read_only_no_reply_capabilities() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_719))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "UnsupportedItemState")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let requests = [
+            exact_delete_item_request(FavoriteItemKey::new(3, 1_450, 2), 1),
+            exact_unlock_item_request(),
+        ];
+
+        let mut unbound = SessionContext::default();
+        for request in &requests {
+            assert!(matches!(
+                dispatch_packet(&services, request, &mut unbound).await,
+                Err(LoginSessionError::ProfileNotBound)
+            ));
+        }
+        let mut malformed = requests[0].clone();
+        malformed.push(0x51);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut unbound).await,
+            Err(LoginSessionError::ItemStateProtocol(
+                ItemStateProtocolError::TrailingBytes { count: 1, .. }
+            ))
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let in_memory_before = context.profile_for(&identity).unwrap().clone();
+        let store = ProfileStore::new(profile_root.path());
+        let durable_before = store.reload(&identity.nickname).unwrap();
+        for _ in 0..2 {
+            for request in &requests {
+                assert_eq!(
+                    dispatch_packet(&services, request, &mut context)
+                        .await
+                        .unwrap(),
+                    Vec::<Vec<u8>>::new()
+                );
+            }
+        }
+        let durable_after = store.reload(&identity.nickname).unwrap();
+        assert_eq!(durable_after.revision, durable_before.revision);
+        assert_eq!(durable_after.profile, durable_before.profile);
+        assert_eq!(context.profile_for(&identity).unwrap(), &in_memory_before);
+
+        let follow_up = PacketWriter::named("PqServerTime");
+        assert_eq!(
+            dispatch_packet(&services, follow_up.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression covers two batches, one-way replies, durable replay, full Get projection, and bound-cache refresh"
+    )]
+    async fn favorite_updates_are_atomic_durable_and_get_returns_the_full_snapshot() {
+        let profile_root = tempfile::tempdir().unwrap();
+        seed_canonical_favorite_profile(profile_root.path(), "FavoriteRoundtrip");
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_720))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "FavoriteRoundtrip")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let cached_before = context.profile_for(&identity).unwrap().clone();
+        assert!(
+            cached_before
+                .favorite_items
+                .as_ref()
+                .is_some_and(FavoriteItems::is_empty)
+        );
+
+        let first_items = (0..200_u16)
+            .map(|serial| FavoriteItemKey::new(3, 1_450, serial))
+            .collect::<Vec<_>>();
+        let first_records = first_items
+            .iter()
+            .copied()
+            .map(|item| (item, 1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispatch_packet(
+                &services,
+                &exact_favorite_item_update(&first_records),
+                &mut context
+            )
+            .await
+            .unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+
+        let last = FavoriteItemKey::new(3, 1_450, 200);
+        let second = exact_favorite_item_update(&[(last, 1)]);
+        assert!(
+            dispatch_packet(&services, &second, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut expected = first_items;
+        expected.push(last);
+        assert_eq!(
+            dispatch_packet(&services, &exact_favorite_item_get(), &mut context)
+                .await
+                .unwrap(),
+            vec![
+                serialize_favorite_item_list(&expected, config.max_login_payload)
+                    .expect("201-item snapshot fits")
+            ]
+        );
+
+        let store = ProfileStore::new(profile_root.path());
+        let durable = store.reload(&identity.nickname).unwrap();
+        assert_eq!(
+            favorite_item_snapshot(durable.profile.favorite_items.as_ref()),
+            expected
+        );
+        let durable_revision = durable.revision;
+        assert!(
+            dispatch_packet(&services, &second, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.reload(&identity.nickname).unwrap().revision,
+            durable_revision,
+            "idempotent add replay must not publish a revision"
+        );
+        let mut expected_cached = cached_before;
+        expected_cached.favorite_items = Some(
+            FavoriteItems::try_from_items(expected.iter().copied())
+                .expect("wire snapshot is canonical"),
+        );
+        assert_eq!(
+            context.profile_for(&identity).unwrap(),
+            &expected_cached,
+            "favorite writes must patch the bound favorite projection without replacing others"
+        );
+        assert_eq!(
+            context
+                .profile
+                .as_ref()
+                .expect("profile remains bound")
+                .profile
+                .revision,
+            durable_revision
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_or_over_cap_favorite_batches_never_partially_commit() {
+        let profile_root = tempfile::tempdir().unwrap();
+        seed_canonical_favorite_profile(profile_root.path(), "FavoriteAtomicity");
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig {
+            max_login_payload: 16,
+            ..ServerConfig::default()
+        };
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_721))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "FavoriteAtomicity")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        let first = FavoriteItemKey::new(3, 1_450, 1);
+        let second = FavoriteItemKey::new(3, 1_450, 2);
+        dispatch_packet(
+            &services,
+            &exact_favorite_item_update(&[(first, 1)]),
+            &mut context,
+        )
+        .await
+        .unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        let before = store.reload(&identity.nickname).unwrap();
+
+        let malformed = exact_favorite_item_update(&[(second, 1), (first, 3)]);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::ItemStateProtocol(
+                ItemStateProtocolError::InvalidFavoriteOperation {
+                    index: 1,
+                    actual: 3
+                }
+            ))
+        ));
+        let after_malformed = store.reload(&identity.nickname).unwrap();
+        assert_eq!(after_malformed.revision, before.revision);
+        assert_eq!(after_malformed.profile, before.profile);
+
+        let over_cap = exact_favorite_item_update(&[(second, 1)]);
+        let error = dispatch_packet(&services, &over_cap, &mut context)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LoginSessionError::FavoriteItemPersistence(FavoriteItemPersistError::State(
+                FavoriteItemStateError::TooManyItems {
+                    count: 2,
+                    maximum: 1
+                }
+            ))
+        ));
+        let after_cap = store.reload(&identity.nickname).unwrap();
+        assert_eq!(after_cap.revision, before.revision);
+        assert_eq!(after_cap.profile, before.profile);
+
+        let replacement = exact_favorite_item_update(&[(second, 1), (first, 2)]);
+        assert!(
+            dispatch_packet(&services, &replacement, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            dispatch_packet(&services, &exact_favorite_item_get(), &mut context)
+                .await
+                .unwrap(),
+            vec![
+                serialize_favorite_item_list(&[second], config.max_login_payload)
+                    .expect("one record fits")
+            ]
+        );
 
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
@@ -9756,6 +10265,142 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.revision, Some(2));
         assert_eq!(persisted.profile.game_option.video_quality, 77);
+
+        world.session_closed(source).await.unwrap();
+        world.session_closed(destination).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+        profile_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression spans accepted favorite persistence, request cancellation, identity drain, migration handoff, and durable verification"
+    )]
+    async fn cancelled_favorite_update_keeps_migration_fenced_until_durable() {
+        let profile_root = tempfile::tempdir().unwrap();
+        seed_canonical_favorite_profile(profile_root.path(), "FavoriteCancellation");
+        let hook = BlockingUpdateHook::new();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let profiles = profiles.with_blocking_update_hook(Arc::clone(&hook));
+        let (world, world_task) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let source = world
+            .register_session(SocketAddr::new(address, 50_010))
+            .await
+            .unwrap();
+        let destination = world
+            .register_session(SocketAddr::new(address, 50_011))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(source, "FavoriteCancellation")
+            .await
+            .unwrap();
+        let admission = profiles
+            .admit(&identity.nickname, "test initial favorite profile load")
+            .await
+            .unwrap();
+        let (_, lane) = profiles
+            .load(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        drop(lane);
+
+        let token = MigrationToken::new(0x5137).unwrap();
+        world
+            .begin_migration(
+                source,
+                ChannelBinding {
+                    channel_id: 12,
+                    game_type: 67,
+                },
+                token,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        let update_profiles = profiles.clone();
+        let update_nickname = identity.nickname.clone();
+        let update_operation = world.admit_identity_operation(source).await.unwrap();
+        let expected = FavoriteItemKey::new(3, 1_450, 7);
+        let update = tokio::spawn(async move {
+            let admission = update_profiles
+                .admit_for_operation(
+                    &update_operation,
+                    &update_nickname,
+                    FAVORITE_ITEM_UPDATE_OPERATION,
+                )
+                .await?;
+            update_profiles
+                .update_favorite_items(
+                    update_nickname,
+                    vec![FavoriteItemChange::new(
+                        expected,
+                        FavoriteItemOperation::Add,
+                    )],
+                    DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS,
+                    admission,
+                )
+                .await
+        });
+        let entered_hook = Arc::clone(&hook);
+        tokio::task::spawn_blocking(move || entered_hook.entered.wait())
+            .await
+            .unwrap();
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+
+        let migration_profiles = profiles.clone();
+        let migration_world = world.clone();
+        let user_no = identity.user_no;
+        let migration_nickname = identity.nickname.clone();
+        let (attempting, attempted) = oneshot::channel();
+        let mut migration = tokio::spawn(async move {
+            let preflight = migration_world
+                .preflight_migration(destination, user_no, 12, token, Instant::now())
+                .await
+                .unwrap();
+            let _ = attempting.send(());
+            preflight.wait_for_operations_drained().await.unwrap();
+            let admission = migration_profiles
+                .admit(&migration_nickname, "test favorite migration handoff")
+                .await
+                .unwrap();
+            let (profile, lane) = migration_profiles
+                .load(migration_nickname, false, admission)
+                .await
+                .unwrap();
+            let profile_lease =
+                MyRoomProfileLease::new(myroom_profile_presentation(&profile.profile), lane);
+            migration_world
+                .complete_preflighted_migration(preflight, profile_lease)
+                .await
+        });
+        attempted.await.unwrap();
+        assert!(
+            time::timeout(Duration::from_millis(50), &mut migration)
+                .await
+                .is_err(),
+            "migration acquired ownership while cancelled favorite persistence still ran"
+        );
+
+        let release_hook = Arc::clone(&hook);
+        tokio::task::spawn_blocking(move || release_hook.release.wait())
+            .await
+            .unwrap();
+        migration.await.unwrap().unwrap();
+
+        let persisted = ProfileStore::new(profile_root.path())
+            .reload(&identity.nickname)
+            .unwrap();
+        assert_eq!(
+            favorite_item_snapshot(persisted.profile.favorite_items.as_ref()),
+            [expected]
+        );
 
         world.session_closed(source).await.unwrap();
         world.session_closed(destination).await.unwrap();

@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod emblem_catalog;
 pub mod equipment;
+pub mod favorite_items;
 pub mod inventory;
 pub mod model;
 pub mod myroom_items;
@@ -16,6 +17,10 @@ pub use catalog::{
 };
 pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
 pub use equipment::{EquipmentExceptions, EquipmentStateError};
+pub use favorite_items::{
+    DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS, FavoriteItemStateError, FavoriteItems,
+    apply_favorite_item_changes, favorite_item_snapshot,
+};
 pub use inventory::{
     InventoryBuildError, apply_rider_item_selection, build_inventory_snapshot,
     build_inventory_snapshot_with_equipment, rider_item_snapshot,
@@ -37,5 +42,5 @@ pub use progression::{
 };
 pub use store::{
     LoadedProfile, ProfileMutation, ProfileStore, ProfileStoreError, ProfileStoreId,
-    ProfileTransaction, RaceRunGeneration, RaceRunLease, SavedProfile,
+    ProfileTransaction, ProfileTransactionContext, RaceRunGeneration, RaceRunLease, SavedProfile,
 };

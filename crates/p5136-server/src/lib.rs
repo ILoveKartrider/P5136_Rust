@@ -2,6 +2,7 @@
 
 mod config;
 mod equipment_persistence;
+mod favorite_persistence;
 mod identity;
 mod main_emblem_persistence;
 mod messenger_hub;
@@ -19,6 +20,7 @@ mod udp_state;
 mod world;
 
 pub use config::{DEFAULT_MAX_LOGIN_SESSIONS, ServerConfig, ServerEndpoints};
+pub use favorite_persistence::FavoriteItemPersistError;
 pub use identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
     IdentityRegistry, MIGRATION_TTL, MigrationCompletion, MigrationPermit, MigrationToken,

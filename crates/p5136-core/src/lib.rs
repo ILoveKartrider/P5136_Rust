@@ -13,6 +13,7 @@ pub mod frame;
 pub mod game_slot_protocol;
 pub mod handshake;
 pub mod inventory;
+pub mod item_state_protocol;
 pub mod kart_physics;
 pub mod lobby_protocol;
 pub mod login;

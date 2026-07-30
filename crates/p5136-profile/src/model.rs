@@ -17,6 +17,12 @@ pub struct Profile {
     pub game_option: GameOptions,
     #[serde(
         default,
+        rename = "P5136RustFavoriteItems",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub favorite_items: Option<crate::favorite_items::FavoriteItems>,
+    #[serde(
+        default,
         rename = "P5136RustRaceRewardReceipt",
         skip_serializing_if = "Option::is_none"
     )]
@@ -470,6 +476,7 @@ mod tests {
         assert_eq!(profile.rider_item.dye, 1);
         assert_eq!(profile.game_option.video_quality, 14);
         assert_eq!(profile.game_option.speed_type, 7);
+        assert!(profile.favorite_items.is_none());
         assert_eq!(profile.race_reward_receipt, None);
     }
 
@@ -501,7 +508,66 @@ mod tests {
         assert_eq!(encoded["futureTopLevel"], json!([1, 2, 3]));
         assert_eq!(encoded["Rider"]["RP"], 456);
         assert_eq!(encoded["RiderItem"]["Set_Character"], 42);
+        assert!(encoded.get("P5136RustFavoriteItems").is_none());
         assert!(encoded.get("P5136RustRaceRewardReceipt").is_none());
+    }
+
+    #[test]
+    fn favorite_items_roundtrip_without_disturbing_unknown_profile_fields() {
+        let source = json!({
+            "P5136RustFavoriteItems": [
+                {"ItemCatID": 3, "ItemID": 1450, "ItemSN": 2},
+                {"ItemCatID": 4, "ItemID": 300, "ItemSN": 7}
+            ],
+            "futureTopLevel": {"keep": true},
+            "Rider": {
+                "futureRiderField": [1, 2, 3]
+            }
+        });
+
+        let profile: Profile = serde_json::from_value(source).unwrap();
+        assert_eq!(profile.favorite_items.as_ref().unwrap().len(), 2);
+        let encoded = serde_json::to_value(profile).unwrap();
+        assert_eq!(encoded["futureTopLevel"]["keep"], true);
+        assert_eq!(
+            encoded["Rider"]["futureRiderField"],
+            serde_json::json!([1, 2, 3])
+        );
+        assert_eq!(
+            encoded["P5136RustFavoriteItems"],
+            json!([
+                {"ItemCatID": 3, "ItemID": 1450, "ItemSN": 2},
+                {"ItemCatID": 4, "ItemID": 300, "ItemSN": 7}
+            ])
+        );
+    }
+
+    #[test]
+    fn explicit_empty_favorite_items_are_not_conflated_with_a_missing_field() {
+        let missing: Profile = serde_json::from_value(json!({})).unwrap();
+        assert!(missing.favorite_items.is_none());
+        assert!(
+            serde_json::to_value(missing)
+                .unwrap()
+                .get("P5136RustFavoriteItems")
+                .is_none()
+        );
+
+        let explicit_empty: Profile = serde_json::from_value(json!({
+            "P5136RustFavoriteItems": []
+        }))
+        .unwrap();
+        assert_eq!(
+            explicit_empty
+                .favorite_items
+                .as_ref()
+                .map(crate::favorite_items::FavoriteItems::is_empty),
+            Some(true)
+        );
+        assert_eq!(
+            serde_json::to_value(explicit_empty).unwrap()["P5136RustFavoriteItems"],
+            json!([])
+        );
     }
 
     #[test]

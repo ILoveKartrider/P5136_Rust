@@ -277,6 +277,28 @@ pub struct SavedProfile {
     pub path: PathBuf,
 }
 
+/// Read-only metadata for the exact snapshot passed to a profile transaction.
+///
+/// A missing revision means the snapshot came from legacy `Launcher.json` or
+/// from in-memory defaults and has not yet been published as an immutable
+/// profile revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileTransactionContext {
+    revision: Option<u64>,
+}
+
+impl ProfileTransactionContext {
+    #[must_use]
+    pub const fn revision(self) -> Option<u64> {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn has_immutable_revision(self) -> bool {
+        self.revision.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProfileMutation<T> {
     Changed { value: T, profile: Box<Profile> },
@@ -664,11 +686,12 @@ impl ProfileStore {
 
     /// Runs one optimistic conditional read-modify-write transaction.
     ///
-    /// The closure sees an immutable disk snapshot and may be called more than
-    /// once if another store or process wins the next immutable revision.
-    /// Therefore it must not perform externally visible side effects. A
-    /// changed transaction publishes only when its expected head revision
-    /// still wins the create-if-absent compare-and-swap.
+    /// The closure sees a read-only snapshot loaded from current disk state (or
+    /// defaults) and may be called more than once if another store or process
+    /// wins the next immutable revision. Therefore it must not perform
+    /// externally visible side effects. A changed transaction publishes only
+    /// when its expected head revision still wins the create-if-absent
+    /// compare-and-swap.
     ///
     /// `ProfileMutation::Unchanged` does not publish a revision, but it does
     /// explicitly sync the containing directory. On success, `saved` is the
@@ -684,12 +707,36 @@ impl ProfileStore {
     where
         F: FnMut(&Profile) -> ProfileMutation<T>,
     {
+        self.transaction_with_context(nickname, |profile, _context| transaction(profile))
+    }
+
+    /// Runs one optimistic conditional read-modify-write transaction and
+    /// supplies metadata for the exact snapshot seen by the closure.
+    ///
+    /// This has the same atomicity and durability semantics as
+    /// [`Self::transaction`]. The closure may be called again with a different
+    /// profile and context after a cross-process compare-and-swap conflict, so
+    /// it must remain free of externally visible side effects. In particular,
+    /// callers can request a changed mutation when
+    /// [`ProfileTransactionContext::revision`] is `None` to canonicalize an
+    /// otherwise unchanged legacy snapshot into its first immutable revision.
+    pub fn transaction_with_context<T, F>(
+        &self,
+        nickname: &str,
+        mut transaction: F,
+    ) -> Result<ProfileTransaction<T>, ProfileStoreError>
+    where
+        F: FnMut(&Profile, ProfileTransactionContext) -> ProfileMutation<T>,
+    {
         let nickname = Self::normalize_storage_nickname(nickname)?;
         let profile_lock = self.profile_lock(&nickname)?;
         let _guard = lock(&profile_lock)?;
         for _ in 0..MAX_TRANSACTION_CAS_ATTEMPTS {
             let snapshot = self.load_or_default_from_disk(&nickname)?;
-            match transaction(&snapshot.profile) {
+            let context = ProfileTransactionContext {
+                revision: snapshot.revision,
+            };
+            match transaction(&snapshot.profile, context) {
                 ProfileMutation::Unchanged(value) => {
                     let durability = self.confirm_snapshot_durability(&nickname, &snapshot);
                     return match durability {
@@ -2247,6 +2294,52 @@ mod tests {
         assert_eq!(reloaded.revision, Some(1));
         assert_eq!(reloaded.profile.rider.extra["Future"], "kept");
         assert_eq!(reloaded.profile.extra["FutureTop"], true);
+    }
+
+    #[test]
+    fn transaction_context_distinguishes_legacy_and_immutable_snapshots() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("Rider");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("Launcher.json"),
+            serde_json::to_vec(&json!({"Rider": {"Lucci": 42}})).unwrap(),
+        )
+        .unwrap();
+        let store = ProfileStore::new(root.path());
+        let mut observed = Vec::new();
+
+        let first = store
+            .transaction_with_context("Rider", |profile, context| {
+                observed.push(context.revision());
+                ProfileMutation::changed(profile.rider.lucci, profile.clone())
+            })
+            .unwrap();
+        assert_eq!(observed, [None]);
+        assert!(matches!(
+            first,
+            ProfileTransaction::Committed {
+                value: 42,
+                saved: super::SavedProfile { revision: 1, .. },
+                ..
+            }
+        ));
+
+        let second = store
+            .transaction_with_context("Rider", |profile, context| {
+                observed.push(context.revision());
+                ProfileMutation::Unchanged(profile.rider.lucci)
+            })
+            .unwrap();
+        assert_eq!(observed, [None, Some(1)]);
+        assert!(matches!(
+            second,
+            ProfileTransaction::Unchanged {
+                value: 42,
+                saved: Some(super::SavedProfile { revision: 1, .. }),
+                ..
+            }
+        ));
     }
 
     #[test]
