@@ -25,6 +25,7 @@ server. The implemented foundation provides:
 - PIN/BML patching with immutable backups, a process lock, and atomic writes;
 - executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
 - versioned JSON profile persistence compatible with legacy `Launcher.json`;
+- bounded read-only KR RHO5 emblem loading with authenticated decompression;
 - a no-argument desktop connector GUI and an equivalent headless CLI.
 
 Room admission, first-state, messenger, and UDP/P2P runtime flows are
@@ -32,8 +33,8 @@ integrated. UDP authorization and room audience selection run inside the world
 actor so channel migration cannot race a stale relay decision. Human
 ready/loading, race start, finish, ranking, settlement, reward persistence, and
 the MyRoom direct/re-enter/random-public-entry, FirstState, owner-info,
-RequestItems, character-position, RiderTalk, and Secede paths are also
-actor-integrated.
+RequestItems, RequestEmblems, three-slot main-emblem update,
+character-position, RiderTalk, and Secede paths are also actor-integrated.
 Reenter restores an exact current membership before falling back to the
 rider's own room. Random entry selects only actor-tracked, owner-present,
 non-full public rooms. Direct entry strictly parses the required owner and
@@ -46,6 +47,13 @@ mints one move-only, exact-generation grant for at most one matching follow-up;
 Garage and Item Dictionary grants authorize exactly one `RequestItems`.
 RequestItems loads a bounded owner snapshot under the canonical profile lane
 and publishes its complete ordered response as one actor-owned queue batch.
+The matching Emblem grant authorizes exactly one bounded `RequestEmblems`
+response and is consumed even if its requester queue is full. Main-emblem
+updates parse the stock client's exact three-`i16` body, require the present
+owner, validate every nonzero ID against an immutable positive-ID catalog, and
+publish success only after a transactional profile write is durable. The
+ordinary room cache is refreshed silently; no unsupported MyRoom peer fanout
+is invented.
 Character positions use actor-derived sender slots and exact-generation peer
 audiences with all-recipient atomic queue reservation. RiderTalk uses the same
 atomic peer path, bounds and redacts the message-bearing request, enforces the
@@ -69,7 +77,7 @@ stock-client end-to-end validation. See
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p p5136-cli
-cargo run -p p5136-cli -- server --catalog /path/to/KartCatalog.xml
+cargo run -p p5136-cli -- server --catalog /path/to/KartCatalog.xml --client-data-dir /path/to/client/Data
 ```
 
 The configured port follows the original topology: login TCP is base `+ 1`,
@@ -80,6 +88,21 @@ never committed. Without `--catalog`, login and channel startup remain
 available, but `PqGetRider` is deliberately rejected rather than serving an
 incomplete inventory. Profiles default to `./Profile`; use `--profile-root` to
 change that location.
+
+`--client-data-dir` points at the stock client's `Data` directory. At startup,
+the server uses a bounded, read-only RHO5 reader to locate exactly one
+`etc_/emblem/emblem@kr.xml`, authenticate and decompress it in memory, and load
+its source-ordered positive IDs for `RequestEmblems` and main-selection
+validation. The installed KR data fixture yields 586 unique IDs, minimum 1 and
+maximum 8803. Startup fails before binding listeners if the configured archive
+set or XML is missing, ambiguous, malformed, or exceeds its limits.
+
+An optional `<Emblems>` section in the format-3 `KartCatalog.xml` remains a
+portable fallback when `--client-data-dir` is omitted. RHO5 definitions take
+precedence when both sources are configured. Without either source, the server
+fails closed with an empty emblem response and permits only `0,0,0`; `0` is
+solely the empty-selection sentinel. The existing C# exporter does not emit
+`<Emblems>`. Client archives and extracted XML must never be committed.
 
 The server binds to `127.0.0.1` by default. To serve another machine, set both
 `--bind` and `--advertise`. Existing profiles may log in remotely, but creating

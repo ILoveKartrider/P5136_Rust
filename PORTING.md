@@ -82,12 +82,15 @@ been demonstrated.
 - [x] direct MyRoom self-bootstrap and actor-tracked public/protected entry
 - [x] current-membership Reenter and bounded random public-room entry
 - [x] strict MyRoom item-password status flow and one-shot owner-item grant
+- [x] bounded MyRoom RequestEmblems authorization and exact catalog packet
+- [x] three-slot transactional main-emblem persistence and cache refresh
 - [x] race start/grid/readiness with deterministic fallback track
 - [ ] live track-pool/mode/random-track control surface
 - [x] finish, ranking, settlement, team booster, and DNF deadline
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
-- [ ] MyRoom emblem-catalog and main-emblem flows
+- [x] bounded read-only native RHO5 emblem-definition extraction
+- [ ] stock-client RequestEmblems/main-emblem E2E
 - [ ] P2P-port and club-name profile mutation/refresh paths
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface
 - [ ] race-wide multi-profile reward journal/recovery

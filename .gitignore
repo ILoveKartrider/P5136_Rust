@@ -16,18 +16,25 @@ Thumbs.db
 /_analysis/
 /past-analysis/
 /research/
+/[Cc]apture/
+/[Cc]aptures/
 /[Pp]hysics[Ss]im/
 /KartRider-P5136/
+*.pcap
+*.pcapng
 
 # Runtime profiles and proprietary client material must remain external
 /[Pp][Rr][Oo][Ff][Ii][Ll][Ee]/
 /[Cc]lient/
+/[Dd]ata/
 /[Gg]ame/
 *.exe
 *.dll
 *.pin
 *.rho
+*.rho5
 *.pak
+emblem@kr.xml
 KartCatalog.xml
 PartsData.xml
 PlantData.json

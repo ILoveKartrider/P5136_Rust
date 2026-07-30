@@ -26,15 +26,98 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
-Committed baseline before the current tranche:
-`dff997c Port protected MyRoom password flows`
+Current implementation checkpoint:
+`f2f6143 Port RHO5 emblem catalog and durable main emblems`
 
 ## Current Rust checkpoint
 
-The current worktree ports `RiderTalk` through the existing actor-owned
-exact-generation peer path. It enforces the authoritative owner's current
-`TalkLock` policy, derives the sender slot from membership, excludes the
-sender, and reserves every peer queue before publishing.
+The current checkpoint ports the bounded emblem catalog request, the
+three-slot main-emblem update, and a native read-only RHO5 source for the stock
+emblem definitions. It also corrects a source defect discovered by comparing
+the C# handler with the stock client: the stock request and every ordinary
+rider projection contain three `i16` emblem values, while C# reads only two
+and hard-codes the third projection to zero. C# remains unchanged; Rust
+persists and publishes all three.
+
+### MyRoom emblem catalog and main selection
+
+- `RmRequestEmblemsPacket` (`0x63F508C5`) is an exact hash-only request.
+  `RmOwnerEmblemPacket` (`0x49AF0774`) is `i32 1`, `i32 1`, an `i32` count,
+  then that many source-ordered `i16` IDs. Count, packet size, XML size,
+  attributes, duplicates, and catalog entries are bounded.
+- Catalog definitions are immutable after startup. A source-ordered
+  `Vec<i16>` is retained for the wire response and a separate `HashSet<i16>`
+  supplies constant-time selection validation. Definition IDs must be
+  positive; zero is reserved solely as the client's empty-selection sentinel.
+  Missing catalog data yields an exact empty response and permits only
+  `0,0,0` updates.
+- Owners and visitors to a public item surface may request the list. A
+  protected visitor needs the exact kind-1 one-shot grant scoped to requester,
+  owner, resource, and room-info revision. A matching attempt consumes the
+  grant in the actor turn before response reservation, including queue-full
+  failure. A grant for another resource is preserved; outsiders and stale or
+  owner-absent memberships receive no packet.
+- The C# response exposes its process-global definition list as though it were
+  the current owner's emblem inventory. Rust currently preserves that
+  client-visible list policy behind stricter authorization because no separate
+  owned-emblem profile model exists. Definition validation and authorization
+  are separate abstractions so an evidence-backed ownership model can replace
+  the list source without weakening either boundary.
+- `RmRqUpdateMainEmblemPacket` (`0x867F0A14`) is exactly three `i16` values.
+  Stock codec `0x0076E120` serializes object offsets `+0x10`, `+0x12`, and
+  `+0x14`; its producer also fills and validates three UI selections.
+  Four-byte bodies are truncated and eight-byte bodies have trailing data.
+  Rust rejects both before authorization, catalog work, or persistence.
+- Every proposed slot must be zero or a known positive catalog ID. Validation
+  is all-or-nothing; one unknown value returns the exact failure body
+  `[0,0]` and changes no profile, revision, or actor cache. Duplicate selected
+  IDs remain legal because the wire describes three presentation slots, not a
+  set.
+- Only the exact present owner may update. Before any worker submission the
+  actor rechecks identity, profile subject, membership/role, quiesce state,
+  conflicting profile writes, and reserves the requester's success queue.
+  Queue saturation therefore starts no worker and mutates no disk state.
+- The write uses a move-only prepared/registered capability, the canonical
+  profile lane, `ProfileStore::transaction`, and an actor-owned pre-reserved
+  completion slot. It mutates only `Rider.Emblem1..3`, preserves flattened
+  future fields, avoids a new revision for an identical immutable snapshot,
+  and confirms an exact revision after a durability-uncertain commit.
+  Cancelling the request cannot discard an accepted outcome.
+- Success `[1,0]` is published only after durability and exact active
+  owner-generation revalidation. The ordinary protocol-room `RoomPlayer`
+  cache is silently refreshed for later slot/start projections; no invented
+  MyRoom peer fanout is sent. A released, superseded, or role-changed
+  generation keeps the durable result but receives no stale success packet.
+  `Emblem3` uses `serde(default)` so legacy two-field profiles load as zero
+  without losing unknown fields.
+- Direct inspection of the installed client data found
+  `etc_/emblem/emblem@kr.xml` once in `DataPack1_00000.rho5`: 586 unique
+  positive IDs, minimum 1 and maximum 8803. This proprietary XML and its
+  archive are evidence only and are not copied into Git.
+- The safe `p5136-rho5` crate scans the configured stock-client `Data`
+  directory without writing to it. It uses checked offsets/ranges, bounded
+  archive/table/path/file counts and declared-size totals, KR key goldens,
+  header and entry checksums, exact first-`0x400` double decryption, exact zlib
+  consumption and decompressed length, and plaintext MD5 authentication.
+  Duplicate or missing normalized target paths fail closed. The workspace
+  forbids `unsafe`, and the reader contains no `unsafe` syntax.
+- The production directory-entry cap is 4096 because the installed fixture has
+  1559 direct entries, mostly legacy non-RHO5 files. Independent archive,
+  per-archive/total-file, table, path, archive-byte, per-entry-byte, and
+  declared-total-byte caps continue to bound retained and extracted data.
+- `--client-data-dir DATA_DIR` loads the exact KR entry on a blocking worker
+  before any listener is bound, parses its bounded UTF-16/UTF-8
+  `<kartEmblem>` document in memory, and makes that immutable catalog
+  authoritative. The local proprietary ignored integration test exercises the
+  complete RHO5 -> XML -> `EmblemCatalog` path and confirms all 586 IDs in
+  source order, minimum 1 and maximum 8803.
+- The existing C# `KartCatalog.xml` exporter does not include emblems.
+  Therefore the optional `<Emblems>` format-3 extension is usable for tests or
+  an externally augmented portable runtime catalog and is the fallback when
+  `--client-data-dir` is omitted. RHO5 definitions take precedence when both
+  sources exist. Without either source, emblem behavior remains
+  fail-closed/empty. Native extraction is complete, but do not claim stock
+  emblem E2E until a Wine/native client run is verified.
 
 ### MyRoom direct protected entry
 
@@ -89,8 +172,9 @@ sender, and reserves every peer queue before publishing.
   actor-owned grant scoped to the exact requester binding, exact owner
   binding, protected resource, and the owner's room-info revision. Garage and
   Item Dictionary grants are consumed by the next `RequestItems` prepare;
-  Emblem and Career grants remain reserved for their still-unported matching
-  request paths and cannot authorize owner items.
+  The Emblem grant is consumed only by `RequestEmblems`; the Career grant
+  remains reserved for its still-unported matching request path. Neither can
+  authorize owner items.
 - The uncached stock-client path sends at most one matching follow-up after a
   successful check, so grants are deliberately one-shot. An unused grant may
   remain until it is consumed or revoked; successful entry/reentry, room
@@ -460,12 +544,15 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 644 passed, 0 failed
+# 681 passed, 0 failed, 2 opt-in proprietary-fixture tests ignored
 git diff --check
 ```
 
-The 644 tests comprise 9 CLI, 35 connector, 135 core, 80 profile, 377 server
-unit, and 8 server integration tests. Doc-tests also passed.
+The 681 passing tests comprise 9 CLI, 35 connector, 138 core, 85 profile,
+13 RHO5, 393 server unit, and 8 server integration tests. The two ignored tests
+exercise local proprietary RHO5 metadata and the full
+RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
+the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
@@ -502,6 +589,20 @@ Focused regressions cover:
   rejection, kind/resource separation, one-shot protected owner-item access,
   empty-stored-secret fail-closed behavior, policy-revision invalidation, and
   grant revocation on entry, Secede, migration, and release;
+- exact empty `RequestEmblems`, bounded source-ordered catalog serialization,
+  public/owner access, protected exact kind-1 grant consumption, wrong-resource
+  preservation, stale-plan suppression, queue-full one-shot behavior, and
+  malformed/duplicate/nonpositive XML rejection;
+- exact three-slot main-emblem parsing, fail-closed catalog validation,
+  present-owner preflight before profile admission, all-or-nothing
+  transaction, durability-before-ACK, cancellation survival, stale-generation
+  and role-change ACK suppression, completion backpressure, registered-ticket
+  abort, accepted-outcome-loss terminal detection, and graceful/forced
+  shutdown accounting;
+- bounded synthetic RHO5 scan/extract goldens for offsets, both key layers,
+  checksums, checked ranges, path normalization, exact zlib consumption,
+  output limits, plaintext MD5, unique lookup, plus an opt-in local
+  proprietary extraction-to-catalog integration;
 - strict character-position input, canonical sender slots, nonmember and
   self-echo suppression, stale-source migration fencing, exact peer packets,
   atomic multi-peer backpressure/retry, dropped ACK, and quiesce rejection;
@@ -534,11 +635,10 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   Consume the reserved kind-1/kind-2 one-shot grants in the emblem/career
-   flows, add the bounded emblem catalog, main-emblem persistence, P2P-port
-   profile writes, club create/rename refresh, and any request still
-   intentionally classified as a no-op. Finish kart tuning/upgrades and the
-   remaining quest/attendance/progression surface.
+   Consume the remaining kind-2 Career grant. Add P2P-port profile writes,
+   club create/rename refresh, and any request still intentionally classified
+   as a no-op. Finish kart tuning/upgrades and the remaining
+   quest/attendance/progression surface.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
    fields; a later storage redesign should add zeroization/at-rest protection
@@ -575,17 +675,11 @@ These items prevent a "port complete" claim.
 
 1. Enumerate every classified request and mark it implemented, intentionally
    unsupported with a typed response, or capture-blocked. No silent fallthrough.
-2. Implement the bounded `RequestEmblems` and durable `UpdateMainEmblem`
-   vertical slices next, consuming only the exact matching kind-1 grant for a
-   protected visitor catalog request. Preserve the now-explicit separation
-   between direct room-password entry and
-   item-password UI checks. Keep one-shot grants move-only, plaintext-free, and
-   scoped to exact requester/owner generations plus owner-info revision.
-   Connect the reserved Emblem and Career resources only when their matching
-   request paths are implemented; never broaden a grant to another resource or
-   a reusable session-global flag. Continue the remaining MyRoom requests in
-   small vertical slices with malformed-input, stale-generation,
-   cancellation/backpressure, and exact-packet tests.
+2. Port the Career request using only its exact kind-2 grant and continue
+   remaining MyRoom requests in small vertical slices with malformed-input,
+   stale-generation, cancellation/backpressure, and exact-packet tests. Keep
+   the completed RHO5 reader narrowly scoped and read-only, and keep every
+   proprietary archive/XML fixture outside Git.
 3. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
 4. Capture and implement movement sequence/tick behavior per sender and exact
