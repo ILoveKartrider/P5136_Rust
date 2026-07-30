@@ -27,17 +27,38 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`64a6d55 Port terminal MyRoom Career list`
+`7c9b8a1 Port terminal locked-item list`
 
 ## Current Rust checkpoint
 
-The current checkpoint uses available stock-client static analysis to make one
-Career behavior wire-safe without inventing server data: an exact hash-only
-list request and a conservative terminal `0,0,0` response. It reuses the
-actor-owned owner-resource authorization boundary, consumes only the kind-2
-capability for protected visitors, and does not clone the incomplete C#
-server's silent fallthrough. Nonempty records and owner-info remain
-evidence-limited. C# remains unchanged.
+The current checkpoint closes one bounded authenticated compatibility packet:
+`PqLockedItemGet` now returns the exact terminal empty
+`PrLockedItemGet`. The P5136 compatibility handler and the stock-era handler
+agree on that reply, while Rust deliberately requires exact request
+exhaustion instead of inheriting C#'s unchecked trailing-body behavior.
+Nonempty protected-item state and updates remain unimplemented because their
+P5136-specific wire and persistence policy is unproven. C# remains unchanged.
+
+### Terminal protected-item list
+
+- `PqLockedItemGet` (`0x2D8105C2`) is treated as a strict hash-only request.
+  Both relevant C# handlers consume no request body, although a separate
+  stock-client producer proof is not available; exact four-byte exhaustion is
+  the safer Rust compatibility policy.
+- `PrLockedItemGet` (`0x2D8F05C3`) begins with a signed `i32 count`. Both C#
+  the P5136 compatibility handler and the stock-era handler return count zero,
+  so Rust emits exactly eight bytes: the reply hash followed by `i32 0`.
+- Truncation, the wrong hash, or trailing bytes produce a typed protocol error.
+  Body validation happens before the bound in-memory profile lookup. The
+  normal identity-operation and exact profile-binding fences still apply.
+- The response is returned directly and only to the authenticated requester.
+  It creates no World command, peer fanout, profile-store read, persistence
+  write, or shared-state mutation.
+- The general C# serializer shows the nonempty record shape, but Rust does not
+  claim or persist nonempty protected-item ownership. `PqLockedItemUpdate`
+  is parsed and persisted by modern code but ignored by the stock-era branch;
+  without P5136 producer or capture proof, update and nonempty list support
+  remain explicitly evidence- and design-blocked.
 
 ### Generation-bound client P2P reports
 
@@ -643,12 +664,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 704 regular tests and 2 opt-in proprietary-fixture tests passed
+# 706 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 704 regular passing tests comprise 9 CLI, 35 connector, 141 core, 85
-profile, 13 RHO5, 413 server unit, and 8 server integration tests. The two
+The 706 regular passing tests comprise 9 CLI, 35 connector, 142 core, 85
+profile, 13 RHO5, 414 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
@@ -706,6 +727,9 @@ Focused regressions cover:
   preservation; policy, owner-generation, and requester-generation stale-plan
   suppression; queue-full grant burning; public/protected owner-tombstone
   distinction; requester-only publication; and quiesce rejection;
+- exact protected-item request/reply hashes, strict truncation/wrong-hash/
+  trailing rejection, exact eight-byte terminal empty response, malformed
+  parsing before profile lookup, and authenticated requester-only dispatch;
 - exact three-slot main-emblem parsing, fail-closed catalog validation,
   present-owner preflight before profile admission, all-or-nothing
   transaction, durability-before-ACK, cancellation survival, stale-generation
@@ -763,6 +787,9 @@ These items prevent a "port complete" claim.
    global membership/name namespace; club creation is a separate system-design
    slice rather than a per-profile string write. Finish kart tuning/upgrades
    and the remaining quest/attendance/progression surface.
+   The terminal empty protected-item list is implemented. Nonempty
+   protected-item ownership and `PqLockedItemUpdate` remain blocked by
+   unproven P5136 wire semantics and durable-state policy.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
    fields; a later storage redesign should add zeroization/at-rest protection
@@ -801,10 +828,13 @@ These items prevent a "port complete" claim.
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. The generic authenticated fallback now
    returns `UnsupportedIdentityPacket`; it no longer reports silent success.
-2. Select the next evidence-complete request from that ledger and keep it a
-   bounded codec/dispatch slice. Leave nonempty Career records and owner-info
-   explicitly capture/evidence-blocked rather than inferring ownership,
-   pagination, or authorization policy.
+2. Port the bounded TCP `GameSlotPacket` codec identified by the stability
+   audit. Validate the P5136 envelope, size limits, player identity, type
+   allowlist, masks, finite numeric fields, and known type-12 operation/length
+   pairs before actor work. Malformed or deliberately unsupported item
+   effects must be observable nonfatal drops, not session-ending generic
+   packet errors. Do not apply the TCP cap to the separate UDP movement
+   envelope.
 3. Capture endpoint-report behavior with two stock clients and NAT-relevant
    topologies before adding a live peer-refresh/fanout packet or coupling the
    durable presentation port to observed UDP routing. Existing peers may

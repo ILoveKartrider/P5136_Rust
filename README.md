@@ -14,6 +14,7 @@ server. The implemented foundation provides:
 - the Korean P5136 first-message payload;
 - authentication, login, identity fencing, and channel migration over real TCP;
 - request-driven startup replies plus catalog-backed rider inventory/equipment;
+- strict terminal empty protected-item list compatibility reply;
 - actor-owned channel rooms with create/list/join/leave, bounded fan-out, and
   stale-generation cancellation;
 - bounded messenger TCP sessions with generation-fenced identity publication;
@@ -87,6 +88,11 @@ compatibility no-reply packets remain no-reply, while an unclassified hash
 returns a typed session error instead of being mistaken for a successful
 handler. MyRoom dispatch is exhaustive so new protocol variants cannot
 silently fall through.
+`PqLockedItemGet` is now a strict four-byte request and returns exactly one
+eight-byte terminal empty `PrLockedItemGet` to the authenticated requester.
+It performs no profile-store I/O or shared-state mutation. Nonempty protected
+items and `PqLockedItemUpdate` remain unimplemented because their
+P5136-specific wire and persistence policy lacks producer or capture proof.
 
 The remaining compatibility work is concentrated in the remaining MyRoom and
 economy requests, capture-derived movement sequencing and UDP first-bind

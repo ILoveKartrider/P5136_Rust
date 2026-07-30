@@ -93,6 +93,7 @@ been demonstrated.
 - [x] exhaustive MyRoom dispatch and explicit rejection of unclassified identity packets
 - [ ] stock-client RequestEmblems/main-emblem E2E
 - [x] generation-bound P2P-port report, persistence, and cache refresh
+- [x] strict terminal empty protected-item list
 - [ ] club rename after global membership/namespace invariants are specified
 - [x] exact MyRoom Career empty-list reply and kind-2 grant consumption
 - [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
