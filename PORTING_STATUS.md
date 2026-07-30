@@ -23,12 +23,9 @@ work should continue.
   preserve it before adding stability fixes.
 - Current branch: `main`
 - Current committed checkpoint:
-  `4bd09cd Document resumable Rust port checkpoint`
-- The FirstState/Secede live-profile tranche described below has passed its
-  independent reviews and full validation.
-- The working tree contains the validated live-presentation, equipment, and
-  migration-safety tranche described below. It is awaiting its final independent
-  reviews and checkpoint commit. Do not discard, overwrite, or stash over it.
+  `dacb7bc Drain graceful wire operations in phases`
+- The live-profile, equipment, exact-transfer migration, and two-phase graceful
+  wire-drain tranches have passed independent reviews and full validation.
 
 ## Compatibility policy
 
@@ -50,116 +47,53 @@ whose bugs must be cloned.
   equipment/reward write or identity migration. Rust retains the last valid
   cached presentation and continues the independent operation.
 
-## Current uncommitted checkpoint
+## Current checkpoint
 
-The dirty tree is based on `4bd09cd` and contains changes in:
+`dacb7bc` adds cancellation-safe global wire admission and a stable outbound
+producer barrier:
 
-```text
-PORTING_STATUS.md
-crates/p5136-core/src/equipment_protocol.rs
-crates/p5136-server/src/identity.rs
-crates/p5136-server/src/lib.rs
-crates/p5136-server/src/myroom_hub.rs
-crates/p5136-server/src/myroom_persistence.rs
-crates/p5136-server/src/profile_io.rs
-crates/p5136-server/src/runtime.rs
-crates/p5136-server/src/session.rs
-crates/p5136-server/src/world.rs
-crates/p5136-server/src/equipment_persistence.rs  # new, untracked
-```
+- every fully decoded login frame owns one non-clone request guard through
+  handler completion, direct response, context update, and ready actor replies;
+- every actor-owned `OutboundBatch` owns a distinct non-clone guard from queue
+  reservation through successful write, write failure, or cancellation;
+- graceful shutdown closes and drains request admission while World/profile
+  services remain live, quiesces producers, drains accepted durable work,
+  establishes a stable World producer seal, closes and drains outbound
+  admission, then retires sessions and actors;
+- force shutdown closes both phases, wakes any graceful waiter, reports exact
+  abandoned request/outbound counts, and preserves the existing durable-disk
+  cleanup contract;
+- quiesce blocks timers, UDP ingress, new registration, and wire-producing
+  commands while allowing the exact completion/read/barrier commands required
+  for convergence;
+- World session close and ownerless migration expiry reconcile silently during
+  quiesce, so cleanup cannot manufacture post-seal wire work.
 
-Do not run a destructive Git command against this tree.
+The preceding `5cfcd02` checkpoint contains the cancellation-independent
+equipment writes, exact transfer IDs, live MyRoom presentation refresh, and
+migration safety work described later in this document.
 
-### Work implemented but not committed
-
-- Added identity-free `MyRoomProfilePresentation` projection and silent Hub
-  refresh. One refresh updates every matching owner/visitor role without an
-  immediate wire packet.
-- Made `GetRider`, channel migration, and durable reward completion carry fresh
-  full presentation data rather than reconstructing it from a historical or
-  partial cache.
-- Added cancellation-independent rider-equipment persistence:
-
-  - World reserves a bounded completion slot and mints an opaque ticket;
-  - a registered capability owns the admitted profile lane;
-  - RAII guards report abort-before-submit and accepted-outcome-loss paths;
-  - the durable transaction validates grants, saves the exact equipment
-    selection, and normalizes a nonzero kart with serial zero to serial one;
-  - World revalidates the ticket, identity generation, durable value, and full
-    presentation before publication;
-  - an active exact session silently refreshes MyRoom, refreshes the game-room
-    cache, and fans out to peers except the sender;
-  - disconnect cleanup is deferred while that source owns a pending equipment
-    write;
-  - graceful and forced shutdown accounting includes equipment tickets and
-    per-user indexes.
-
-- Made the equipment session continuation reload the full canonical profile
-  while it still owns the profile lane. The bound session can no longer retain
-  unrelated stale profile fields after an equipment write.
-- Matched the useful C# `SetRiderItems` framing behavior: an authenticated short
-  body is silently ignored, while trailing bytes after the first 65 are ignored.
-  The Rust path still identity-fences both cases.
-- Made `GetRider` normalize `kart != 0 && serial == 0` to serial one, durably
-  save it, and reply from the exact immutable receipt.
-- Made live race equipment changes update the frozen participant's GameResult
-  character and kart fields. Historical reward calculation remains sealed to
-  the completed result.
-- Reworked migration around an actor-minted exact transfer ID:
-
-  - preflight freezes that exact source identity generation;
-  - a linear RAII registration owns a pre-reserved completion slot;
-  - dropping the request reports abort independently of request cancellation;
-  - stale aborts cannot ABA-release a newer transfer using the same permit;
-  - completion revalidates source, destination, permit, and transfer ID;
-  - TTL is checked at actor dequeue time;
-  - graceful and forced shutdown account for admitted migration transfers.
-
-- Separated optional MyRoom presentation publication from durable reward,
-  equipment, migration, and GetRider correctness. Invalid presentation retains
-  the last valid Hub snapshot without killing World or rejecting the independent
-  operation.
-- Added focused tests for durability uncertainty, exact kart normalization,
-  malformed/trailing equipment packets, dropped response waiters, explicit
-  deferred close, silent MyRoom refresh, game result serialization, profile-lane
-  recovery, migration cancellation/ABA/TTL, and shutdown blocking/accounting.
-
-### Validation snapshot for the dirty tree
+### Validation snapshot
 
 Passed:
 
 ```text
-cargo test -p p5136-server --lib
-# 282 passed, 0 failed
-
-cargo check --workspace --all-features
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-# 547 passed, 0 failed
-
-cargo fmt --all -- --check
+# 562 passed, 0 failed
 git diff --check
 ```
 
 The 2026-07-29 source scan found no production Rust `unsafe` syntax, and the
 workspace forbids unsafe code.
 
-Three final read-only reviews examined this diff:
-
-- protocol/state review found no P0/P1 regression in equipment, GetRider,
-  live-race equipment, invalid-presentation isolation, exact-ID migration, or
-  deferred close;
-- Rust safety review found no P0 and confirmed zero unsafe code, but identified
-  the pre-existing graceful-shutdown operation-drain P1 recorded below;
-- test review found no blocking false positive and confirmed that the central
-  tests reach production handler, persistence, actor, serializer, and shutdown
-  paths.
-
-The remaining P2 coverage gaps are an outbound-queue-triggered deferred close,
-preflight reply cancellation before capability receipt, TTL expiry while the
-profile lane is blocked, and exact final GameResult batch ordering in the
-live-equipment test. The durable reward receipt mismatch is also a P2 typed
-terminal-invariant problem rather than a direct actor crash.
+Independent World/test and Rust-safety reviews found no P0/P1/P2 blocker.
+They verified exact RAII retirement on reserve/send/write failures, typed actor
+error recovery at the final World join, the producer command allowlist, and
+zero new production panic/unwrap/unsafe. Optional P3 coverage remains for a
+direct instrumented `AsyncWrite` cancellation test and a real TCP durable
+request that transitions from graceful to forced shutdown.
 
 ### Highest-priority follow-up
 
@@ -177,14 +111,21 @@ leases rather than copy the C# mechanics:
 5. timeout/abort cannot release another migration or leak a frozen identity;
 6. accepted durable work retains its normal publication/reply semantics.
 
-The same lease must also fix an existing graceful-shutdown P1: normal shutdown
-currently quiesces World and aborts session tasks before every already-admitted
-wire operation reaches its socket reply and session-context update. A profile
-save can therefore commit durably while the client receives no result. Graceful
-shutdown must close new packet admission, wait for operation leases to reach
-zero while World/profile/sidecars stay alive, and only then retire sessions.
-Forced shutdown may bypass the wait, but must report the exact abandoned
-operation count.
+Do not implement this as a copyable generation stamp. A pre-freeze command can
+remain queued after its requester is cancelled, so the World command or durable
+ticket must own the lease and return it with its reply. Compose the global wire
+guard and per-generation identity lease into one non-clone typestate capability.
+Acquire in the order global request guard → identity lease → profile lane.
+
+Migration preflight must freeze in the World actor, return a drain waiter, and
+perform the await in the session future; the actor must never await its own
+operation drain. Only after drain may migration acquire the profile lane.
+Success retires the old gate and installs a fresh gate for the new generation;
+exact abort/TTL reopens only the matching frozen gate.
+
+TCP is not the whole boundary. Production UDP ingress must acquire the same
+generation gate before readiness/dispatch. Keep recipient/background lookup
+separate so freezing source admission does not hide valid outbound recipients.
 
 This is a correctness fix and may intentionally differ internally from C#.
 
@@ -257,18 +198,19 @@ This is a correctness fix and may intentionally differ internally from C#.
 
 The normal path is now:
 
-1. World quiesce
-2. actor-owned session drain
-3. session task abort/join
-4. reward persistence drain
-5. profile runtime admission close and accepted-job drain while World is alive
-6. MyRoom completion FIFO barrier
-7. guarded World shutdown/join
-8. UDP and messenger cleanup
+1. close login request admission;
+2. wait for every admitted request guard while World/profile services are live;
+3. quiesce World timers, UDP ingress, registration, and new producers;
+4. stop/drain reward persistence and profile I/O;
+5. cross the MyRoom completion FIFO and stable World producer barriers;
+6. close outbound admission and wait for every queued writer guard;
+7. reconcile/drain World sessions, then abort/join their writer tasks;
+8. guarded World shutdown/join, followed by UDP and messenger cleanup.
 
-A deterministic supervisor test blocks the MyRoom profile worker, starts
-shutdown, proves World remains responsive, releases the worker, and verifies
-that the durable completion retires before World exits.
+Deterministic supervisor tests hold request guards and MyRoom profile work,
+prove World remains responsive, verify the durable publication reaches the
+active owner, and prove a later force request wakes an in-progress graceful
+wire drain.
 
 ### Force-shutdown visibility
 
@@ -353,7 +295,7 @@ that the durable completion retires before World exits.
   failure. Projection invariant failures and unrelated Hub invariant failures
   must keep their typed sources.
 
-## Verification completed at the previous clean checkpoint
+## Historical live-profile verification
 
 Passed:
 
@@ -407,18 +349,18 @@ P0, P1, or P2 findings:
 - test review: no blocking defect; optional future stress coverage is listed
   in the resume plan below.
 
-The full server suite, focused live-wire tests, workspace-wide tests,
-workspace-wide strict Clippy, formatting, and diff checks passed for committed
-checkpoint `4bd09cd`. See "Validation snapshot for the dirty tree" above for
-the newer, uncommitted tranche.
+These counts describe the earlier `4bd09cd` live-profile checkpoint. The
+current `dacb7bc` validation and larger counts are recorded in "Current
+checkpoint" above.
 
 ## Known gaps and decisions still required
 
 1. **Migration active-operation drain**
 
    Implement the exact operation-lease property described in
-   "Highest-priority follow-up," including the graceful-shutdown ordering fix.
-   This is the next correctness tranche after the current checkpoint commit.
+   "Highest-priority follow-up." Global graceful request/outbound draining is
+   complete; this next tranche closes the per-generation migration gap for
+   queued commands, durable tickets, cancellation, and UDP ingress.
 
 2. **Reward completion terminal invariant**
 
@@ -446,7 +388,7 @@ the newer, uncommitted tranche.
 4. **Fresh presentation beyond request-driven First/Secede**
 
    The live wire plan now makes FirstState and Secede faithful to C# disk
-   reads. The dirty tranche adds silent refresh for migration, equipment,
+   reads. The `5cfcd02` checkpoint adds silent refresh for migration, equipment,
    `GetRider`, and reward completion. Freshness still must cover:
 
    - direct/random/re-enter must load fresh owner and entrant presentation as
@@ -488,50 +430,35 @@ the newer, uncommitted tranche.
 
 9. **C# stability audit parity**
 
-   `P5136_STABILITY_AUDIT.md` identifies confirmed missing reconnect restore
-   for per-user `PartsData.json` and `LevelData.json`, an incomplete-kart grant
-   risk, insufficient `GameSlotPacket` framing checks, missing movement relay
-   fallback, and possible finish/ceremony state divergence. Repair confirmed
-   defects in C# with codec fixtures, and independently check the Rust port for
-   the intended safety property. Do not mechanically port the faulty C# path.
+   The C# tree now repairs confirmed Tune/Plant/Level/Parts reconnect restore,
+   kart 814 quarantine, TCP/GameSlot bounds, frozen result admission, settlement
+   cleanup, active-race team mutation, and Modern-vs-P5136 parser/RP separation.
+   Movement fallback and endpoint rebinding remain capture/policy questions,
+   not confirmed defects to copy mechanically.
 
 ## Exact resume plan
 
-1. Finish the three read-only reviews of the current dirty diff:
-
-   - protocol and intended-state compatibility, separating required behavior
-     from C# defects;
-   - Rust abstraction, cancellation, typed-error, terminal-invariant, and
-     `unsafe` audit;
-   - production-path and missing-interleaving test audit.
-
-   Resolve every P0/P1. Resolve or explicitly record P2 findings, rerun the
-   stabilization gate, and commit this tranche as one coherent checkpoint.
-
-2. Implement migration operation drain in a separate small commit:
+1. Implement migration operation drain in a separate small commit:
 
    - actor-minted, generation-bound, linear operation leases;
    - freeze-before-drain so no new source work enters;
+   - non-clone frame capability moved through queued World commands and durable
+     MyRoom/equipment tickets, then returned with the operation reply;
    - cancellation-independent exact lease retirement;
    - pending preflight release only after the active set becomes empty;
+   - source freeze and drain before acquiring the profile lane;
+   - UDP source admission through the same generation gate;
    - deterministic timeout, abort, stale-generation, shutdown, and request-
      cancellation tests;
    - an accepted durable equipment/profile operation must still publish and
      receive its normal result before migration commits.
 
-3. In the C# repository, convert the stability audit into tested fixes without
-   disturbing its pre-existing dirty work:
+2. Commit the reviewed C# stability tranche in its own repository. Keep the
+   audit's remaining evidence gates explicit: generic type-12 body shapes,
+   race-wide reward atomicity, nonzero AI master behavior, and advertised vs
+   observed P2P endpoints.
 
-   - restore per-user X-parts and level exception data during P5136 login;
-   - evaluate Tune/Level12/Parts12 sibling restore streams from captured client
-     requirements;
-   - quarantine or completeness-filter invalid kart grant candidates;
-   - validate `GameSlotPacket` framing before every typed read and log bounded
-     diagnostic metadata;
-   - add generation-fenced observed-endpoint movement relay fallback;
-   - define finish/result/ceremony admission from coherent race state.
-
-4. Harden remaining Rust completion paths:
+3. Harden remaining Rust completion paths:
 
    - make impossible durable reward receipt mismatches actor-terminal and
      diagnostic if the final review confirms the gap;
@@ -540,7 +467,7 @@ the newer, uncommitted tranche.
    - prove equipment completion cannot publish through a superseded identity;
    - keep invalid optional presentation isolated from durable operation success.
 
-5. Apply the same intended stability properties to Rust where applicable:
+4. Apply the same intended stability properties to Rust where applicable:
 
    - reconnect restore for every supported equipment enhancement generation;
    - catalog completeness filtering;
@@ -548,7 +475,7 @@ the newer, uncommitted tranche.
    - movement relay fallback using actor-owned generation-fenced UDP routes;
    - coherent race-result and ceremony participation.
 
-6. Resume the remaining MyRoom requests in small commits:
+5. Resume the remaining MyRoom requests in small commits:
 
    - direct/random/re-enter with intentional status codes and fresh entry
      presentation;
@@ -558,20 +485,20 @@ the newer, uncommitted tranche.
    - password and emblem flows;
    - main-emblem durable write and session refresh.
 
-7. Port `ChClientP2pAddrPacket` and club-name mutation paths before declaring
+6. Port `ChClientP2pAddrPacket` and club-name mutation paths before declaring
    MyRoom presentation complete.
 
-8. Resolve owner-disconnect semantics using stock-client captures and explicit
+7. Resolve owner-disconnect semantics using stock-client captures and explicit
    tests. Do not copy the C# tombstone behavior unless it is externally useful.
 
-9. Add Windows, macOS, and Linux CI, then validate the connector through
+8. Add Windows, macOS, and Linux CI, then validate the connector through
    Wine/CrossOver and run a two-client login/channel/room/race/persistence flow.
 
-10. For every request, preserve required wire behavior with a malformed-input
+9. For every request, preserve required wire behavior with a malformed-input
    test, exact-generation test, backpressure/cancellation test where relevant,
    and exact packet fixture.
 
-11. Run this stabilization gate before every Rust checkpoint:
+10. Run this stabilization gate before every Rust checkpoint:
 
    ```text
    cargo fmt --all -- --check
@@ -583,7 +510,7 @@ the newer, uncommitted tranche.
    git diff --check
    ```
 
-12. Search for accidental unsafe code:
+11. Search for accidental unsafe code:
 
    ```text
    rg -n "\bunsafe\b" crates -g "*.rs"
