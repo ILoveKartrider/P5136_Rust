@@ -116,6 +116,22 @@ speculative extra-data success code or value. Both paths reuse global identity
 admission and authorization, return one direct requester reply, and leave
 profile, disk, World domain state, and peer queues unchanged.
 
+`PqGetRiderInfo` now has a strict stock-producer parser for its zero scalar,
+empty reserved string, bounded target nickname, and raw mode byte. Successful
+cross-profile projection is deliberately unavailable until visibility,
+offline lookup, and public-profile policy are specified. The authenticated
+path therefore returns only the exact five-byte failure reply. It never logs
+the target nickname, loads or creates the target profile, mutates state, or
+fans out a request.
+
+`PqStartRiderSchool` is likewise exact: one encoded byte after the request hash
+and no suffix. Its 240-byte reply uses the shared validated P5136 kart-physics
+builder. This deliberately keeps the normal physics formula instead of
+copying two drifted C# shortcut constants or depending on process-global
+`SpeedPatch` state. Both the request and the direct reply are profile
+read-only, generation-fenced, and covered by stale/quiesce error-priority
+tests.
+
 Both stock P5136 shop-buy aliases are also explicit. Rust strictly parses the
 producer-derived 9-byte normal body and 11-byte item-preset body, then returns
 the exact common 29-byte failure packet. It does not execute a purchase,

@@ -27,18 +27,89 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 Current implementation checkpoint:
-`44c1266 Port strict stateless compatibility replies`
+`b5ef015 Port strict rider lookup and school start`
 
 ## Current Rust checkpoint
 
-The current checkpoint closes two additional stateless authenticated startup
-gaps. Stock-executable producers prove that `PqRequestExtradata` and
-`PqWebEventCompleteCheckPacket` are exact hash-only requests, so Rust rejects
-the trailing bytes that the C# handlers silently accepted. Their exact
-fail-closed replies are returned directly without profile I/O, state mutation,
-or fanout. The request-specific parser and the global identity-operation fence
-retain distinct typed error priorities, now fixed by combination tests. The C#
-repository remains unchanged and is evidence only.
+The current checkpoint closes two direct authenticated requests:
+`PqGetRiderInfo` and `PqStartRiderSchool`. Rust accepts only the exact
+stock-producer request layouts, preserves global generation/quiesce admission
+as the outermost fence, and then applies strict parsing before packet-specific
+identity/profile authorization. Rider lookup remains fail-closed until its
+cross-profile privacy and projection policy is designed. Rider-school start
+uses the canonical validated physics builder instead of cloning two anomalous
+C# shortcut constants or process-global mutable tuning state. Both paths are
+direct and profile read-only. The C# repository remains unchanged and is
+evidence only.
+
+### Fail-closed rider-info lookup
+
+- `PqGetRiderInfo` is `0x27770563`; `PrGetRiderInfo` is `0x27840564`.
+  The ordinary stock producer writes
+  `u32 scalar 0 | empty reserved UTF-16 string | bounded target UTF-16 string |
+  raw u8 mode`, for `17 + 2 * target_utf16_units` total bytes.
+- Rust accepts only scalar zero and an exactly empty reserved string, bounds
+  the target before allocation, preserves the complete `u8` mode domain, and
+  requires complete consumption. Nonzero scalar, negative/nonempty reserved
+  length, truncation, invalid or oversized target encoding, wrong hash, and
+  trailing bytes remain distinct typed errors.
+- The parsed request has private fields and getter-only access. It deliberately
+  does not implement `Debug`, and the session handler neither reads nor logs
+  the target nickname or mode.
+- The only exposed reply is the exact five-byte failure
+  `[64 05 84 27 00]`. It clears the stock client's pending lookup and reports
+  an unknown rider without disclosing whether a local or offline profile
+  exists. The handler has no profile-coordinator parameter and performs no
+  target-profile read, creation, persistence, request-specific World command,
+  mutation, retry, or fanout.
+- A successful response is intentionally deferred. The available response
+  schema has 44 fields, while the current C# compatibility serializer omits
+  ten tail bytes. Its nonzero-scalar branch corresponds to the derived couple
+  request rather than the ordinary producer. Rust does not expose either
+  malformed success projection until public-field, privacy, offline lookup,
+  and repository policy are explicit.
+- Global admission precedes parsing. For a live admitted identity, exact
+  parsing precedes `AuthorizeIdentity` and the bound-profile fence; malformed
+  plus unbound therefore returns `RiderInfoProtocolError`. Stale ownership and
+  quiesce remain outer errors and return `StaleSession` or
+  `OutboundProductionClosed` before this parser runs.
+- Tests pin both hashes, the exact stock request and failure bytes, every
+  truncated prefix, scalar/reserved invariants, UTF-16 unit bounds including
+  surrogate pairs, raw mode boundary values, trailing rejection, authenticated
+  fail-closed dispatch, in-memory and durable profile immutability, follow-up
+  session liveness, and stale/quiesce priority.
+
+### Canonical rider-school start
+
+- `PqStartRiderSchool` is `0x4327072D`; `PrStartRiderSchool` is
+  `0x4338072E`. The stock producer writes exactly one encoded `u8` after the
+  request hash, so the request is exactly five bytes. Rust decodes and
+  preserves the full `u8` domain without inventing an undocumented business
+  range, then rejects every truncated or trailing shape the C# handler
+  ignored.
+- The reply is exactly `hash | raw status 1 | 235-byte P5136 kart-physics
+  block`, for 240 total bytes. Serialization is fallible and
+  `KartPhysicsBuildError` propagates through `LoginSessionError`; no panic or
+  default-on-error path can emit a partial reply.
+- Rust reuses `build_p5136_kart_physics_block` with the validated S7 baseline.
+  The normal formula yields `2304.0` and `3745.587890625` at physics offsets
+  138 and 142. The compatibility shortcut instead hardcodes `2305.0` and
+  `3745.0`; that isolated drift and the mutable global `SpeedPatch` dependency
+  are deliberately not cloned. The canonical full-packet SHA-256 is
+  `52f16bc897e349ad220b226f3563653cb02718a2a2827076249ece194104ad9e`.
+- The opaque request byte currently selects no server state because neither
+  producer nor consumer evidence establishes its meaning. After exact parsing,
+  the request passes identity/profile fences and returns the canonical direct
+  reply without profile I/O, revision change, request-specific World command,
+  mutation, retry, or fanout.
+- Tests cover both hashes, exhaustive encoded-byte decoding, all truncations,
+  wrong hash and trailing rejection, exact response length/status/physics
+  fields/digest, unbound-profile ordering, authenticated direct dispatch,
+  profile immutability, follow-up liveness, stale migration ownership, and
+  quiesce.
+- The direct P5136 request-disposition ledger is now 32 of 40 explicit, with
+  eight remaining. The deliberate compatibility no-op table remains 25 of 25
+  explicit. Stock-client school-start E2E remains an open validation gate.
 
 ### Strict stateless compatibility replies
 
@@ -75,8 +146,9 @@ repository remains unchanged and is evidence only.
   the malformed/error-priority combinations.
 - These were tracked as additional shared startup-handler gaps rather than
   members of the 40 direct P5136 request-disposition set. That direct ledger
-  therefore remains 30 of 40 explicit with 10 missing; the deliberate no-op
-  table remains 25 of 25 explicit.
+  was therefore unchanged by this slice. After the later rider-info and
+  rider-school work, the current ledger is 32 of 40 explicit with eight
+  missing; the deliberate no-op table remains 25 of 25 explicit.
 - Stock analysis artifacts remain outside this repository. Stock-client E2E
   behavior and the successful extra-data value policy remain open evidence
   gaps.
@@ -114,12 +186,12 @@ repository remains unchanged and is evidence only.
   malformed input, identity continuity, stale migration ownership, and
   quiesce rejection. Stock-client purchase UI/E2E behavior and the meanings of
   the unknown fields remain open evidence gaps.
-- The direct P5136 request-disposition audit is now 30 of 40 explicit, leaving
-  10 missing requests after these two aliases were closed. The separate
-  deliberate compatibility no-op table remains 25 of 25 explicit.
-- The remaining direct-request names are `PqGetRiderInfo`,
-  `PqStartRiderSchool`, `LoRqDeleteItemPacket`, `PqUnLockedItem`,
-  `PqFavoriteItemUpdate`, `PqCheckMyClubStatePacket`,
+- These two aliases contributed to the earlier 30-of-40 checkpoint. The
+  current direct P5136 request-disposition audit is 32 of 40 explicit after
+  rider-info and rider-school integration. The separate deliberate
+  compatibility no-op table remains 25 of 25 explicit.
+- The remaining direct-request names are `LoRqDeleteItemPacket`,
+  `PqUnLockedItem`, `PqFavoriteItemUpdate`, `PqCheckMyClubStatePacket`,
   `PqGetUserWaitingJoinClubPacket`, `PqCheckCreateClubConditionPacket`,
   `PqGetClubListCountPacket`, and `PqGetClubWaitingCrewCountPacket`.
   `LoRqDeleteItemPacket` must not copy the C# success-without-deletion
@@ -788,6 +860,15 @@ these areas:
 - Bounds are enforced before variable-size allocation where Rust owns the
   decoder. The audit's broader C# "checksum before allocation" wording is not
   treated as a compatibility rule.
+- Ordinary rider-info lookup does not copy the C# parser's nonzero-scalar
+  branch from a derived couple-request schema or its ten-byte-short success
+  serializer. Rust strictly accepts the stock ordinary request and returns
+  only the non-disclosing failure until cross-profile public data policy is
+  defined.
+- Rider-school start does not copy the C# compatibility shortcut's two
+  drifted acceleration constants or read mutable process-global `SpeedPatch`
+  state. It uses the same validated canonical physics builder as normal Rust
+  race data and propagates serialization failure.
 - RequestItems never publishes Tune chunks before later sidecar validation,
   never reads unused Parts12 data, never uses the C# process-global
   `PreventItem` race, and never drops parts merely because the kart list is
@@ -858,18 +939,27 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored
-# 742 regular tests and 2 opt-in proprietary-fixture tests passed
+# 757 regular tests and 2 opt-in proprietary-fixture tests passed
 git diff --check
 ```
 
-The 742 regular passing tests comprise 9 CLI, 35 connector, 167 core, 85
-profile, 13 RHO5, 425 server unit, and 8 server integration tests. The two
+The 757 regular passing tests comprise 9 CLI, 35 connector, 179 core, 85
+profile, 13 RHO5, 428 server unit, and 8 server integration tests. The two
 opt-in tests exercise local proprietary RHO5 metadata and the full
 RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
 the installed fixture. Doc-tests also passed.
 
 Focused regressions cover:
 
+- exact ordinary rider-info scalar/reserved/target/mode parsing, private
+  parser-minted representation, UTF-16 and complete-consumption bounds, exact
+  five-byte non-disclosing failure, authenticated direct dispatch without
+  remote profile access, profile/revision immutability, session continuity,
+  and unbound/stale/quiesce error ordering;
+- exact five-byte encoded rider-school request over the complete decoded `u8`
+  domain; canonical 240-byte response fields and digest; fallible physics
+  serialization; strict truncation/trailing rejection; profile immutability;
+  follow-up liveness; and stale/quiesce priority;
 - exact hash-only extra-data/web-event requests; all four packet hashes; exact
   six-/four-byte replies; truncation, wrong-hash, and trailing rejection;
   authenticated direct dispatch; profile/revision immutability; identity
@@ -1013,6 +1103,12 @@ These items prevent a "port complete" claim.
    closed with the exact common response. Actual purchase authorization,
    pricing, inventory/currency transactions, replay/idempotency policy, and
    stock-client success behavior remain an economy design and evidence slice.
+   Ordinary rider-info lookup now parses the exact stock request and returns a
+   non-disclosing failure without target-profile access. A success path still
+   requires a public profile DTO, field-level privacy rules, offline lookup
+   authorization, and a corrected complete serializer; do not expose the
+   current C# ten-byte-short projection or create profiles as a lookup side
+   effect.
    Password request values are bounded and redacted but still use ordinary
    `String` storage and comparison, matching the existing plaintext profile
    fields; a later storage redesign should add zeroization/at-rest protection
@@ -1031,8 +1127,9 @@ These items prevent a "port complete" claim.
 
    Also add captures/fixtures for special observer-map master policy, AI
    roster/start and nonzero AI-master payloads, the real track-pool/control
-   surface, and any P5136-vs-modern packet difference still represented by a
-   fallback.
+   surface, stock-client rider-school start acceptance of the canonical
+   physics reply, and any P5136-vs-modern packet difference still represented
+   by a fallback.
 
 5. **Race-wide crash atomicity**
 
@@ -1058,12 +1155,16 @@ These items prevent a "port complete" claim.
 1. Continue the packet-disposition ledger: every known request must be
    implemented, an evidence-backed deliberate no-reply, explicitly
    unsupported, or capture-blocked. `PqServerTime` and both fail-closed shop
-   aliases are now explicit; 30 of 40 direct P5136 requests are classified,
-   leaving 10. The additional shared `PqRequestExtradata` and
+   aliases, strict fail-closed `PqGetRiderInfo`, and canonical
+   `PqStartRiderSchool` are now explicit; 32 of 40 direct P5136 requests are
+   classified, leaving eight. The additional shared `PqRequestExtradata` and
    `PqWebEventCompleteCheckPacket` paths are also explicit and strict from
-   stock producer evidence. Next inspect `PqGetRiderInfo` and
-   `PqStartRiderSchool`, then the club-query group; do not implement a request
-   or success policy before its producer, consumer, and serializer boundaries
+   stock producer evidence. Next inspect the five club-query requests as one
+   read-only evidence group, then `LoRqDeleteItemPacket`,
+   `PqUnLockedItem`, and `PqFavoriteItemUpdate`. Do not copy C# ACK-without-
+   deletion behavior, and require a fully parsed, validated, atomic durable
+   transition before any favorite-item update. Do not implement a request or
+   success policy before its producer, consumer, and serializer boundaries
    are established. The generic authenticated fallback returns
    `UnsupportedIdentityPacket`; it never reports silent success.
 2. Keep the completed bounded TCP GameSlot slice frozen at its current
@@ -1092,6 +1193,7 @@ These items prevent a "port complete" claim.
    cargo fmt --all -- --check
    cargo clippy --workspace --all-targets --all-features -- -D warnings
    cargo test --workspace --all-features
+   cargo test --workspace --all-features -- --ignored
    git diff --check
    rg -n "\bunsafe\b" crates -g "*.rs"
    ```

@@ -48,6 +48,8 @@ been demonstrated.
 - [x] cross-World capability misuse is rejected
 - [x] authenticated `PqServerTime` / `PrServerTime` legacy clock reply
 - [x] strict stock `PqRequestExtradata` and web-event completion replies
+- [x] strict fail-closed cross-profile `PqGetRiderInfo` boundary
+- [x] strict `PqStartRiderSchool` and canonical 240-byte physics reply
 
 ## World, Messenger, and UDP
 
