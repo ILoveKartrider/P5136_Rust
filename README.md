@@ -217,7 +217,7 @@ location.
 ### Runtime packet diagnostics
 
 Every `p5136` run creates a log file at
-`<current working directory>/logs/p5136-<timestamp>-<pid>.log`. The GUI shows
+`<p5136 executable directory>/logs/p5136-<timestamp>-<pid>.log`. The GUI shows
 the exact path beneath its title; set `P5136_LOG_DIR` to place it elsewhere.
 If the directory or file cannot be created, startup fails instead of silently
 running without diagnostics.
@@ -336,8 +336,7 @@ The Server tab can copy its advertised address and configured port into the
 Connector tab. GUI edits apply to the next server start and are intentionally
 not persisted.
 
-The Connector tab defaults its game directory to the process current working
-directory. It is a native Rust application on each host. On macOS/Linux it
+The Connector tab is a native Rust application on each host. On macOS/Linux it
 launches only `KartRider.exe` through Wine or CrossOver; on Windows, `auto` uses
 a UAC-backed native launch and refuses elevation unless the executable still
 has the known stock P5136 SHA-256. Use `p5136 connect --help` for the headless

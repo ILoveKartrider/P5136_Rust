@@ -379,8 +379,10 @@ fn item_probability_grid(ui: &mut egui::Ui, entries: &mut [ItemProbabilityEntry]
 }
 
 fn default_game_directory() -> PathBuf {
-    std::env::current_dir()
+    std::env::current_exe()
         .ok()
+        .and_then(|executable| executable.parent().map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -1403,14 +1405,8 @@ mod tests {
     use p5136_server::ItemProbabilityRankPolicy;
 
     use super::{
-        ConnectorGuiEvent, GuiInputs, GuiRunState, GuiRunner, GuiSuccess, P5136GuiApp,
-        ServerInputs, default_game_directory,
+        ConnectorGuiEvent, GuiInputs, GuiRunState, GuiRunner, GuiSuccess, P5136GuiApp, ServerInputs,
     };
-
-    #[test]
-    fn connector_defaults_to_the_process_current_directory() {
-        assert_eq!(default_game_directory(), std::env::current_dir().unwrap());
-    }
 
     fn fixture_inputs() -> GuiInputs {
         GuiInputs {
