@@ -12800,9 +12800,14 @@ mod tests {
             .unwrap();
         drop(next_owner.await.unwrap().unwrap());
 
-        let equipment =
-            EquipmentExceptions::load(profile_root.path(), profile_root.path().join("PlantRider"))
-                .unwrap();
+        let stored_profile = ProfileStore::new(profile_root.path())
+            .reload("PlantRider")
+            .unwrap();
+        let rider_directory = stored_profile
+            .source_path
+            .parent()
+            .expect("the stored profile revision has a rider directory");
+        let equipment = EquipmentExceptions::load(profile_root.path(), rider_directory).unwrap();
         assert_eq!(equipment.plant.len(), 1);
         assert_eq!(equipment.plant[0].id, 1);
         assert_eq!(equipment.plant[0].engine_category, 43);
