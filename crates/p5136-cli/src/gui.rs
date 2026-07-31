@@ -13,7 +13,11 @@ use p5136_connector::{
     Runner, RunnerBackend, execute_connector_with_progress_and_cancellation,
 };
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
-use p5136_server::{BoundServer, ServerConfig, ServerEndpoints};
+use p5136_server::{
+    BoundServer, ItemProbabilityConfiguration, ItemProbabilityEntry, ItemProbabilityRankBand,
+    ItemProbabilityRankPolicy, ServerConfig, ServerEndpoints, load_client_item_probabilities,
+    load_item_probability_xml,
+};
 
 use crate::{LoggingRuntime, client_paths};
 
@@ -199,6 +203,17 @@ struct ServerInputs {
     session_idle_timeout_seconds: String,
     session_write_timeout_seconds: String,
     max_login_sessions: String,
+    trust_client_item_rank: bool,
+    item_probabilities: ItemProbabilityConfiguration,
+    item_probability_source: GuiItemProbabilitySource,
+    item_probability_xml: String,
+    show_team_item_probabilities: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiItemProbabilitySource {
+    AutoClient,
+    Edited,
 }
 
 impl Default for ServerInputs {
@@ -216,6 +231,11 @@ impl Default for ServerInputs {
             session_idle_timeout_seconds: "300".to_owned(),
             session_write_timeout_seconds: "15".to_owned(),
             max_login_sessions: p5136_server::DEFAULT_MAX_LOGIN_SESSIONS.to_string(),
+            trust_client_item_rank: true,
+            item_probabilities: ItemProbabilityConfiguration::safe_fallback(),
+            item_probability_source: GuiItemProbabilitySource::AutoClient,
+            item_probability_xml: String::new(),
+            show_team_item_probabilities: false,
         }
     }
 }
@@ -255,6 +275,18 @@ impl ServerInputs {
             profile_root: required_path(&self.profile_root, "profile root")?,
             catalog_path: client_paths.catalog_path,
             client_data_dir: client_paths.client_data_dir,
+            item_probability_rank_policy: if self.trust_client_item_rank {
+                ItemProbabilityRankPolicy::TrustClientReported
+            } else {
+                ItemProbabilityRankPolicy::CombinedFallback
+            },
+            item_probabilities: match self.item_probability_source {
+                GuiItemProbabilitySource::AutoClient => None,
+                GuiItemProbabilitySource::Edited => {
+                    self.item_probabilities.validate()?;
+                    Some(self.item_probabilities.clone())
+                }
+            },
             first_message_delay: Duration::from_millis(parse_u64(
                 &self.first_message_delay_ms,
                 "first-message delay",
@@ -306,6 +338,44 @@ fn parse_usize(value: &str, label: &str) -> Result<usize> {
         .trim()
         .parse::<usize>()
         .with_context(|| format!("{label} must be a nonnegative integer"))
+}
+
+fn item_probability_grid(ui: &mut egui::Ui, entries: &mut [ItemProbabilityEntry]) -> bool {
+    let mut changed = false;
+    egui::ScrollArea::horizontal()
+        .id_salt("item-probability-table-scroll")
+        .show(ui, |ui| {
+            egui::Grid::new("item-probability-table")
+                .num_columns(6)
+                .striped(true)
+                .spacing([12.0, 5.0])
+                .show(ui, |ui| {
+                    for heading in ["ID", "Item", "1st", "High", "Middle", "Low"] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+                    for entry in entries {
+                        ui.label(entry.item_id.to_string());
+                        ui.label(&entry.name);
+                        for weight in [
+                            &mut entry.top_weight,
+                            &mut entry.high_weight,
+                            &mut entry.middle_weight,
+                            &mut entry.low_weight,
+                        ] {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(weight)
+                                        .range(0..=1_000_000_u32)
+                                        .speed(1.0),
+                                )
+                                .changed();
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    changed
 }
 
 fn default_game_directory() -> PathBuf {
@@ -416,6 +486,7 @@ struct P5136GuiApp {
     close_requested: bool,
     close_force_deadline: Option<Instant>,
     close_force_requested: bool,
+    item_probability_status: String,
 }
 
 impl P5136GuiApp {
@@ -436,6 +507,9 @@ impl P5136GuiApp {
             close_requested: false,
             close_force_deadline: None,
             close_force_requested: false,
+            item_probability_status:
+                "Auto: load the stock client item.rho/RHO5 tables when the server starts."
+                    .to_owned(),
         }
     }
 
@@ -747,6 +821,173 @@ impl P5136GuiApp {
         }
     }
 
+    fn load_client_item_probability_defaults(&mut self) {
+        let outcome = (|| -> Result<(ItemProbabilityConfiguration, PathBuf)> {
+            let paths = client_paths::resolve_client_runtime_paths(
+                optional_path(&self.server_inputs.client_path),
+                optional_path(&self.server_inputs.client_data_dir),
+            )?;
+            let data_dir = paths.client_data_dir.ok_or_else(|| {
+                anyhow!(
+                    "set the stock client directory or Client Data override before loading item.rho/RHO5"
+                )
+            })?;
+            let configuration = load_client_item_probabilities(&data_dir)
+                .with_context(|| format!("failed to load {}", data_dir.display()))?;
+            Ok((configuration, data_dir))
+        })();
+        match outcome {
+            Ok((configuration, data_dir)) => {
+                self.server_inputs.item_probabilities = configuration;
+                self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
+                self.item_probability_status = format!(
+                    "Loaded and pinned stock item.rho/RHO5 tables from {}.",
+                    data_dir.display()
+                );
+            }
+            Err(error) => {
+                self.item_probability_status = format!("item.rho/RHO5 load failed: {error:#}");
+            }
+        }
+    }
+
+    fn load_item_probability_xml_override(&mut self) {
+        let outcome = required_path(
+            &self.server_inputs.item_probability_xml,
+            "item-probability XML",
+        )
+        .and_then(|path| {
+            load_item_probability_xml(&path)
+                .with_context(|| format!("failed to load {}", path.display()))
+        });
+        match outcome {
+            Ok(configuration) => {
+                self.server_inputs.item_probabilities = configuration;
+                self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
+                "Loaded and pinned portable XML tables."
+                    .clone_into(&mut self.item_probability_status);
+            }
+            Err(error) => {
+                self.item_probability_status = format!("XML load failed: {error:#}");
+            }
+        }
+    }
+
+    fn item_probability_rank_policy_editor(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(
+            &mut self.server_inputs.trust_client_item_rank,
+            "Trust client-reported live rank (LAN/friends)",
+        )
+        .on_hover_text(
+            "Checked: Live uses the client's Top/High/Middle/Low rank. Unchecked: Live uses Combined weights.",
+        );
+    }
+
+    fn item_probability_editor(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Item probability editor", |ui| {
+            let mut edited = false;
+            self.item_probability_rank_policy_editor(ui);
+            let pinned =
+                self.server_inputs.item_probability_source == GuiItemProbabilitySource::Edited;
+            ui.add_enabled_ui(pinned, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Rank weights");
+                    egui::ComboBox::from_id_salt("item-probability-rank-band")
+                        .selected_text(self.server_inputs.item_probabilities.rank_band.label())
+                        .show_ui(ui, |ui| {
+                            for rank_band in [
+                                ItemProbabilityRankBand::Live,
+                                ItemProbabilityRankBand::Top,
+                                ItemProbabilityRankBand::High,
+                                ItemProbabilityRankBand::Middle,
+                                ItemProbabilityRankBand::Low,
+                                ItemProbabilityRankBand::Combined,
+                            ] {
+                                edited |= ui
+                                    .selectable_value(
+                                        &mut self.server_inputs.item_probabilities.rank_band,
+                                        rank_band,
+                                        rank_band.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("Load client item.rho/RHO5 values").clicked() {
+                    self.load_client_item_probability_defaults();
+                }
+                if ui.button("Use client values automatically").clicked() {
+                    self.server_inputs.item_probability_source =
+                        GuiItemProbabilitySource::AutoClient;
+                    "Auto: reload stock item.rho/RHO5 tables each time the server starts."
+                        .clone_into(&mut self.item_probability_status);
+                }
+                if ui.button("Use safe fallback").clicked() {
+                    self.server_inputs.item_probabilities =
+                        ItemProbabilityConfiguration::safe_fallback();
+                    self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
+                    "Pinned the bounded 14/18-item safe fallback tables."
+                        .clone_into(&mut self.item_probability_status);
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Portable XML");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.server_inputs.item_probability_xml)
+                        .hint_text("item-probabilities.xml")
+                        .desired_width(360.0),
+                );
+                if ui.button("Load XML").clicked() {
+                    self.load_item_probability_xml_override();
+                }
+            });
+
+            if pinned {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.server_inputs.show_team_item_probabilities,
+                        false,
+                        "Individual item",
+                    );
+                    ui.selectable_value(
+                        &mut self.server_inputs.show_team_item_probabilities,
+                        true,
+                        "Team item",
+                    );
+                });
+
+                let entries = if self.server_inputs.show_team_item_probabilities {
+                    &mut self.server_inputs.item_probabilities.team
+                } else {
+                    &mut self.server_inputs.item_probabilities.individual
+                };
+                edited |= item_probability_grid(ui, entries);
+            } else {
+                ui.weak(
+                    "Automatic client tables are resolved at server start. Use 'Load client item.rho/RHO5 values' to preview and pin them before editing.",
+                );
+            }
+            if edited {
+                self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
+                "Edited values are pinned for the next server start."
+                    .clone_into(&mut self.item_probability_status);
+            }
+            let status_color = if self.item_probability_status.contains("failed") {
+                egui::Color32::LIGHT_RED
+            } else {
+                egui::Color32::GRAY
+            };
+            ui.colored_label(status_color, &self.item_probability_status);
+            ui.weak(
+                "ID and item names are read-only. Weights are bounded and validated before bind.",
+            );
+        });
+    }
+
     fn server_input_panel(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("server-inputs")
             .num_columns(2)
@@ -847,6 +1088,7 @@ impl P5136GuiApp {
                     ui.end_row();
                 });
         });
+        self.item_probability_editor(ui);
 
         ui.weak(
             "Port offsets: game UDP = base, login TCP/P2P UDP = base + 1, messenger TCP = base + 2.",
@@ -1069,6 +1311,7 @@ fn run_server_worker(
         profile_root = %config.profile_root.display(),
         catalog_path = ?config.catalog_path,
         client_data_dir = ?config.client_data_dir,
+        item_probability_rank_policy = ?config.item_probability_rank_policy,
         remote_profile_creation = config.allow_remote_profile_creation,
         "GUI requested P5136 server startup"
     );
@@ -1159,6 +1402,7 @@ mod tests {
     };
 
     use p5136_connector::{ConnectorCancellation, ConnectorStage, RunnerBackend};
+    use p5136_server::ItemProbabilityRankPolicy;
 
     use super::{
         ConnectorGuiEvent, GuiInputs, GuiRunState, GuiRunner, GuiSuccess, P5136GuiApp, ServerInputs,
@@ -1218,6 +1462,7 @@ mod tests {
             session_idle_timeout_seconds: "240".to_owned(),
             session_write_timeout_seconds: "20".to_owned(),
             max_login_sessions: "32".to_owned(),
+            ..ServerInputs::default()
         };
 
         let config = inputs.server_config().unwrap();
@@ -1229,12 +1474,27 @@ mod tests {
         assert_eq!(config.profile_root, Path::new("runtime/Profiles"));
         assert_eq!(config.catalog_path, None);
         assert_eq!(config.client_data_dir, None);
+        assert_eq!(
+            config.item_probability_rank_policy,
+            ItemProbabilityRankPolicy::TrustClientReported
+        );
         assert!(config.allow_remote_profile_creation);
         assert_eq!(config.first_message_delay, Duration::from_millis(500));
         assert_eq!(config.login_timeout, Duration::from_secs(10));
         assert_eq!(config.session_idle_timeout, Duration::from_secs(240));
         assert_eq!(config.session_write_timeout, Duration::from_secs(20));
         assert_eq!(config.max_login_sessions, 32);
+
+        let safe = ServerInputs {
+            trust_client_item_rank: false,
+            ..inputs
+        }
+        .server_config()
+        .unwrap();
+        assert_eq!(
+            safe.item_probability_rank_policy,
+            ItemProbabilityRankPolicy::CombinedFallback
+        );
     }
 
     #[test]

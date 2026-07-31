@@ -1,0 +1,39 @@
+use std::sync::LazyLock;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+const VECTOR_BYTES: &str = "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";
+
+static ENCRYPT_VECTORS: LazyLock<Box<[u32]>> = LazyLock::new(|| {
+    let bytes = STANDARD
+        .decode(VECTOR_BYTES)
+        .expect("the embedded legacy RHO vector table is valid base64");
+    assert_eq!(
+        bytes.len(),
+        4 * 256 * size_of::<u32>(),
+        "the embedded legacy RHO vector table has a fixed audited size"
+    );
+    bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("chunks_exact returns four bytes")))
+        .collect()
+});
+
+pub(super) fn get_vector(value: u32) -> u32 {
+    (0..4).fold(0_u32, |vector, table| {
+        let index = usize::try_from((value >> (table * 8)) & 0xff)
+            .expect("one legacy RHO key byte fits usize");
+        vector ^ ENCRYPT_VECTORS[table * 256 + index]
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_vector;
+
+    #[test]
+    fn vector_table_matches_csharp_goldens() {
+        assert_eq!(get_vector(0), 0xefb2_be7c);
+        assert_eq!(get_vector(0x0102_0304), 0x7ff1_490d);
+    }
+}

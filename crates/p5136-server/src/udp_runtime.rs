@@ -471,6 +471,26 @@ impl UdpService {
         response_rx.await.map_err(|_| UdpServiceError::Closed)
     }
 
+    /// Authorizes a same-generation endpoint reset at one reactor arrival
+    /// boundary. Only later datagrams may claim the now-unbound routes.
+    pub async fn authorize_rebind(
+        &self,
+        identity: IdentityBinding,
+        boundary_epoch: u64,
+    ) -> Result<(), UdpServiceError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.commands
+            .send(UdpCommand::AuthorizeRebind {
+                identity,
+                boundary_epoch,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| UdpServiceError::Closed)?;
+        response_rx.await.map_err(|_| UdpServiceError::Closed)??;
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<(), UdpServiceError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.commands
@@ -501,6 +521,11 @@ enum UdpCommand {
         transport: UdpTransport,
         identity: IdentityBinding,
         response: oneshot::Sender<Option<CurrentUdpEndpoint>>,
+    },
+    AuthorizeRebind {
+        identity: IdentityBinding,
+        boundary_epoch: u64,
+        response: oneshot::Sender<Result<(), UdpEndpointStateError>>,
     },
     Shutdown {
         response: oneshot::Sender<()>,
@@ -878,6 +903,14 @@ async fn run_actor(
                 let target = endpoints.current_authorized_target(transport, &identity);
                 let _ = response.send(target);
             }
+            UdpCommand::AuthorizeRebind {
+                identity,
+                boundary_epoch,
+                response,
+            } => {
+                let result = endpoints.authorize_rebind(&identity, boundary_epoch);
+                let _ = response.send(result);
+            }
             UdpCommand::Shutdown { response } => {
                 endpoints.clear();
                 let _ = response.send(());
@@ -907,11 +940,12 @@ async fn dispatch_ingress(
     }
 
     let transport = request.ingress.transport;
-    let binding = endpoints.bind_authorized_ingress(
+    let binding = endpoints.bind_authorized_ingress_at(
         transport,
         &request.identity,
         request.ingress.source,
         request.ingress.route_hash,
+        request.ingress.arrival_epoch,
     )?;
     let socket = match transport {
         UdpTransport::Game => game_socket,

@@ -17,15 +17,23 @@ use cap_std::{
     fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions},
 };
 use fs2::FileExt;
-use p5136_core::nickname::{NicknameError, canonical_nickname_key, normalize_nickname};
+use p5136_core::{
+    equipment_protocol::XPartEquipRequest,
+    inventory::PartsExcRecord,
+    nickname::{NicknameError, canonical_nickname_key, normalize_nickname},
+};
 use rand::random;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
-use crate::{FavoriteItems, Profile};
+use crate::{
+    FavoriteItems, Profile,
+    equipment::{EquipmentExceptions, EquipmentProfileError},
+};
 
 const LEGACY_FILENAME: &str = "Launcher.json";
 const LEGACY_FAVORITE_ITEMS_FILENAME: &str = "Favorite.json";
+const LEGACY_LOCKED_ITEMS_FILENAME: &str = "Locked.json";
 const VERSION_PREFIX: &str = "Launcher.v";
 const VERSION_SUFFIX: &str = ".json";
 const RACE_RUN_GENERATION_PREFIX: &str = ".P5136RustRaceRun.v";
@@ -267,25 +275,25 @@ pub enum ProfileStoreError {
     },
 }
 
-/// Failure while importing the C# favorite-item sidecar into a Rust profile.
+/// Failure while importing a C# item-collection sidecar into a Rust profile.
 ///
 /// The importer deliberately has a narrower, fail-closed contract than the
-/// legacy C# reader: only a regular `Favorite.json` containing the exact
-/// bounded `FavoriteItems` JSON representation is accepted. A missing file is
-/// the sole empty-state case.
+/// legacy C# reader: only a regular, non-link JSON file containing the exact
+/// bounded item-key representation is accepted. A missing file is the sole
+/// empty-state case.
 #[derive(Debug, Error)]
-pub enum FavoriteItemImportError {
-    #[error("favorite-item profile storage operation failed")]
+pub enum LegacyItemCollectionImportError {
+    #[error("item-collection profile storage operation failed")]
     Store {
         #[source]
         source: Box<ProfileStoreError>,
     },
 
-    #[error("legacy favorite-item sidecar at {path} is not a regular non-symbolic-link file")]
+    #[error("legacy item-collection sidecar at {path} is not a regular non-symbolic-link file")]
     InvalidStorageEntry { path: PathBuf },
 
     #[error(
-        "legacy favorite-item sidecar at {path} has at least {length} bytes; configured maximum is {maximum}"
+        "legacy item-collection sidecar at {path} has at least {length} bytes; configured maximum is {maximum}"
     )]
     TooLarge {
         path: PathBuf,
@@ -293,7 +301,7 @@ pub enum FavoriteItemImportError {
         maximum: u64,
     },
 
-    #[error("legacy favorite-item JSON at {path} is invalid")]
+    #[error("legacy item-collection JSON at {path} is invalid")]
     Json {
         path: PathBuf,
         #[source]
@@ -301,7 +309,10 @@ pub enum FavoriteItemImportError {
     },
 }
 
-impl From<ProfileStoreError> for FavoriteItemImportError {
+pub type FavoriteItemImportError = LegacyItemCollectionImportError;
+pub type LockedItemImportError = LegacyItemCollectionImportError;
+
+impl From<ProfileStoreError> for LegacyItemCollectionImportError {
     fn from(source: ProfileStoreError) -> Self {
         Self::Store {
             source: Box::new(source),
@@ -348,23 +359,25 @@ impl ProfileTransactionContext {
     }
 }
 
-/// The provenance of favorite-item state supplied to a legacy-aware
-/// transaction.
+/// The provenance of item-collection state supplied to a legacy-aware transaction.
 ///
 /// Imported state must satisfy every current reply-bound before Rust seals the
 /// migration marker. Canonical state may be temporarily over a newly lowered
 /// bound so a later operation can shrink it without making recovery
 /// impossible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FavoriteItemStateOrigin {
+pub enum LegacyItemCollectionStateOrigin {
     /// State already present in the loaded Rust profile; external import was
     /// resolved by an earlier writer or legacy migration.
     Canonical,
-    /// The one captured C# `Favorite.json` sidecar snapshot.
+    /// The one captured C# sidecar snapshot.
     LegacySidecar,
 }
 
-impl FavoriteItemStateOrigin {
+pub type FavoriteItemStateOrigin = LegacyItemCollectionStateOrigin;
+pub type LockedItemStateOrigin = LegacyItemCollectionStateOrigin;
+
+impl LegacyItemCollectionStateOrigin {
     #[must_use]
     pub const fn is_legacy_sidecar(self) -> bool {
         matches!(self, Self::LegacySidecar)
@@ -461,6 +474,78 @@ impl ProfileStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Loads equipment sidecars through the run-bound root capability. The
+    /// profile directory and every optional file are opened without following
+    /// symbolic links/reparse points, and non-regular entries fail closed.
+    pub fn load_equipment_exceptions(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+    ) -> Result<EquipmentExceptions, EquipmentProfileError> {
+        self.validate_race_run_lease(lease)?;
+        let nickname = Self::normalize_storage_nickname(nickname)?;
+        let profile_lock = self.profile_lock(&nickname)?;
+        let _guard = lock(&profile_lock)?;
+        let snapshot = self.load_or_default_from_disk(&nickname)?;
+        let directory_name =
+            snapshot
+                .directory
+                .file_name()
+                .ok_or(ProfileStoreError::InternalInvariant {
+                    message: "equipment profile directory must have one terminal component",
+                })?;
+        let profile_directory = lease
+            .root_capability
+            .open_dir_nofollow(directory_name)
+            .map_err(|source| ProfileStoreError::Io {
+                operation: "open equipment profile directory without following links",
+                path: snapshot.directory.clone(),
+                source,
+            })?;
+        Ok(EquipmentExceptions::load_from_capabilities(
+            &lease.root_capability,
+            &profile_directory,
+            lease.root(),
+            &snapshot.directory,
+        )?)
+    }
+
+    /// Applies one X-part selection through the same lease-bound, no-follow
+    /// profile capability used by the importer and publishes its sidecar
+    /// atomically before returning.
+    pub fn equip_x_part(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        request: XPartEquipRequest,
+    ) -> Result<PartsExcRecord, EquipmentProfileError> {
+        self.validate_race_run_lease(lease)?;
+        let nickname = Self::normalize_storage_nickname(nickname)?;
+        let profile_lock = self.profile_lock(&nickname)?;
+        let _guard = lock(&profile_lock)?;
+        let snapshot = self.load_or_default_from_disk(&nickname)?;
+        let directory_name =
+            snapshot
+                .directory
+                .file_name()
+                .ok_or(ProfileStoreError::InternalInvariant {
+                    message: "equipment profile directory must have one terminal component",
+                })?;
+        let profile_directory = lease
+            .root_capability
+            .open_dir_nofollow(directory_name)
+            .map_err(|source| ProfileStoreError::Io {
+                operation: "open X-parts profile directory without following links",
+                path: snapshot.directory.clone(),
+                source,
+            })?;
+        Ok(EquipmentExceptions::equip_x_part_capability(
+            &profile_directory,
+            &snapshot.directory,
+            request,
+        )?)
     }
 
     pub(crate) fn normalize_storage_nickname(nickname: &str) -> Result<String, ProfileStoreError> {
@@ -881,6 +966,72 @@ impl ProfileStore {
         )
     }
 
+    /// Locked-item counterpart to
+    /// [`Self::transaction_with_legacy_favorite_items`]. An absent canonical
+    /// marker captures `Locked.json` exactly once through the same lease-bound,
+    /// no-follow reader, then publishes the import and incoming batch in one
+    /// immutable profile revision.
+    pub fn transaction_with_legacy_locked_items<T, E, F>(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        mut transaction: F,
+    ) -> Result<ProfileTransaction<Result<T, E>>, LockedItemImportError>
+    where
+        F: FnMut(&FavoriteItems, LockedItemStateOrigin) -> Result<(T, FavoriteItems), E>,
+    {
+        self.validate_race_run_lease(lease)?;
+        let nickname = Self::normalize_storage_nickname(nickname)?;
+        let profile_lock = self.profile_lock(&nickname)?;
+        let _guard = lock(&profile_lock)?;
+        let initial_snapshot = self.load_or_default_from_disk(&nickname)?;
+        let imported = initial_snapshot
+            .profile
+            .locked_items
+            .is_none()
+            .then(|| {
+                self.read_legacy_item_collection(
+                    lease,
+                    &initial_snapshot,
+                    LEGACY_LOCKED_ITEMS_FILENAME,
+                )
+            })
+            .transpose()?;
+        self.transaction_with_snapshot_locked(
+            &nickname,
+            Some(initial_snapshot),
+            |snapshot, context| {
+                let (current_items, origin) = match snapshot.profile.locked_items.as_ref() {
+                    Some(items) => (items, LockedItemStateOrigin::Canonical),
+                    None => (
+                        imported.as_ref().ok_or_else(|| {
+                            LockedItemImportError::from(ProfileStoreError::InternalInvariant {
+                                message:
+                                    "an unresolved locked-item marker requires one captured import",
+                            })
+                        })?,
+                        LockedItemStateOrigin::LegacySidecar,
+                    ),
+                };
+
+                let (value, next_items) = match transaction(current_items, origin) {
+                    Ok(result) => result,
+                    Err(error) => return Ok(ProfileMutation::Unchanged(Err(error))),
+                };
+
+                if context.has_immutable_revision()
+                    && snapshot.profile.locked_items.as_ref() == Some(&next_items)
+                {
+                    return Ok(ProfileMutation::Unchanged(Ok(value)));
+                }
+
+                let mut profile = snapshot.profile.clone();
+                profile.locked_items = Some(next_items);
+                Ok(ProfileMutation::changed(Ok(value), profile))
+            },
+        )
+    }
+
     fn transaction_with_snapshot<T, E, F>(
         &self,
         nickname: &str,
@@ -1112,22 +1263,28 @@ impl ProfileStore {
         lease: &RaceRunLease,
         snapshot: &DiskProfileSnapshot,
     ) -> Result<FavoriteItems, FavoriteItemImportError> {
+        self.read_legacy_item_collection(lease, snapshot, LEGACY_FAVORITE_ITEMS_FILENAME)
+    }
+
+    fn read_legacy_item_collection(
+        &self,
+        lease: &RaceRunLease,
+        snapshot: &DiskProfileSnapshot,
+        filename: &'static str,
+    ) -> Result<FavoriteItems, LegacyItemCollectionImportError> {
         let Some(directory_name) = snapshot.directory.file_name() else {
             return Err(ProfileStoreError::InternalInvariant {
                 message: "profile directory must have one terminal component",
             }
             .into());
         };
-        let sidecar_path = lease
-            .root()
-            .join(directory_name)
-            .join(LEGACY_FAVORITE_ITEMS_FILENAME);
+        let sidecar_path = lease.root().join(directory_name).join(filename);
         let profile_directory = lease
             .root_capability
             .open_dir_nofollow(directory_name)
             .map_err(|source| {
                 favorite_item_import_io(
-                    "open legacy favorite-item profile directory without following links",
+                    "open legacy item-collection profile directory without following links",
                     sidecar_path.clone(),
                     source,
                 )
@@ -1135,30 +1292,32 @@ impl ProfileStore {
         // This precheck avoids opening a known FIFO/device at all. It is not
         // trusted for authorization: the later no-follow nonblocking open and
         // opened-handle metadata check close the replacement race.
-        let metadata = match profile_directory.symlink_metadata(LEGACY_FAVORITE_ITEMS_FILENAME) {
+        let metadata = match profile_directory.symlink_metadata(filename) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 return Ok(FavoriteItems::default());
             }
             Err(source) => {
                 return Err(favorite_item_import_io(
-                    "inspect legacy favorite-item sidecar without following links",
+                    "inspect legacy item-collection sidecar without following links",
                     sidecar_path,
                     source,
                 ));
             }
         };
         if !metadata.file_type().is_file() {
-            return Err(FavoriteItemImportError::InvalidStorageEntry { path: sidecar_path });
+            return Err(LegacyItemCollectionImportError::InvalidStorageEntry {
+                path: sidecar_path,
+            });
         }
 
         let mut options = CapabilityOpenOptions::new();
         options.read(true).follow(FollowSymlinks::No).nonblock(true);
-        let file = match profile_directory.open_with(LEGACY_FAVORITE_ITEMS_FILENAME, &options) {
+        let file = match profile_directory.open_with(filename, &options) {
             Ok(file) => file,
             Err(source) => {
                 return Err(favorite_item_import_io(
-                    "open legacy favorite-item sidecar without following links",
+                    "open legacy item-collection sidecar without following links",
                     sidecar_path,
                     source,
                 ));
@@ -1166,16 +1325,18 @@ impl ProfileStore {
         };
         let opened_metadata = file.metadata().map_err(|source| {
             favorite_item_import_io(
-                "inspect opened legacy favorite-item sidecar",
+                "inspect opened legacy item-collection sidecar",
                 sidecar_path.clone(),
                 source,
             )
         })?;
         if !opened_metadata.file_type().is_file() {
-            return Err(FavoriteItemImportError::InvalidStorageEntry { path: sidecar_path });
+            return Err(LegacyItemCollectionImportError::InvalidStorageEntry {
+                path: sidecar_path,
+            });
         }
         if opened_metadata.len() > self.maximum_bytes {
-            return Err(FavoriteItemImportError::TooLarge {
+            return Err(LegacyItemCollectionImportError::TooLarge {
                 path: sidecar_path,
                 length: opened_metadata.len(),
                 maximum: self.maximum_bytes,
@@ -1197,11 +1358,11 @@ impl ProfileStore {
             })?;
         let length = u64::try_from(bytes.len()).map_err(|_| {
             FavoriteItemImportError::from(ProfileStoreError::InternalInvariant {
-                message: "favorite-item sidecar byte length must fit u64",
+                message: "item-collection sidecar byte length must fit u64",
             })
         })?;
         if length > self.maximum_bytes {
-            return Err(FavoriteItemImportError::TooLarge {
+            return Err(LegacyItemCollectionImportError::TooLarge {
                 path: sidecar_path,
                 length,
                 maximum: self.maximum_bytes,
@@ -1210,7 +1371,7 @@ impl ProfileStore {
         // C# sidecar readers accept an optional UTF-8 BOM; preserve that
         // migration compatibility while keeping the JSON record schema strict.
         let json = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-        serde_json::from_slice(json).map_err(|source| FavoriteItemImportError::Json {
+        serde_json::from_slice(json).map_err(|source| LegacyItemCollectionImportError::Json {
             path: sidecar_path,
             source,
         })
@@ -2318,7 +2479,8 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs, io,
+        fs::{self, File},
+        io,
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
@@ -2326,8 +2488,11 @@ mod tests {
         thread,
     };
 
+    use p5136_core::equipment_protocol::XPartEquipRequest;
     use serde_json::json;
     use tempfile::tempdir;
+
+    use crate::{EquipmentProfileError, EquipmentStateError, equipment::MAX_EQUIPMENT_STATE_BYTES};
 
     use super::{
         PROFILE_REVISION_RETENTION, ProfileMutation, ProfileStore, ProfileStoreError,
@@ -2336,6 +2501,21 @@ mod tests {
         race_run_generations, race_run_marker_bytes, revisions_descending, store_id_file_bytes,
         version_filename,
     };
+
+    fn valid_x_part_request() -> XPartEquipRequest {
+        XPartEquipRequest {
+            kart_id: 1_401,
+            kart_serial: 1,
+            item_category: 63,
+            item_id: 2,
+            quantity: i16::MAX,
+            unknown_1: 0,
+            grade: 1,
+            unknown_2: 1,
+            parts_value: 1_180,
+            unknown_3: 0,
+        }
+    }
 
     #[test]
     fn creates_and_loads_an_immutable_first_revision() {
@@ -2362,6 +2542,75 @@ mod tests {
 
         store.load_or_create("Rider").unwrap();
         assert!(store.profile_exists("rIDER").unwrap());
+    }
+
+    #[test]
+    fn x_part_capability_rejects_a_nonregular_sidecar_before_mutation() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        store.load_or_create("XPartDirectory").unwrap();
+        let sidecar = root.path().join("xpartdirectory").join("PartsData.json");
+        fs::create_dir(&sidecar).unwrap();
+        let lease = store.acquire_race_run_lease().unwrap();
+
+        assert!(matches!(
+            store.equip_x_part(&lease, "XPartDirectory", valid_x_part_request()),
+            Err(EquipmentProfileError::State(
+                EquipmentStateError::InvalidStorageEntry { .. }
+            ))
+        ));
+        assert!(sidecar.is_dir());
+    }
+
+    #[test]
+    fn x_part_capability_rejects_malformed_and_oversized_sidecars() {
+        let malformed_root = tempdir().unwrap();
+        let malformed_store = ProfileStore::new(malformed_root.path());
+        malformed_store.load_or_create("MalformedXPart").unwrap();
+        let malformed_sidecar = malformed_root
+            .path()
+            .join("malformedxpart")
+            .join("PartsData.json");
+        fs::write(&malformed_sidecar, b"{not-json").unwrap();
+        let malformed_lease = malformed_store.acquire_race_run_lease().unwrap();
+        assert!(matches!(
+            malformed_store.equip_x_part(
+                &malformed_lease,
+                "MalformedXPart",
+                valid_x_part_request(),
+            ),
+            Err(EquipmentProfileError::State(
+                EquipmentStateError::Json { .. }
+            ))
+        ));
+        assert_eq!(fs::read(&malformed_sidecar).unwrap(), b"{not-json");
+
+        let oversized_root = tempdir().unwrap();
+        let oversized_store = ProfileStore::new(oversized_root.path());
+        oversized_store.load_or_create("OversizedXPart").unwrap();
+        let oversized_sidecar = oversized_root
+            .path()
+            .join("oversizedxpart")
+            .join("PartsData.json");
+        File::create(&oversized_sidecar)
+            .unwrap()
+            .set_len(MAX_EQUIPMENT_STATE_BYTES + 1)
+            .unwrap();
+        let oversized_lease = oversized_store.acquire_race_run_lease().unwrap();
+        assert!(matches!(
+            oversized_store.equip_x_part(
+                &oversized_lease,
+                "OversizedXPart",
+                valid_x_part_request(),
+            ),
+            Err(EquipmentProfileError::State(
+                EquipmentStateError::TooLarge { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::metadata(&oversized_sidecar).unwrap().len(),
+            MAX_EQUIPMENT_STATE_BYTES + 1
+        );
     }
 
     #[test]

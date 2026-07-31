@@ -226,8 +226,31 @@ impl CatalogInventory {
             .filter(move |item| item.category == category)
     }
 
+    /// Returns whether one catalog item is safe to expose as owned inventory.
+    ///
+    /// Older inventory-only catalogs have no kart-name/spec metadata, so their
+    /// kart grants retain the historical behavior. When a kart has an exported
+    /// name, however, that name must resolve to an actual spec; exposing a
+    /// named-but-unresolved kart makes the stock client's `MyRoom` search
+    /// instantiate incomplete client data.
+    #[must_use]
+    pub fn grants_item(&self, category: u16, item_id: u16) -> bool {
+        self.items.iter().any(|item| {
+            item.category == category
+                && item.id == item_id
+                && is_grant_item(item)
+                && self.has_usable_kart_spec(item)
+        })
+    }
+
     pub fn grant_items(&self) -> impl Iterator<Item = &CatalogInventoryItem> {
-        self.items.iter().filter(|item| is_grant_item(item))
+        self.items
+            .iter()
+            .filter(|item| is_grant_item(item) && self.has_usable_kart_spec(item))
+    }
+
+    fn has_usable_kart_spec(&self, item: &CatalogInventoryItem) -> bool {
+        item.category != 3 || self.kart_name(item.id).is_none() || self.kart_spec(item.id).is_some()
     }
 
     fn from_reader<R: BufRead>(
@@ -2047,7 +2070,10 @@ mod tests {
                     <Spec name="one"><BodyParam /></Spec>
                     <Spec name="unreferenced"><BodyParam /></Spec>
                 </Specs>
-                <Inventory total="0" categories="0" />
+                <Inventory total="2" categories="1">
+                    <Item category="3" id="1" />
+                    <Item category="3" id="2" />
+                </Inventory>
             </KartCatalog>"#,
         )
         .unwrap();
@@ -2055,6 +2081,15 @@ mod tests {
         assert!(unresolved.kart_spec(2).is_none());
         assert_eq!(unresolved.kart_spec_stats().unresolved_names, 1);
         assert_eq!(unresolved.kart_spec_stats().unreferenced_specs, 1);
+        assert!(unresolved.grants_item(3, 1));
+        assert!(!unresolved.grants_item(3, 2));
+        assert_eq!(
+            unresolved
+                .grant_items()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
 
         let target_overflow = parse_structural(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">

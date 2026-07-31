@@ -17,6 +17,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

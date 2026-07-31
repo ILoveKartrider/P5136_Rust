@@ -1,4 +1,4 @@
-//! Bounded, stable-order favorite-item state stored inside a Rust profile.
+//! Bounded, stable-order item-key collections stored inside a Rust profile.
 //!
 //! The C# server uses a separate sidecar for this state. Rust profiles use an
 //! explicitly namespaced field instead; importing the C# sidecar is an
@@ -20,7 +20,7 @@ use serde::{
 };
 use thiserror::Error;
 
-/// A bounded, insertion-ordered collection of unique favorite-item keys.
+/// A bounded, insertion-ordered collection of unique P5136 item keys.
 ///
 /// Mutation is exposed only as a pure whole-batch operation. That keeps the
 /// original value available for an atomic profile transaction if validation
@@ -30,10 +30,20 @@ pub struct FavoriteItems {
     items: Vec<FavoriteItemKey>,
 }
 
+/// Locked items have the same key, stable-order, deduplication, batch, and wire
+/// bounds as favorite items. Keeping one value abstraction prevents their
+/// persistence rules from drifting while profile fields retain distinct names.
+pub type LockedItems = FavoriteItems;
+
 /// Projects an absent, not-yet-canonicalized profile field as an empty wire
 /// snapshot.
 #[must_use]
 pub fn favorite_item_snapshot(items: Option<&FavoriteItems>) -> &[FavoriteItemKey] {
+    item_collection_snapshot(items)
+}
+
+#[must_use]
+pub fn item_collection_snapshot(items: Option<&FavoriteItems>) -> &[FavoriteItemKey] {
     items.map_or(&[], FavoriteItems::as_slice)
 }
 
@@ -44,6 +54,14 @@ pub fn favorite_item_snapshot(items: Option<&FavoriteItems>) -> &[FavoriteItemKe
 /// marker distinguishes a canonical empty collection from a legacy profile
 /// whose external-import decision has not yet been made.
 pub fn apply_favorite_item_changes(
+    current: Option<&FavoriteItems>,
+    changes: &[FavoriteItemChange],
+    effective_maximum: usize,
+) -> Result<FavoriteItems, FavoriteItemStateError> {
+    apply_item_collection_changes(current, changes, effective_maximum)
+}
+
+pub fn apply_item_collection_changes(
     current: Option<&FavoriteItems>,
     changes: &[FavoriteItemChange],
     effective_maximum: usize,

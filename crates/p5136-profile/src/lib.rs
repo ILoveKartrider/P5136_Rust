@@ -16,14 +16,15 @@ pub use catalog::{
     is_grant_item,
 };
 pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
-pub use equipment::{EquipmentExceptions, EquipmentStateError};
+pub use equipment::{EquipmentExceptions, EquipmentProfileError, EquipmentStateError};
 pub use favorite_items::{
-    DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS, FavoriteItemStateError, FavoriteItems,
-    apply_favorite_item_changes, favorite_item_snapshot,
+    DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS, FavoriteItemStateError, FavoriteItems, LockedItems,
+    apply_favorite_item_changes, apply_item_collection_changes, favorite_item_snapshot,
+    item_collection_snapshot,
 };
 pub use inventory::{
     InventoryBuildError, apply_rider_item_selection, build_inventory_snapshot,
-    build_inventory_snapshot_with_equipment, rider_item_snapshot,
+    build_inventory_snapshot_with_equipment, generated_x_part_is_granted, rider_item_snapshot,
 };
 pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,
@@ -41,7 +42,8 @@ pub use progression::{
     apply_race_reward_once, apply_time_reward, finish_reward, time_reward_from_rolls,
 };
 pub use store::{
-    FavoriteItemImportError, FavoriteItemStateOrigin, LoadedProfile, ProfileMutation, ProfileStore,
-    ProfileStoreError, ProfileStoreId, ProfileTransaction, ProfileTransactionContext,
-    RaceRunGeneration, RaceRunLease, SavedProfile,
+    FavoriteItemImportError, FavoriteItemStateOrigin, LegacyItemCollectionImportError,
+    LegacyItemCollectionStateOrigin, LoadedProfile, LockedItemImportError, LockedItemStateOrigin,
+    ProfileMutation, ProfileStore, ProfileStoreError, ProfileStoreId, ProfileTransaction,
+    ProfileTransactionContext, RaceRunGeneration, RaceRunLease, SavedProfile,
 };

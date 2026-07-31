@@ -23,6 +23,12 @@ pub struct Profile {
     pub favorite_items: Option<crate::favorite_items::FavoriteItems>,
     #[serde(
         default,
+        rename = "P5136RustLockedItems",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub locked_items: Option<crate::favorite_items::LockedItems>,
+    #[serde(
+        default,
         rename = "P5136RustRaceRewardReceipt",
         skip_serializing_if = "Option::is_none"
     )]

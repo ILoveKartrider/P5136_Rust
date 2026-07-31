@@ -46,6 +46,11 @@ been demonstrated.
 - [x] Wine and CrossOver launch specifications
 - [x] no-argument Server/Connector GUI and equivalent CLI
 - [x] GUI-configurable server lifecycle with explicit graceful/forced shutdown
+- [x] GUI item-probability rank/table editor with client archive, portable XML,
+  automatic-client, and bounded-fallback sources; automatic rows require an
+  explicit load-and-pin before editing
+- [x] explicit client-reported live-rank trust toggle, enabled by default for
+  the current LAN/friends model with Combined fallback when disabled
 - [ ] verified launch of a stock client on Windows
 - [ ] verified launch of the same client through Wine or CrossOver
 
@@ -76,13 +81,20 @@ been demonstrated.
 - [x] typed standalone World startup and actor-termination errors
 - [x] atomic eight-slot concurrent room admission
 - [x] channel-isolated room create/list/join/leave integration
+- [x] table-driven public race-channel mapping for speed/item individual/team
+  and matching newbie channels
 - [x] ready, team, master, and observer actor state
 - [x] bounded AI slot/wire primitives
 - [x] loading readiness, timeout, start ordering, and frozen race roster
 - [x] generation-bound Game/P2P endpoint registration and relay
 - [x] synchronized UDP receive/activation order across generation boundaries
 - [x] exact-generation actor-owned UDP audience selection
-- [x] bounded TCP GameSlot parsing and exact-generation atomic relay
+- [x] exact-generation UDP reconnect reset for both Game/P2P routes with an
+  arrival-epoch fence against stale datagrams
+- [x] bounded TCP GameSlot type 1/2/4/6/9/10/11/12/16 parsing and
+  exact-generation atomic relay for evidence-backed audiences
+- [x] strict 67-class type-12 state/length/count manifest with typed
+  retained/static/default evidence and fail-closed static-only actions
 - [x] Messenger identity validation, chat rooms, and single-writer queues
 - [x] Messenger split/coalesced frame and mid-frame generation fencing
 - [x] bounded actor-output flushing without read-loop starvation
@@ -92,7 +104,9 @@ been demonstrated.
 ## Profile, MyRoom, and gameplay
 
 - [x] versioned atomic profile store and canonical per-profile lanes
-- [x] rider/account initialization and catalog-backed inventory preload
+- [x] rider/account initialization and catalog-backed inventory preload,
+  excluding named kart entries whose exported spec cannot be resolved and
+  sanitizing persisted equipment/sidecars that still reference them
 - [x] durable rider equipment/plant selection with actor cache publication
 - [x] MyRoom core topology and generation-aware cleanup/migration
 - [x] fresh MyRoom FirstState projection
@@ -109,11 +123,16 @@ been demonstrated.
 - [x] bounded MyRoom RequestEmblems authorization and exact catalog packet
 - [x] three-slot transactional main-emblem persistence and cache refresh
 - [x] race start/grid/readiness with deterministic fallback track
+- [x] actor-owned room track, basic-AI, closed-slot, rider-talk, and macro-chat
+  transitions with bounded atomic fanout
 - [ ] live track-pool/mode/random-track control surface
 - [x] finish, ranking, settlement, team booster, and DNF deadline
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
 - [x] bounded read-only native RHO5 emblem-definition extraction
+- [x] bounded read-only legacy Rh-layer-1.1 `item.rho` probability extraction,
+  authenticated block decoding, BML parsing, and strict bounded portable XML
+  override
 - [x] exhaustive MyRoom dispatch and explicit rejection of unclassified identity packets
 - [ ] stock-client RequestEmblems/main-emblem E2E
 - [x] generation-bound P2P-port report, persistence, and cache refresh
@@ -121,15 +140,33 @@ been demonstrated.
 - [x] exact normal/preset shop-buy parsing and fail-closed failure reply
 - [x] atomic durable canonical favorite-item Get/Update and session-cache refresh
 - [x] lease-bound/no-follow C# `Favorite.json` import and encrypted-TCP favorite E2E
-- [ ] authoritative type-1/type-2 item pickup award and synthesis
+- [x] atomic durable canonical locked-item Get/Update and lease-bound/no-follow
+  C# `Locked.json` import
+- [x] lease-bound/no-follow X-parts update with atomic sidecar publication
+  before the exact success reply
+- [x] shared generated X-parts grant/serialization table and non-terminal
+  inferred failure reply for unpublished values or sidecar persistence errors
+- [x] requested kart/speed single-player physics with explicit bounded
+  contribution fallbacks
+- [x] atomic time-attack start/finish persistence, checked economy arithmetic,
+  and one-shot finish replay protection
+- [x] bounded complete telemetry codecs for every retained report shape,
+  including the isolated four-length unidentified driving report
+- [x] authoritative type-1/type-2 item pickup probability roll, exact response
+  synthesis, strict captured request/token validation, replay/rate admission,
+  and sender-inclusive atomic room broadcast in game types 2/4
+- [ ] actor-owned live race position and track-box spawn/collision authority
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
 - [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow
 - [x] exact MyRoom Career empty-list reply and kind-2 grant consumption
 - [x] durable single-player scenario start and bound-revision completion reply
 - [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
-- [ ] evidence ledger for every deliberate no-reply/unsupported packet
-- [ ] implement the 21 stateful or unidentified TCP requests still marked
-  pending in `CAPTURED_PACKET_COVERAGE.md`
+- [x] evidence ledger for every deliberate no-reply/unsupported packet in the
+  retained corpus
+- [x] all 28 formerly unclassified retained TCP request families assigned to
+  typed query, actor, durable-state, client-event, single-player, or telemetry
+  domains
+- [ ] X-parts categories outside the retained category-63 producer evidence
 - [ ] remaining kart tuning/upgrades and quest/attendance/progression surface
 - [ ] race-wide multi-profile reward journal/recovery
 
@@ -140,11 +177,17 @@ been demonstrated.
 - [ ] differential request/response harness passes for the supported flow
 - [ ] movement envelope, tick wrap, and fallback are capture-verified
 - [ ] production AI start and nonzero AI-master behavior are capture-verified
-- [ ] generic type-12 behavior is capture-verified
+- [x] all 1,471 retained TCP GameSlot records cross the strict parser
+- [ ] static-only type-12 reachability, source/target/object ownership, and
+  type 4/6/16 routing are capture-verified
 - [ ] Windows, macOS, and Linux CI pass
 - [ ] native Windows connector launches a stock P5136 client
 - [ ] Wine or CrossOver connector launches the same client
 - [ ] two clients login, migrate, join a room, race, persist, and shut down
+- [x] opt-in external corpus audit parses all 19,496 retained inbound records,
+  resolves all 100 hashes, fully parses all former 28 gap families, strictly
+  parses all 1,471 TCP GameSlot records, and decodes every retained routed
+  UDP/P2P packet
 - [x] build, runtime, connector, and resume documentation exists
 
 Detailed retained-log coverage:

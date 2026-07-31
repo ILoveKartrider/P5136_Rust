@@ -3,12 +3,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use p5136_core::{
-    equipment_protocol::RiderItemSelection,
+    equipment_protocol::{RiderItemSelection, XPartEquipRequest},
     inventory::{InventorySnapshot, RiderItemGroup, RiderItemRecord},
 };
 use thiserror::Error;
 
-use crate::{CatalogInventory, EquipmentExceptions, Profile, RiderItems, is_grant_item};
+use crate::{CatalogInventory, EquipmentExceptions, Profile, RiderItems};
 
 const PRE_PARTS_CATEGORY_ORDER: &[u16] = &[
     21, 52, 1, 32, 16, 11, 8, 9, 61, 7, 28, 22, 23, 12, 13, 18, 20, 4, 31, 27, 26, 70, 2, 30, 36,
@@ -119,9 +119,8 @@ pub fn apply_rider_item_selection(items: &mut RiderItems, selection: RiderItemSe
 /// Builds the complete catalog-backed rider-item portion of `PqGetRider`.
 ///
 /// Plant and equipped-parts exception records are profile sidecars in the C#
-/// implementation. They remain empty here until those two sidecar formats are
-/// loaded; the item stream itself is complete and preserves its physical
-/// category/X-parts boundaries.
+/// implementation. Loaded records are restricted to client-safe catalog karts;
+/// the item stream preserves its physical category/X-parts boundaries.
 pub fn build_inventory_snapshot(
     catalog: &CatalogInventory,
     profile: &Profile,
@@ -132,8 +131,15 @@ pub fn build_inventory_snapshot(
 pub fn build_inventory_snapshot_with_equipment(
     catalog: &CatalogInventory,
     profile: &Profile,
-    equipment: EquipmentExceptions,
+    mut equipment: EquipmentExceptions,
 ) -> Result<InventorySnapshot, InventoryBuildError> {
+    equipment
+        .plant
+        .retain(|record| exception_kart_is_granted(catalog, record.id));
+    equipment
+        .parts
+        .retain(|record| exception_kart_is_granted(catalog, record.id));
+
     let prevent_item = profile.server_setting.prevent_item_use != 0;
     let slot_changer = profile.rider.slot_changer;
     let mut records = catalog
@@ -182,79 +188,127 @@ pub fn build_inventory_snapshot_with_equipment(
     })
 }
 
+fn exception_kart_is_granted(catalog: &CatalogInventory, kart_id: i16) -> bool {
+    u16::try_from(kart_id).is_ok_and(|kart_id| catalog.grants_item(3, kart_id))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GeneratedPartsSeries {
+    item_id: u16,
+    grade: u8,
+    starts: [i16; 4],
+    engine_end: i16,
+    step: i16,
+}
+
+const GENERATED_PARTS_SERIES: &[GeneratedPartsSeries] = &[
+    GeneratedPartsSeries {
+        item_id: 1,
+        grade: 1,
+        starts: [1_053, 1_053, 1_053, 1_053],
+        engine_end: 1_080,
+        step: 3,
+    },
+    GeneratedPartsSeries {
+        item_id: 1,
+        grade: 2,
+        starts: [1_005, 1_005, 1_005, 1_005],
+        engine_end: 1_050,
+        step: 5,
+    },
+    GeneratedPartsSeries {
+        item_id: 1,
+        grade: 3,
+        starts: [910, 910, 910, 910],
+        engine_end: 1_000,
+        step: 10,
+    },
+    GeneratedPartsSeries {
+        item_id: 1,
+        grade: 4,
+        starts: [810, 810, 810, 810],
+        engine_end: 900,
+        step: 10,
+    },
+    GeneratedPartsSeries {
+        item_id: 2,
+        grade: 1,
+        starts: [1_153, 1_053, 1_153, 1_053],
+        engine_end: 1_180,
+        step: 3,
+    },
+    GeneratedPartsSeries {
+        item_id: 2,
+        grade: 2,
+        starts: [1_105, 1_005, 1_105, 1_005],
+        engine_end: 1_150,
+        step: 5,
+    },
+    GeneratedPartsSeries {
+        item_id: 2,
+        grade: 3,
+        starts: [1_010, 910, 1_010, 910],
+        engine_end: 1_100,
+        step: 10,
+    },
+    GeneratedPartsSeries {
+        item_id: 2,
+        grade: 4,
+        starts: [910, 810, 910, 810],
+        engine_end: 1_000,
+        step: 10,
+    },
+];
+
 fn add_generated_parts_groups(item_groups: &mut Vec<RiderItemGroup>, slot_changer: u16) {
-    add_parts_group(
-        item_groups,
-        1,
-        1,
-        [1_053, 1_053, 1_053, 1_053],
-        1_080,
-        3,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        1,
-        2,
-        [1_005, 1_005, 1_005, 1_005],
-        1_050,
-        5,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        1,
-        3,
-        [910, 910, 910, 910],
-        1_000,
-        10,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        1,
-        4,
-        [810, 810, 810, 810],
-        900,
-        10,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        2,
-        1,
-        [1_153, 1_053, 1_153, 1_053],
-        1_180,
-        3,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        2,
-        2,
-        [1_105, 1_005, 1_105, 1_005],
-        1_150,
-        5,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        2,
-        3,
-        [1_010, 910, 1_010, 910],
-        1_100,
-        10,
-        slot_changer,
-    );
-    add_parts_group(
-        item_groups,
-        2,
-        4,
-        [910, 810, 910, 810],
-        1_000,
-        10,
-        slot_changer,
-    );
+    for series in GENERATED_PARTS_SERIES {
+        add_parts_group(
+            item_groups,
+            series.item_id,
+            series.grade,
+            series.starts,
+            series.engine_end,
+            series.step,
+            slot_changer,
+        );
+    }
+}
+
+/// Verifies that an X-parts request names an exact record from the generated
+/// inventory sent to this profile.
+///
+/// Categories 63 through 66 are synthesized rather than loaded as ordinary
+/// catalog grants. Keeping this predicate on the same series table as the
+/// serializer prevents the server from rejecting an item it issued itself.
+#[must_use]
+pub fn generated_x_part_is_granted(slot_changer: u16, request: XPartEquipRequest) -> bool {
+    let Ok(category) = u16::try_from(request.item_category) else {
+        return false;
+    };
+    let Ok(item_id) = u16::try_from(request.item_id) else {
+        return false;
+    };
+    let Some(category_index) = category
+        .checked_sub(63)
+        .filter(|index| usize::from(*index) < 4)
+        .map(usize::from)
+    else {
+        return false;
+    };
+    if u16::from_le_bytes(request.quantity.to_le_bytes()) != slot_changer {
+        return false;
+    }
+    let Some(series) = GENERATED_PARTS_SERIES
+        .iter()
+        .find(|series| series.item_id == item_id && series.grade == request.grade)
+    else {
+        return false;
+    };
+    let start = series.starts[category_index];
+    let end = series.engine_end - series.starts[0] + start;
+    request.parts_value >= start
+        && request.parts_value <= end
+        && (request.parts_value - start) % series.step == 0
 }
 
 fn catalog_amount(category: u16, id: u16, slot_changer: u16) -> u16 {
@@ -282,9 +336,8 @@ fn add_granted_karts(
     prevent_item: bool,
 ) {
     let known_karts = catalog
-        .items()
-        .iter()
-        .filter(|item| item.category == 3 && is_grant_item(item))
+        .grant_items()
+        .filter(|item| item.category == 3)
         .map(|item| item.id)
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
@@ -348,7 +401,9 @@ mod tests {
     use std::{collections::BTreeMap, fmt::Write as _};
 
     use p5136_core::{
-        equipment_protocol::{SET_RIDER_ITEMS_REQUEST_NAME, parse_set_rider_items},
+        equipment_protocol::{
+            SET_RIDER_ITEMS_REQUEST_NAME, XPartEquipRequest, parse_set_rider_items,
+        },
         inventory::{PartsExcRecord, PlantExcRecord, RiderItemGroup},
         packet::PacketWriter,
     };
@@ -357,7 +412,7 @@ mod tests {
 
     use super::{
         InventoryBuildError, add_catalog_groups, apply_rider_item_selection,
-        build_inventory_snapshot_with_equipment, rider_item_snapshot,
+        build_inventory_snapshot_with_equipment, generated_x_part_is_granted, rider_item_snapshot,
     };
 
     fn complete_catalog_xml() -> String {
@@ -385,7 +440,17 @@ mod tests {
         }
 
         let mut xml = format!(
-            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr"><Inventory total="{}" categories="60">"#,
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+               <Names>
+                   <Kart id="1450" name="resolvedTestKart" />
+                   <Kart id="1453" name="unresolvedTestKart" />
+               </Names>
+               <Specs>
+                   <Spec name="resolvedTestKart">
+                       <BodyParam ForwardAccelForce="147" DragFactor="-0.05" />
+                   </Spec>
+               </Specs>
+               <Inventory total="{}" categories="60">"#,
             items.len()
         );
         for (category, id) in items {
@@ -393,6 +458,55 @@ mod tests {
         }
         xml.push_str("</Inventory></KartCatalog>");
         xml
+    }
+
+    fn equipment_with_unresolved_sidecars() -> EquipmentExceptions {
+        let granted_plant = PlantExcRecord {
+            id: 1_450,
+            serial: 2,
+            engine_category: 43,
+            engine_id: 1,
+            handle_category: 44,
+            handle_id: 2,
+            wheel_category: 45,
+            wheel_id: 3,
+            kit_category: 46,
+            kit_id: 4,
+        };
+        let granted_parts = PartsExcRecord {
+            id: 1_450,
+            serial: 2,
+            engine: 1,
+            engine_grade: 1,
+            engine_value: 1_053,
+            handle: 2,
+            handle_grade: 1,
+            handle_value: 1_053,
+            wheel: 3,
+            wheel_grade: 1,
+            wheel_value: 1_053,
+            booster: 4,
+            booster_grade: 1,
+            booster_value: 1_053,
+            coating: 5,
+            tail_lamp: 6,
+        };
+        EquipmentExceptions {
+            plant: vec![
+                granted_plant,
+                PlantExcRecord {
+                    id: 1_453,
+                    ..granted_plant
+                },
+            ],
+            parts: vec![
+                granted_parts,
+                PartsExcRecord {
+                    id: 1_453,
+                    ..granted_parts
+                },
+            ],
+        }
     }
 
     #[test]
@@ -416,42 +530,16 @@ mod tests {
             },
         ];
 
-        let equipment = EquipmentExceptions {
-            plant: vec![PlantExcRecord {
-                id: 1_450,
-                serial: 2,
-                engine_category: 43,
-                engine_id: 1,
-                handle_category: 44,
-                handle_id: 2,
-                wheel_category: 45,
-                wheel_id: 3,
-                kit_category: 46,
-                kit_id: 4,
-            }],
-            parts: vec![PartsExcRecord {
-                id: 1_450,
-                serial: 2,
-                engine: 1,
-                engine_grade: 1,
-                engine_value: 1_053,
-                handle: 2,
-                handle_grade: 1,
-                handle_value: 1_053,
-                wheel: 3,
-                wheel_grade: 1,
-                wheel_value: 1_053,
-                booster: 4,
-                booster_grade: 1,
-                booster_value: 1_053,
-                coating: 5,
-                tail_lamp: 6,
-            }],
-        };
-        let snapshot =
-            build_inventory_snapshot_with_equipment(&catalog, &profile, equipment).unwrap();
+        let snapshot = build_inventory_snapshot_with_equipment(
+            &catalog,
+            &profile,
+            equipment_with_unresolved_sidecars(),
+        )
+        .unwrap();
         assert_eq!(snapshot.plant_exceptions.len(), 1);
         assert_eq!(snapshot.parts_exceptions.len(), 1);
+        assert_eq!(snapshot.plant_exceptions[0].id, 1_450);
+        assert_eq!(snapshot.parts_exceptions[0].id, 1_450);
         assert_eq!(snapshot.item_groups.len(), 49);
         assert_eq!(snapshot.item_groups[0].records[0].category, 21);
         assert_eq!(snapshot.item_groups[35].records[0].category, 39);
@@ -490,6 +578,40 @@ mod tests {
                 .amount,
             321
         );
+    }
+
+    #[test]
+    fn generated_x_part_validation_uses_the_same_series_as_inventory_publication() {
+        let observed_v1_engine = XPartEquipRequest {
+            kart_id: 1_454,
+            kart_serial: 1,
+            item_category: 63,
+            item_id: 2,
+            quantity: i16::MAX,
+            unknown_1: 0,
+            grade: 2,
+            unknown_2: 1,
+            parts_value: 1_150,
+            unknown_3: 0,
+        };
+        assert!(generated_x_part_is_granted(
+            i16::MAX as u16,
+            observed_v1_engine
+        ));
+
+        let mut value_not_published = observed_v1_engine;
+        value_not_published.parts_value = 1_149;
+        assert!(!generated_x_part_is_granted(
+            i16::MAX as u16,
+            value_not_published
+        ));
+
+        let mut wrong_inventory_amount = observed_v1_engine;
+        wrong_inventory_amount.quantity = 321;
+        assert!(!generated_x_part_is_granted(
+            i16::MAX as u16,
+            wrong_inventory_amount
+        ));
     }
 
     #[test]

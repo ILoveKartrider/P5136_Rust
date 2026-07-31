@@ -26,13 +26,13 @@ short feature ledger is in [PORTING.md](PORTING.md).
 
 Branch: `main`
 
-State: clean, reviewed captured-initialization checkpoint. The next live action
-is to rerun the stock client with the `p5136-corpus-audit` release named below
-and verify that traffic progresses beyond `SpRqKoinBalance` through the
-already-supported channel switch. The wider retained gameplay corpus is
-inventoried but not falsely marked complete.
+State: retained-corpus implementation complete, independently reviewed, and
+release-validated. The next live action after this checkpoint is a fresh
+stock-client startup run, followed by the two-machine LAN multiplayer E2E.
+Protocol coverage is not presented as proof of those live client gates.
 
 Current implementation checkpoint:
+uncommitted retained-corpus completion work on `main` +
 `406a9e9 Handle captured Koin queries and scenarios` +
 `1cdb3aa Complete login initialization query coverage` +
 `4c806af Complete post-rider startup query replies` +
@@ -43,6 +43,205 @@ Current implementation checkpoint:
 `8be036e Add bounded packet diagnostics`
 
 ## Current Rust checkpoint
+
+### Authoritative item-box pickup and probability controls (2026-07-30)
+
+The stock-client run in
+`target\p5136-gameslot-static\release\logs\p5136-1785453355779-31260.log`
+reached item individual gameplay and sent three valid 73-byte type-1
+`GameSlotPacket` item-box requests at 23:18:36 and 23:18:46. All three passed
+the strict hash, sender, all-bits mask, finite-position, blob-length, and
+`GopCube`/`GoItemCube` checks. The World actor then returned the explicit
+`ItemPickupSynthesis` evidence-pending outcome, so no packet was sent. This
+was the complete cause of the missing item acquisition; there was no new
+transport or client disconnect error in that interval.
+
+- Parsed type 1/2 requests now mint a `SynthesizeItemPickup` capability.
+  Before minting it, the parser requires the captured pre-award state and the
+  repeated object/tick/owner fields to agree. Type 1 requires its
+  `0xF00000xx` object and `tick/tick+1500` relation; type 2 requires its
+  `0x00FFFFFF` sentinel and captured current-item state. A reflected server
+  award is therefore not accepted as another request.
+  `ParsedGameSlotPacket::into_item_pickup_award` consumes that capability,
+  requires a positive item ID, preserves the validated request, replaces
+  offsets 38..39 with the chosen `i16`, and writes success byte 40. The exact
+  73-byte tail, declared 24-byte blob, and `GopCube` payload remain unchanged.
+- The single-writer World actor permits pickup only for the exact frozen human
+  sender during the existing active-race window and only in item individual
+  game type 2 or item team game type 4. Per race/player it rejects an exact
+  `(operation tick, kind, object)` replay and a wrapping-monotonic tick
+  regression while allowing the captured same-tick/different-object burst.
+  A six-token bucket refilling at four awards per second bounds fabricated
+  increasing ticks; the retained 65 pickups peak at three events in 100 ms,
+  500 ms, and one second, so the complete corpus remains admitted. Token,
+  replay, and rate state commit only after every recipient queue is reserved.
+  The actor then broadcasts the synthesized packet to the whole room including
+  the sender. Any full queue rejects the complete pickup without consuming
+  admission state.
+- `ItemProbabilityConfiguration` owns separate individual/team immutable
+  tables and `Live`, `Top`, `High`, `Middle`, `Low`, or `Combined` selection.
+  The explicit `ItemProbabilityRankPolicy` makes the trust boundary visible.
+  For the current LAN/friends model it defaults to `TrustClientReported`, so
+  `Live` uses the C# mapping (eight racers:
+  `Top, High, High, Middle, Middle, Low, Low, Low`). The GUI checkbox or
+  `--trust-client-item-rank false` selects `CombinedFallback` without changing
+  explicit Top/High/Middle/Low/Combined choices. IDs must be positive and
+  unique, tables are capped at 512 rows, names at 64 characters, each weight
+  at 1,000,000, and every active rank total must be nonzero. Checked `u64`
+  totals and an explicit `[0,total)` roll avoid overflow and modulo bias.
+- The installed P5136 data keeps these tables in the 28.9MB legacy
+  `Data\item.rho`, not the RHO5 packs. The new no-`unsafe`, read-only
+  Rh-layer-1.1 reader bounds archive/block/directory/name sizes, validates the
+  decrypted header and nonzero block checksums, rejects duplicate/out-of-range
+  metadata, and extracts only
+  `slot/itemProb_indi@zz.bml` and `slot/itemProb_team@zz.bml`. Its bounded
+  UTF-16 BML path reproduces the C# result exactly: 14 individual rows with
+  combined sum 400 and 18 team rows with sum 410. Equivalent RHO5 entries are
+  supported when no legacy `item.rho` exists.
+- A portable XML override uses
+  `<itemProbabilities rankBand="..."><individual>...` and `<team>...` with
+  stock `item` attributes `idx`, `name`, `toprank`, `highrank`, `midrank`,
+  and `lowrank`. It is read through one bounded handle and requires one exact
+  root, one instance of each section, complete closure, no DTD/text payload,
+  bounded rows, and no trailing partial document. CLI uses
+  `--item-probability-xml PATH`.
+- The native Server GUI now has the C#-equivalent rank selector, individual
+  and team tables, read-only IDs/names, bounded editable weights, and buttons
+  for client `item.rho`/RHO5 values, portable XML, automatic client reload,
+  and the safe 14/18-item fallback. As with the existing GUI controls, edits
+  apply at the next server start and are not persisted. Automatic tables are
+  intentionally non-editable until `Load client item.rho/RHO5 values` pins the
+  actual resolved rows, preventing a displayed fallback table from being
+  mistaken for the stock distribution. `Trust client-reported live rank
+  (LAN/friends)` is checked by default and can be cleared independently of the
+  selected probability table.
+- Kart-specific item remapping and actor-owned three-slot consumption/use
+  effects remain separate work. The base probability award is authoritative,
+  but Rust does not yet copy C# transformations that can double-transform an
+  item. The monotonic token and bounded rate gate do not yet prove track-box
+  spawn/collision ownership or clock freshness; those require actor-owned
+  track state or a verified UDP client-clock binding. Type 4/6/16 routing and
+  static-only type-12 ownership also remain evidence-gated.
+- The user confirmed the preceding item-individual room-mode fix and V1 parts
+  equip fix both work in the stock client. The next stock run should verify
+  visible item acquisition; a two-machine LAN run remains necessary for
+  sender-inclusive peer delivery.
+
+### Live MyRoom/X-parts/room-mode fixes (2026-07-30)
+
+The stock-client run recorded in
+`target\p5136-gameslot-static\release\logs\p5136-1785449807325-35392.log`
+separated one intentional EOF from two actionable failures and one room-mode
+policy gap.
+
+- MyRoom search sent no follow-up request before the client reset its TCP
+  connection. Static catalog comparison found five named kart entries without
+  a matching exported spec; one is kart `814`, `monster13`, which is included
+  by a `몬스터` search. Catalog grants now exclude only
+  named-but-unresolved karts when name/spec metadata exists. Inventory-only
+  legacy catalogs retain their old behavior, while profile duplicate-kart
+  grants use the same filtered grant iterator. A persisted equipped kart that
+  is no longer client-safe is atomically reset to the unequipped state during
+  `PqGetRider`, and plant/parts exception records for such karts are omitted
+  from the outbound preload.
+- The captured V1 engine request
+  `(kart=1454, serial=1, category=63, item=2, grade=2, value=1150)` was an
+  exact record generated and sent by the Rust inventory builder. The old
+  equipment path incorrectly checked it as an ordinary XML catalog grant,
+  making every generated category-63 through category-66 part impossible to
+  equip. Publication and authorization now share one typed series table and
+  validate category, item, grade, value step/range, and the profile-specific
+  inventory amount. A rejected value or sidecar persistence error returns an
+  inferred `PrEquipXPartsItem` result-1 failure and leaves durable state
+  unchanged instead of terminating the TCP session. Only result 0 is present
+  in retained traffic, so result 1 is documented as a compatibility inference,
+  not a captured golden. A real encrypted-TCP malformed-sidecar test verifies
+  the failure frame is followed by a successful request on the same session.
+- Public channel-to-room mapping now includes item individual
+  `65 -> 2`, item team `66 -> 4`, and the corresponding item/speed newbie
+  channels `8 -> 2`, `7 -> 4`, `14 -> 1`, and `13 -> 3`. Special battle,
+  club, and matchmaking channels remain closed rather than being silently
+  treated as ordinary rooms.
+- Regression coverage proves named unresolved kart grants, persisted rider
+  selection, and equipment sidecars are filtered; observed V1 values are
+  accepted from the same generated series; invalid values and sidecar failures
+  are non-terminal and non-mutating; and both item channels create matching
+  rooms.
+
+### Retained 19,496-record corpus completion (2026-07-30)
+
+- The external
+  `C:\Users\drash\Documents\kartrider\KartRider_5136\logs` corpus is now an
+  executable opt-in test boundary rather than a prose-only inventory.
+  `P5136_PACKET_TRACE_DIR` drives a read-only parser that verifies all 19,496
+  incoming records, 100 distinct hashes, and 97 TCP hashes. Every TCP hash is
+  owned by a composed Rust dispatch domain, every actual packet in the former
+  28-hash gap is fully consumed by its strict codec, and every Game/P2P UDP
+  record passes the routed UDP codec.
+- The five room-control gaps use the existing actor boundary. Track/room-data,
+  bounded basic AI, closed slots, room talk, and macro chat are parsed before
+  an actor command; authorization/state checks and all-recipient queue
+  reservation precede atomic fanout. Macro text comes from the bound profile
+  and preserves team filtering.
+- X-parts now load and publish `PartsData.json` through the run lease and
+  no-follow profile capability. The file is atomically replaced and synced
+  before the exact success reply is possible. Windows directory-handle
+  `sync_all` incompatibility is handled by syncing the file and rename, then
+  verifying the directory capability; Unix retains directory `fsync`.
+  Nonregular, malformed, and oversized sidecars fail closed without mutation.
+  Only category 63 appears in this retained corpus; broader X-parts evidence
+  remains an explicit non-corpus feature gap.
+- Locked items share the bounded ordered-set value abstraction with favorites
+  but remain a distinct canonical profile field. Get/Update use one canonical
+  profile lane and immutable durability receipt. An unresolved C#
+  `Locked.json` is captured exactly once through the same lease-bound,
+  no-follow importer; import plus the first update share one revision.
+  Nonregular, malformed, and oversized sidecars leave canonical state
+  unresolved and cannot produce success.
+- The single-player/time-attack codec consumes the complete captured shapes,
+  including producer bytes ignored by C#. Kart physics is built for the
+  requested kart and speed from the catalog with explicit fallback reasons
+  for contributions not represented by current authoritative data. Time
+  attack start atomically charges the checked entry fee and stores
+  mode/track state before reply. Finish requires one active start, uses checked
+  Lucci arithmetic, atomically stores time/RP/Lucci before reply, and consumes
+  the active-run capability so a replay cannot reward twice.
+  A duplicate start while that capability is active is rejected before profile
+  I/O or fee deduction; its regression test proves revision, Lucci, and the
+  exact active-run state remain unchanged.
+- Career state and UDP reconnect are typed client events. Career state is
+  bounded diagnostic input. Reconnect authorizes only the same identity
+  generation and clears both Game/P2P route bindings behind the UDP arrival
+  epoch fence, preventing a pre-reset datagram from becoming the replacement
+  endpoint.
+- Game AI, game report, frame, relay, ride-event, and ride-path telemetry all
+  have bounded complete-consumption codecs. The repeated unknown hash
+  `0x5815082A` is isolated to its four retained lengths
+  `64/68/76/80`; arbitrary unknown hashes still fail closed. Rust does not
+  copy the C# client-authoritative anti-cheat mutation or its disabled relay
+  branch.
+- Strict Windows gates pass with 896 registered tests: 893 run by default and
+  three ignored local opt-in tests. The opt-in set covers both proprietary
+  client-data extractors and the complete external packet corpus. Workspace
+  all-target/all-feature Clippy with `-D warnings`, formatting, and
+  `git diff --check` pass. Production Rust remains under workspace
+  `unsafe_code = "forbid"`; the legacy RHO crypto and parsing path also uses no
+  `unsafe`.
+- The independent GameSlot re-review found no P0. Its native-zero reserved
+  word and stale-frozen-recipient findings were corrected and revalidated.
+  The 67 manifest pairs and count formulas were independently matched against
+  the external matrix. Automatic future synchronization with that external
+  analysis artifact and authoritative object ownership remain documented
+  evidence/tooling gaps rather than guessed runtime policy.
+- The fresh CLI/GUI E2E build is
+  `target\p5136-gameslot-static\release\p5136.exe` (16,265,728 bytes, SHA-256
+  `AC668AE6D7D9A8E6660696EDD6F6917EB2FD3D4BE5953A99F1D39E12BC727BDC`).
+  It was built in a distinct target directory and its `--help` startup path
+  exits successfully. Launch with no arguments for the Server/Connector GUI
+  or use the documented `server`/`connect` CLI commands.
+- No C# files were modified. C# remains protocol/product evidence; checked
+  arithmetic, persist-before-success, replay denial, actor state ownership,
+  and explicit unknown rejection intentionally improve unsafe C# behavior.
 
 The current checkpoint closes the direct-request disposition ledger at 40 of
 40 by adding strict item-state boundaries for `LoRqDeleteItemPacket`,
@@ -256,14 +455,18 @@ unchanged and is evidence only.
   lengths as successful no-reply compatibility packets. Independent review
   rejected it: room track/AI/slot/chat, X-parts, kart physics, and time-attack
   requests require replies, broadcasts, or durable state changes. That broad
-  fallback was removed before commit or release. The remaining 21 gaps
-  deliberately return `UnsupportedIdentityPacket`, with a regression test
-  pinning every hash, instead of letting client/server state diverge.
+  fallback was removed before commit or release. At that historical
+  checkpoint the remaining 21 gaps deliberately returned
+  `UnsupportedIdentityPacket` rather than letting state diverge; the current
+  retained-corpus checkpoint above supersedes that state and implements all
+  21 in their owning domains.
 - Independent final review found no P1 issue after that correction. Its P2
   recommendations were applied: scenario identity/profile validation now
   precedes profile-lane admission, opaque completion documentation says
   length-only validation, malformed 21/23-byte and wrong-hash completion tests
-  were added, and all 21 pending hashes are asserted fail-closed.
+  were added, and the then-pending hashes were asserted fail-closed. Those
+  assertions were removed only as each owning implementation and regression
+  test replaced them.
 - Workspace all-feature validation passes with 839 regular tests and two local
   opt-in tests ignored. Formatting, `git diff --check`, workspace
   all-target/all-feature Clippy with `-D warnings`, and the workspace
@@ -670,23 +873,37 @@ unchanged and is evidence only.
   bytes before copying it. This codec is independent of the opaque UDP relay
   envelope that happens to use the same packet name; the TCP cap is never
   applied to UDP movement traffic.
-- The accepted Korean P5136 types are exactly `1`, `2`, `9`, `10`, `11`, and
-  `12`. Claimed player IDs must be in `0..=15`; type-specific masks, exact
-  declared lengths, complete consumption, item-vector counts, pickup
-  operation hashes, and finite pickup coordinates are validated before the
-  actor command is created. Modern-only types `5`, `7`, `8`, and `17` are
-  nonfatal unsupported drops.
-- Type 12 uses a checked-in static allowlist of 74 exact
-  operation/base-operation hash pairs rather than scanning a packet-name enum
-  at runtime. Tests independently recompute every pair from its two names,
-  require 74 unique entries, and parse every entry. Banana, Course, Rocket,
-  and Barricade also require captured raw lengths `30`, `32`, `73`, and `73`;
-  a wrong length cannot fall back to the generic branch.
-- A Barricade operation additionally requires its marker, inner owner,
-  reserved field, and all twelve transform floats to be valid. Only that
-  validated operation includes the sender. The remaining 70 generic pairs
-  currently prove only the pair, nonzero low-16 mask, bounded exact envelope,
-  and overall cap; their inner bodies are not claimed to be capture-verified.
+- The accepted Korean P5136 wire types are `1`, `2`, `4`, `6`, `9`, `10`,
+  `11`, `12`, and `16`. Claimed player IDs must be in `0..=15`;
+  type-specific masks, declared lengths, complete consumption, item-vector
+  counts, object IDs, known operation hashes, and finite coordinates are
+  checked before an actor command exists. Unsupported types are nonfatal
+  no-side-effect drops.
+- Type 12 uses a checked-in manifest of the 67 writer classes recovered by
+  the static item-operation audit. Each exact operation/base pair carries its
+  state-field width and offset plus fixed, state-mapped, or checked
+  count-derived raw-length rules. Object ID `-1`, length drift, truncated
+  fields, a nonzero native-reserved outer word, count overflow, and bodies
+  above 960 bytes fail closed. Tests cover all 67 unique pairs, every explicit
+  branch and default shape, adjacent length drift, every canonical truncated
+  prefix, and missing object IDs.
+- The 67-class manifest is a manually transcribed static-writer candidate
+  set, not proof that every native state is reachable or peer-safe. Its
+  evidence type distinguishes retained trace, explicit static branch, and
+  writer default. Static-only forms parse into an `EvidencePending` action
+  and cannot be relayed or mutate state.
+- Only four exact type-12 forms currently mint relay capability:
+  `GopBanana` state 2/30 bytes, `GopRocket` state 2/73 bytes,
+  `GopBarricade` state 1/73 bytes, and `GopCourse` states 0 or 1 with count 4
+  and its checked 32-byte `24 + 2 * count` length. Other Course counts remain
+  static-only. Barricade also validates object ID, owner, reserved field, and
+  all twelve finite transform floats.
+- Types 4 and 6 preserve the fixed collection envelope and nested
+  `GopLucci`/`GopBonusItem` body, including matching nonmissing object IDs,
+  state 1, bounded collector ID, ticks, finite position, variant, and exact
+  25-byte body. Type 16 shares the full type-10 codec without inheriting
+  type-10 policy. All three remain `EvidencePending` because actor
+  authorization and recipient behavior are not evidenced.
 - `ParsedGameSlotPacket` is a parser-minted, move-only capability. Its raw
   bytes, actor action, body, claimed ID, and mask are private; read-only
   accessors expose the validated facts and `into_raw(self)` consumes the
@@ -702,26 +919,42 @@ unchanged and is evidence only.
   `AwaitingDeadline`. The open Settling path is required because Rust enters
   Settling at the first finish while other racers may still send late item
   events.
-- Type 9, type 10, and ordinary type 12 relay the exact original bytes to all
-  active exact-generation frozen recipients except the sender. Type 11 sends
-  only to frozen player IDs selected by its low-16 recipient mask and still
-  excludes the sender. A validated Barricade reaches the whole exact audience,
-  including its sender. Missing, migrated, released, or replacement
-  generations are never silently substituted.
+- Type 9 and type 11 honor the low-16 recipient mask and exclude the sender.
+  Type 10 preserves its full `u16` status and other producer fields, honors
+  the exact recipient mask, and may include the sender. For the four
+  trace-confirmed type-12 forms, the World actor derives the expected mask
+  from all other active exact-generation non-observer racers and rejects any
+  omission or extra bit; accepted bytes go to every active exact-generation
+  peer except the sender, including observers. Missing, migrated, released,
+  or replacement generations are never substituted.
+- The older static `SendGameSlotBroadcast` design note describes a
+  sender-inclusive all-active-player mask. The retained encrypted two-client
+  traces are stronger runtime evidence for the implemented type-12 path:
+  player 0 sends mask `0x2`, player 1 sends `0x1`, and a solo sender sends
+  zero. Rust therefore requires the peer-racer mask and excludes the sender.
+  Observer delivery follows the room-observation fanout, but an
+  observer-present stock trace is still an explicit verification gap.
 - All recipient queue permits are reserved before the first publication. One
   full queue drops the whole time-sensitive event, releases earlier permits,
   leaves race state unchanged, and does not enqueue a heartbeat retry. An
   empty audience is a valid zero-recipient outcome. Quiesce continues to block
   the enclosing `WorldCommand::Race` before publication.
-- Valid type-1/type-2 pickup frames are not relayed. In C#, the field at the
-  live-rank offset is replaced with a server-selected item before a new room
-  packet is synthesized; relaying the request would present rank as item ID.
-  Rust records an explicit deferred/no-relay outcome until an authoritative
-  item award and serializer are supported by stronger fixtures.
-- Rust also omits the C# type-10/type-11 kart side effects, bonus item
-  synthesis, probability rerolls, and item remapping. The stability audit
-  identifies double transformation and synthetic packet behavior as failure
-  risks. Exact raw relay is implemented without reproducing those defects.
+- Valid type-1/type-2 pickup frames are not relayed. The parser mints a
+  synthesis-only capability because the request's live-rank field occupies the
+  response item-ID field. Captured pre-award state plus repeated object, tick,
+  state, and owner fields must all agree. In game types 2/4, the actor enforces
+  per-player monotonic replay tokens and a capture-sized rate bucket, draws
+  from its immutable probability snapshot, consumes the capability to patch
+  offsets 38..40, and atomically broadcasts the exact 73-byte success packet
+  to all active frozen recipients including the sender. `Live` follows the
+  explicit rank trust policy: client-reported C# mapping for the current
+  LAN/friends default, or Combined fallback when disabled. Speed rooms reject
+  synthesis.
+- Rust still omits the C# type-10/type-11 kart side effects, bonus-item
+  synthesis, kart-specific pickup remapping, and actor-owned item-slot/use
+  effects. The stability audit identifies double transformation and synthetic
+  packet behavior as failure risks. Base pickup selection is now authoritative;
+  the remaining effects stay separate rather than reproducing those defects.
 - GameSlot wire errors, unsupported P5136 types, wrong phase, spoofing,
   observer source, inactive frozen membership, closed settlement, and outbound
   saturation are structured nonfatal drops. Stale global identity ownership,
@@ -730,34 +963,35 @@ unchanged and is evidence only.
   bounded metadata and typed reasons; the dedicated local `p5136_packet` file
   sink additionally retains bounded raw packet diagnostics as documented
   above.
-- The audit records 1,471 compatible C# traces, but that corpus is not checked
-  into either repository and could not be replayed independently. Actual
-  type-9/type-10 and generic type-12 capture-derived differential fixtures,
-  authoritative pickup synthesis, and stock-client E2E remain evidence gaps.
-  GameSlot-specific quiesce and session-after-queue-full tests are also absent;
-  the shared Race quiesce gate, actor atomic backpressure test, and session
-  expected-rejection test cover those mechanisms separately.
+- The opt-in external audit now sends all 1,471 retained TCP GameSlot RX
+  records through the strict parser: type 1=`43`, type 2=`22`, type
+  9=`1,337`, type 10=`38`, type 11=`1`, and type 12=`30`. The external
+  capture directory remains uncommitted. This proves parser compatibility
+  with that corpus, not type 4/6/16 routing, arbitrary static-only type-12
+  reachability, object ownership, source/target semantics, kart side effects,
+  visible stock-client pickup E2E, or stock-client multiplayer E2E.
 
-### Terminal protected-item list
+### Canonical protected-item state
 
 - `PqLockedItemGet` (`0x2D8105C2`) is treated as a strict hash-only request.
-  Both relevant C# handlers consume no request body, although a separate
-  stock-client producer proof is not available; exact four-byte exhaustion is
-  the safer Rust compatibility policy.
+  The retained stock-client corpus confirms the exact four-byte producer.
 - `PrLockedItemGet` (`0x2D8F05C3`) begins with a signed `i32 count`. Both C#
-  the P5136 compatibility handler and the stock-era handler return count zero,
-  so Rust emits exactly eight bytes: the reply hash followed by `i32 0`.
+  handlers default to count zero; Rust now serializes the same bounded
+  seven-byte record projection used by the client when canonical locked items
+  are nonempty.
 - Truncation, the wrong hash, or trailing bytes produce a typed protocol error.
-  Body validation happens before the bound in-memory profile lookup. The
-  normal identity-operation and exact profile-binding fences still apply.
-- The response is returned directly and only to the authenticated requester.
-  It creates no World command, peer fanout, profile-store read, persistence
-  write, or shared-state mutation.
-- The general C# serializer shows the nonempty record shape, but Rust does not
-  claim or persist nonempty protected-item ownership. `PqLockedItemUpdate`
-  is parsed and persisted by modern code but ignored by the stock-era branch;
-  without P5136 producer or capture proof, update and nonempty list support
-  remain explicitly evidence- and design-blocked.
+  Get/Update then pass the normal identity-operation and exact profile-binding
+  fences and use one canonical profile lane.
+- The retained nine-byte `PqLockedItemUpdate` shape is
+  `hash | scope:u8=1 | count:u32=0`; the shared strict batch codec also
+  supports bounded Add/Remove records. Updates are atomic, idempotent ordered
+  set transitions and publish session cache state only after immutable
+  durability confirmation.
+- `Profile.locked_items: Option<LockedItems>` is the migration marker. `None`
+  captures a missing or strict bounded C# `Locked.json` exactly once through
+  the run lease and no-follow profile capability. Import plus the incoming
+  batch are sealed in one revision; malformed, oversized, nonregular, or
+  linked candidates fail closed and leave the marker unresolved.
 
 ### Generation-bound client P2P reports
 
@@ -1378,16 +1612,21 @@ The current worktree passed on Windows:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo test --workspace --all-features -- --ignored
-# 815 regular tests and 2 opt-in local-data tests passed
+$env:P5136_CLIENT_DATA_DIR='C:\Users\drash\Documents\kartrider\KartRider_5136\Data'
+cargo test -p p5136-server configured_stock_client_archive_tables_match_the_known_p5136_totals
+# 893 regular tests passed; the installed item.rho 14/18-row, 400/410-total gate passed
 git diff --check
 ```
 
-The 815 regular passing tests comprise 9 CLI, 35 connector, 204 core, 100
-profile, 13 RHO5, 446 server unit, and 8 server integration tests. The two
-opt-in tests exercise local proprietary RHO5 metadata and the full
-RHO5-to-`EmblemCatalog` runtime path; both pass when explicitly enabled with
-the installed fixture. Doc-tests also passed.
+The 893 regular passing tests comprise 16 CLI, 35 connector, 234 core, 105
+profile, 17 RHO/RHO5, 478 server unit, and 8 server integration tests. The three
+opt-in tests exercise local proprietary RHO5 metadata, the full
+RHO5-to-`EmblemCatalog` runtime path, and all 19,496 retained inbound packet
+records including the strict 1,471-record TCP GameSlot replay. They pass when
+explicitly enabled with the installed client data and external trace
+directory. The environment-selected non-ignored item archive gate additionally
+reads the installed legacy `item.rho` and checks both row counts and combined
+weight totals. Doc-tests also passed.
 
 Focused regressions cover:
 
@@ -1438,18 +1677,21 @@ Focused regressions cover:
 - cross-World capability rejection on ordinary and durable paths;
 - typed zero-capacity World startup and observable actor termination;
 - malformed room/race packets before mutation;
-- TCP GameSlot hash classification; strict type 1/2/9/10/11/12 parsing;
+- TCP GameSlot hash classification; strict type 1/2/4/6/9/10/11/12/16
+  parsing;
   1013-byte logical and 960-byte blob limits; every supported-frame
   truncation; nonfatal malformed/unsupported dispatch followed by a live
   request; and no direct synthetic response;
-- all 74 fixed type-12 name/hash pairs, uniqueness, actual parse admission,
-  four capture-derived exact lengths, Cube/CubeForBoss/Lucci exclusion,
-  pickup and Barricade finite values, and strict Barricade body ownership;
+- all 67 type-12 manifest pairs, every explicit/default/count-derived writer
+  shape, uniqueness, length drift and truncation rejection, object-ID checks,
+  four retained-trace relay capabilities, and static-only no-relay evidence
+  boundaries;
 - exact frozen-generation GameSlot routing for type 9/10/11/12, observer
   receive-only policy, claimed-ID spoof rejection, Loading and closed
-  settlement rejection, open Settling relay, pickup deferral, byte-exact
-  sender inclusion/exclusion, masked observer delivery, stale replacement
-  exclusion, and all-recipient queue rollback/retry;
+  settlement rejection, open Settling relay, pickup/static-operation
+  deferral, exact type-10/type-11 masks, server-derived type-12 peer masks,
+  byte-exact sender inclusion/exclusion, masked observer delivery, stale
+  replacement exclusion, and all-recipient queue rollback/retry;
 - exact MyRoom owner-item packets for owner, visitor, empty owner, and missing
   owner, plus strict malformed input;
 - owner-item generation/topology/visibility revalidation, requester
@@ -1537,8 +1779,9 @@ These items prevent a "port complete" claim.
 
    The identity-bound dispatcher now rejects an unclassified hash explicitly;
    the MyRoom match is exhaustive, so adding a classified request without a
-   handler is a compile error. Complete the evidence ledger for the existing
-   deliberate no-reply list.
+   handler is a compile error. The retained-corpus deliberate no-reply ledger
+   is complete; future packet families require their own evidence and owning
+   domain before admission.
 
    The exact terminal empty `RmOwnerCareerListPacket` and matching kind-2
    grant path are implemented. Static client analysis establishes that safe
@@ -1555,9 +1798,10 @@ These items prevent a "port complete" claim.
    replay policy; they are a system-design slice rather than per-profile
    string writes. Finish kart tuning/upgrades and the remaining
    quest/attendance/progression surface.
-   The terminal empty protected-item list is implemented. Nonempty
-   protected-item ownership and `PqLockedItemUpdate` remain blocked by
-   unproven P5136 wire semantics and durable-state policy.
+   Canonical nonempty protected-item ownership, bounded Get/Update, and
+   lease-bound `Locked.json` migration are implemented. Successful item
+   deletion/unlock authentication and the broader economy rules remain
+   separate gaps.
    Both shop-buy aliases now parse their exact producer-derived bodies and fail
    closed with the exact common response. Actual purchase authorization,
    pricing, inventory/currency transactions, replay/idempotency policy, and
@@ -1576,13 +1820,16 @@ These items prevent a "port complete" claim.
 
 4. **Evidence-dependent packet behavior**
 
-   TCP GameSlot now has a strict bounded envelope and safe relay policy.
-   Capture real type-9/type-10 frames and each generic type-12 body before
-   narrowing their internal layouts. Capture type-1/type-2 pickup requests and
-   authoritative server replies before implementing item selection or
-   synthesis. Do not add the C# type-10/type-11 side effects until fixtures
-   prove both their state transition and any extra wire packet without double
-   transformation.
+   TCP GameSlot now strictly parses every one of the 1,471 retained records
+   and models all 67 statically recovered type-12 writer schemas. Capture
+   type 4/6/16 routing, source/target/object-ownership semantics, and
+   static-only type-12 reachability before promoting their
+   `EvidencePending` actions. Type-1/type-2 selection and synthesis now follow
+   the C# writer and installed client probability data; capture a fresh visible
+   pickup plus two-client sender-inclusive reply before calling that E2E
+   complete. Do not add the C# type-10/type-11 or kart-remapping side effects
+   until fixtures prove both their state transition and any extra wire packet
+   without double transformation.
 
    Also add captures/fixtures for special observer-map master policy, AI
    roster/start and nonzero AI-master payloads, the real track-pool/control
@@ -1611,27 +1858,35 @@ These items prevent a "port complete" claim.
 
 ## Exact resume plan
 
-1. Keep the completed bounded TCP GameSlot slice frozen at its current
-   evidence boundary. Collect stock-client type-1/type-2 request/reply,
-   type-9/type-10, and generic type-12 fixtures before implementing pickup
-   synthesis, inner-body rules, or server item side effects. Differentially
-   verify exact bytes and recipient behavior; never apply the TCP cap to the
-   separate opaque UDP movement envelope.
-2. Capture endpoint-report behavior with two stock clients and NAT-relevant
+1. Start the fresh `p5136-gameslot-static` release with the stock
+   `KartRider_5136\Profile\KartCatalog.xml` and `KartRider_5136\Data`, launch
+   the local stock client, and preserve the matching server/client logs.
+   Verify that initialization reaches channel switch and then exercise the
+   captured menu, scenario, time-attack, room, and race entry paths.
+2. Use a second physical LAN machine for the first multiplayer run. Verify
+   two distinct clients login, migrate, join one room, exchange ready/team/
+   track/chat state, start, exchange UDP/P2P traffic, finish, persist, and
+   shut down. One local installation is not a safe multi-client target.
+3. Verify the new type-1/type-2 award in the stock client: collect the request,
+   synthesized reply, selected item, effective rank band, and visible slot
+   result. The first two-machine LAN run must confirm the same sender-inclusive
+   73-byte reply reaches both exact generations. Separately collect type 4/6/16
+   routing fixtures and trace source, target, and `(base_hash, object_id)`
+   ownership semantics before promoting any static-only type-12 class. Never
+   apply the TCP cap to the separate opaque UDP movement envelope.
+4. Capture endpoint-report behavior with two stock clients and NAT-relevant
    topologies before adding a live peer-refresh/fanout packet or coupling the
    durable presentation port to observed UDP routing. Existing peers may
    retain an earlier serialized endpoint until a normal room snapshot.
-3. Add TCP-issued UDP bind capabilities without weakening the existing
+5. Add TCP-issued UDP bind capabilities without weakening the existing
    generation/IP/logical-epoch fences.
-4. Capture and implement movement sequence/tick behavior per sender and exact
+6. Capture and implement movement sequence/tick behavior per sender and exact
    race generation; never copy the broken C# recipient-global predicate.
-5. Close remaining economy and packet-fixture gaps, then design race-wide
+7. Close remaining economy and packet-fixture gaps, then design race-wide
    reward recovery.
-6. Run the existing three-desktop CI matrix to green, record the run, and
+8. Run the existing three-desktop CI matrix to green, record the run, and
    exercise the connector on Wine/CrossOver.
-7. Run the stock two-client end-to-end flow and record its exact environment,
-   packets, persistence outcome, and shutdown result.
-8. Before every checkpoint run:
+9. Before every checkpoint run:
 
    ```text
    cargo fmt --all -- --check

@@ -15,8 +15,9 @@ use p5136_connector::{
 };
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
 use p5136_server::{
-    BoundServer, DEFAULT_MAX_LOGIN_SESSIONS, RewardPersistenceRuntimeError, ServerConfig,
-    ServerError, ServerHandle,
+    BoundServer, DEFAULT_MAX_LOGIN_SESSIONS, ItemProbabilityRankPolicy,
+    RewardPersistenceRuntimeError, ServerConfig, ServerError, ServerHandle,
+    load_item_probability_xml,
 };
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -69,9 +70,19 @@ struct ServerArgs {
     #[arg(long, value_name = "CLIENT_DIR_OR_CATALOG")]
     catalog: Option<PathBuf>,
 
-    /// Stock-client Data directory containing the KR *.rho5 archives.
+    /// Stock-client Data directory containing KR archives and item.rho.
     #[arg(long, value_name = "DATA_DIR")]
     client_data_dir: Option<PathBuf>,
+
+    /// Portable item-probability XML override. Without this, client
+    /// item.rho/RHO5 data is loaded automatically when Data is configured.
+    #[arg(long, value_name = "PATH")]
+    item_probability_xml: Option<PathBuf>,
+
+    /// Trust the live rank carried by item-pickup packets. Set false for the
+    /// Combined fallback when clients are outside the LAN/friends trust boundary.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    trust_client_item_rank: bool,
 
     #[arg(long, default_value_t = 250)]
     first_message_delay_ms: u64,
@@ -275,6 +286,12 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         .context("configured port cannot provide all P5136 service offsets")?;
     let client_paths =
         client_paths::resolve_client_runtime_paths(args.catalog, args.client_data_dir)?;
+    let item_probabilities = args
+        .item_probability_xml
+        .as_deref()
+        .map(load_item_probability_xml)
+        .transpose()
+        .context("failed to load the item-probability XML override")?;
     let config = ServerConfig {
         bind_address: args.bind,
         advertised_address: args.advertise,
@@ -282,6 +299,12 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         profile_root: args.profile_root,
         catalog_path: client_paths.catalog_path,
         client_data_dir: client_paths.client_data_dir,
+        item_probabilities,
+        item_probability_rank_policy: if args.trust_client_item_rank {
+            ItemProbabilityRankPolicy::TrustClientReported
+        } else {
+            ItemProbabilityRankPolicy::CombinedFallback
+        },
         first_message_delay: Duration::from_millis(args.first_message_delay_ms),
         login_timeout: Duration::from_secs(args.login_timeout_seconds),
         session_idle_timeout: Duration::from_secs(args.session_idle_timeout_seconds),
@@ -567,7 +590,15 @@ mod tests {
             args.max_login_sessions,
             p5136_server::DEFAULT_MAX_LOGIN_SESSIONS
         );
+        assert!(args.trust_client_item_rank);
         assert!(!args.allow_remote_profile_creation);
+
+        let cli =
+            Cli::try_parse_from(["p5136", "server", "--trust-client-item-rank", "false"]).unwrap();
+        let Some(Command::Server(args)) = cli.command else {
+            panic!("server subcommand should parse as Command::Server");
+        };
+        assert!(!args.trust_client_item_rank);
     }
 
     #[test]

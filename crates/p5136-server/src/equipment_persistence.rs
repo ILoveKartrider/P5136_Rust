@@ -13,7 +13,7 @@ use p5136_core::{
 };
 use p5136_profile::{
     CatalogInventory, Profile, ProfileMutation, ProfileStore, ProfileStoreError, SavedProfile,
-    apply_rider_item_selection, is_grant_item, rider_item_snapshot,
+    apply_rider_item_selection, rider_item_snapshot,
 };
 use thiserror::Error;
 
@@ -491,9 +491,7 @@ fn persist_rider_equipment(
 }
 
 pub(crate) fn catalog_grants(catalog: &CatalogInventory, category: u16, item_id: u16) -> bool {
-    catalog
-        .category(category)
-        .any(|item| item.id == item_id && is_grant_item(item))
+    catalog.grants_item(category, item_id)
 }
 
 pub(crate) fn kart_is_owned(
@@ -565,11 +563,7 @@ pub(crate) fn validate_rider_item_selection(
     }
 
     let serial = normalized_kart_serial(selection.kart, selection.kart_serial);
-    let current_serial = normalized_kart_serial(current.kart, current.kart_serial);
-    if selection.kart != 0
-        && (selection.kart != current.kart || serial != current_serial)
-        && !kart_is_owned(catalog, profile, selection.kart, serial)
-    {
+    if selection.kart != 0 && !kart_is_owned(catalog, profile, selection.kart, serial) {
         return Err(RiderEquipmentValidationError::KartNotGranted {
             kart_id: selection.kart,
             serial,
@@ -706,6 +700,21 @@ pub(crate) mod tests {
 
         profile.rider_item.character = 999;
         validate_rider_item_selection(&catalog, &profile, invalid).unwrap();
+
+        profile.rider_item.kart = 1_453;
+        profile.rider_item.kart_serial = 1;
+        invalid.kart = 1_453;
+        invalid.kart_serial = 1;
+        assert_eq!(
+            validate_rider_item_selection(&catalog, &profile, invalid),
+            Err(RiderEquipmentValidationError::KartNotGranted {
+                kart_id: 1_453,
+                serial: 1,
+            })
+        );
+        profile.rider_item.kart = 0;
+        profile.rider_item.kart_serial = 0;
+
         profile.granted_karts.push(GrantedKart {
             kart_id: 1,
             serial: 2,

@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     adler32,
     packet::{PacketError, PacketReader, PacketWriter},
-    room_protocol::{MAX_RIDER_NICKNAME_UTF16_UNITS, ROOM_SLOT_COUNT},
+    room_protocol::{MAX_RIDER_NICKNAME_UTF16_UNITS, ROOM_DATA_LENGTH, ROOM_SLOT_COUNT, RoomAi},
 };
 
 pub const SET_SLOT_STATE_REQUEST_NAME: &str = "GrRequestSetSlotStatePacket";
@@ -21,8 +21,19 @@ pub const CHANGE_TEAM_REPLY_NAME: &str = "GrChangeTeamPacketReply";
 pub const CHANGE_MASTER_REQUEST_NAME: &str = "PqRoomMasterChangePacket";
 pub const START_ROOM_REQUEST_NAME: &str = "GrRequestStartPacket";
 pub const START_ROOM_REPLY_NAME: &str = "GrReplyStartPacket";
+pub const CHANGE_TRACK_REQUEST_NAME: &str = "GrChangeTrackPacket";
+pub const BASIC_AI_REQUEST_NAME: &str = "GrRequestBasicAiPacket";
+pub const BASIC_AI_SLOT_DATA_NAME: &str = "GrSlotDataBasicAi";
+pub const BASIC_AI_REPLY_NAME: &str = "GrReplyBasicAiPacket";
+pub const CLOSE_SLOT_REQUEST_NAME: &str = "GrRequestClosePacket";
+pub const CLOSE_SLOT_REPLY_NAME: &str = "GrReplyClosePacket";
+pub const RIDER_TALK_REQUEST_NAME: &str = "GrRiderTalkPacket";
+pub const RIDER_ECHO_NAME: &str = "GrRiderEchoPacket";
+pub const MACRO_CHAT_REQUEST_NAME: &str = "PqSendMacroChat";
+pub const MACRO_CHAT_RELAY_NAME: &str = "PcSendMacroChat";
 
 pub const ROOM_OBSERVER_ID_END: i32 = 15;
+pub const MAX_ROOM_CHAT_UTF16_UNITS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LobbyRequest {
@@ -30,6 +41,11 @@ pub enum LobbyRequest {
     ChangeTeam,
     ChangeMaster,
     StartRoom,
+    ChangeTrack,
+    BasicAi,
+    CloseSlot,
+    RiderTalk,
+    MacroChat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +107,64 @@ pub struct StartRoomRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeTrackRequest {
+    pub track: u32,
+    pub room_data_header: u32,
+    pub room_data: [u8; ROOM_DATA_LENGTH],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasicAiRequest {
+    pub player_id: u32,
+    /// The reference server reads this byte but treats the presence of the
+    /// requested AI ID as the authoritative add/remove decision.
+    pub option: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseSlotOperation {
+    Open,
+    Close,
+}
+
+impl CloseSlotOperation {
+    fn from_wire(value: u8) -> Result<Self, LobbyProtocolError> {
+        match value {
+            0 => Ok(Self::Open),
+            1 => Ok(Self::Close),
+            _ => Err(LobbyProtocolError::InvalidCloseSlotOperation(value)),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_close(self) -> bool {
+        matches!(self, Self::Close)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseSlotRequest {
+    pub first_member_id: u32,
+    pub operation: CloseSlotOperation,
+    pub first_slot_id: u32,
+    pub second_member_id: u32,
+    pub second_slot_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiderTalkRequest {
+    pub message: String,
+    pub reserved: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroChatRequest {
+    pub chat_type: i32,
+    pub message_id: u8,
+    pub client_message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartRoomStatus {
     Success = 0,
     NotAllReady = 2,
@@ -126,6 +200,21 @@ pub enum LobbyProtocolError {
     #[error("room slot position {position} at index {index} is outside -1..=7")]
     InvalidSlotPosition { index: usize, position: i32 },
 
+    #[error("close-slot operation {0} is not open (0) or close (1)")]
+    InvalidCloseSlotOperation(u8),
+
+    #[error("room slot ID {0} is outside 0..7")]
+    InvalidRoomSlotId(u8),
+
+    #[error("room slot ID {0} appears more than once")]
+    DuplicateRoomSlotId(u8),
+
+    #[error("basic-AI update count {actual} exceeds the P5136 maximum {maximum}")]
+    BasicAiCountLimit { actual: usize, maximum: usize },
+
+    #[error("room chat has {actual} UTF-16 units; maximum is {maximum}")]
+    ChatTooLong { actual: usize, maximum: usize },
+
     #[error("master nickname has {actual} UTF-16 units; maximum is {maximum}")]
     NicknameTooLong { actual: usize, maximum: usize },
 }
@@ -137,6 +226,11 @@ pub fn classify_lobby_request(hash: u32) -> Option<LobbyRequest> {
         (CHANGE_TEAM_REQUEST_NAME, LobbyRequest::ChangeTeam),
         (CHANGE_MASTER_REQUEST_NAME, LobbyRequest::ChangeMaster),
         (START_ROOM_REQUEST_NAME, LobbyRequest::StartRoom),
+        (CHANGE_TRACK_REQUEST_NAME, LobbyRequest::ChangeTrack),
+        (BASIC_AI_REQUEST_NAME, LobbyRequest::BasicAi),
+        (CLOSE_SLOT_REQUEST_NAME, LobbyRequest::CloseSlot),
+        (RIDER_TALK_REQUEST_NAME, LobbyRequest::RiderTalk),
+        (MACRO_CHAT_REQUEST_NAME, LobbyRequest::MacroChat),
     ]
     .into_iter()
     .find_map(|(name, request)| (adler32::packet_hash(name) == hash).then_some(request))
@@ -186,6 +280,75 @@ pub fn parse_start_room_request(packet: &[u8]) -> Result<StartRoomRequest, Lobby
     Ok(request)
 }
 
+pub fn parse_change_track_request(packet: &[u8]) -> Result<ChangeTrackRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, CHANGE_TRACK_REQUEST_NAME)?;
+    let track = reader.read_u32()?;
+    let room_data_header = reader.read_u32()?;
+    let room_data = reader
+        .read_bytes(ROOM_DATA_LENGTH)?
+        .try_into()
+        .expect("the exact room-data byte count was read");
+    ensure_exhausted(&reader, CHANGE_TRACK_REQUEST_NAME)?;
+    Ok(ChangeTrackRequest {
+        track,
+        room_data_header,
+        room_data,
+    })
+}
+
+pub fn parse_basic_ai_request(packet: &[u8]) -> Result<BasicAiRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, BASIC_AI_REQUEST_NAME)?;
+    let request = BasicAiRequest {
+        player_id: reader.read_u32()?,
+        option: reader.read_u8()?,
+    };
+    ensure_exhausted(&reader, BASIC_AI_REQUEST_NAME)?;
+    Ok(request)
+}
+
+pub fn parse_close_slot_request(packet: &[u8]) -> Result<CloseSlotRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, CLOSE_SLOT_REQUEST_NAME)?;
+    let first_member_id = reader.read_u32()?;
+    let operation = CloseSlotOperation::from_wire(reader.read_u8()?)?;
+    let first_slot_id = reader.read_u32()?;
+    let second_member_id = reader.read_u32()?;
+    let second_slot_id = reader.read_u32()?;
+    ensure_exhausted(&reader, CLOSE_SLOT_REQUEST_NAME)?;
+    Ok(CloseSlotRequest {
+        first_member_id,
+        operation,
+        first_slot_id,
+        second_member_id,
+        second_slot_id,
+    })
+}
+
+pub fn parse_rider_talk_request(packet: &[u8]) -> Result<RiderTalkRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, RIDER_TALK_REQUEST_NAME)?;
+    let request = RiderTalkRequest {
+        message: reader.read_utf16_bounded(MAX_ROOM_CHAT_UTF16_UNITS)?,
+        reserved: reader.read_u32()?,
+    };
+    ensure_exhausted(&reader, RIDER_TALK_REQUEST_NAME)?;
+    Ok(request)
+}
+
+pub fn parse_macro_chat_request(packet: &[u8]) -> Result<MacroChatRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, MACRO_CHAT_REQUEST_NAME)?;
+    let request = MacroChatRequest {
+        chat_type: reader.read_i32()?,
+        message_id: reader.read_u8()?,
+        client_message: reader.read_utf16_bounded(MAX_ROOM_CHAT_UTF16_UNITS)?,
+    };
+    ensure_exhausted(&reader, MACRO_CHAT_REQUEST_NAME)?;
+    Ok(request)
+}
+
 pub fn serialize_slot_state(
     states_by_id: [i32; ROOM_SLOT_COUNT],
 ) -> Result<Vec<u8>, LobbyProtocolError> {
@@ -228,6 +391,99 @@ pub fn serialize_change_team_reply(
     packet.write_i32(player_id);
     packet.write_u8(team as u8);
     write_slot_positions(&mut packet, slot_positions);
+    Ok(packet.into_inner())
+}
+
+pub fn serialize_basic_ai_added(
+    ais: &[(i32, RoomAi)],
+    slot_positions: [i32; ROOM_SLOT_COUNT],
+) -> Result<Vec<u8>, LobbyProtocolError> {
+    const MAX_BASIC_AI_UPDATE_COUNT: usize = 2;
+    if ais.is_empty() || ais.len() > MAX_BASIC_AI_UPDATE_COUNT {
+        return Err(LobbyProtocolError::BasicAiCountLimit {
+            actual: ais.len(),
+            maximum: MAX_BASIC_AI_UPDATE_COUNT,
+        });
+    }
+    validate_slot_positions(slot_positions)?;
+    let mut packet = PacketWriter::named(BASIC_AI_SLOT_DATA_NAME);
+    packet.write_i32(0);
+    packet
+        .write_u8(u8::try_from(ais.len()).expect("the validated basic-AI update count fits in u8"));
+    for &(player_id, ai) in ais {
+        validate_racer_player_id(player_id)?;
+        packet.write_i32(player_id);
+        write_room_ai_body(&mut packet, ai);
+    }
+    write_slot_positions(&mut packet, slot_positions);
+    Ok(packet.into_inner())
+}
+
+pub fn serialize_basic_ai_removed(
+    player_id: i32,
+    slot_positions: [i32; ROOM_SLOT_COUNT],
+) -> Result<Vec<u8>, LobbyProtocolError> {
+    validate_racer_player_id(player_id)?;
+    validate_slot_positions(slot_positions)?;
+    let mut packet = PacketWriter::named(BASIC_AI_SLOT_DATA_NAME);
+    packet.write_i32(1);
+    packet.write_u8(1);
+    packet.write_i32(player_id);
+    packet.write_bytes(&[0; 13]);
+    write_slot_positions(&mut packet, slot_positions);
+    Ok(packet.into_inner())
+}
+
+#[must_use]
+pub fn serialize_basic_ai_reply(changed: bool) -> Vec<u8> {
+    let mut packet = PacketWriter::named(BASIC_AI_REPLY_NAME);
+    packet.write_u8(u8::from(changed));
+    packet.into_inner()
+}
+
+pub fn serialize_close_slot_reply(
+    user_no: u32,
+    accepted: bool,
+    first_member_id: u32,
+    second_member_id: u32,
+    operation: CloseSlotOperation,
+    closed_slot_ids: &[u8],
+) -> Result<Vec<u8>, LobbyProtocolError> {
+    validate_closed_slot_ids(closed_slot_ids)?;
+    let mut packet = PacketWriter::named(CLOSE_SLOT_REPLY_NAME);
+    packet.write_u32(user_no);
+    packet.write_u8(u8::from(accepted));
+    packet.write_u32(first_member_id);
+    packet.write_u32(second_member_id);
+    packet.write_i32(i32::from(operation.is_close() && accepted));
+    packet.write_i32(
+        i32::try_from(closed_slot_ids.len()).expect("the validated closed-slot count fits in i32"),
+    );
+    packet.write_bytes(closed_slot_ids);
+    Ok(packet.into_inner())
+}
+
+pub fn serialize_rider_echo(player_id: i32, message: &str) -> Result<Vec<u8>, LobbyProtocolError> {
+    validate_racer_player_id(player_id)?;
+    validate_chat(message)?;
+    let mut packet = PacketWriter::named(RIDER_ECHO_NAME);
+    packet.write_i32(player_id);
+    packet.write_utf16(message)?;
+    Ok(packet.into_inner())
+}
+
+pub fn serialize_macro_chat_relay(
+    user_no: u32,
+    chat_type: i32,
+    message_id: u8,
+    message: &str,
+) -> Result<Vec<u8>, LobbyProtocolError> {
+    validate_chat(message)?;
+    let mut packet = PacketWriter::named(MACRO_CHAT_RELAY_NAME);
+    packet.write_u32(user_no);
+    packet.write_i32(chat_type);
+    packet.write_u8(message_id);
+    packet.write_utf16(message)?;
     Ok(packet.into_inner())
 }
 
@@ -277,6 +533,53 @@ fn validate_player_id(player_id: i32) -> Result<(), LobbyProtocolError> {
     }
 }
 
+fn validate_racer_player_id(player_id: i32) -> Result<(), LobbyProtocolError> {
+    if (0..i32::try_from(ROOM_SLOT_COUNT).expect("room slot count fits in i32"))
+        .contains(&player_id)
+    {
+        Ok(())
+    } else {
+        Err(LobbyProtocolError::InvalidPlayerId(player_id))
+    }
+}
+
+fn validate_closed_slot_ids(slots: &[u8]) -> Result<(), LobbyProtocolError> {
+    let mut seen = [false; ROOM_SLOT_COUNT];
+    for &slot in slots {
+        let index = usize::from(slot);
+        if index >= ROOM_SLOT_COUNT {
+            return Err(LobbyProtocolError::InvalidRoomSlotId(slot));
+        }
+        if seen[index] {
+            return Err(LobbyProtocolError::DuplicateRoomSlotId(slot));
+        }
+        seen[index] = true;
+    }
+    Ok(())
+}
+
+fn validate_chat(message: &str) -> Result<(), LobbyProtocolError> {
+    let actual = message.encode_utf16().count();
+    if actual <= MAX_ROOM_CHAT_UTF16_UNITS {
+        Ok(())
+    } else {
+        Err(LobbyProtocolError::ChatTooLong {
+            actual,
+            maximum: MAX_ROOM_CHAT_UTF16_UNITS,
+        })
+    }
+}
+
+fn write_room_ai_body(packet: &mut PacketWriter, ai: RoomAi) {
+    packet.write_i16(ai.character);
+    packet.write_i16(ai.rider);
+    packet.write_i16(ai.kart);
+    packet.write_i16(ai.balloon);
+    packet.write_i16(ai.head_band);
+    packet.write_i16(ai.goggle);
+    packet.write_u8(ai.team);
+}
+
 fn validate_slot_positions(positions: [i32; ROOM_SLOT_COUNT]) -> Result<(), LobbyProtocolError> {
     for (index, position) in positions.into_iter().enumerate() {
         if !(-1..=7).contains(&position) {
@@ -295,14 +598,19 @@ fn write_slot_positions(packet: &mut PacketWriter, positions: [i32; ROOM_SLOT_CO
 #[cfg(test)]
 mod tests {
     use super::{
-        CHANGE_MASTER_REQUEST_NAME, CHANGE_TEAM_REQUEST_NAME, LobbyProtocolError, LobbyRequest,
-        PlayerSlotState, RoomTeam, SET_SLOT_STATE_REQUEST_NAME, START_ROOM_REQUEST_NAME,
-        StartRoomStatus, classify_lobby_request, parse_change_master_request,
-        parse_change_team_request, parse_set_slot_state_request, parse_start_room_request,
-        serialize_change_team_reply, serialize_set_slot_state_reply, serialize_slot_state,
-        serialize_start_room_reply,
+        BASIC_AI_REQUEST_NAME, CHANGE_MASTER_REQUEST_NAME, CHANGE_TEAM_REQUEST_NAME,
+        CHANGE_TRACK_REQUEST_NAME, CLOSE_SLOT_REQUEST_NAME, CloseSlotOperation, LobbyProtocolError,
+        LobbyRequest, MACRO_CHAT_REQUEST_NAME, PlayerSlotState, RIDER_TALK_REQUEST_NAME, RoomTeam,
+        SET_SLOT_STATE_REQUEST_NAME, START_ROOM_REQUEST_NAME, StartRoomStatus,
+        classify_lobby_request, parse_basic_ai_request, parse_change_master_request,
+        parse_change_team_request, parse_change_track_request, parse_close_slot_request,
+        parse_macro_chat_request, parse_rider_talk_request, parse_set_slot_state_request,
+        parse_start_room_request, serialize_basic_ai_added, serialize_basic_ai_removed,
+        serialize_basic_ai_reply, serialize_change_team_reply, serialize_close_slot_reply,
+        serialize_macro_chat_relay, serialize_rider_echo, serialize_set_slot_state_reply,
+        serialize_slot_state, serialize_start_room_reply,
     };
-    use crate::{adler32, packet::PacketWriter};
+    use crate::{adler32, packet::PacketWriter, room_protocol::RoomAi};
 
     #[test]
     fn dispatch_uses_the_exact_p5136_packet_names_and_hashes() {
@@ -326,6 +634,27 @@ mod tests {
                 START_ROOM_REQUEST_NAME,
                 0x5341_0808,
                 LobbyRequest::StartRoom,
+            ),
+            (
+                CHANGE_TRACK_REQUEST_NAME,
+                0x4734_074C,
+                LobbyRequest::ChangeTrack,
+            ),
+            (BASIC_AI_REQUEST_NAME, 0x619A_0886, LobbyRequest::BasicAi),
+            (
+                CLOSE_SLOT_REQUEST_NAME,
+                0x525E_07F0,
+                LobbyRequest::CloseSlot,
+            ),
+            (
+                RIDER_TALK_REQUEST_NAME,
+                0x39E7_0693,
+                LobbyRequest::RiderTalk,
+            ),
+            (
+                MACRO_CHAT_REQUEST_NAME,
+                0x2D36_05BD,
+                LobbyRequest::MacroChat,
             ),
         ];
         for (name, expected_hash, request) in fixtures {
@@ -407,6 +736,94 @@ mod tests {
     }
 
     #[test]
+    fn captured_room_control_requests_parse_as_typed_values() {
+        let track = parse_change_track_request(&decode_hex(concat!(
+            "4C073447",
+            "2303E622",
+            "00000000",
+            "B2A9564AD2A5DFCE0AA1265359F3FDD7",
+            "EF980E5C97E3A59540E0F6640D0D0DE6"
+        )))
+        .unwrap();
+        assert_eq!(track.track, 0x22E6_0323);
+        assert_eq!(track.room_data_header, 0);
+        assert_eq!(track.room_data[0], 0xB2);
+        assert_eq!(track.room_data[31], 0xE6);
+
+        let ai = parse_basic_ai_request(&decode_hex("86089A610100000000")).unwrap();
+        assert_eq!(ai.player_id, 1);
+        assert_eq!(ai.option, 0);
+
+        let close =
+            parse_close_slot_request(&decode_hex("F0075E52040000000104000000FFFFFFFF00000000"))
+                .unwrap();
+        assert_eq!(close.first_member_id, 4);
+        assert_eq!(close.operation, CloseSlotOperation::Close);
+        assert_eq!(close.first_slot_id, 4);
+        assert_eq!(close.second_member_id, u32::MAX);
+        assert_eq!(close.second_slot_id, 0);
+
+        let talk = parse_rider_talk_request(&decode_hex("9306E73901000000410000000000")).unwrap();
+        assert_eq!(talk.message, "A");
+        assert_eq!(talk.reserved, 0);
+
+        let macro_chat =
+            parse_macro_chat_request(&decode_hex("BD05362D000000000100000000")).unwrap();
+        assert_eq!(macro_chat.chat_type, 0);
+        assert_eq!(macro_chat.message_id, 1);
+        assert!(macro_chat.client_message.is_empty());
+    }
+
+    #[test]
+    fn room_control_replies_match_csharp_field_order() {
+        let ai = RoomAi {
+            character: 1,
+            rider: 2,
+            kart: 3,
+            balloon: 4,
+            head_band: 5,
+            goggle: 6,
+            team: 0,
+        };
+        let positions = [0, 1, -1, -1, -1, -1, -1, -1];
+        assert_eq!(
+            serialize_basic_ai_added(&[(1, ai)], positions).unwrap(),
+            decode_hex(concat!(
+                "61068C39",
+                "0000000001",
+                "01000000",
+                "01000200030004000500060000",
+                "0000000001000000FFFFFFFFFFFFFFFF",
+                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+            ))
+        );
+        assert_eq!(
+            serialize_basic_ai_removed(1, [0, -1, -1, -1, -1, -1, -1, -1]).unwrap(),
+            decode_hex(concat!(
+                "61068C39",
+                "0100000001",
+                "01000000",
+                "00000000000000000000000000",
+                "00000000FFFFFFFFFFFFFFFFFFFFFFFF",
+                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+            ))
+        );
+        assert_eq!(serialize_basic_ai_reply(true), decode_hex("A907904F01"));
+        assert_eq!(
+            serialize_close_slot_reply(6, true, 4, 4, CloseSlotOperation::Close, &[4],).unwrap(),
+            decode_hex("13070E4206000000010400000004000000010000000100000004")
+        );
+        assert_eq!(
+            serialize_rider_echo(0, "A").unwrap(),
+            decode_hex("86065F3900000000010000004100")
+        );
+        assert_eq!(
+            serialize_macro_chat_relay(10, 0, 1, "").unwrap(),
+            decode_hex("AF05722C0A000000000000000100000000")
+        );
+    }
+
+    #[test]
     fn request_and_response_validation_rejects_spoofed_shapes() {
         let mut invalid_state = PacketWriter::named(SET_SLOT_STATE_REQUEST_NAME);
         invalid_state.write_i32(6);
@@ -441,6 +858,22 @@ mod tests {
         assert!(matches!(
             serialize_set_slot_state_reply(1, true, 16, PlayerSlotState::Ready),
             Err(LobbyProtocolError::InvalidPlayerId(16))
+        ));
+
+        let mut invalid_close = PacketWriter::named(CLOSE_SLOT_REQUEST_NAME);
+        invalid_close.write_u32(0);
+        invalid_close.write_u8(2);
+        invalid_close.write_u32(0);
+        invalid_close.write_u32(0);
+        invalid_close.write_u32(0);
+        assert!(matches!(
+            parse_close_slot_request(invalid_close.as_slice()),
+            Err(LobbyProtocolError::InvalidCloseSlotOperation(2))
+        ));
+
+        assert!(matches!(
+            serialize_close_slot_reply(1, true, 0, 0, CloseSlotOperation::Close, &[2, 2]),
+            Err(LobbyProtocolError::DuplicateRoomSlotId(2))
         ));
     }
 

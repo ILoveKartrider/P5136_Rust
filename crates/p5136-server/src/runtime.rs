@@ -24,10 +24,11 @@ use tokio::{
 };
 
 use crate::{
-    MessengerConnectionError, MessengerRuntimeConfig, MessengerServiceError,
-    MessengerServiceHandle, ServerClock, ServerConfig, ServerEndpoints, UdpRuntime,
-    UdpRuntimeConfig, UdpRuntimeEvent, UdpRuntimeFailure, UdpRuntimeStartError, UdpServiceError,
-    WorldError, WorldHandle,
+    ItemProbabilityConfiguration, ItemProbabilityError, MessengerConnectionError,
+    MessengerRuntimeConfig, MessengerServiceError, MessengerServiceHandle, ServerClock,
+    ServerConfig, ServerEndpoints, UdpRuntime, UdpRuntimeConfig, UdpRuntimeEvent,
+    UdpRuntimeFailure, UdpRuntimeStartError, UdpServiceError, WorldError, WorldHandle,
+    load_client_item_probabilities,
     operation_gate::WireOperationGate,
     profile_io::{
         DurableRewardReceipt, ProfileIoBootstrap, ProfileIoConfigError, ProfileIoHandle,
@@ -85,6 +86,16 @@ pub enum ServerError {
 
     #[error("client emblem catalog loader task failed")]
     EmblemCatalogTask(#[source] JoinError),
+
+    #[error("failed to load item-probability definitions from {path}")]
+    LoadItemProbabilities {
+        path: PathBuf,
+        #[source]
+        source: ItemProbabilityError,
+    },
+
+    #[error("item-probability loader task failed")]
+    ItemProbabilityTask(#[source] JoinError),
 
     #[error(transparent)]
     ProfileIoConfig(#[from] ProfileIoConfigError),
@@ -261,6 +272,7 @@ pub struct BoundServer {
     config: ServerConfig,
     catalog: Option<Arc<CatalogInventory>>,
     emblems: Option<Arc<EmblemCatalog>>,
+    item_probabilities: Arc<ItemProbabilityConfiguration>,
     profiles: ProfileIoBootstrap,
     game_udp: UdpSocket,
     login_tcp: TcpListener,
@@ -279,9 +291,13 @@ impl BoundServer {
             config.max_login_sessions,
             reward_persistence_worker_limit(config.max_login_sessions),
         )?;
-        let (catalog, emblems) = tokio::try_join!(
+        let (catalog, emblems, item_probabilities) = tokio::try_join!(
             load_catalog(config.catalog_path.clone()),
             load_emblem_catalog(config.client_data_dir.clone()),
+            load_item_probability_configuration(
+                config.item_probabilities.clone(),
+                config.client_data_dir.clone(),
+            ),
         )?;
         let bind_address = config.bind_address;
         let game_udp = UdpSocket::bind(SocketAddr::new(bind_address, config.ports.game_udp()))
@@ -309,6 +325,7 @@ impl BoundServer {
             config,
             catalog,
             emblems,
+            item_probabilities,
             profiles,
             game_udp,
             login_tcp,
@@ -344,6 +361,7 @@ impl BoundServer {
             config,
             catalog,
             emblems,
+            item_probabilities,
             profiles,
             game_udp,
             login_tcp,
@@ -357,21 +375,28 @@ impl BoundServer {
         let profile_root = config.profile_root.clone();
         let catalog_path = config.catalog_path.clone();
         let client_data_dir = config.client_data_dir.clone();
+        let item_probabilities_overridden = config.item_probabilities.is_some();
+        let item_probability_rank_policy = config.item_probability_rank_policy;
         let remote_profile_creation = config.allow_remote_profile_creation;
         let catalog_loaded = catalog.is_some();
         let emblem_catalog_loaded = emblems.is_some();
+        let item_probability_rank_band = item_probabilities.rank_band;
+        let individual_item_probability_count = item_probabilities.individual.len();
+        let team_item_probability_count = item_probabilities.team.len();
         let messenger_config = messenger_runtime_config(&config);
         let udp_config = udp_runtime_config(&config);
         let udp_mailbox_capacity = udp_config.admission_capacity;
         let clock = ServerClock::new();
         let udp = UdpRuntime::spawn_with_clock(game_udp, p2p_udp, udp_config, clock.clone())?;
         let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config)?;
-        let (world, world_task) = WorldHandle::spawn_with_services(
+        let (world, world_task) = WorldHandle::spawn_with_services_and_item_probabilities(
             1_024,
             udp_mailbox_capacity,
             messenger.clone(),
             udp.service(),
             clock,
+            item_probabilities,
+            item_probability_rank_policy,
         );
         let (profile_io, profile_runtime) = profiles.spawn();
         let wire_operations = WireOperationGate::new();
@@ -421,6 +446,11 @@ impl BoundServer {
             catalog_loaded,
             client_data_dir = ?client_data_dir,
             emblem_catalog_loaded,
+            item_probabilities_overridden,
+            ?item_probability_rank_band,
+            ?item_probability_rank_policy,
+            individual_item_probability_count,
+            team_item_probability_count,
             remote_profile_creation,
             "P5136 server configuration validated and transports started"
         );
@@ -693,6 +723,34 @@ async fn load_emblem_catalog(
     .map_err(ServerError::EmblemCatalogTask)?
     .map_err(|source| ServerError::LoadEmblemCatalog { path, source })?;
     Ok(Some(Arc::new(catalog)))
+}
+
+async fn load_item_probability_configuration(
+    configured: Option<ItemProbabilityConfiguration>,
+    client_data_dir: Option<PathBuf>,
+) -> Result<Arc<ItemProbabilityConfiguration>, ServerError> {
+    if let Some(configuration) = configured {
+        configuration
+            .validate()
+            .map_err(|source| ServerError::LoadItemProbabilities {
+                path: PathBuf::from("<configured override>"),
+                source,
+            })?;
+        return Ok(Arc::new(configuration));
+    }
+    let Some(path) = client_data_dir else {
+        tracing::warn!(
+            "no client Data directory was configured; using the bounded safe item-probability table"
+        );
+        return Ok(Arc::new(ItemProbabilityConfiguration::safe_fallback()));
+    };
+    let worker_path = path.clone();
+    let configuration =
+        tokio::task::spawn_blocking(move || load_client_item_probabilities(worker_path))
+            .await
+            .map_err(ServerError::ItemProbabilityTask)?
+            .map_err(|source| ServerError::LoadItemProbabilities { path, source })?;
+    Ok(Arc::new(configuration))
 }
 
 fn production_rho5_limits() -> Rho5Limits {
@@ -2146,7 +2204,8 @@ mod tests {
         channel::serialize_pr_channel_move_in,
         datagram::{DEFAULT_MAX_DATAGRAM_PAYLOAD, encode_datagram},
         equipment_protocol::{
-            PlantPartEquipRequest, serialize_equip_tuning_failure, serialize_equip_tuning_success,
+            PlantPartEquipRequest, XPartEquipRequest, serialize_equip_tuning_failure,
+            serialize_equip_tuning_success, serialize_equip_x_part_failure,
         },
         frame, handshake,
         item_state_protocol::FavoriteItemKey,
@@ -2190,10 +2249,10 @@ mod tests {
         udp_runtime_config, unexpected_profile_exit, world_sidecar_error,
     };
     use crate::{
-        ChannelBinding, MessengerServiceHandle, MigrationToken, ProfileIoConfigError,
-        ProfileIoError, ProfileIoRuntimeError, ProfileIoShutdownError, ServerClock, ServerConfig,
-        ServerEndpoints, UdpIngress, UdpIngressBody, UdpRuntime, UdpTransport, WorldError,
-        WorldHandle, decode_udp_ingress,
+        ChannelBinding, ItemProbabilityConfiguration, MessengerServiceHandle, MigrationToken,
+        ProfileIoConfigError, ProfileIoError, ProfileIoRuntimeError, ProfileIoShutdownError,
+        ServerClock, ServerConfig, ServerEndpoints, UdpIngress, UdpIngressBody, UdpRuntime,
+        UdpTransport, WorldError, WorldHandle, decode_udp_ingress,
         myroom_persistence::{MyRoomInfoPublication, MyRoomInfoWriteError},
         operation_gate::WireOperationGate,
         profile_io::{ProfileIoBootstrap, ProfileIoLimits},
@@ -3386,6 +3445,7 @@ mod tests {
             config,
             catalog: None,
             emblems: None,
+            item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -3663,6 +3723,7 @@ mod tests {
             config,
             catalog: None,
             emblems: None,
+            item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -3822,6 +3883,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_x_part_sidecar_failure_keeps_the_session_usable() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let catalog_path = profile_root.path().join("KartCatalog.xml");
+        fs::write(&catalog_path, complete_catalog_xml()).unwrap();
+        let nickname = "BrokenXPartSidecar";
+        let saved = ProfileStore::new(profile_root.path())
+            .save(nickname, &Profile::default())
+            .unwrap();
+        fs::write(
+            saved.path.parent().unwrap().join("PartsData.json"),
+            b"[malformed",
+        )
+        .unwrap();
+
+        let (server, maximum) = start_test_server(profile_root.path(), Some(&catalog_path)).await;
+        let mut client =
+            authenticate_and_login(server.endpoints().login_tcp, maximum, nickname).await;
+        assert_no_login_data(&mut client.stream).await;
+        let request = XPartEquipRequest {
+            kart_id: 1,
+            kart_serial: 1,
+            item_category: 63,
+            item_id: 2,
+            quantity: i16::MAX,
+            unknown_1: 0,
+            grade: 2,
+            unknown_2: 1,
+            parts_value: 1_150,
+            unknown_3: 0,
+        };
+        let packet = build_x_part_request(request);
+        send_packet(&mut client.stream, &packet, &mut client.send_iv, maximum).await;
+        assert_eq!(
+            read_login_packet(&mut client, maximum).await,
+            serialize_equip_x_part_failure(request)
+        );
+        assert_eq!(
+            request_named(&mut client, "PqLoginVipInfo", maximum).await,
+            serialize_pr_login_vip_info(5)
+        );
+
+        drop(client);
+        wait_for_session_count(&server.world(), 0).await;
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn catalog_inventory_precedes_get_rider_and_late_request_is_a_noop() {
         let profile_root = tempfile::tempdir().unwrap();
         let catalog_path = profile_root.path().join("KartCatalog.xml");
@@ -3934,6 +4042,7 @@ mod tests {
             config,
             catalog: None,
             emblems: None,
+            item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -4238,6 +4347,7 @@ mod tests {
             config,
             catalog,
             emblems: None,
+            item_probabilities: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             profiles,
             game_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
@@ -4438,6 +4548,21 @@ mod tests {
         if trailing {
             packet.write_u8(0xff);
         }
+        packet.into_inner()
+    }
+
+    fn build_x_part_request(request: XPartEquipRequest) -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqEquipXPartsItem");
+        packet.write_i16(request.kart_id);
+        packet.write_i16(request.kart_serial);
+        packet.write_i16(request.item_category);
+        packet.write_i16(request.item_id);
+        packet.write_i16(request.quantity);
+        packet.write_i16(request.unknown_1);
+        packet.write_u8(request.grade);
+        packet.write_u8(request.unknown_2);
+        packet.write_i16(request.parts_value);
+        packet.write_i16(request.unknown_3);
         packet.into_inner()
     }
 

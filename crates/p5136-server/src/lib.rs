@@ -4,6 +4,8 @@ mod config;
 mod equipment_persistence;
 mod favorite_persistence;
 mod identity;
+mod item_probability;
+mod locked_item_persistence;
 mod main_emblem_persistence;
 mod messenger_hub;
 mod messenger_runtime;
@@ -27,6 +29,12 @@ pub use identity::{
     IdentityRegistry, MIGRATION_TTL, MigrationCompletion, MigrationPermit, MigrationToken,
     ReleasedIdentity, UserNo,
 };
+pub use item_probability::{
+    ItemProbabilityConfiguration, ItemProbabilityEntry, ItemProbabilityError,
+    ItemProbabilityRankBand, ItemProbabilityRankPolicy, load_client_item_probabilities,
+    load_item_probability_xml,
+};
+pub use locked_item_persistence::LockedItemPersistError;
 pub use messenger_hub::{
     ChatClaim, EnterClaim, EnterOutcome, GenerationAdvance, GuildChatClaim, IdentityRelease,
     InviteClaim, LeaveClaim, MessengerDelivery, MessengerEvent, MessengerGeneration, MessengerHub,

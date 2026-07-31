@@ -11,8 +11,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use p5136_core::{
-    equipment_protocol::PlantPartEquipRequest,
+    equipment_protocol::{PlantPartEquipRequest, XPartEquipRequest},
     inventory::{PartsExcRecord, PlantExcRecord},
 };
 use quick_xml::{
@@ -25,6 +27,8 @@ use serde::{
     de::{DeserializeSeed, Deserializer, Error as _, SeqAccess, Visitor},
 };
 use thiserror::Error;
+
+use crate::store::ProfileStoreError;
 
 pub const MAX_EQUIPMENT_STATE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_EQUIPMENT_RECORDS: usize = 65_535;
@@ -49,9 +53,10 @@ impl EquipmentExceptions {
         let rider_directory = rider_directory.as_ref();
         let plant_path = rider_directory.join("PlantData.json");
         let parts_path = profile_root.join("PartsData.xml");
+        let user_parts_path = rider_directory.join("PartsData.json");
         Ok(Self {
             plant: load_plant_records(&plant_path)?,
-            parts: load_parts_records(&parts_path)?,
+            parts: load_merged_parts_records(&parts_path, &user_parts_path)?,
         })
     }
 
@@ -98,6 +103,127 @@ impl EquipmentExceptions {
         write_plant_states(&path, &states)?;
         Ok(result)
     }
+
+    /// Applies one validated P5136 X-parts selection and atomically publishes
+    /// the rider-specific C# `PartsData.json` sidecar.
+    pub fn equip_x_part(
+        rider_directory: impl AsRef<Path>,
+        request: XPartEquipRequest,
+    ) -> Result<PartsExcRecord, EquipmentStateError> {
+        validate_x_part_request(request)?;
+        let rider_directory = rider_directory.as_ref();
+        fs::create_dir_all(rider_directory).map_err(|source| EquipmentStateError::Io {
+            operation: "create rider equipment directory",
+            path: rider_directory.to_owned(),
+            source,
+        })?;
+        let path = rider_directory.join("PartsData.json");
+        let mut states = load_user_parts_states(&path)?;
+        let serial = normalize_kart_serial(request.kart_id, request.kart_serial);
+        let state = if let Some(state) = states
+            .iter_mut()
+            .find(|state| state.id == request.kart_id && state.serial == serial)
+        {
+            state
+        } else {
+            if states.len() >= MAX_EQUIPMENT_RECORDS {
+                return Err(EquipmentStateError::TooManyRecords {
+                    kind: "parts",
+                    maximum: MAX_EQUIPMENT_RECORDS,
+                });
+            }
+            states.push(PartsState {
+                id: request.kart_id,
+                serial,
+                ..PartsState::default()
+            });
+            states
+                .last_mut()
+                .expect("a state was appended immediately before lookup")
+        };
+        state.set_part(request);
+        let result = state.as_exception();
+        write_equipment_states(&path, ".PartsData", &states)?;
+        Ok(result)
+    }
+
+    pub(crate) fn load_from_capabilities(
+        profile_root: &CapabilityDir,
+        rider_directory: &CapabilityDir,
+        profile_root_path: &Path,
+        rider_directory_path: &Path,
+    ) -> Result<Self, EquipmentStateError> {
+        let plant_path = rider_directory_path.join("PlantData.json");
+        let parts_path = profile_root_path.join("PartsData.xml");
+        let user_parts_path = rider_directory_path.join("PartsData.json");
+        let plant = parse_plant_states(
+            &plant_path,
+            read_optional_bounded_capability(rider_directory, "PlantData.json", &plant_path)?,
+        )?
+        .iter()
+        .map(PlantState::as_exception)
+        .collect();
+        let parts = merge_parts_records(
+            parse_parts_records(
+                &parts_path,
+                read_optional_bounded_capability(profile_root, "PartsData.xml", &parts_path)?,
+            )?,
+            parse_user_parts_states(
+                &user_parts_path,
+                read_optional_bounded_capability(
+                    rider_directory,
+                    "PartsData.json",
+                    &user_parts_path,
+                )?,
+            )?,
+        )?;
+        Ok(Self { plant, parts })
+    }
+
+    pub(crate) fn equip_x_part_capability(
+        rider_directory: &CapabilityDir,
+        rider_directory_path: &Path,
+        request: XPartEquipRequest,
+    ) -> Result<PartsExcRecord, EquipmentStateError> {
+        validate_x_part_request(request)?;
+        let path = rider_directory_path.join("PartsData.json");
+        let mut states = parse_user_parts_states(
+            &path,
+            read_optional_bounded_capability(rider_directory, "PartsData.json", &path)?,
+        )?;
+        let serial = normalize_kart_serial(request.kart_id, request.kart_serial);
+        let state = if let Some(state) = states
+            .iter_mut()
+            .find(|state| state.id == request.kart_id && state.serial == serial)
+        {
+            state
+        } else {
+            if states.len() >= MAX_EQUIPMENT_RECORDS {
+                return Err(EquipmentStateError::TooManyRecords {
+                    kind: "parts",
+                    maximum: MAX_EQUIPMENT_RECORDS,
+                });
+            }
+            states.push(PartsState {
+                id: request.kart_id,
+                serial,
+                ..PartsState::default()
+            });
+            states
+                .last_mut()
+                .expect("a state was appended immediately before lookup")
+        };
+        state.set_part(request);
+        let result = state.as_exception();
+        write_equipment_states_capability(
+            rider_directory,
+            &path,
+            "PartsData.json",
+            ".PartsData",
+            &states,
+        )?;
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -116,6 +242,9 @@ pub enum EquipmentStateError {
         actual: u64,
         maximum: u64,
     },
+
+    #[error("equipment state entry at {path} is not a regular non-symbolic-link file")]
+    InvalidStorageEntry { path: PathBuf },
 
     #[error("plant state JSON at {path} is invalid")]
     Json {
@@ -151,6 +280,24 @@ pub enum EquipmentStateError {
 
     #[error("plant target kart ID {0} must be positive")]
     InvalidPlantKart(i16),
+
+    #[error("X-parts category {0} is not one of 63..=66, 68, or 69")]
+    InvalidXPartCategory(i16),
+
+    #[error("X-parts item ID {0} cannot be negative")]
+    InvalidXPartItem(i16),
+
+    #[error("X-parts target kart ID {0} must be positive")]
+    InvalidXPartKart(i16),
+}
+
+#[derive(Debug, Error)]
+pub enum EquipmentProfileError {
+    #[error(transparent)]
+    Store(#[from] ProfileStoreError),
+
+    #[error(transparent)]
+    State(#[from] EquipmentStateError),
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -215,6 +362,82 @@ impl PlantState {
             wheel_id: self.wheel_id,
             kit_category: self.kit_category,
             kit_id: self.kit_id,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+struct PartsState {
+    #[serde(rename = "ID")]
+    id: i16,
+    #[serde(rename = "SN")]
+    serial: i16,
+    engine: i16,
+    engine_grade: u8,
+    engine_value: i16,
+    handle: i16,
+    handle_grade: u8,
+    handle_value: i16,
+    wheel: i16,
+    wheel_grade: u8,
+    wheel_value: i16,
+    booster: i16,
+    booster_grade: u8,
+    booster_value: i16,
+    coating: i16,
+    tail_lamp: i16,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl PartsState {
+    fn set_part(&mut self, request: XPartEquipRequest) {
+        match request.item_category {
+            63 => {
+                self.engine = request.item_id;
+                self.engine_grade = request.grade;
+                self.engine_value = request.parts_value;
+            }
+            64 => {
+                self.handle = request.item_id;
+                self.handle_grade = request.grade;
+                self.handle_value = request.parts_value;
+            }
+            65 => {
+                self.wheel = request.item_id;
+                self.wheel_grade = request.grade;
+                self.wheel_value = request.parts_value;
+            }
+            66 => {
+                self.booster = request.item_id;
+                self.booster_grade = request.grade;
+                self.booster_value = request.parts_value;
+            }
+            68 => self.coating = request.item_id,
+            69 => self.tail_lamp = request.item_id,
+            _ => unreachable!("X-parts request validation precedes mutation"),
+        }
+    }
+
+    fn as_exception(&self) -> PartsExcRecord {
+        PartsExcRecord {
+            id: self.id,
+            serial: normalize_kart_serial(self.id, self.serial),
+            engine: self.engine,
+            engine_grade: self.engine_grade,
+            engine_value: self.engine_value,
+            handle: self.handle,
+            handle_grade: self.handle_grade,
+            handle_value: self.handle_value,
+            wheel: self.wheel,
+            wheel_grade: self.wheel_grade,
+            wheel_value: self.wheel_value,
+            booster: self.booster,
+            booster_grade: self.booster_grade,
+            booster_value: self.booster_value,
+            coating: self.coating,
+            tail_lamp: self.tail_lamp,
         }
     }
 }
@@ -292,7 +515,14 @@ fn load_plant_records(path: &Path) -> Result<Vec<PlantExcRecord>, EquipmentState
 }
 
 fn load_plant_states(path: &Path) -> Result<Vec<PlantState>, EquipmentStateError> {
-    let Some(bytes) = read_optional_bounded(path)? else {
+    parse_plant_states(path, read_optional_bounded(path)?)
+}
+
+fn parse_plant_states(
+    path: &Path,
+    bytes: Option<Vec<u8>>,
+) -> Result<Vec<PlantState>, EquipmentStateError> {
+    let Some(bytes) = bytes else {
         return Ok(Vec::new());
     };
     let bytes = bytes
@@ -343,7 +573,30 @@ fn validate_plant_request(request: PlantPartEquipRequest) -> Result<(), Equipmen
     Ok(())
 }
 
+fn validate_x_part_request(request: XPartEquipRequest) -> Result<(), EquipmentStateError> {
+    if !matches!(request.item_category, 63..=66 | 68 | 69) {
+        return Err(EquipmentStateError::InvalidXPartCategory(
+            request.item_category,
+        ));
+    }
+    if request.item_id < 0 {
+        return Err(EquipmentStateError::InvalidXPartItem(request.item_id));
+    }
+    if request.kart_id <= 0 {
+        return Err(EquipmentStateError::InvalidXPartKart(request.kart_id));
+    }
+    Ok(())
+}
+
 fn write_plant_states(path: &Path, states: &[PlantState]) -> Result<(), EquipmentStateError> {
+    write_equipment_states(path, ".PlantData", states)
+}
+
+fn write_equipment_states<T: Serialize>(
+    path: &Path,
+    temporary_prefix: &str,
+    states: &[T],
+) -> Result<(), EquipmentStateError> {
     let mut bytes =
         serde_json::to_vec_pretty(states).map_err(|source| EquipmentStateError::Json {
             path: path.to_owned(),
@@ -362,7 +615,7 @@ fn write_plant_states(path: &Path, states: &[PlantState]) -> Result<(), Equipmen
     let directory = path
         .parent()
         .expect("PlantData.json always has a rider-directory parent");
-    let temporary_path = create_equipment_temporary(directory, &bytes)?;
+    let temporary_path = create_equipment_temporary(directory, temporary_prefix, &bytes)?;
     let publish_result =
         fs::rename(&temporary_path, path).map_err(|source| EquipmentStateError::Io {
             operation: "publish plant equipment state",
@@ -376,17 +629,129 @@ fn write_plant_states(path: &Path, states: &[PlantState]) -> Result<(), Equipmen
     sync_equipment_directory(directory)
 }
 
+fn write_equipment_states_capability<T: Serialize>(
+    directory: &CapabilityDir,
+    display_path: &Path,
+    filename: &str,
+    temporary_prefix: &str,
+    states: &[T],
+) -> Result<(), EquipmentStateError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(states).map_err(|source| EquipmentStateError::Json {
+            path: display_path.to_owned(),
+            source,
+        })?;
+    bytes.push(b'\n');
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if length > MAX_EQUIPMENT_STATE_BYTES {
+        return Err(EquipmentStateError::TooLarge {
+            path: display_path.to_owned(),
+            actual: length,
+            maximum: MAX_EQUIPMENT_STATE_BYTES,
+        });
+    }
+
+    let temporary_name = loop {
+        let sequence = EQUIPMENT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary_name = format!("{temporary_prefix}.{}.{}.tmp", std::process::id(), sequence);
+        let temporary_path = display_path.with_file_name(&temporary_name);
+        let mut options = CapabilityOpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = match directory.open_with(&temporary_name, &options) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(EquipmentStateError::Io {
+                    operation: "create no-follow equipment temporary",
+                    path: temporary_path,
+                    source,
+                });
+            }
+        };
+        let metadata = file.metadata().map_err(|source| EquipmentStateError::Io {
+            operation: "inspect opened equipment temporary",
+            path: temporary_path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            let _ = directory.remove_file(&temporary_name);
+            return Err(EquipmentStateError::InvalidStorageEntry {
+                path: temporary_path,
+            });
+        }
+        if let Err(source) = file
+            .write_all(&bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = directory.remove_file(&temporary_name);
+            return Err(EquipmentStateError::Io {
+                operation: "write no-follow equipment temporary",
+                path: temporary_path,
+                source,
+            });
+        }
+        break temporary_name;
+    };
+
+    let publish = directory.rename(&temporary_name, directory, filename);
+    if let Err(source) = publish {
+        let _ = directory.remove_file(&temporary_name);
+        return Err(EquipmentStateError::Io {
+            operation: "publish no-follow equipment state",
+            path: display_path.to_owned(),
+            source,
+        });
+    }
+    sync_equipment_capability_directory(directory, display_path.parent().unwrap_or(display_path))
+}
+
+#[cfg(unix)]
+fn sync_equipment_capability_directory(
+    directory: &CapabilityDir,
+    display_path: &Path,
+) -> Result<(), EquipmentStateError> {
+    directory
+        .open(".")
+        .and_then(|directory_file| directory_file.sync_all())
+        .map_err(|source| EquipmentStateError::Io {
+            operation: "sync equipment profile directory capability",
+            path: display_path.to_owned(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_equipment_capability_directory(
+    directory: &CapabilityDir,
+    display_path: &Path,
+) -> Result<(), EquipmentStateError> {
+    // Windows does not permit opening a directory for `File::sync_all` through
+    // the ordinary file API. The temporary file itself was synced before the
+    // atomic rename; retain the capability anchor and verify that the published
+    // directory still resolves without following an attacker-controlled path.
+    directory
+        .dir_metadata()
+        .map(|_| ())
+        .map_err(|source| EquipmentStateError::Io {
+            operation: "verify equipment profile directory capability",
+            path: display_path.to_owned(),
+            source,
+        })
+}
+
 fn create_equipment_temporary(
     directory: &Path,
+    prefix: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, EquipmentStateError> {
     loop {
         let sequence = EQUIPMENT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!(
-            ".PlantData.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
+        let path = directory.join(format!("{prefix}.{}.{}.tmp", std::process::id(), sequence));
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -437,7 +802,14 @@ fn sync_equipment_directory(directory: &Path) -> Result<(), EquipmentStateError>
 }
 
 fn load_parts_records(path: &Path) -> Result<Vec<PartsExcRecord>, EquipmentStateError> {
-    let Some(bytes) = read_optional_bounded(path)? else {
+    parse_parts_records(path, read_optional_bounded(path)?)
+}
+
+fn parse_parts_records(
+    path: &Path,
+    bytes: Option<Vec<u8>>,
+) -> Result<Vec<PartsExcRecord>, EquipmentStateError> {
+    let Some(bytes) = bytes else {
         return Ok(Vec::new());
     };
     let mut reader = Reader::from_reader(bytes.as_slice());
@@ -482,6 +854,148 @@ fn load_parts_records(path: &Path) -> Result<Vec<PartsExcRecord>, EquipmentState
         buffer.clear();
     }
     Ok(records)
+}
+
+fn load_merged_parts_records(
+    global_path: &Path,
+    user_path: &Path,
+) -> Result<Vec<PartsExcRecord>, EquipmentStateError> {
+    merge_parts_records(
+        load_parts_records(global_path)?,
+        load_user_parts_states(user_path)?,
+    )
+}
+
+fn merge_parts_records(
+    mut merged: Vec<PartsExcRecord>,
+    user_states: Vec<PartsState>,
+) -> Result<Vec<PartsExcRecord>, EquipmentStateError> {
+    for user in user_states {
+        let user = user.as_exception();
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|record| record.id == user.id && record.serial == user.serial)
+        {
+            *existing = user;
+        } else {
+            if merged.len() >= MAX_EQUIPMENT_RECORDS {
+                return Err(EquipmentStateError::TooManyRecords {
+                    kind: "merged parts",
+                    maximum: MAX_EQUIPMENT_RECORDS,
+                });
+            }
+            merged.push(user);
+        }
+    }
+    Ok(merged)
+}
+
+fn load_user_parts_states(path: &Path) -> Result<Vec<PartsState>, EquipmentStateError> {
+    parse_user_parts_states(path, read_optional_bounded(path)?)
+}
+
+fn parse_user_parts_states(
+    path: &Path,
+    bytes: Option<Vec<u8>>,
+) -> Result<Vec<PartsState>, EquipmentStateError> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    let bytes = bytes
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(bytes.as_slice());
+    let limit_exceeded = Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let states = match (PartsStatesSeed {
+        limit_exceeded: &limit_exceeded,
+    })
+    .deserialize(&mut deserializer)
+    {
+        Ok(states) => states,
+        Err(_source) if limit_exceeded.get() => {
+            return Err(EquipmentStateError::TooManyRecords {
+                kind: "parts",
+                maximum: MAX_EQUIPMENT_RECORDS,
+            });
+        }
+        Err(source) => {
+            return Err(EquipmentStateError::Json {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    deserializer
+        .end()
+        .map_err(|source| EquipmentStateError::Json {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(states)
+}
+
+struct PartsStatesSeed<'a> {
+    limit_exceeded: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for PartsStatesSeed<'_> {
+    type Value = Vec<PartsState>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(PartsStatesVisitor {
+            limit_exceeded: self.limit_exceeded,
+        })
+    }
+}
+
+struct PartsStatesVisitor<'a> {
+    limit_exceeded: &'a Cell<bool>,
+}
+
+impl<'de> Visitor<'de> for PartsStatesVisitor<'_> {
+    type Value = Vec<PartsState>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of P5136 X-parts state records")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let capacity = sequence.size_hint().unwrap_or(0).min(MAX_EQUIPMENT_RECORDS);
+        let mut states = Vec::with_capacity(capacity);
+        while states.len() < MAX_EQUIPMENT_RECORDS {
+            let Some(state) = sequence.next_element::<PartsState>()? else {
+                return Ok(states);
+            };
+            states.push(state);
+        }
+        let extra = sequence.next_element_seed(RejectAdditionalPartsRecord {
+            limit_exceeded: self.limit_exceeded,
+        })?;
+        debug_assert!(extra.is_none());
+        Ok(states)
+    }
+}
+
+struct RejectAdditionalPartsRecord<'a> {
+    limit_exceeded: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for RejectAdditionalPartsRecord<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, _deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        self.limit_exceeded.set(true);
+        Err(D::Error::custom("X-parts equipment record limit exceeded"))
+    }
 }
 
 fn parse_parts_record<R>(
@@ -629,6 +1143,76 @@ fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>, EquipmentStateE
     Ok(Some(bytes))
 }
 
+fn read_optional_bounded_capability(
+    directory: &CapabilityDir,
+    filename: &str,
+    display_path: &Path,
+) -> Result<Option<Vec<u8>>, EquipmentStateError> {
+    let metadata = match directory.symlink_metadata(filename) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(EquipmentStateError::Io {
+                operation: "inspect equipment sidecar without following links",
+                path: display_path.to_owned(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(EquipmentStateError::InvalidStorageEntry {
+            path: display_path.to_owned(),
+        });
+    }
+
+    let mut options = CapabilityOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file =
+        directory
+            .open_with(filename, &options)
+            .map_err(|source| EquipmentStateError::Io {
+                operation: "open equipment sidecar without following links",
+                path: display_path.to_owned(),
+                source,
+            })?;
+    let opened_metadata = file.metadata().map_err(|source| EquipmentStateError::Io {
+        operation: "inspect opened equipment sidecar",
+        path: display_path.to_owned(),
+        source,
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(EquipmentStateError::InvalidStorageEntry {
+            path: display_path.to_owned(),
+        });
+    }
+    if opened_metadata.len() > MAX_EQUIPMENT_STATE_BYTES {
+        return Err(EquipmentStateError::TooLarge {
+            path: display_path.to_owned(),
+            actual: opened_metadata.len(),
+            maximum: MAX_EQUIPMENT_STATE_BYTES,
+        });
+    }
+
+    let capacity = usize::try_from(opened_metadata.len().min(64 * 1024)).unwrap_or_default();
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_EQUIPMENT_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| EquipmentStateError::Io {
+            operation: "read opened equipment sidecar",
+            path: display_path.to_owned(),
+            source,
+        })?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > MAX_EQUIPMENT_STATE_BYTES {
+        return Err(EquipmentStateError::TooLarge {
+            path: display_path.to_owned(),
+            actual,
+            maximum: MAX_EQUIPMENT_STATE_BYTES,
+        });
+    }
+    Ok(Some(bytes))
+}
+
 const fn normalize_kart_serial(id: i16, serial: i16) -> i16 {
     if id != 0 && serial == 0 { 1 } else { serial }
 }
@@ -637,7 +1221,7 @@ const fn normalize_kart_serial(id: i16, serial: i16) -> i16 {
 mod tests {
     use std::fs;
 
-    use p5136_core::equipment_protocol::PlantPartEquipRequest;
+    use p5136_core::equipment_protocol::{PlantPartEquipRequest, XPartEquipRequest};
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -846,5 +1430,82 @@ mod tests {
             Err(EquipmentStateError::InvalidPlantPartCategory(42))
         ));
         assert!(!root.path().join("PlantData.json").exists());
+    }
+
+    #[test]
+    fn equips_x_parts_atomically_and_preload_prefers_the_rider_sidecar() {
+        let root = tempdir().unwrap();
+        let rider = root.path().join("Rider");
+        fs::create_dir(&rider).unwrap();
+        fs::write(root.path().join("PartsData.xml"), PARTS_XML).unwrap();
+        fs::write(
+            rider.join("PartsData.json"),
+            concat!(
+                "[{\"ID\":1401,\"SN\":1,\"Engine\":1,\"EngineGrade\":2,",
+                "\"EngineValue\":3,\"FutureField\":{\"keep\":true}}]"
+            ),
+        )
+        .unwrap();
+        let request = XPartEquipRequest {
+            kart_id: 1_401,
+            kart_serial: 1,
+            item_category: 63,
+            item_id: 2,
+            quantity: i16::MAX,
+            unknown_1: 0,
+            grade: 1,
+            unknown_2: 1,
+            parts_value: 1_180,
+            unknown_3: 0,
+        };
+
+        let equipped = EquipmentExceptions::equip_x_part(&rider, request).unwrap();
+        assert_eq!(equipped.id, 1_401);
+        assert_eq!(equipped.serial, 1);
+        assert_eq!(equipped.engine, 2);
+        assert_eq!(equipped.engine_grade, 1);
+        assert_eq!(equipped.engine_value, 1_180);
+
+        let encoded: Value =
+            serde_json::from_slice(&fs::read(rider.join("PartsData.json")).unwrap()).unwrap();
+        assert_eq!(encoded[0]["FutureField"]["keep"], true);
+        assert_eq!(encoded[0]["Engine"], 2);
+        assert_eq!(encoded[0]["EngineGrade"], 1);
+        assert_eq!(encoded[0]["EngineValue"], 1_180);
+        assert!(fs::read_dir(&rider).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        let loaded = EquipmentExceptions::load(root.path(), &rider).unwrap();
+        assert_eq!(loaded.parts.len(), 2);
+        assert_eq!(loaded.parts[0], equipped);
+        assert_eq!(loaded.parts[1].serial, 3);
+    }
+
+    #[test]
+    fn direct_x_part_mutation_revalidates_typed_requests() {
+        let root = tempdir().unwrap();
+        let request = XPartEquipRequest {
+            kart_id: 1_401,
+            kart_serial: 1,
+            item_category: 67,
+            item_id: -1,
+            quantity: 0,
+            unknown_1: 0,
+            grade: 0,
+            unknown_2: 0,
+            parts_value: 0,
+            unknown_3: 0,
+        };
+
+        assert!(matches!(
+            EquipmentExceptions::equip_x_part(root.path(), request),
+            Err(EquipmentStateError::InvalidXPartCategory(67))
+        ));
+        assert!(!root.path().join("PartsData.json").exists());
     }
 }

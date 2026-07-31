@@ -109,6 +109,16 @@ pub enum UdpEndpointStateError {
         attempted_generation: u64,
         current_generation: u64,
     },
+
+    #[error(
+        "{transport} account ID {account_id} UDP arrival epoch {arrival_epoch} does not follow reconnect boundary {boundary_epoch}"
+    )]
+    IngressPredatesReconnect {
+        transport: UdpTransport,
+        account_id: u32,
+        arrival_epoch: u64,
+        boundary_epoch: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -183,6 +193,19 @@ impl UdpEndpointState {
         source: SocketAddr,
         route_hash: u32,
     ) -> Result<UdpIngressBinding, UdpEndpointStateError> {
+        self.bind_authorized_ingress_at(transport, identity, source, route_hash, u64::MAX)
+    }
+
+    /// Production ingress variant which also enforces any same-generation
+    /// reconnect boundary published by the TCP control plane.
+    pub fn bind_authorized_ingress_at(
+        &mut self,
+        transport: UdpTransport,
+        identity: &IdentityBinding,
+        source: SocketAddr,
+        route_hash: u32,
+        arrival_epoch: u64,
+    ) -> Result<UdpIngressBinding, UdpEndpointStateError> {
         let account_id = identity.user_no.get();
         let user_no = identity.user_no;
         if source.port() == 0 {
@@ -208,6 +231,16 @@ impl UdpEndpointState {
                 received: identity.source_ip,
             });
         }
+        if let Some(boundary_epoch) = active.reconnect_boundary_epoch
+            && arrival_epoch <= boundary_epoch
+        {
+            return Err(UdpEndpointStateError::IngressPredatesReconnect {
+                transport,
+                account_id,
+                arrival_epoch,
+                boundary_epoch,
+            });
+        }
         if source.ip() != active.source_ip {
             return Err(UdpEndpointStateError::SourceIpMismatch {
                 account_id,
@@ -231,6 +264,46 @@ impl UdpEndpointState {
             endpoint,
             status,
         })
+    }
+
+    /// Clears both endpoints for one exact active generation and installs an
+    /// arrival-epoch barrier. A datagram received before the TCP reconnect
+    /// report cannot race the actor queue and reclaim the endpoint afterward.
+    pub fn authorize_rebind(
+        &mut self,
+        identity: &IdentityBinding,
+        boundary_epoch: u64,
+    ) -> Result<(), UdpEndpointStateError> {
+        let account_id = identity.user_no.get();
+        let active = self
+            .active
+            .get_mut(&identity.user_no)
+            .ok_or(UdpEndpointStateError::InactiveAccount { account_id })?;
+        if active.generation != identity.generation {
+            return Err(UdpEndpointStateError::StaleGeneration {
+                transport: UdpTransport::Game,
+                account_id,
+                attempted_generation: identity.generation.get(),
+                current_generation: active.generation.get(),
+            });
+        }
+        if active.source_ip != identity.source_ip {
+            return Err(UdpEndpointStateError::SourceIpMismatch {
+                account_id,
+                expected: active.source_ip,
+                received: identity.source_ip,
+            });
+        }
+        if active
+            .reconnect_boundary_epoch
+            .is_some_and(|current| boundary_epoch <= current)
+        {
+            return Ok(());
+        }
+        active.reconnect_boundary_epoch = Some(boundary_epoch);
+        self.game.release(identity.user_no, identity.generation);
+        self.p2p.release(identity.user_no, identity.generation);
+        Ok(())
     }
 
     /// Returns a target only when both its identity and endpoint belong to the
@@ -351,6 +424,7 @@ impl UdpEndpointState {
 struct ActiveIdentity {
     generation: IdentityGeneration,
     source_ip: IpAddr,
+    reconnect_boundary_epoch: Option<u64>,
 }
 
 impl From<&IdentityBinding> for ActiveIdentity {
@@ -358,6 +432,7 @@ impl From<&IdentityBinding> for ActiveIdentity {
         Self {
             generation: identity.generation,
             source_ip: identity.source_ip,
+            reconnect_boundary_epoch: None,
         }
     }
 }
@@ -977,6 +1052,80 @@ mod tests {
             assert!(endpoints.game.bindings.is_empty());
             assert!(endpoints.p2p.bindings.is_empty());
         }
+    }
+
+    #[test]
+    fn fresh_identity_accepts_epoch_zero_until_a_reconnect_boundary_is_published() {
+        let (_identities, identity) = active_identity();
+        let mut endpoints = UdpEndpointState::new();
+        endpoints.advance_identity(&identity).unwrap();
+
+        let initial = endpoints
+            .bind_authorized_ingress_at(UdpTransport::Game, &identity, GAME_ENDPOINT, 1, 0)
+            .unwrap();
+        assert_eq!(initial.status, UdpEndpointBindStatus::Bound);
+
+        endpoints.authorize_rebind(&identity, 0).unwrap();
+        assert_eq!(
+            endpoints.bind_authorized_ingress_at(
+                UdpTransport::Game,
+                &identity,
+                GAME_ENDPOINT,
+                2,
+                0,
+            ),
+            Err(UdpEndpointStateError::IngressPredatesReconnect {
+                transport: UdpTransport::Game,
+                account_id: identity.user_no.get(),
+                arrival_epoch: 0,
+                boundary_epoch: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn reconnect_boundary_clears_both_routes_and_rejects_pre_report_arrivals() {
+        let (_identities, identity) = active_identity();
+        let mut endpoints = UdpEndpointState::new();
+        endpoints.advance_identity(&identity).unwrap();
+        endpoints
+            .bind_authorized_ingress_at(UdpTransport::Game, &identity, GAME_ENDPOINT, 1, 10)
+            .unwrap();
+        endpoints
+            .bind_authorized_ingress_at(UdpTransport::P2p, &identity, P2P_ENDPOINT, 2, 11)
+            .unwrap();
+
+        endpoints.authorize_rebind(&identity, 20).unwrap();
+        assert!(
+            endpoints
+                .current_authorized_target(UdpTransport::Game, &identity)
+                .is_none()
+        );
+        assert!(
+            endpoints
+                .current_authorized_target(UdpTransport::P2p, &identity)
+                .is_none()
+        );
+        assert_eq!(
+            endpoints.bind_authorized_ingress_at(
+                UdpTransport::Game,
+                &identity,
+                GAME_ENDPOINT,
+                3,
+                20,
+            ),
+            Err(UdpEndpointStateError::IngressPredatesReconnect {
+                transport: UdpTransport::Game,
+                account_id: identity.user_no.get(),
+                arrival_epoch: 20,
+                boundary_epoch: 20,
+            })
+        );
+        let rebound = endpoints
+            .bind_authorized_ingress_at(UdpTransport::Game, &identity, GAME_ALTERNATE, 4, 21)
+            .unwrap();
+        assert_eq!(rebound.status, UdpEndpointBindStatus::Bound);
+        assert_eq!(rebound.endpoint.endpoint, GAME_ALTERNATE);
     }
 
     fn active_identity() -> (IdentityRegistry, crate::IdentityBinding) {

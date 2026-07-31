@@ -23,6 +23,9 @@ pub const UNLOCK_ITEM_REPLY_NAME: &str = "PrUnLockedItem";
 pub const FAVORITE_ITEM_GET_REQUEST_NAME: &str = "PqFavoriteItemGet";
 pub const FAVORITE_ITEM_GET_REPLY_NAME: &str = "PrFavoriteItemGet";
 pub const FAVORITE_ITEM_UPDATE_REQUEST_NAME: &str = "PqFavoriteItemUpdate";
+pub const LOCKED_ITEM_GET_REQUEST_NAME: &str = "PqLockedItemGet";
+pub const LOCKED_ITEM_GET_REPLY_NAME: &str = "PrLockedItemGet";
+pub const LOCKED_ITEM_UPDATE_REQUEST_NAME: &str = "PqLockedItemUpdate";
 
 pub const DELETE_ITEM_REQUEST_HASH: u32 = 0x4F4E_07B8;
 pub const DELETE_ITEM_REPLY_HASH: u32 = 0x4F3D_07B7;
@@ -31,6 +34,9 @@ pub const UNLOCK_ITEM_REPLY_HASH: u32 = 0x27CD_0566;
 pub const FAVORITE_ITEM_GET_REQUEST_HASH: u32 = 0x3BAD_06B0;
 pub const FAVORITE_ITEM_GET_REPLY_HASH: u32 = 0x3BBD_06B1;
 pub const FAVORITE_ITEM_UPDATE_REQUEST_HASH: u32 = 0x5278_07F3;
+pub const LOCKED_ITEM_GET_REQUEST_HASH: u32 = 0x2D81_05C2;
+pub const LOCKED_ITEM_GET_REPLY_HASH: u32 = 0x2D8F_05C3;
+pub const LOCKED_ITEM_UPDATE_REQUEST_HASH: u32 = 0x4182_0705;
 
 /// Exact stock producer cap for one favorite-item update batch.
 pub const MAX_FAVORITE_ITEM_UPDATE_RECORDS: usize = 200;
@@ -54,6 +60,8 @@ pub enum ItemStateRequest {
     UnlockItem,
     FavoriteItemGet,
     FavoriteItemUpdate,
+    LockedItemGet,
+    LockedItemUpdate,
 }
 
 impl ItemStateRequest {
@@ -64,6 +72,8 @@ impl ItemStateRequest {
             Self::UnlockItem => UNLOCK_ITEM_REQUEST_NAME,
             Self::FavoriteItemGet => FAVORITE_ITEM_GET_REQUEST_NAME,
             Self::FavoriteItemUpdate => FAVORITE_ITEM_UPDATE_REQUEST_NAME,
+            Self::LockedItemGet => LOCKED_ITEM_GET_REQUEST_NAME,
+            Self::LockedItemUpdate => LOCKED_ITEM_UPDATE_REQUEST_NAME,
         }
     }
 
@@ -73,7 +83,8 @@ impl ItemStateRequest {
             Self::DeleteItem => Some(DELETE_ITEM_REPLY_NAME),
             Self::UnlockItem => Some(UNLOCK_ITEM_REPLY_NAME),
             Self::FavoriteItemGet => Some(FAVORITE_ITEM_GET_REPLY_NAME),
-            Self::FavoriteItemUpdate => None,
+            Self::LockedItemGet => Some(LOCKED_ITEM_GET_REPLY_NAME),
+            Self::FavoriteItemUpdate | Self::LockedItemUpdate => None,
         }
     }
 }
@@ -174,6 +185,8 @@ enum ParsedItemStateFields {
     Unlock,
     FavoriteGet,
     FavoriteUpdate(Vec<FavoriteItemChange>),
+    LockedGet,
+    LockedUpdate(Vec<FavoriteItemChange>),
 }
 
 /// A fully validated and exactly consumed stock item-state request.
@@ -198,7 +211,9 @@ impl ParsedItemStateRequest {
             ParsedItemStateFields::Delete(fields) => Some(*fields),
             ParsedItemStateFields::Unlock
             | ParsedItemStateFields::FavoriteGet
-            | ParsedItemStateFields::FavoriteUpdate(_) => None,
+            | ParsedItemStateFields::FavoriteUpdate(_)
+            | ParsedItemStateFields::LockedGet
+            | ParsedItemStateFields::LockedUpdate(_) => None,
         }
     }
 
@@ -208,7 +223,9 @@ impl ParsedItemStateRequest {
             ParsedItemStateFields::FavoriteUpdate(changes) => Some(changes),
             ParsedItemStateFields::Delete(_)
             | ParsedItemStateFields::Unlock
-            | ParsedItemStateFields::FavoriteGet => None,
+            | ParsedItemStateFields::FavoriteGet
+            | ParsedItemStateFields::LockedGet
+            | ParsedItemStateFields::LockedUpdate(_) => None,
         }
     }
 
@@ -217,12 +234,28 @@ impl ParsedItemStateRequest {
             ParsedItemStateFields::FavoriteUpdate(changes) => Ok(changes),
             ParsedItemStateFields::Delete(_)
             | ParsedItemStateFields::Unlock
-            | ParsedItemStateFields::FavoriteGet => {
+            | ParsedItemStateFields::FavoriteGet
+            | ParsedItemStateFields::LockedGet
+            | ParsedItemStateFields::LockedUpdate(_) => {
                 Err(ItemStateProtocolError::ParsedKindMismatch {
                     expected: ItemStateRequest::FavoriteItemUpdate,
                     actual: self.kind,
                 })
             }
+        }
+    }
+
+    pub fn into_locked_changes(self) -> Result<Vec<FavoriteItemChange>, ItemStateProtocolError> {
+        match self.fields {
+            ParsedItemStateFields::LockedUpdate(changes) => Ok(changes),
+            ParsedItemStateFields::Delete(_)
+            | ParsedItemStateFields::Unlock
+            | ParsedItemStateFields::FavoriteGet
+            | ParsedItemStateFields::FavoriteUpdate(_)
+            | ParsedItemStateFields::LockedGet => Err(ItemStateProtocolError::ParsedKindMismatch {
+                expected: ItemStateRequest::LockedItemUpdate,
+                actual: self.kind,
+            }),
         }
     }
 }
@@ -253,16 +286,30 @@ pub enum ItemStateProtocolError {
     #[error("PqFavoriteItemUpdate producer scope must be one, received {actual}")]
     InvalidFavoriteUpdateScope { actual: u8 },
 
+    #[error("PqLockedItemUpdate producer scope must be one, received {actual}")]
+    InvalidLockedUpdateScope { actual: u8 },
+
     #[error("PqFavoriteItemUpdate has {count} records; stock producer maximum is {maximum}")]
     FavoriteUpdateCountLimitExceeded { count: u32, maximum: usize },
 
     #[error("PqFavoriteItemUpdate record count {count} cannot fit this platform")]
     FavoriteUpdateCountOutOfRange { count: u32 },
 
+    #[error("PqLockedItemUpdate has {count} records; stock producer maximum is {maximum}")]
+    LockedUpdateCountLimitExceeded { count: u32, maximum: usize },
+
+    #[error("PqLockedItemUpdate record count {count} cannot fit this platform")]
+    LockedUpdateCountOutOfRange { count: u32 },
+
     #[error(
         "PqFavoriteItemUpdate record {index} has unsupported operation {actual}; expected 1 or 2"
     )]
     InvalidFavoriteOperation { index: usize, actual: u8 },
+
+    #[error(
+        "PqLockedItemUpdate record {index} has unsupported operation {actual}; expected 1 or 2"
+    )]
+    InvalidLockedOperation { index: usize, actual: u8 },
 
     #[error(
         "favorite-item reply has {count} records; payload cap {maximum_payload} permits {maximum_records}"
@@ -292,6 +339,8 @@ pub const fn classify_item_state_request(hash: u32) -> Option<ItemStateRequest> 
         UNLOCK_ITEM_REQUEST_HASH => Some(ItemStateRequest::UnlockItem),
         FAVORITE_ITEM_GET_REQUEST_HASH => Some(ItemStateRequest::FavoriteItemGet),
         FAVORITE_ITEM_UPDATE_REQUEST_HASH => Some(ItemStateRequest::FavoriteItemUpdate),
+        LOCKED_ITEM_GET_REQUEST_HASH => Some(ItemStateRequest::LockedItemGet),
+        LOCKED_ITEM_UPDATE_REQUEST_HASH => Some(ItemStateRequest::LockedItemUpdate),
         _ => None,
     }
 }
@@ -331,46 +380,87 @@ pub fn parse_item_state_request(
             ParsedItemStateFields::Unlock
         }
         ItemStateRequest::FavoriteItemGet => ParsedItemStateFields::FavoriteGet,
-        ItemStateRequest::FavoriteItemUpdate => {
-            let scope = reader.read_u8()?;
-            if scope != 1 {
-                return Err(ItemStateProtocolError::InvalidFavoriteUpdateScope { actual: scope });
-            }
-            let wire_count = reader.read_u32()?;
-            if wire_count > MAX_FAVORITE_ITEM_UPDATE_RECORDS_U32 {
-                return Err(ItemStateProtocolError::FavoriteUpdateCountLimitExceeded {
-                    count: wire_count,
-                    maximum: MAX_FAVORITE_ITEM_UPDATE_RECORDS,
-                });
-            }
-            let count = usize::try_from(wire_count).map_err(|_| {
-                ItemStateProtocolError::FavoriteUpdateCountOutOfRange { count: wire_count }
-            })?;
-            let mut changes = Vec::with_capacity(count);
-            for index in 0..count {
-                let item = FavoriteItemKey::new(
-                    reader.read_u16()?,
-                    reader.read_u16()?,
-                    reader.read_u16()?,
-                );
-                let actual = reader.read_u8()?;
-                let operation = match actual {
-                    1 => FavoriteItemOperation::Add,
-                    2 => FavoriteItemOperation::Remove,
-                    _ => {
-                        return Err(ItemStateProtocolError::InvalidFavoriteOperation {
-                            index,
-                            actual,
-                        });
-                    }
-                };
-                changes.push(FavoriteItemChange::new(item, operation));
-            }
-            ParsedItemStateFields::FavoriteUpdate(changes)
-        }
+        ItemStateRequest::FavoriteItemUpdate => ParsedItemStateFields::FavoriteUpdate(
+            parse_update_batch(&mut reader, ItemStateRequest::FavoriteItemUpdate)?,
+        ),
+        ItemStateRequest::LockedItemGet => ParsedItemStateFields::LockedGet,
+        ItemStateRequest::LockedItemUpdate => ParsedItemStateFields::LockedUpdate(
+            parse_update_batch(&mut reader, ItemStateRequest::LockedItemUpdate)?,
+        ),
     };
     ensure_exhausted(&reader, kind.request_name())?;
     Ok(ParsedItemStateRequest { kind, fields })
+}
+
+fn parse_update_batch(
+    reader: &mut PacketReader<'_>,
+    kind: ItemStateRequest,
+) -> Result<Vec<FavoriteItemChange>, ItemStateProtocolError> {
+    debug_assert!(matches!(
+        kind,
+        ItemStateRequest::FavoriteItemUpdate | ItemStateRequest::LockedItemUpdate
+    ));
+    let scope = reader.read_u8()?;
+    if scope != 1 {
+        return Err(match kind {
+            ItemStateRequest::FavoriteItemUpdate => {
+                ItemStateProtocolError::InvalidFavoriteUpdateScope { actual: scope }
+            }
+            ItemStateRequest::LockedItemUpdate => {
+                ItemStateProtocolError::InvalidLockedUpdateScope { actual: scope }
+            }
+            _ => unreachable!("only item-set update kinds call parse_update_batch"),
+        });
+    }
+    let wire_count = reader.read_u32()?;
+    if wire_count > MAX_FAVORITE_ITEM_UPDATE_RECORDS_U32 {
+        return Err(match kind {
+            ItemStateRequest::FavoriteItemUpdate => {
+                ItemStateProtocolError::FavoriteUpdateCountLimitExceeded {
+                    count: wire_count,
+                    maximum: MAX_FAVORITE_ITEM_UPDATE_RECORDS,
+                }
+            }
+            ItemStateRequest::LockedItemUpdate => {
+                ItemStateProtocolError::LockedUpdateCountLimitExceeded {
+                    count: wire_count,
+                    maximum: MAX_FAVORITE_ITEM_UPDATE_RECORDS,
+                }
+            }
+            _ => unreachable!("only item-set update kinds call parse_update_batch"),
+        });
+    }
+    let count = usize::try_from(wire_count).map_err(|_| match kind {
+        ItemStateRequest::FavoriteItemUpdate => {
+            ItemStateProtocolError::FavoriteUpdateCountOutOfRange { count: wire_count }
+        }
+        ItemStateRequest::LockedItemUpdate => {
+            ItemStateProtocolError::LockedUpdateCountOutOfRange { count: wire_count }
+        }
+        _ => unreachable!("only item-set update kinds call parse_update_batch"),
+    })?;
+    let mut changes = Vec::with_capacity(count);
+    for index in 0..count {
+        let item = FavoriteItemKey::new(reader.read_u16()?, reader.read_u16()?, reader.read_u16()?);
+        let actual = reader.read_u8()?;
+        let operation = match actual {
+            1 => FavoriteItemOperation::Add,
+            2 => FavoriteItemOperation::Remove,
+            _ => {
+                return Err(match kind {
+                    ItemStateRequest::FavoriteItemUpdate => {
+                        ItemStateProtocolError::InvalidFavoriteOperation { index, actual }
+                    }
+                    ItemStateRequest::LockedItemUpdate => {
+                        ItemStateProtocolError::InvalidLockedOperation { index, actual }
+                    }
+                    _ => unreachable!("only item-set update kinds call parse_update_batch"),
+                });
+            }
+        };
+        changes.push(FavoriteItemChange::new(item, operation));
+    }
+    Ok(changes)
 }
 
 /// Serializes a bounded `PrFavoriteItemGet` snapshot.
@@ -380,6 +470,14 @@ pub fn parse_item_state_request(
 /// serializer here because their reply objects are consumer-side success
 /// capabilities, not failure envelopes.
 pub fn serialize_favorite_item_list(
+    items: &[FavoriteItemKey],
+    maximum_payload: usize,
+) -> Result<Vec<u8>, ItemStateProtocolError> {
+    serialize_item_list(FAVORITE_ITEM_GET_REPLY_NAME, items, maximum_payload)
+}
+
+fn serialize_item_list(
+    reply_name: &'static str,
     items: &[FavoriteItemKey],
     maximum_payload: usize,
 ) -> Result<Vec<u8>, ItemStateProtocolError> {
@@ -404,7 +502,7 @@ pub fn serialize_favorite_item_list(
             maximum_payload,
         }
     })?;
-    let mut packet = PacketWriter::named(FAVORITE_ITEM_GET_REPLY_NAME);
+    let mut packet = PacketWriter::named(reply_name);
     packet.write_u32(count);
     for item in items {
         packet.write_u16(item.category());
@@ -413,6 +511,13 @@ pub fn serialize_favorite_item_list(
         packet.write_u8(0);
     }
     Ok(packet.into_inner())
+}
+
+pub fn serialize_locked_item_list(
+    items: &[FavoriteItemKey],
+    maximum_payload: usize,
+) -> Result<Vec<u8>, ItemStateProtocolError> {
+    serialize_item_list(LOCKED_ITEM_GET_REPLY_NAME, items, maximum_payload)
 }
 
 /// Returns the greatest favorite-list record count that fits one payload.
@@ -467,9 +572,12 @@ mod tests {
         FAVORITE_ITEM_GET_REQUEST_HASH, FAVORITE_ITEM_GET_REQUEST_NAME,
         FAVORITE_ITEM_UPDATE_REQUEST_HASH, FAVORITE_ITEM_UPDATE_REQUEST_NAME, FavoriteItemChange,
         FavoriteItemKey, FavoriteItemOperation, ItemStateProtocolError, ItemStateRequest,
-        MAX_FAVORITE_ITEM_UPDATE_RECORDS, UNLOCK_ITEM_REPLY_HASH, UNLOCK_ITEM_REPLY_NAME,
-        UNLOCK_ITEM_REQUEST_HASH, UNLOCK_ITEM_REQUEST_NAME, classify_item_state_request,
-        favorite_item_list_capacity, parse_item_state_request, serialize_favorite_item_list,
+        LOCKED_ITEM_GET_REPLY_HASH, LOCKED_ITEM_GET_REPLY_NAME, LOCKED_ITEM_GET_REQUEST_HASH,
+        LOCKED_ITEM_GET_REQUEST_NAME, LOCKED_ITEM_UPDATE_REQUEST_HASH,
+        LOCKED_ITEM_UPDATE_REQUEST_NAME, MAX_FAVORITE_ITEM_UPDATE_RECORDS, UNLOCK_ITEM_REPLY_HASH,
+        UNLOCK_ITEM_REPLY_NAME, UNLOCK_ITEM_REQUEST_HASH, UNLOCK_ITEM_REQUEST_NAME,
+        classify_item_state_request, favorite_item_list_capacity, parse_item_state_request,
+        serialize_favorite_item_list, serialize_locked_item_list,
     };
     use crate::{
         adler32,
@@ -477,7 +585,7 @@ mod tests {
         packet::{PacketError, PacketWriter},
     };
 
-    const HASHES: [(&str, u32); 7] = [
+    const HASHES: [(&str, u32); 10] = [
         (DELETE_ITEM_REQUEST_NAME, DELETE_ITEM_REQUEST_HASH),
         (DELETE_ITEM_REPLY_NAME, DELETE_ITEM_REPLY_HASH),
         (UNLOCK_ITEM_REQUEST_NAME, UNLOCK_ITEM_REQUEST_HASH),
@@ -491,13 +599,21 @@ mod tests {
             FAVORITE_ITEM_UPDATE_REQUEST_NAME,
             FAVORITE_ITEM_UPDATE_REQUEST_HASH,
         ),
+        (LOCKED_ITEM_GET_REQUEST_NAME, LOCKED_ITEM_GET_REQUEST_HASH),
+        (LOCKED_ITEM_GET_REPLY_NAME, LOCKED_ITEM_GET_REPLY_HASH),
+        (
+            LOCKED_ITEM_UPDATE_REQUEST_NAME,
+            LOCKED_ITEM_UPDATE_REQUEST_HASH,
+        ),
     ];
 
-    const REQUESTS: [ItemStateRequest; 4] = [
+    const REQUESTS: [ItemStateRequest; 6] = [
         ItemStateRequest::DeleteItem,
         ItemStateRequest::UnlockItem,
         ItemStateRequest::FavoriteItemGet,
         ItemStateRequest::FavoriteItemUpdate,
+        ItemStateRequest::LockedItemGet,
+        ItemStateRequest::LockedItemUpdate,
     ];
 
     fn delete_request(category: u16, item_id: u16, serial: u16, quantity_or_mode: u16) -> Vec<u8> {
@@ -524,7 +640,15 @@ mod tests {
     }
 
     fn favorite_update_request(scope: u8, records: &[(FavoriteItemKey, u8)]) -> Vec<u8> {
-        let mut packet = PacketWriter::named(FAVORITE_ITEM_UPDATE_REQUEST_NAME);
+        item_update_request(FAVORITE_ITEM_UPDATE_REQUEST_NAME, scope, records)
+    }
+
+    fn item_update_request(
+        name: &'static str,
+        scope: u8,
+        records: &[(FavoriteItemKey, u8)],
+    ) -> Vec<u8> {
+        let mut packet = PacketWriter::named(name);
         packet.write_u8(scope);
         packet.write_u32(u32::try_from(records.len()).expect("test count fits"));
         for (item, operation) in records {
@@ -548,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_and_reply_pairing_cover_only_the_four_requests() {
+    fn classifier_and_reply_pairing_cover_only_the_six_requests() {
         fn assert_copy_and_eq<T: Copy + Eq>() {}
         assert_copy_and_eq::<ItemStateRequest>();
 
@@ -571,11 +695,17 @@ mod tests {
             Some(FAVORITE_ITEM_GET_REPLY_NAME)
         );
         assert_eq!(ItemStateRequest::FavoriteItemUpdate.reply_name(), None);
+        assert_eq!(
+            ItemStateRequest::LockedItemGet.reply_name(),
+            Some(LOCKED_ITEM_GET_REPLY_NAME)
+        );
+        assert_eq!(ItemStateRequest::LockedItemUpdate.reply_name(), None);
         for hash in [
             0,
             DELETE_ITEM_REPLY_HASH,
             UNLOCK_ITEM_REPLY_HASH,
             FAVORITE_ITEM_GET_REPLY_HASH,
+            LOCKED_ITEM_GET_REPLY_HASH,
             u32::MAX,
         ] {
             assert_eq!(classify_item_state_request(hash), None);
@@ -886,6 +1016,49 @@ mod tests {
         assert_eq!(
             sha256_hex(&reply),
             "816a87043d9494e065a93c336cab2fe515840edf6d2064e9bbd06da1b14b200b"
+        );
+    }
+
+    #[test]
+    fn locked_update_and_get_match_captured_and_csharp_derived_goldens() {
+        let captured = item_update_request(LOCKED_ITEM_UPDATE_REQUEST_NAME, 1, &[]);
+        assert_eq!(captured, [0x05, 0x07, 0x82, 0x41, 1, 0, 0, 0, 0]);
+        let parsed = parse_item_state_request(&captured).expect("captured empty update");
+        assert_eq!(parsed.kind(), ItemStateRequest::LockedItemUpdate);
+        assert_eq!(
+            parsed
+                .into_locked_changes()
+                .expect("locked update exposes owned changes"),
+            []
+        );
+
+        let key = FavoriteItemKey::new(3, 1_450, 2);
+        let one = item_update_request(LOCKED_ITEM_UPDATE_REQUEST_NAME, 1, &[(key, 1)]);
+        assert_eq!(
+            one,
+            [
+                0x05, 0x07, 0x82, 0x41, 1, 1, 0, 0, 0, 3, 0, 0xAA, 0x05, 2, 0, 1,
+            ]
+        );
+        assert_eq!(
+            parse_item_state_request(&one)
+                .expect("source-derived one-record update")
+                .into_locked_changes()
+                .expect("locked changes"),
+            [FavoriteItemChange::new(key, FavoriteItemOperation::Add)]
+        );
+
+        let get = PacketWriter::named(LOCKED_ITEM_GET_REQUEST_NAME).into_inner();
+        assert_eq!(get, [0xC2, 0x05, 0x81, 0x2D]);
+        assert_eq!(
+            parse_item_state_request(&get).expect("locked get").kind(),
+            ItemStateRequest::LockedItemGet
+        );
+        assert_eq!(
+            serialize_locked_item_list(&[key], DEFAULT_MAX_PAYLOAD).expect("locked reply"),
+            [
+                0xC3, 0x05, 0x8F, 0x2D, 1, 0, 0, 0, 3, 0, 0xAA, 0x05, 2, 0, 0,
+            ]
         );
     }
 

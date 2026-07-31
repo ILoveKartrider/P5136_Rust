@@ -94,11 +94,14 @@ compatibility no-reply packets remain no-reply, while an unclassified hash
 returns a typed session error instead of being mistaken for a successful
 handler. MyRoom dispatch is exhaustive so new protocol variants cannot
 silently fall through.
-`PqLockedItemGet` is now a strict four-byte request and returns exactly one
-eight-byte terminal empty `PrLockedItemGet` to the authenticated requester.
-It performs no profile-store I/O or shared-state mutation. Nonempty protected
-items and `PqLockedItemUpdate` remain unimplemented because their
-P5136-specific wire and persistence policy lacks producer or capture proof.
+`PqLockedItemGet` is a strict four-byte request and returns the bounded
+canonical protected-item projection to the authenticated requester.
+`PqLockedItemUpdate` uses the captured strict batch layout and applies
+idempotent Add/Remove operations through the canonical profile lane. An
+unresolved C# `Locked.json` is imported exactly once through the process run
+lease and a no-follow profile capability; import plus the first request share
+one immutable revision. Malformed, oversized, nonregular, or linked sidecars
+fail closed without sealing canonical state.
 `PqServerTime` likewise has an explicit authenticated path and returns the
 exact eight-byte `PrServerTime`: reply hash, days since 1900 modulo 65,536,
 and quarter-seconds since local midnight. The corroborating C# handlers do not
@@ -144,27 +147,40 @@ but unknown business meanings and value ranges are deliberately not invented.
 
 TCP `GameSlotPacket` is handled separately from the opaque UDP packet that
 shares its name. Rust bounds the complete TCP packet at 1013 bytes and each
-nested blob at 960 bytes, validates P5136 types 1, 2, 9, 10, 11, and 12, and
-freezes the audited 74 type-12 operation pairs in a static allowlist. The
-World actor accepts only an exact frozen-generation human racer during
-`Running` or the still-open `Settling` window. It relays the original bytes to
-the exact current frozen audience, applies the type-11 recipient mask, and
-reserves every recipient queue before publishing. Valid Barricade placement
-is the sole sender-inclusive relay. Malformed, spoofed, unsupported,
-inactive-frozen-generation, wrong-phase, and backpressured item events are
-observable nonfatal drops; stale global identity ownership, actor termination,
-and invariant failures still propagate.
+nested blob at 960 bytes and validates P5136 types 1, 2, 4, 6, 9, 10, 11, 12,
+and 16. Type 12 uses a strict 67-class state/length/count manifest with typed
+evidence: only the exact Banana, Rocket, Barricade, and Course forms present
+in retained traces can relay, while static-writer-only shapes remain explicit
+no-side-effect evidence boundaries. The opt-in corpus test sends all 1,471
+retained TCP GameSlot records through this parser.
 
-Rust deliberately does not copy the C# item side effects called out by the
-stability audit. Type 1/2 pickup packets require a server-selected item in a
-different wire field, so they are validated and explicitly deferred instead
-of relaying the client rank as an item ID. Type 10/11 packets are relayed
-without speculative kart effects, bonus-item synthesis, probability rerolls,
-or double item transformation. Those behaviors remain capture- and
-design-blocked rather than bug-for-bug cloned.
+The World actor accepts only an exact frozen-generation human racer during
+`Running` or the still-open `Settling` window. Type 9/10/11 honor their
+recipient masks according to their captured sender rules. Trace-confirmed
+type-12 packets must carry the exact peer-racer mask derived by the server;
+client omissions and extra bits are rejected. All recipient queues are
+reserved before byte-exact publication. Malformed, spoofed, unsupported,
+evidence-pending, inactive-generation, wrong-phase, and backpressured item
+events have no side effects; stale global identity ownership, actor
+termination, and invariant failures still propagate.
 
-The remaining compatibility work is concentrated in authoritative item-pickup
-synthesis, capture-backed GameSlot bodies and side effects, the remaining
+Type 1/2 item-box requests are never relayed as-is because their rank field
+occupies the item-ID position in the response. In item individual/team rooms,
+the parser first verifies the captured pre-award state and repeated
+object/tick/state/owner fields. Per-player monotonic replay tokens and a
+capture-sized rate bucket are actor-owned and commit only after every outbound
+queue is reserved. For the current LAN/friends trust model, the default
+`Live` policy uses the client-reported rank and the C# Top/High/Middle/Low
+mapping. Uncheck the GUI trust option, or pass
+`--trust-client-item-rank false`, to use Combined weights instead. The actor
+synthesizes the exact 73-byte success packet and broadcasts it to all active
+frozen participants including the sender. Type 10/11 remain byte-exact relay only:
+Rust does not copy speculative kart side effects, bonus-item synthesis, or the
+C# double-transformation risk.
+
+The remaining compatibility work is concentrated in type 4/6/16 routing and
+type-12 ownership semantics, actor-owned item-slot/use effects, kart-specific
+pickup remapping, the remaining
 MyRoom and economy requests, capture-derived movement sequencing and UDP
 first-bind capabilities, packet fixtures, green cross-platform CI evidence,
 and stock-client end-to-end validation. See
@@ -254,6 +270,20 @@ fails closed with an empty emblem response and permits only `0,0,0`; `0` is
 solely the empty-selection sentinel. The existing C# exporter does not emit
 `<Emblems>`. Client archives and extracted XML must never be committed.
 
+The same `Data` directory supplies item probabilities. P5136 stores them in
+the legacy read-only `item.rho` paths
+`slot/itemProb_indi@zz.bml` and `slot/itemProb_team@zz.bml`, not in the RHO5
+packs. Rust validates the Rh-layer-1.1 header and block checksums, bounds every
+table/block/name, decrypts and decompresses only the exact entries, then
+parses their UTF-16 BML. The installed client yields 14 individual rows with
+combined weight 400 and 18 team rows with combined weight 410. If `item.rho`
+is absent, the loader can use equivalent RHO5 entries; without client data it
+uses a bounded 14/18-item safe table. `--item-probability-xml PATH` loads a
+portable `<itemProbabilities rankBand="...">` override containing
+`<individual>` and `<team>` sections with `item` attributes `idx`, `name`,
+`toprank`, `highrank`, `midrank`, and `lowrank`. XML is read through a bounded
+single handle and requires one complete exact root and one of each section.
+
 The server binds to `127.0.0.1` by default. To serve another machine, set both
 `--bind` and `--advertise`. Existing profiles may log in remotely, but creating
 new profiles from non-loopback clients additionally requires the explicit
@@ -284,13 +314,21 @@ same server options as the CLI: bind and advertised addresses, configured port,
 profile root, an optional stock-client/`Profile` path, remote profile creation,
 and advanced session limits/timeouts. The client path automatically resolves
 the C#-exported catalog and sibling `Data` directory. On Windows, the GUI loads
-the installed 맑은 고딕 system font so Korean operating-system errors render
+the installed `Malgun Gothic` system font so Korean operating-system errors render
 correctly. The advanced `Client Data override` field handles a non-standard
 client-data location. Starting and graceful stopping keep the supervisor on a dedicated worker; if retained reward recovery blocks graceful
 shutdown, the GUI reports that state and requires an explicit force-stop click.
 Closing a window with a live server cancels the close, requests graceful
 shutdown, waits for a bounded interval, then requests a force-stop and joins
 the worker before allowing process exit.
+The Server tab also contains an item-probability editor equivalent to the C#
+control: `Live/Top/High/Middle/Low/Combined` rank selection, separate
+individual/team tables, read-only IDs/names, editable bounded weights, client
+`item.rho`/RHO5 loading, portable XML loading, automatic client reload, and a
+safe fallback. Automatic tables must be loaded and pinned before their rank or
+weights can be edited, so the fallback preview cannot silently replace the
+stock distribution. `Trust client-reported live rank (LAN/friends)` is checked
+by default; clearing it changes only the `Live` policy to Combined fallback.
 The Server tab can copy its advertised address and configured port into the
 Connector tab. GUI edits apply to the next server start and are intentionally
 not persisted.

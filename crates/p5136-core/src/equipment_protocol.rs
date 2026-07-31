@@ -1,4 +1,4 @@
-//! P5136 rider-equipment update and plant-part equip codecs.
+//! P5136 rider-equipment, plant-part, and X-parts codecs.
 
 use thiserror::Error;
 
@@ -11,12 +11,15 @@ use crate::{
 pub const SET_RIDER_ITEMS_REQUEST_NAME: &str = "LoRqSetRiderItemOnPacket";
 pub const EQUIP_PLANT_PART_REQUEST_NAME: &str = "PqEquipTuningExPacket";
 pub const EQUIP_TUNING_REPLY_NAME: &str = "PrEquipTuningPacket";
+pub const EQUIP_X_PART_REQUEST_NAME: &str = "PqEquipXPartsItem";
+pub const EQUIP_X_PART_REPLY_NAME: &str = "PrEquipXPartsItem";
 pub const ROOM_SLOT_ITEMS_PACKET_NAME: &str = "GrSlotItemOnPacket";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EquipmentRequest {
     SetRiderItems,
     EquipPlantPart,
+    EquipXPart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +68,25 @@ pub struct PlantPartEquipRequest {
     pub kart_serial: i16,
 }
 
+/// The exact 18-byte body emitted by P5136 for one X-parts selection.
+///
+/// The four fields whose meaning is still unknown are retained and echoed
+/// verbatim. Only the fields consumed by the C# persistence path are used for
+/// state mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XPartEquipRequest {
+    pub kart_id: i16,
+    pub kart_serial: i16,
+    pub item_category: i16,
+    pub item_id: i16,
+    pub quantity: i16,
+    pub unknown_1: i16,
+    pub grade: u8,
+    pub unknown_2: u8,
+    pub parts_value: i16,
+    pub unknown_3: i16,
+}
+
 #[derive(Debug, Error)]
 pub enum EquipmentProtocolError {
     #[error(transparent)]
@@ -89,6 +111,15 @@ pub enum EquipmentProtocolError {
     #[error("plant target kart ID {0} must be positive")]
     InvalidPlantKart(i16),
 
+    #[error("X-parts category {0} is not one of 63..=66, 68, or 69")]
+    InvalidXPartCategory(i16),
+
+    #[error("X-parts item ID {0} cannot be negative")]
+    InvalidXPartItem(i16),
+
+    #[error("X-parts target kart ID {0} must be positive")]
+    InvalidXPartKart(i16),
+
     #[error("room equipment player ID {0} is outside 0..=15")]
     InvalidRoomPlayerId(i32),
 }
@@ -99,6 +130,8 @@ pub fn classify_equipment_request(hash: u32) -> Option<EquipmentRequest> {
         Some(EquipmentRequest::SetRiderItems)
     } else if hash == adler32::packet_hash(EQUIP_PLANT_PART_REQUEST_NAME) {
         Some(EquipmentRequest::EquipPlantPart)
+    } else if hash == adler32::packet_hash(EQUIP_X_PART_REQUEST_NAME) {
+        Some(EquipmentRequest::EquipXPart)
     } else {
         None
     }
@@ -180,6 +213,36 @@ pub fn parse_equip_plant_part(
     Ok(request)
 }
 
+pub fn parse_equip_x_part(packet: &[u8]) -> Result<XPartEquipRequest, EquipmentProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, EQUIP_X_PART_REQUEST_NAME)?;
+    let request = XPartEquipRequest {
+        kart_id: reader.read_i16()?,
+        kart_serial: reader.read_i16()?,
+        item_category: reader.read_i16()?,
+        item_id: reader.read_i16()?,
+        quantity: reader.read_i16()?,
+        unknown_1: reader.read_i16()?,
+        grade: reader.read_u8()?,
+        unknown_2: reader.read_u8()?,
+        parts_value: reader.read_i16()?,
+        unknown_3: reader.read_i16()?,
+    };
+    ensure_exhausted(&reader, EQUIP_X_PART_REQUEST_NAME)?;
+    if !matches!(request.item_category, 63..=66 | 68 | 69) {
+        return Err(EquipmentProtocolError::InvalidXPartCategory(
+            request.item_category,
+        ));
+    }
+    if request.item_id < 0 {
+        return Err(EquipmentProtocolError::InvalidXPartItem(request.item_id));
+    }
+    if request.kart_id <= 0 {
+        return Err(EquipmentProtocolError::InvalidXPartKart(request.kart_id));
+    }
+    Ok(request)
+}
+
 #[must_use]
 pub fn serialize_equip_tuning_failure() -> Vec<u8> {
     let mut packet = PacketWriter::named(EQUIP_TUNING_REPLY_NAME);
@@ -196,6 +259,39 @@ pub fn serialize_equip_tuning_success(request: PlantPartEquipRequest) -> Vec<u8>
     packet.write_i16(request.kart_id);
     packet.write_i16(request.item_category);
     packet.write_i16(request.item_id);
+    packet.into_inner()
+}
+
+/// Serializes the C# `result = 0` response followed by an exact request echo.
+#[must_use]
+pub fn serialize_equip_x_part_success(request: XPartEquipRequest) -> Vec<u8> {
+    serialize_equip_x_part_reply(0, request)
+}
+
+/// Serializes an inferred non-terminal rejection followed by the exact echo.
+///
+/// Only result `0` is present in the retained C#/client traffic. Result `1` is
+/// an explicit compatibility inference from the leading `i32` result field;
+/// keeping the fixed reply layout avoids turning rejected input into a
+/// transport failure, but does not claim a captured failure golden.
+#[must_use]
+pub fn serialize_equip_x_part_failure(request: XPartEquipRequest) -> Vec<u8> {
+    serialize_equip_x_part_reply(1, request)
+}
+
+fn serialize_equip_x_part_reply(result: i32, request: XPartEquipRequest) -> Vec<u8> {
+    let mut packet = PacketWriter::named(EQUIP_X_PART_REPLY_NAME);
+    packet.write_i32(result);
+    packet.write_i16(request.kart_id);
+    packet.write_i16(request.kart_serial);
+    packet.write_i16(request.item_category);
+    packet.write_i16(request.item_id);
+    packet.write_i16(request.quantity);
+    packet.write_i16(request.unknown_1);
+    packet.write_u8(request.grade);
+    packet.write_u8(request.unknown_2);
+    packet.write_i16(request.parts_value);
+    packet.write_i16(request.unknown_3);
     packet.into_inner()
 }
 
@@ -264,10 +360,11 @@ const _: () = assert!(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH == 65);
 #[cfg(test)]
 mod tests {
     use super::{
-        EQUIP_PLANT_PART_REQUEST_NAME, EquipmentProtocolError, EquipmentRequest,
-        PlantPartEquipRequest, RiderItemSelection, SET_RIDER_ITEMS_REQUEST_NAME,
-        classify_equipment_request, parse_equip_plant_part, parse_set_rider_items,
-        serialize_equip_tuning_failure, serialize_equip_tuning_success, serialize_room_slot_items,
+        EQUIP_PLANT_PART_REQUEST_NAME, EQUIP_X_PART_REQUEST_NAME, EquipmentProtocolError,
+        EquipmentRequest, PlantPartEquipRequest, RiderItemSelection, SET_RIDER_ITEMS_REQUEST_NAME,
+        XPartEquipRequest, classify_equipment_request, parse_equip_plant_part, parse_equip_x_part,
+        parse_set_rider_items, serialize_equip_tuning_failure, serialize_equip_tuning_success,
+        serialize_equip_x_part_failure, serialize_equip_x_part_success, serialize_room_slot_items,
     };
     use crate::{adler32, packet::PacketWriter};
 
@@ -282,6 +379,10 @@ mod tests {
             Some(EquipmentRequest::EquipPlantPart)
         );
         assert_eq!(
+            classify_equipment_request(0x3B5A_06B6),
+            Some(EquipmentRequest::EquipXPart)
+        );
+        assert_eq!(
             adler32::packet_hash(SET_RIDER_ITEMS_REQUEST_NAME),
             0x7234_0944
         );
@@ -289,6 +390,7 @@ mod tests {
             adler32::packet_hash(EQUIP_PLANT_PART_REQUEST_NAME),
             0x5AB9_084F
         );
+        assert_eq!(adler32::packet_hash(EQUIP_X_PART_REQUEST_NAME), 0x3B5A_06B6);
         assert_eq!(classify_equipment_request(0xDEAD_BEEF), None);
     }
 
@@ -352,6 +454,83 @@ mod tests {
             serialize_equip_tuning_failure(),
             decode_hex("9307E74A00000000")
         );
+    }
+
+    #[test]
+    fn captured_x_part_request_and_success_reply_match_the_csharp_echo() {
+        let request = decode_hex("B6065A3B790501003F000200FF7F000001019C040000");
+        let parsed = parse_equip_x_part(&request).unwrap();
+        assert_eq!(
+            parsed,
+            XPartEquipRequest {
+                kart_id: 1_401,
+                kart_serial: 1,
+                item_category: 63,
+                item_id: 2,
+                quantity: i16::MAX,
+                unknown_1: 0,
+                grade: 1,
+                unknown_2: 1,
+                parts_value: 1_180,
+                unknown_3: 0,
+            }
+        );
+        assert_eq!(
+            serialize_equip_x_part_success(parsed),
+            decode_hex("B7066A3B00000000790501003F000200FF7F000001019C040000")
+        );
+        let mut trailing = request;
+        trailing.push(0);
+        assert!(matches!(
+            parse_equip_x_part(&trailing),
+            Err(EquipmentProtocolError::TrailingBytes {
+                name: EQUIP_X_PART_REQUEST_NAME,
+                count: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn inferred_x_part_failure_preserves_the_reply_shape_and_exact_echo() {
+        let parsed =
+            parse_equip_x_part(&decode_hex("B6065A3B790501003F000200FF7F000001019C040000"))
+                .unwrap();
+        assert_eq!(
+            serialize_equip_x_part_failure(parsed),
+            decode_hex("B7066A3B01000000790501003F000200FF7F000001019C040000")
+        );
+    }
+
+    #[test]
+    fn x_part_success_echo_preserves_a_zero_wire_serial() {
+        let request = XPartEquipRequest {
+            kart_id: 1_401,
+            kart_serial: 0,
+            item_category: 63,
+            item_id: 2,
+            quantity: i16::MAX,
+            unknown_1: 0,
+            grade: 1,
+            unknown_2: 1,
+            parts_value: 1_180,
+            unknown_3: 0,
+        };
+        let mut packet = PacketWriter::named(EQUIP_X_PART_REQUEST_NAME);
+        packet.write_i16(request.kart_id);
+        packet.write_i16(request.kart_serial);
+        packet.write_i16(request.item_category);
+        packet.write_i16(request.item_id);
+        packet.write_i16(request.quantity);
+        packet.write_i16(request.unknown_1);
+        packet.write_u8(request.grade);
+        packet.write_u8(request.unknown_2);
+        packet.write_i16(request.parts_value);
+        packet.write_i16(request.unknown_3);
+
+        let parsed = parse_equip_x_part(packet.as_slice()).unwrap();
+        assert_eq!(parsed.kart_serial, 0);
+        let reply = serialize_equip_x_part_success(parsed);
+        assert_eq!(i16::from_le_bytes(reply[10..12].try_into().unwrap()), 0);
     }
 
     #[test]

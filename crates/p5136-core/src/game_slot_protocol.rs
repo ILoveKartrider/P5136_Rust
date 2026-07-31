@@ -13,6 +13,10 @@
 
 use thiserror::Error;
 
+use crate::game_slot_item_schema::{
+    ItemOperationEvidence, ItemOperationSchema, ItemOperationValidationError, item_operation_schema,
+};
+
 pub const GAME_SLOT_PACKET_NAME: &str = "GameSlotPacket";
 pub const GAME_SLOT_PACKET_HASH: u32 = 0x27C0_0574;
 pub const MAX_GAME_SLOT_LOGICAL_LENGTH: usize = 1_013;
@@ -32,125 +36,90 @@ pub const GO_ITEM_ROCKET_HASH: u32 = 0x1D4C_04AD;
 pub const GOP_BARRICADE_HASH: u32 = 0x1D86_04A3;
 pub const GO_ITEM_BARRICADE_HASH: u32 = 0x2D06_05C2;
 
+pub const GOP_LUCCI_HASH: u32 = 0x0D89_0316;
+pub const GO_LUCCI_HASH: u32 = 0x0A33_02A6;
+pub const GOP_BONUS_ITEM_HASH: u32 = 0x1DF9_04BC;
+pub const GO_BONUS_ITEM_HASH: u32 = 0x18E3_044C;
+
 const COMMON_ENVELOPE_LENGTH: usize = 13;
 const P5136_PLAYER_MASK: u32 = 0x0000_ffff;
 const PICKUP_BLOB_LENGTH: usize = 24;
-const BANANA_OPERATION_LENGTH: usize = 30;
-const COURSE_OPERATION_LENGTH: usize = 32;
-const ROCKET_OPERATION_LENGTH: usize = 73;
-const BARRICADE_OPERATION_LENGTH: usize = 73;
-
-/// Exact operation/base-operation pairs derived from the checked-in P5136
-/// packet-name table. `GopCube*` is intentionally excluded; `GopCourse` is
-/// paired with the table's exceptional `GoCourse` spelling.
-pub const P5136_ITEM_OPERATION_PAIRS: [(u32, u32); 74] = [
-    (0x0D49_030D, 0x184D_042C), // GopAngel / GoItemAngel
-    (0x1457_03C9, 0x2199_04E8), // GopAreaUfo / GoItemAreaUfo
-    (0x14A6_03ED, 0x21E8_050C), // GopBalloon / GoItemBalloon
-    (GOP_BANANA_HASH, GO_ITEM_BANANA_HASH),
-    (GOP_BARRICADE_HASH, GO_ITEM_BARRICADE_HASH),
-    (0x0D59_0311, 0x185D_0430), // GopBlock / GoItemBlock
-    (0x233A_0538, 0x33D9_0657), // GopBossPrison / GoItemBossPrison
-    (0x1DB9_04A4, 0x2D39_05C3), // GopBoundRoad / GoItemBoundRoad
-    (0x1DC1_04AE, 0x2D41_05CD), // GopBoundWall / GoItemBoundWall
-    (0x14E9_03F7, 0x222B_0516), // GopChopper / GoItemChopper
-    (0x0D7B_031D, 0x187F_043C), // GopCloud / GoItemCloud
-    (0x10CA_034F, 0x1CED_046E), // GopCloud2 / GoItemCloud2
-    (0x1900_0448, 0x2761_0567), // GopCokebomb / GoItemCokebomb
-    (0x2261_0510, 0x3300_062F), // GopCokeRocket / GoItemCokeRocket
-    (GOP_COURSE_HASH, GO_COURSE_HASH),
-    (0x0D69_031A, 0x186D_0439), // GopDevil / GoItemDevil
-    (0x3A06_069F, 0x4F21_07BE), // GopDinoClawRocket / GoItemDinoClawRocket
-    (0x0D6A_030E, 0x186E_042D), // GopDrmad / GoItemDrmad
-    (0x1977_0461, 0x27D8_0580), // GopDynamite / GoItemDynamite
-    (0x07AE_0248, 0x1074_0367), // GopEmp / GoItemEmp
-    (0x2856_057F, 0x3A14_069E), // GopEventObject / GoItemEventObject
-    (0x14A7_03E3, 0x21E9_0502), // GopFalling / GoItemFalling
-    (0x1DC6_04B1, 0x2D46_05D0), // GopForceZone / GoItemForceZone
-    (0x0DAE_0334, 0x18B2_0453), // GopFrost / GoItemFrost
-    (0x0D8B_032B, 0x188F_044A), // GopGhost / GoItemGhost
-    (0x228A_0514, 0x3329_0633), // GopGoldRocket / GoItemGoldRocket
-    (0x2271_0505, 0x3310_0624), // GopGoldShield / GoItemGoldShield
-    (0x10D3_0380, 0x1CF6_049F), // GopHammer / GoItemHammer
-    (0x17FB_040D, 0x265C_052C), // GopHeadBand / GoItemHeadBand
-    (0x10C3_0382, 0x1CE6_04A1), // GopIcefly / GoItemIcefly
-    (0x2DC1_05C8, 0x409E_06E7), // GopInfectedBomb / GoItemInfectedBomb
-    (0x0D82_031D, 0x1886_043C), // GopJewel / GoItemJewel
-    (0x3BEA_06CF, 0x5105_07EE), // GopLockdownRocket / GoItemLockdownRocket
-    (0x10DE_0382, 0x1D01_04A1), // GopMagnet / GoItemMagnet
-    (0x0A6B_02AF, 0x1450_03CE), // GopMine / GoItemMine
-    (0x1E52_04C0, 0x2DD2_05DF), // GopMovingUfo / GoItemMovingUfo
-    (0x1476_03D8, 0x21B8_04F7), // GopMqDevil / GoItemMqDevil
-    (0x18D8_0444, 0x2739_0563), // GopNewDevil / GoItemNewDevil
-    (0x07C0_024A, 0x1086_0369), // GopOil / GoItemOil
-    (0x2369_052B, 0x3408_064A), // GopPiratebomb / GoItemPiratebomb
-    (0x0DC1_0333, 0x18C5_0452), // GopPress / GoItemPress
-    (0x1DC5_04A1, 0x2D45_05C0), // GopRobotBeam / GoItemRobotBeam
-    (GOP_ROCKET_HASH, GO_ITEM_ROCKET_HASH),
-    (0x2954_059D, 0x3B12_06BC), // GopRollingbomb / GoItemRollingbomb
-    (0x42E4_071F, 0x591E_083E), // GopRollingCokebomb / GoItemRollingCokebomb
-    (0x6381_08BF, 0x7E37_09DE), // GopRollingInfectedbomb / GoItemRollingInfectedbomb
-    (0x1942_0457, 0x27A3_0576), // GopScanning / GoItemScanning
-    (0x1110_037F, 0x1D33_049E), // GopShield / GoItemShield
-    (0x150D_03E9, 0x224F_0508), // GopSilence / GoItemSilence
-    (0x0DB2_0327, 0x18B6_0446), // GopSiren / GoItemSiren
-    (0x28A5_0580, 0x3A63_069F), // GopSirenShield / GoItemSirenShield
-    (0x196B_0451, 0x27CC_0570), // GopSlotLock / GoItemSlotLock
-    (0x19EB_046D, 0x284C_058C), // GopSnowbomb / GoItemSnowbomb
-    (0x1584_0409, 0x22C6_0528), // GopSnowman / GoItemSnowman
-    (0x2262_0502, 0x3301_0621), // GopSpaceCraft / GoItemSpaceCraft
-    (0x3473_0640, 0x486F_075F), // GopSpecialShield / GoItemSpecialShield
-    (0x2E54_05E8, 0x4131_0707), // GopSpecialSiren / GoItemSpecialSiren
-    (0x2E3D_05E0, 0x411A_06FF), // GopSpecialSmall / GoItemSpecialSmall
-    (0x1DB2_04AF, 0x2D32_05CE), // GopSpeedDown / GoItemSpeedDown
-    (0x116F_0399, 0x1D92_04B8), // GopSpring / GoItemSpring
-    (0x3C6F_06D4, 0x518A_07F3), // GopStraightRocket / GoItemStraightRocket
-    (0x198F_044A, 0x27F0_0569), // GopSuperMag / GoItemSuperMag
-    (0x2973_05B1, 0x3B31_06D0), // GopThunderbolt / GoItemThunderbolt
-    (0x2882_0589, 0x3A40_06A8), // GopTigerRocket / GoItemTigerRocket
-    (0x196A_0455, 0x27CB_0574), // GopTimebomb / GoItemTimebomb
-    (0x2DDA_05D7, 0x40B7_06F6), // GopTimeCokebomb / GoItemTimeCokebomb
-    (0x48D7_0757, 0x6030_0876), // GopTimeInfectedBomb / GoItemTimeInfectedBomb
-    (0x1909_043E, 0x276A_055D), // GopTimeMine / GoItemTimeMine
-    (0x2EC5_05FC, 0x41A2_071B), // GopTimeSnowbomb / GoItemTimeSnowbomb
-    (0x1E29_04C1, 0x2DA9_05E0), // GopTombStone / GoItemTombStone
-    (0x07CF_0250, 0x1095_036F), // GopUfo / GoItemUfo
-    (0x1E65_04C9, 0x2DE5_05E8), // GopWaterbomb / GoItemWaterbomb
-    (0x19AE_0474, 0x280F_0593), // GopWaterfly / GoItemWaterfly
-    (0x1E04_04B2, 0x2D84_05D1), // GopWaterMine / GoItemWaterMine
-];
 
 /// The only actions implied by a successful P5136 decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameSlotAction {
-    /// Type 1/2 must never be relayed as received. Until a separate
-    /// authoritative award/synthesis path is implemented, this is an explicit
-    /// no-relay/drop action.
-    PickupRequiresServerSynthesis,
+    /// The actor must select an item from its immutable probability snapshot
+    /// and synthesize a sender-inclusive authoritative pickup response.
+    SynthesizeItemPickup,
+    /// The wire shape is validated, but a server behavior needed for relay has
+    /// not yet crossed its evidence gate.
+    EvidencePending(GameSlotEvidencePending),
     /// Relay the exact owned input bytes to the validated audience.
     RelayOriginal(GameSlotRelayAudience),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GameSlotRelayAudience {
-    RoomIncludingSender,
-    RoomExceptSender,
-    RecipientMaskExceptSender,
+pub enum GameSlotEvidencePending {
+    WorldObjectCollectionAuthorization(WorldObjectCollectionKind),
+    SpawnedItemUseRouting,
+    StaticItemOperation {
+        class_name: &'static str,
+        state: u32,
+        evidence: ItemOperationEvidence,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameSlotRelayAudience {
+    /// The actor must derive the complete current racer peer mask and require
+    /// the client mask to match it before publishing.
+    AllRacePeersMaskMatch,
+    RecipientMaskIncludingSender,
+    RecipientMaskExceptSender,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemPickupKind {
     Type1,
     Type2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemPickupToken {
+    pub object_id: u32,
+    pub operation_tick: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ItemPickup {
     pub kind: ItemPickupKind,
+    pub token: ItemPickupToken,
     pub live_rank: i16,
     pub x: f32,
     pub y: f32,
     pub z: f32,
+    pub blob: GameSlotPayloadRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldObjectCollectionKind {
+    Lucci,
+    BonusItem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldObjectCollection {
+    pub kind: WorldObjectCollectionKind,
+    pub object_id: u32,
+    pub current_tick: u32,
+    pub expiry_tick: u32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub trailing_word: u16,
+    pub collector_id: u8,
+    pub operation_tick: u32,
+    pub variant: u8,
     pub blob: GameSlotPayloadRange,
 }
 
@@ -175,11 +144,20 @@ impl ItemVector {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemUse {
-    pub uni: u8,
-    pub success: u8,
-    pub unknown: u8,
-    pub skill: i16,
+    pub kind: ItemUseKind,
+    pub common: u8,
+    pub status: u16,
+    pub item_or_skill: u16,
+    pub flag_18: u8,
+    pub flag_19: u8,
+    pub trailing_word: u16,
     pub blob: GameSlotPayloadRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemUseKind {
+    Ordinary,
+    SpawnedWorldObject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,17 +171,12 @@ pub struct ItemReaction {
 pub struct ItemOperation {
     pub operation_hash: u32,
     pub operation_base_hash: u32,
-    pub shape: ItemOperationShape,
+    pub schema: &'static ItemOperationSchema,
+    pub object_id: u32,
+    pub state: u32,
+    pub evidence: ItemOperationEvidence,
+    pub barricade: Option<BarricadePlacement>,
     pub payload: GameSlotPayloadRange,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ItemOperationShape {
-    Banana,
-    Course,
-    Rocket,
-    Barricade(BarricadePlacement),
-    GenericKnownPair,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -236,6 +209,7 @@ impl BarricadePlacement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GameSlotBody {
     ItemPickup(ItemPickup),
+    WorldObjectCollection(WorldObjectCollection),
     ItemVector(ItemVector),
     ItemUse(ItemUse),
     ItemReaction(ItemReaction),
@@ -254,16 +228,32 @@ impl GameSlotBody {
                 kind: ItemPickupKind::Type2,
                 ..
             }) => 2,
+            Self::WorldObjectCollection(WorldObjectCollection {
+                kind: WorldObjectCollectionKind::Lucci,
+                ..
+            }) => 4,
+            Self::WorldObjectCollection(WorldObjectCollection {
+                kind: WorldObjectCollectionKind::BonusItem,
+                ..
+            }) => 6,
             Self::ItemVector(_) => 9,
-            Self::ItemUse(_) => 10,
+            Self::ItemUse(ItemUse {
+                kind: ItemUseKind::Ordinary,
+                ..
+            }) => 10,
             Self::ItemReaction(_) => 11,
             Self::ItemOperation(_) => 12,
+            Self::ItemUse(ItemUse {
+                kind: ItemUseKind::SpawnedWorldObject,
+                ..
+            }) => 16,
         }
     }
 
     const fn payload_range(&self) -> GameSlotPayloadRange {
         match self {
             Self::ItemPickup(value) => value.blob,
+            Self::WorldObjectCollection(value) => value.blob,
             Self::ItemVector(value) => value.payload,
             Self::ItemUse(value) => value.blob,
             Self::ItemReaction(value) => value.blob,
@@ -340,6 +330,30 @@ impl ParsedGameSlotPacket {
         self.raw
     }
 
+    pub fn into_item_pickup_award(
+        mut self,
+        item_id: i16,
+    ) -> Result<Vec<u8>, GameSlotSynthesisError> {
+        if item_id <= 0 {
+            return Err(GameSlotSynthesisError::InvalidItemId(item_id));
+        }
+        if self.action != GameSlotAction::SynthesizeItemPickup
+            || !matches!(self.body, GameSlotBody::ItemPickup(_))
+        {
+            return Err(GameSlotSynthesisError::NotItemPickup);
+        }
+        let item_id_end = 40;
+        if self.raw.len() <= item_id_end {
+            return Err(GameSlotSynthesisError::PickupInvariant {
+                actual: self.raw.len(),
+                minimum: item_id_end + 1,
+            });
+        }
+        self.raw[38..item_id_end].copy_from_slice(&item_id.to_le_bytes());
+        self.raw[item_id_end] = 1;
+        Ok(self.raw)
+    }
+
     #[must_use]
     pub fn payload(&self) -> Option<&[u8]> {
         let payload = self.body.payload_range();
@@ -412,6 +426,42 @@ pub enum GameSlotDropReason {
         operation_base_hash: u32,
     },
 
+    #[error(
+        "GameSlot type {packet_type} item-pickup request state is status {status}, item {item_id}; not a captured pre-award shape"
+    )]
+    InvalidPickupRequestState {
+        packet_type: u8,
+        status: u8,
+        item_id: u32,
+    },
+
+    #[error("item-pickup outer object ID 0x{outer:08X} differs from nested ID 0x{nested:08X}")]
+    PickupObjectIdMismatch { outer: u32, nested: u32 },
+
+    #[error(
+        "GameSlot type 1 item-pickup object ID 0x{actual:08X} is outside 0xF0000000..=0xF00000FF"
+    )]
+    InvalidType1PickupObjectId { actual: u32 },
+
+    #[error("GameSlot type 2 item-pickup object ID 0x{actual:08X} is not 0x00FFFFFF")]
+    InvalidType2PickupObjectId { actual: u32 },
+
+    #[error(
+        "GameSlot type {packet_type} item-pickup {field} tick is {actual}; expected {expected}"
+    )]
+    InvalidPickupTick {
+        packet_type: u8,
+        field: &'static str,
+        actual: u32,
+        expected: u32,
+    },
+
+    #[error("item-pickup nested state is {actual}; expected 1")]
+    InvalidPickupState { actual: u32 },
+
+    #[error("item-pickup nested owner {nested} does not match claimed player {claimed}")]
+    InvalidPickupOwner { claimed: u8, nested: u32 },
+
     #[error("item-pickup coordinate {axis} is not finite")]
     NonFinitePickupPosition { axis: usize },
 
@@ -434,18 +484,50 @@ pub enum GameSlotDropReason {
         operation_base_hash: u32,
     },
 
+    #[error("GameSlot type 12 reserved word is 0x{actual:04X}; expected zero")]
+    InvalidItemOperationReservedWord { actual: u16 },
+
+    #[error(transparent)]
+    ItemOperationValidation(#[from] ItemOperationValidationError),
+
     #[error(
-        "known item-operation 0x{operation_hash:08X}/0x{operation_base_hash:08X} has {actual} bytes; expected {expected}"
+        "GameSlot type {packet_type} collection operation pair 0x{operation_hash:08X}/0x{operation_base_hash:08X} is not the statically bound class"
     )]
-    InvalidKnownItemOperationLength {
+    InvalidCollectionOperation {
+        packet_type: u8,
         operation_hash: u32,
         operation_base_hash: u32,
+    },
+
+    #[error(
+        "GameSlot type {packet_type} collection body has {actual} bytes; expected exactly {expected}"
+    )]
+    InvalidCollectionBlobLength {
+        packet_type: u8,
         actual: usize,
         expected: usize,
     },
 
-    #[error("barricade operation marker is {actual}; expected 1")]
-    InvalidBarricadeMarker { actual: u8 },
+    #[error("GameSlot type {packet_type} collection carries object ID -1")]
+    MissingCollectionObjectId { packet_type: u8 },
+
+    #[error(
+        "GameSlot type {packet_type} outer object ID {outer} differs from nested object ID {nested}"
+    )]
+    CollectionObjectIdMismatch {
+        packet_type: u8,
+        outer: u32,
+        nested: u32,
+    },
+
+    #[error("GameSlot type {packet_type} collection state is {actual}; expected 1")]
+    InvalidCollectionState { packet_type: u8, actual: u32 },
+
+    #[error("GameSlot type {packet_type} collector ID {collector} is outside 0..=15")]
+    InvalidCollectionCollector { packet_type: u8, collector: i32 },
+
+    #[error("GameSlot type {packet_type} collection coordinate {axis} is not finite")]
+    NonFiniteCollectionPosition { packet_type: u8, axis: usize },
 
     #[error("barricade owner ID {owner_id} does not match claimed player ID {player_id}")]
     InvalidBarricadeOwner { player_id: u8, owner_id: i32 },
@@ -455,6 +537,18 @@ pub enum GameSlotDropReason {
 
     #[error("barricade transform float {index} is not finite")]
     NonFiniteBarricadeTransform { index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum GameSlotSynthesisError {
+    #[error("item-pickup award item ID {0} must be positive")]
+    InvalidItemId(i16),
+    #[error("only a validated item-pickup request can synthesize an item award")]
+    NotItemPickup,
+    #[error(
+        "validated item-pickup packet invariant failed: got {actual} bytes, need at least {minimum}"
+    )]
+    PickupInvariant { actual: usize, minimum: usize },
 }
 
 /// `Ok` means actor policy may continue; `Err` means drop without relay or
@@ -497,9 +591,12 @@ pub fn parse_game_slot_packet(packet: &[u8]) -> GameSlotDisposition {
     let packet_type = packet[12];
 
     let (body, action) = match packet_type {
-        1 | 2 => parse_item_pickup(packet, packet_type, item_or_recipient_mask)?,
+        1 | 2 => parse_item_pickup(packet, packet_type, player_id, item_or_recipient_mask)?,
+        4 | 6 => {
+            parse_world_object_collection(packet, packet_type, player_id, item_or_recipient_mask)?
+        }
         9 => parse_item_vector(packet, player_id, item_or_recipient_mask)?,
-        10 => parse_item_use(packet, item_or_recipient_mask)?,
+        10 | 16 => parse_item_use(packet, packet_type, item_or_recipient_mask)?,
         11 => parse_item_reaction(packet, item_or_recipient_mask)?,
         12 => parse_item_operation(packet, player_id, item_or_recipient_mask)?,
         unsupported => return Err(GameSlotDropReason::UnsupportedType(unsupported)),
@@ -517,6 +614,7 @@ pub fn parse_game_slot_packet(packet: &[u8]) -> GameSlotDisposition {
 fn parse_item_pickup(
     packet: &[u8],
     packet_type: u8,
+    player_id: u8,
     mask: u32,
 ) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
     const BLOB_LENGTH_OFFSET: usize = 45;
@@ -541,6 +639,7 @@ fn parse_item_pickup(
             operation_base_hash,
         });
     }
+    let (kind, token) = parse_item_pickup_token(packet, packet_type, player_id)?;
 
     let position = [
         read_f32(packet, 26, "GameSlot item pickup position")?,
@@ -553,13 +652,9 @@ fn parse_item_pickup(
         }
     }
 
-    let kind = if packet_type == 1 {
-        ItemPickupKind::Type1
-    } else {
-        ItemPickupKind::Type2
-    };
     let pickup = ItemPickup {
         kind,
+        token,
         live_rank: read_i16(packet, 38, "GameSlot item pickup live rank")?,
         x: position[0],
         y: position[1],
@@ -568,7 +663,201 @@ fn parse_item_pickup(
     };
     Ok((
         GameSlotBody::ItemPickup(pickup),
-        GameSlotAction::PickupRequiresServerSynthesis,
+        GameSlotAction::SynthesizeItemPickup,
+    ))
+}
+
+fn parse_item_pickup_token(
+    packet: &[u8],
+    packet_type: u8,
+    player_id: u8,
+) -> Result<(ItemPickupKind, ItemPickupToken), GameSlotDropReason> {
+    let request_status = packet[40];
+    let request_item_id = read_u32(packet, 41, "GameSlot item pickup request state")?;
+    let valid_request_state = if packet_type == 1 {
+        request_status == 0 && request_item_id == 0x0000_ffff
+    } else {
+        request_status == 8 && (1..=32_767).contains(&request_item_id)
+    };
+    if !valid_request_state {
+        return Err(GameSlotDropReason::InvalidPickupRequestState {
+            packet_type,
+            status: request_status,
+            item_id: request_item_id,
+        });
+    }
+
+    let object_id = read_u32(packet, 14, "GameSlot item pickup object")?;
+    let nested_object_id = read_u32(packet, 57, "GameSlot item pickup nested object")?;
+    if nested_object_id != object_id {
+        return Err(GameSlotDropReason::PickupObjectIdMismatch {
+            outer: object_id,
+            nested: nested_object_id,
+        });
+    }
+    let nested_state = read_u32(packet, 61, "GameSlot item pickup state")?;
+    if nested_state != 1 {
+        return Err(GameSlotDropReason::InvalidPickupState {
+            actual: nested_state,
+        });
+    }
+    let nested_owner = read_u32(packet, 65, "GameSlot item pickup owner")?;
+    if nested_owner != u32::from(player_id) {
+        return Err(GameSlotDropReason::InvalidPickupOwner {
+            claimed: player_id,
+            nested: nested_owner,
+        });
+    }
+
+    let first_tick = read_u32(packet, 18, "GameSlot item pickup tick")?;
+    let second_tick = read_u32(packet, 22, "GameSlot item pickup tick")?;
+    let operation_tick = read_u32(packet, 69, "GameSlot item pickup operation tick")?;
+    let kind = if packet_type == 1 {
+        if object_id & 0xffff_ff00 != 0xf000_0000 {
+            return Err(GameSlotDropReason::InvalidType1PickupObjectId { actual: object_id });
+        }
+        if first_tick != operation_tick {
+            return Err(GameSlotDropReason::InvalidPickupTick {
+                packet_type,
+                field: "first",
+                actual: first_tick,
+                expected: operation_tick,
+            });
+        }
+        let expected_second = first_tick.wrapping_add(1_500);
+        if second_tick != expected_second {
+            return Err(GameSlotDropReason::InvalidPickupTick {
+                packet_type,
+                field: "second",
+                actual: second_tick,
+                expected: expected_second,
+            });
+        }
+        ItemPickupKind::Type1
+    } else {
+        if object_id != 0x00ff_ffff {
+            return Err(GameSlotDropReason::InvalidType2PickupObjectId { actual: object_id });
+        }
+        if second_tick != first_tick {
+            return Err(GameSlotDropReason::InvalidPickupTick {
+                packet_type,
+                field: "second",
+                actual: second_tick,
+                expected: first_tick,
+            });
+        }
+        ItemPickupKind::Type2
+    };
+    Ok((
+        kind,
+        ItemPickupToken {
+            object_id,
+            operation_tick,
+        },
+    ))
+}
+
+fn parse_world_object_collection(
+    packet: &[u8],
+    packet_type: u8,
+    player_id: u8,
+    mask: u32,
+) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
+    const BLOB_LENGTH_OFFSET: usize = 40;
+    const BLOB_OFFSET: usize = 44;
+    const BLOB_LENGTH: usize = 25;
+    ensure_minimum(packet, "GameSlot world-object collection", BLOB_OFFSET)?;
+    validate_mask(packet_type, mask, player_id, GameSlotMaskRule::AllBitsSet)?;
+    let declared = read_u32(
+        packet,
+        BLOB_LENGTH_OFFSET,
+        "GameSlot world-object collection",
+    )?;
+    let blob = validate_blob(packet, packet_type, BLOB_OFFSET, declared)?;
+    if blob.length != BLOB_LENGTH {
+        return Err(GameSlotDropReason::InvalidCollectionBlobLength {
+            packet_type,
+            actual: blob.length,
+            expected: BLOB_LENGTH,
+        });
+    }
+
+    let kind = if packet_type == 4 {
+        WorldObjectCollectionKind::Lucci
+    } else {
+        WorldObjectCollectionKind::BonusItem
+    };
+    let expected_pair = match kind {
+        WorldObjectCollectionKind::Lucci => (GOP_LUCCI_HASH, GO_LUCCI_HASH),
+        WorldObjectCollectionKind::BonusItem => (GOP_BONUS_ITEM_HASH, GO_BONUS_ITEM_HASH),
+    };
+    let operation_hash = read_u32(packet, BLOB_OFFSET, "collection operation hash")?;
+    let operation_base_hash = read_u32(packet, BLOB_OFFSET + 4, "collection base-operation hash")?;
+    if (operation_hash, operation_base_hash) != expected_pair {
+        return Err(GameSlotDropReason::InvalidCollectionOperation {
+            packet_type,
+            operation_hash,
+            operation_base_hash,
+        });
+    }
+
+    let outer_object_id = read_u32(packet, 14, "collection outer object ID")?;
+    let nested_object_id = read_u32(packet, BLOB_OFFSET + 8, "collection nested object ID")?;
+    if outer_object_id == u32::MAX || nested_object_id == u32::MAX {
+        return Err(GameSlotDropReason::MissingCollectionObjectId { packet_type });
+    }
+    if outer_object_id != nested_object_id {
+        return Err(GameSlotDropReason::CollectionObjectIdMismatch {
+            packet_type,
+            outer: outer_object_id,
+            nested: nested_object_id,
+        });
+    }
+    let state = read_u32(packet, BLOB_OFFSET + 12, "collection state")?;
+    if state != 1 {
+        return Err(GameSlotDropReason::InvalidCollectionState {
+            packet_type,
+            actual: state,
+        });
+    }
+    let collector = read_i32(packet, BLOB_OFFSET + 16, "collection collector ID")?;
+    let collector_id = u8::try_from(collector)
+        .ok()
+        .filter(|value| *value <= MAX_GAME_SLOT_PLAYER_ID)
+        .ok_or(GameSlotDropReason::InvalidCollectionCollector {
+            packet_type,
+            collector,
+        })?;
+
+    let position = [
+        read_f32(packet, 26, "collection position")?,
+        read_f32(packet, 30, "collection position")?,
+        read_f32(packet, 34, "collection position")?,
+    ];
+    for (axis, value) in position.into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(GameSlotDropReason::NonFiniteCollectionPosition { packet_type, axis });
+        }
+    }
+
+    Ok((
+        GameSlotBody::WorldObjectCollection(WorldObjectCollection {
+            kind,
+            object_id: outer_object_id,
+            current_tick: read_u32(packet, 18, "collection current tick")?,
+            expiry_tick: read_u32(packet, 22, "collection expiry tick")?,
+            x: position[0],
+            y: position[1],
+            z: position[2],
+            trailing_word: read_u16(packet, 38, "collection trailing word")?,
+            collector_id,
+            operation_tick: read_u32(packet, BLOB_OFFSET + 20, "collection operation tick")?,
+            variant: packet[BLOB_OFFSET + 24],
+            blob,
+        }),
+        GameSlotAction::EvidencePending(
+            GameSlotEvidencePending::WorldObjectCollectionAuthorization(kind),
+        ),
     ))
 }
 
@@ -627,30 +916,47 @@ fn parse_item_vector(
             count,
             payload,
         }),
-        GameSlotAction::RelayOriginal(GameSlotRelayAudience::RoomExceptSender),
+        GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender),
     ))
 }
 
 fn parse_item_use(
     packet: &[u8],
+    packet_type: u8,
     mask: u32,
 ) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
     const BLOB_LENGTH_OFFSET: usize = 22;
     const BLOB_OFFSET: usize = 26;
     ensure_minimum(packet, "GameSlot item use", BLOB_OFFSET)?;
-    validate_mask(10, mask, 0, GameSlotMaskRule::LowSixteenBits)?;
+    validate_mask(packet_type, mask, 0, GameSlotMaskRule::LowSixteenBits)?;
     let declared = read_u32(packet, BLOB_LENGTH_OFFSET, "GameSlot item use")?;
-    let blob = validate_blob(packet, 10, BLOB_OFFSET, declared)?;
+    let blob = validate_blob(packet, packet_type, BLOB_OFFSET, declared)?;
+    let kind = if packet_type == 10 {
+        ItemUseKind::Ordinary
+    } else {
+        ItemUseKind::SpawnedWorldObject
+    };
+    let action = match kind {
+        ItemUseKind::Ordinary => {
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskIncludingSender)
+        }
+        ItemUseKind::SpawnedWorldObject => {
+            GameSlotAction::EvidencePending(GameSlotEvidencePending::SpawnedItemUseRouting)
+        }
+    };
 
     Ok((
         GameSlotBody::ItemUse(ItemUse {
-            uni: packet[13],
-            success: packet[14],
-            unknown: packet[15],
-            skill: read_i16(packet, 16, "GameSlot item use skill")?,
+            kind,
+            common: packet[13],
+            status: read_u16(packet, 14, "GameSlot item use status")?,
+            item_or_skill: read_u16(packet, 16, "GameSlot item use item/skill")?,
+            flag_18: packet[18],
+            flag_19: packet[19],
+            trailing_word: read_u16(packet, 20, "GameSlot item use trailing word")?,
             blob,
         }),
-        GameSlotAction::RelayOriginal(GameSlotRelayAudience::RoomExceptSender),
+        action,
     ))
 }
 
@@ -684,7 +990,13 @@ fn parse_item_operation(
     const PAYLOAD_OFFSET: usize = 20;
     const MINIMUM_LENGTH: usize = 28;
     ensure_minimum(packet, "GameSlot item operation", MINIMUM_LENGTH)?;
-    validate_mask(12, mask, player_id, GameSlotMaskRule::NonzeroLowSixteenBits)?;
+    validate_mask(12, mask, player_id, GameSlotMaskRule::LowSixteenBits)?;
+    let reserved_word = read_u16(packet, 14, "GameSlot item operation reserved word")?;
+    if reserved_word != 0 {
+        return Err(GameSlotDropReason::InvalidItemOperationReservedWord {
+            actual: reserved_word,
+        });
+    }
     let declared = read_u32(packet, PAYLOAD_LENGTH_OFFSET, "GameSlot item operation")?;
     let payload = validate_blob(packet, 12, PAYLOAD_OFFSET, declared)?;
     let operation_hash = read_u32(packet, PAYLOAD_OFFSET, "GameSlot item operation hash")?;
@@ -693,65 +1005,59 @@ fn parse_item_operation(
         PAYLOAD_OFFSET + 4,
         "GameSlot item base-operation hash",
     )?;
-    let pair = (operation_hash, operation_base_hash);
-
-    let (shape, audience) = match exact_operation_length(pair) {
-        Some(expected) if payload.length != expected => {
-            return Err(GameSlotDropReason::InvalidKnownItemOperationLength {
-                operation_hash,
-                operation_base_hash,
-                actual: payload.length,
-                expected,
-            });
-        }
-        Some(BANANA_OPERATION_LENGTH) if pair == (GOP_BANANA_HASH, GO_ITEM_BANANA_HASH) => (
-            ItemOperationShape::Banana,
-            GameSlotRelayAudience::RoomExceptSender,
-        ),
-        Some(COURSE_OPERATION_LENGTH) if pair == (GOP_COURSE_HASH, GO_COURSE_HASH) => (
-            ItemOperationShape::Course,
-            GameSlotRelayAudience::RoomExceptSender,
-        ),
-        Some(ROCKET_OPERATION_LENGTH) if pair == (GOP_ROCKET_HASH, GO_ITEM_ROCKET_HASH) => (
-            ItemOperationShape::Rocket,
-            GameSlotRelayAudience::RoomExceptSender,
-        ),
-        Some(BARRICADE_OPERATION_LENGTH)
-            if pair == (GOP_BARRICADE_HASH, GO_ITEM_BARRICADE_HASH) =>
-        {
-            (
-                ItemOperationShape::Barricade(parse_barricade(packet, player_id)?),
-                GameSlotRelayAudience::RoomIncludingSender,
-            )
-        }
-        None if P5136_ITEM_OPERATION_PAIRS.contains(&pair) => (
-            ItemOperationShape::GenericKnownPair,
-            GameSlotRelayAudience::RoomExceptSender,
-        ),
-        Some(_) | None => {
-            return Err(GameSlotDropReason::UnsupportedItemOperation {
-                operation_hash,
-                operation_base_hash,
-            });
-        }
+    let Some(schema) = item_operation_schema(operation_hash, operation_base_hash) else {
+        return Err(GameSlotDropReason::UnsupportedItemOperation {
+            operation_hash,
+            operation_base_hash,
+        });
+    };
+    let payload_end = payload.offset.checked_add(payload.length).ok_or(
+        GameSlotDropReason::BlobLengthOverCap {
+            packet_type: 12,
+            declared,
+            maximum: MAX_GAME_SLOT_BLOB_LENGTH,
+        },
+    )?;
+    let raw =
+        packet
+            .get(payload.offset..payload_end)
+            .ok_or(GameSlotDropReason::BlobLengthMismatch {
+                packet_type: 12,
+                declared,
+                actual: packet.len().saturating_sub(payload.offset),
+            })?;
+    let validated = schema.validate(raw)?;
+    let barricade = if operation_hash == GOP_BARRICADE_HASH && validated.state == 1 {
+        Some(parse_barricade(packet, player_id)?)
+    } else {
+        None
+    };
+    let action = if validated.evidence.relay_confirmed() {
+        GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
+    } else {
+        GameSlotAction::EvidencePending(GameSlotEvidencePending::StaticItemOperation {
+            class_name: schema.class_name,
+            state: validated.state,
+            evidence: validated.evidence,
+        })
     };
 
     Ok((
         GameSlotBody::ItemOperation(ItemOperation {
             operation_hash,
             operation_base_hash,
-            shape,
+            schema,
+            object_id: validated.object_id,
+            state: validated.state,
+            evidence: validated.evidence,
+            barricade,
             payload,
         }),
-        GameSlotAction::RelayOriginal(audience),
+        action,
     ))
 }
 
 fn parse_barricade(packet: &[u8], player_id: u8) -> Result<BarricadePlacement, GameSlotDropReason> {
-    let marker = packet[32];
-    if marker != 1 {
-        return Err(GameSlotDropReason::InvalidBarricadeMarker { actual: marker });
-    }
     let owner_id = read_i32(packet, 37, "GameSlot barricade owner")?;
     if owner_id != i32::from(player_id) {
         return Err(GameSlotDropReason::InvalidBarricadeOwner {
@@ -778,16 +1084,6 @@ fn parse_barricade(packet: &[u8], player_id: u8) -> Result<BarricadePlacement, G
         owner_id: player_id,
         transform,
     })
-}
-
-const fn exact_operation_length(pair: (u32, u32)) -> Option<usize> {
-    match pair {
-        (GOP_BANANA_HASH, GO_ITEM_BANANA_HASH) => Some(BANANA_OPERATION_LENGTH),
-        (GOP_COURSE_HASH, GO_COURSE_HASH) => Some(COURSE_OPERATION_LENGTH),
-        (GOP_ROCKET_HASH, GO_ITEM_ROCKET_HASH) => Some(ROCKET_OPERATION_LENGTH),
-        (GOP_BARRICADE_HASH, GO_ITEM_BARRICADE_HASH) => Some(BARRICADE_OPERATION_LENGTH),
-        _ => None,
-    }
 }
 
 fn validate_mask(
@@ -876,6 +1172,14 @@ fn read_i16(
     Ok(i16::from_le_bytes(read_array(packet, offset, context)?))
 }
 
+fn read_u16(
+    packet: &[u8],
+    offset: usize,
+    context: &'static str,
+) -> Result<u16, GameSlotDropReason> {
+    Ok(u16::from_le_bytes(read_array(packet, offset, context)?))
+}
+
 fn read_i32(
     packet: &[u8],
     offset: usize,
@@ -928,144 +1232,49 @@ fn read_array<const LENGTH: usize>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::{
         GAME_KART_ITEM_INFO_HASH, GAME_SLOT_PACKET_HASH, GAME_SLOT_PACKET_NAME,
-        GO_ITEM_BANANA_HASH, GO_ITEM_BARRICADE_HASH, GO_ITEM_CUBE_HASH, GO_ITEM_ROCKET_HASH,
-        GOP_BANANA_HASH, GOP_BARRICADE_HASH, GOP_CUBE_HASH, GOP_ROCKET_HASH, GameSlotAction,
-        GameSlotBody, GameSlotDropReason, GameSlotMaskRule, GameSlotRelayAudience,
-        ItemOperationShape, ItemPickupKind, MAX_GAME_SLOT_BLOB_LENGTH,
-        MAX_GAME_SLOT_LOGICAL_LENGTH, P5136_ITEM_OPERATION_PAIRS, parse_game_slot_packet,
+        GO_ITEM_BARRICADE_HASH, GO_ITEM_CUBE_HASH, GOP_BANANA_HASH, GOP_BARRICADE_HASH,
+        GOP_CUBE_HASH, GameSlotAction, GameSlotBody, GameSlotDropReason, GameSlotEvidencePending,
+        GameSlotMaskRule, GameSlotRelayAudience, ItemPickupKind, ItemUseKind,
+        MAX_GAME_SLOT_BLOB_LENGTH, MAX_GAME_SLOT_LOGICAL_LENGTH, WorldObjectCollectionKind,
+        parse_game_slot_packet,
     };
-    use crate::{adler32, packet::PacketWriter};
+    use crate::{
+        game_slot_item_schema::{ItemOperationEvidence, ItemOperationValidationError},
+        packet::PacketWriter,
+    };
 
     const PLAYER_ID: i32 = 3;
     const PLAYER_MASK: u32 = 1 << PLAYER_ID;
     const WATERBOMB_PAIR: (u32, u32) = (0x1E65_04C9, 0x2DE5_05E8);
     const WATERFLY_BASE_HASH: u32 = 0x280F_0593;
-    const PAIR_NAMES: [(&str, &str); 74] = [
-        ("GopAngel", "GoItemAngel"),
-        ("GopAreaUfo", "GoItemAreaUfo"),
-        ("GopBalloon", "GoItemBalloon"),
-        ("GopBanana", "GoItemBanana"),
-        ("GopBarricade", "GoItemBarricade"),
-        ("GopBlock", "GoItemBlock"),
-        ("GopBossPrison", "GoItemBossPrison"),
-        ("GopBoundRoad", "GoItemBoundRoad"),
-        ("GopBoundWall", "GoItemBoundWall"),
-        ("GopChopper", "GoItemChopper"),
-        ("GopCloud", "GoItemCloud"),
-        ("GopCloud2", "GoItemCloud2"),
-        ("GopCokebomb", "GoItemCokebomb"),
-        ("GopCokeRocket", "GoItemCokeRocket"),
-        ("GopCourse", "GoCourse"),
-        ("GopDevil", "GoItemDevil"),
-        ("GopDinoClawRocket", "GoItemDinoClawRocket"),
-        ("GopDrmad", "GoItemDrmad"),
-        ("GopDynamite", "GoItemDynamite"),
-        ("GopEmp", "GoItemEmp"),
-        ("GopEventObject", "GoItemEventObject"),
-        ("GopFalling", "GoItemFalling"),
-        ("GopForceZone", "GoItemForceZone"),
-        ("GopFrost", "GoItemFrost"),
-        ("GopGhost", "GoItemGhost"),
-        ("GopGoldRocket", "GoItemGoldRocket"),
-        ("GopGoldShield", "GoItemGoldShield"),
-        ("GopHammer", "GoItemHammer"),
-        ("GopHeadBand", "GoItemHeadBand"),
-        ("GopIcefly", "GoItemIcefly"),
-        ("GopInfectedBomb", "GoItemInfectedBomb"),
-        ("GopJewel", "GoItemJewel"),
-        ("GopLockdownRocket", "GoItemLockdownRocket"),
-        ("GopMagnet", "GoItemMagnet"),
-        ("GopMine", "GoItemMine"),
-        ("GopMovingUfo", "GoItemMovingUfo"),
-        ("GopMqDevil", "GoItemMqDevil"),
-        ("GopNewDevil", "GoItemNewDevil"),
-        ("GopOil", "GoItemOil"),
-        ("GopPiratebomb", "GoItemPiratebomb"),
-        ("GopPress", "GoItemPress"),
-        ("GopRobotBeam", "GoItemRobotBeam"),
-        ("GopRocket", "GoItemRocket"),
-        ("GopRollingbomb", "GoItemRollingbomb"),
-        ("GopRollingCokebomb", "GoItemRollingCokebomb"),
-        ("GopRollingInfectedbomb", "GoItemRollingInfectedbomb"),
-        ("GopScanning", "GoItemScanning"),
-        ("GopShield", "GoItemShield"),
-        ("GopSilence", "GoItemSilence"),
-        ("GopSiren", "GoItemSiren"),
-        ("GopSirenShield", "GoItemSirenShield"),
-        ("GopSlotLock", "GoItemSlotLock"),
-        ("GopSnowbomb", "GoItemSnowbomb"),
-        ("GopSnowman", "GoItemSnowman"),
-        ("GopSpaceCraft", "GoItemSpaceCraft"),
-        ("GopSpecialShield", "GoItemSpecialShield"),
-        ("GopSpecialSiren", "GoItemSpecialSiren"),
-        ("GopSpecialSmall", "GoItemSpecialSmall"),
-        ("GopSpeedDown", "GoItemSpeedDown"),
-        ("GopSpring", "GoItemSpring"),
-        ("GopStraightRocket", "GoItemStraightRocket"),
-        ("GopSuperMag", "GoItemSuperMag"),
-        ("GopThunderbolt", "GoItemThunderbolt"),
-        ("GopTigerRocket", "GoItemTigerRocket"),
-        ("GopTimebomb", "GoItemTimebomb"),
-        ("GopTimeCokebomb", "GoItemTimeCokebomb"),
-        ("GopTimeInfectedBomb", "GoItemTimeInfectedBomb"),
-        ("GopTimeMine", "GoItemTimeMine"),
-        ("GopTimeSnowbomb", "GoItemTimeSnowbomb"),
-        ("GopTombStone", "GoItemTombStone"),
-        ("GopUfo", "GoItemUfo"),
-        ("GopWaterbomb", "GoItemWaterbomb"),
-        ("GopWaterfly", "GoItemWaterfly"),
-        ("GopWaterMine", "GoItemWaterMine"),
-    ];
 
     #[test]
-    fn packet_hash_and_operation_allowlist_match_the_audited_table() {
-        assert_eq!(
-            adler32::packet_hash(GAME_SLOT_PACKET_NAME),
-            GAME_SLOT_PACKET_HASH
-        );
-        assert_eq!(P5136_ITEM_OPERATION_PAIRS.len(), 74);
-        assert_eq!(
-            P5136_ITEM_OPERATION_PAIRS
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>()
-                .len(),
-            74
-        );
-        assert!(P5136_ITEM_OPERATION_PAIRS.contains(&WATERBOMB_PAIR));
-        assert!(
-            P5136_ITEM_OPERATION_PAIRS
-                .iter()
-                .all(|pair| pair.0 != GOP_CUBE_HASH)
-        );
-        for ((operation_hash, base_hash), (operation_name, base_name)) in
-            P5136_ITEM_OPERATION_PAIRS.into_iter().zip(PAIR_NAMES)
-        {
-            assert_eq!(adler32::packet_hash(operation_name), operation_hash);
-            assert_eq!(adler32::packet_hash(base_name), base_hash);
-        }
-    }
-
-    #[test]
-    fn both_pickup_types_are_deferred_without_raw_relay() {
+    fn both_pickup_types_synthesize_a_bounded_authoritative_award() {
         for (packet_type, kind) in [(1, ItemPickupKind::Type1), (2, ItemPickupKind::Type2)] {
             let mut wire = pickup_packet(packet_type, [12.5, -3.25, 0.0], -2);
             let parsed = parse_game_slot_packet(&wire).unwrap();
             assert_eq!(parsed.player_id(), 3);
             assert_eq!(parsed.item_or_recipient_mask(), u32::MAX);
-            assert_eq!(
-                parsed.action(),
-                GameSlotAction::PickupRequiresServerSynthesis
-            );
+            assert_eq!(parsed.action(), GameSlotAction::SynthesizeItemPickup);
             assert_eq!(parsed.body().packet_type(), packet_type);
             let GameSlotBody::ItemPickup(pickup) = parsed.body() else {
                 panic!("expected item pickup");
             };
             assert_eq!(pickup.kind, kind);
+            assert_eq!(
+                pickup.token.object_id,
+                if packet_type == 1 {
+                    0xf000_0001
+                } else {
+                    0x00ff_ffff
+                }
+            );
+            assert_eq!(
+                pickup.token.operation_tick,
+                if packet_type == 1 { 1_000 } else { 2_000 }
+            );
             assert_eq!(pickup.live_rank, -2);
             assert_eq!(pickup.x.to_bits(), 12.5_f32.to_bits());
             assert_eq!(pickup.y.to_bits(), (-3.25_f32).to_bits());
@@ -1078,9 +1287,15 @@ mod tests {
             );
 
             let original_hash = parsed.raw()[..4].to_vec();
+            let original_tail = parsed.raw()[41..].to_vec();
             wire[..4].fill(0);
             assert_eq!(parsed.raw()[..4], original_hash);
-            assert_eq!(parsed.into_raw().len(), 73);
+            let award = parsed.into_item_pickup_award(111).unwrap();
+            assert_eq!(award.len(), 73);
+            assert_eq!(&award[..4], original_hash);
+            assert_eq!(i16::from_le_bytes(award[38..40].try_into().unwrap()), 111);
+            assert_eq!(award[40], 1);
+            assert_eq!(&award[41..], original_tail);
         }
     }
 
@@ -1129,7 +1344,7 @@ mod tests {
                 Err(GameSlotDropReason::InvalidPlayerId(actual)) if actual == player_id
             ));
         }
-        for packet_type in [0, 3, 4, 5, 6, 7, 8, 13, 17, u8::MAX] {
+        for packet_type in [0, 3, 5, 7, 8, 13, 17, u8::MAX] {
             let packet = common_packet(PLAYER_ID, PLAYER_MASK, packet_type).into_inner();
             assert!(matches!(
                 parse_game_slot_packet(&packet),
@@ -1180,6 +1395,45 @@ mod tests {
             Err(GameSlotDropReason::UnsupportedPickupOperation { .. })
         ));
 
+        let mut reflected_award = pickup_packet(1, [0.0; 3], 0);
+        reflected_award[40] = 1;
+        assert!(matches!(
+            parse_game_slot_packet(&reflected_award),
+            Err(GameSlotDropReason::InvalidPickupRequestState {
+                packet_type: 1,
+                status: 1,
+                ..
+            })
+        ));
+
+        let mut mismatched_object = pickup_packet(1, [0.0; 3], 0);
+        set_u32(&mut mismatched_object, 57, 0xf000_0002);
+        assert!(matches!(
+            parse_game_slot_packet(&mismatched_object),
+            Err(GameSlotDropReason::PickupObjectIdMismatch { .. })
+        ));
+
+        let mut wrong_tick = pickup_packet(1, [0.0; 3], 0);
+        set_u32(&mut wrong_tick, 69, 999);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_tick),
+            Err(GameSlotDropReason::InvalidPickupTick {
+                packet_type: 1,
+                field: "first",
+                ..
+            })
+        ));
+
+        let mut wrong_owner = pickup_packet(2, [0.0; 3], 0);
+        set_u32(&mut wrong_owner, 65, 4);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_owner),
+            Err(GameSlotDropReason::InvalidPickupOwner {
+                claimed: 3,
+                nested: 4,
+            })
+        ));
+
         for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             for axis in 0..3 {
                 let mut position = [0.0; 3];
@@ -1194,13 +1448,95 @@ mod tests {
     }
 
     #[test]
+    fn lucci_and_bonus_collection_wire_shapes_are_typed_evidence_pending() {
+        for (packet_type, kind) in [
+            (4, WorldObjectCollectionKind::Lucci),
+            (6, WorldObjectCollectionKind::BonusItem),
+        ] {
+            let parsed =
+                parse_game_slot_packet(&world_object_collection_packet(packet_type)).unwrap();
+            let GameSlotBody::WorldObjectCollection(collection) = parsed.body() else {
+                panic!("expected world-object collection");
+            };
+            assert_eq!(collection.kind, kind);
+            assert_eq!(collection.object_id, 0x1122_3344);
+            assert_eq!(collection.collector_id, u8::try_from(PLAYER_ID).unwrap());
+            assert_eq!(collection.current_tick, 0x1020_3040);
+            assert_eq!(collection.operation_tick, 0x1020_3040);
+            assert_eq!(collection.variant, 7);
+            assert_eq!(collection.blob.len(), 25);
+            assert_eq!(
+                parsed.action(),
+                GameSlotAction::EvidencePending(
+                    GameSlotEvidencePending::WorldObjectCollectionAuthorization(kind)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn collection_rejects_invalid_ids_states_pairs_and_non_finite_positions() {
+        let mut mismatched_object = world_object_collection_packet(4);
+        set_u32(&mut mismatched_object, 52, 9);
+        assert!(matches!(
+            parse_game_slot_packet(&mismatched_object),
+            Err(GameSlotDropReason::CollectionObjectIdMismatch { .. })
+        ));
+
+        let mut wrong_state = world_object_collection_packet(6);
+        set_u32(&mut wrong_state, 56, 2);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_state),
+            Err(GameSlotDropReason::InvalidCollectionState {
+                packet_type: 6,
+                actual: 2
+            })
+        ));
+
+        let mut wrong_collector = world_object_collection_packet(4);
+        set_i32(&mut wrong_collector, 60, 16);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_collector),
+            Err(GameSlotDropReason::InvalidCollectionCollector { packet_type: 4, .. })
+        ));
+
+        let mut unbound_collector = world_object_collection_packet(4);
+        set_i32(&mut unbound_collector, 60, PLAYER_ID + 1);
+        let parsed = parse_game_slot_packet(&unbound_collector).unwrap();
+        let GameSlotBody::WorldObjectCollection(collection) = parsed.body() else {
+            panic!("expected world-object collection");
+        };
+        assert_eq!(
+            collection.collector_id,
+            u8::try_from(PLAYER_ID + 1).unwrap()
+        );
+
+        let mut wrong_pair = world_object_collection_packet(4);
+        set_u32(&mut wrong_pair, 44, super::GOP_BONUS_ITEM_HASH);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_pair),
+            Err(GameSlotDropReason::InvalidCollectionOperation { packet_type: 4, .. })
+        ));
+
+        let mut non_finite = world_object_collection_packet(6);
+        set_f32(&mut non_finite, 30, f32::NAN);
+        assert!(matches!(
+            parse_game_slot_packet(&non_finite),
+            Err(GameSlotDropReason::NonFiniteCollectionPosition {
+                packet_type: 6,
+                axis: 1
+            })
+        ));
+    }
+
+    #[test]
     fn item_vector_has_a_bounded_typed_item_list_and_peer_relay() {
         for items in [vec![], vec![7], vec![7, 11], vec![7, 11, 13]] {
             let wire = item_vector_packet(PLAYER_MASK | 1, &items);
             let parsed = parse_game_slot_packet(&wire).unwrap();
             assert_eq!(
                 parsed.action(),
-                GameSlotAction::RelayOriginal(GameSlotRelayAudience::RoomExceptSender)
+                GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender)
             );
             let GameSlotBody::ItemVector(vector) = parsed.body() else {
                 panic!("expected item vector");
@@ -1254,17 +1590,44 @@ mod tests {
     #[test]
     fn item_use_and_reaction_expose_fields_and_distinct_relay_audiences() {
         let use_blob = [0x10, 0x20, 0x30];
-        let item_use =
-            parse_game_slot_packet(&item_use_packet(0, 7, 2, 9, -123, &use_blob)).unwrap();
+        let item_use = parse_game_slot_packet(&item_use_packet(
+            10, 0, 7, 0x1002, 0xFF85, 9, 10, 0x1234, &use_blob,
+        ))
+        .unwrap();
         let GameSlotBody::ItemUse(fields) = item_use.body() else {
             panic!("expected item use");
         };
-        assert_eq!((fields.uni, fields.success, fields.unknown), (7, 2, 9));
-        assert_eq!(fields.skill, -123);
+        assert_eq!(fields.kind, ItemUseKind::Ordinary);
+        assert_eq!(fields.common, 7);
+        assert_eq!(fields.status, 0x1002);
+        assert_eq!(fields.item_or_skill, 0xFF85);
+        assert_eq!((fields.flag_18, fields.flag_19), (9, 10));
+        assert_eq!(fields.trailing_word, 0x1234);
         assert_eq!(item_use.payload(), Some(use_blob.as_slice()));
         assert_eq!(
             item_use.action(),
-            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RoomExceptSender)
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskIncludingSender)
+        );
+
+        let type_16 = parse_game_slot_packet(&item_use_packet(
+            16,
+            PLAYER_MASK,
+            7,
+            1,
+            0x71,
+            0,
+            0,
+            0,
+            &use_blob,
+        ))
+        .unwrap();
+        let GameSlotBody::ItemUse(fields) = type_16.body() else {
+            panic!("expected spawned-world-object item use");
+        };
+        assert_eq!(fields.kind, ItemUseKind::SpawnedWorldObject);
+        assert_eq!(
+            type_16.action(),
+            GameSlotAction::EvidencePending(GameSlotEvidencePending::SpawnedItemUseRouting)
         );
 
         let reaction_blob = [0xAA, 0x55];
@@ -1285,9 +1648,9 @@ mod tests {
 
     #[test]
     fn use_and_reaction_masks_blob_caps_and_consumption_are_enforced() {
-        assert!(parse_game_slot_packet(&item_use_packet(0, 0, 0, 0, 0, &[])).is_ok());
+        assert!(parse_game_slot_packet(&item_use_packet(10, 0, 0, 0, 0, 0, 0, 0, &[])).is_ok());
         assert!(matches!(
-            parse_game_slot_packet(&item_use_packet(1 << 16, 0, 0, 0, 0, &[])),
+            parse_game_slot_packet(&item_use_packet(10, 1 << 16, 0, 0, 0, 0, 0, 0, &[])),
             Err(GameSlotDropReason::InvalidMask {
                 packet_type: 10,
                 rule: GameSlotMaskRule::LowSixteenBits,
@@ -1307,12 +1670,32 @@ mod tests {
 
         let maximum_blob = vec![0x5a; MAX_GAME_SLOT_BLOB_LENGTH];
         assert!(
-            parse_game_slot_packet(&item_use_packet(PLAYER_MASK, 0, 0, 0, 0, &maximum_blob,))
-                .is_ok()
+            parse_game_slot_packet(&item_use_packet(
+                10,
+                PLAYER_MASK,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &maximum_blob,
+            ))
+            .is_ok()
         );
         let oversized_blob = vec![0; MAX_GAME_SLOT_BLOB_LENGTH + 1];
         assert!(matches!(
-            parse_game_slot_packet(&item_use_packet(PLAYER_MASK, 0, 0, 0, 0, &oversized_blob,)),
+            parse_game_slot_packet(&item_use_packet(
+                10,
+                PLAYER_MASK,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &oversized_blob,
+            )),
             Err(GameSlotDropReason::BlobLengthOverCap {
                 packet_type: 10,
                 declared: 961,
@@ -1333,140 +1716,137 @@ mod tests {
     }
 
     #[test]
-    fn type_twelve_accepts_only_allowlisted_pairs_and_four_strict_shapes() {
-        let generic =
-            parse_game_slot_packet(&operation_packet(PLAYER_MASK, WATERBOMB_PAIR, 8)).unwrap();
-        let GameSlotBody::ItemOperation(operation) = generic.body() else {
-            panic!("expected item operation");
-        };
-        assert_eq!(operation.shape, ItemOperationShape::GenericKnownPair);
-        assert_eq!(
-            generic.action(),
-            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RoomExceptSender)
-        );
-
-        let shapes = [
-            (
-                (GOP_BANANA_HASH, GO_ITEM_BANANA_HASH),
-                30,
-                ItemOperationShape::Banana,
-            ),
-            (
-                (super::GOP_COURSE_HASH, super::GO_COURSE_HASH),
-                32,
-                ItemOperationShape::Course,
-            ),
-            (
-                (GOP_ROCKET_HASH, GO_ITEM_ROCKET_HASH),
-                73,
-                ItemOperationShape::Rocket,
-            ),
+    fn retained_type_twelve_shapes_are_strict_relay_capabilities() {
+        let fixtures = [
+            operation_state_packet(0, (0x1090_0367, 0x1CB3_0486), 2, 30),
+            course_packet(PLAYER_MASK, 0, 4),
+            operation_state_packet(PLAYER_MASK, (0x1129_038E, 0x1D4C_04AD), 2, 73),
+            barricade_packet(),
         ];
-        for (pair, length, expected_shape) in shapes {
-            let parsed =
-                parse_game_slot_packet(&operation_packet(PLAYER_MASK, pair, length)).unwrap();
-            let GameSlotBody::ItemOperation(operation) = parsed.body() else {
-                panic!("expected item operation");
-            };
-            assert_eq!(operation.shape, expected_shape);
-        }
-    }
-
-    #[test]
-    fn every_audited_type_twelve_pair_parses_with_its_supported_shape() {
-        for pair in P5136_ITEM_OPERATION_PAIRS {
-            let wire = if pair == (GOP_BARRICADE_HASH, GO_ITEM_BARRICADE_HASH) {
-                barricade_packet()
-            } else {
-                operation_packet(
-                    PLAYER_MASK,
-                    pair,
-                    super::exact_operation_length(pair).unwrap_or(8),
-                )
-            };
+        for wire in fixtures {
             let parsed = parse_game_slot_packet(&wire).unwrap();
             let GameSlotBody::ItemOperation(operation) = parsed.body() else {
                 panic!("expected item operation");
             };
+            assert_eq!(operation.evidence, ItemOperationEvidence::RetainedTrace);
+            assert_ne!(operation.object_id, u32::MAX);
             assert_eq!(
-                (operation.operation_hash, operation.operation_base_hash),
-                pair
+                parsed.action(),
+                GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
             );
         }
     }
 
     #[test]
-    fn cube_for_boss_and_lucci_pairs_are_explicitly_outside_the_allowlist() {
-        for pair in [
-            (
-                adler32::packet_hash("GopCubeForBoss"),
-                adler32::packet_hash("GoItemCubeForBoss"),
+    fn static_only_type_twelve_shapes_are_typed_but_not_relay_capabilities() {
+        for wire in [
+            operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125),
+            operation_state_packet(
+                PLAYER_MASK,
+                (super::GOP_CUBE_HASH, super::GO_ITEM_CUBE_HASH),
+                1,
+                24,
             ),
-            (
-                adler32::packet_hash("GopLucci"),
-                adler32::packet_hash("GoLucci"),
+            operation_state_packet(
+                PLAYER_MASK,
+                (super::GOP_LUCCI_HASH, super::GO_LUCCI_HASH),
+                1,
+                25,
             ),
         ] {
-            assert!(!P5136_ITEM_OPERATION_PAIRS.contains(&pair));
+            let parsed = parse_game_slot_packet(&wire).unwrap();
+            let GameSlotBody::ItemOperation(operation) = parsed.body() else {
+                panic!("expected item operation");
+            };
+            assert!(!operation.evidence.relay_confirmed());
             assert!(matches!(
-                parse_game_slot_packet(&operation_packet(PLAYER_MASK, pair, 8)),
-                Err(GameSlotDropReason::UnsupportedItemOperation {
-                    operation_hash,
-                    operation_base_hash,
-                }) if (operation_hash, operation_base_hash) == pair
+                parsed.action(),
+                GameSlotAction::EvidencePending(
+                    GameSlotEvidencePending::StaticItemOperation { .. }
+                )
             ));
         }
     }
 
     #[test]
-    fn type_twelve_rejects_masks_unknown_pairs_wrong_known_lengths_and_envelopes() {
-        for mask in [0, 1 << 16] {
-            assert!(matches!(
-                parse_game_slot_packet(&operation_packet(mask, WATERBOMB_PAIR, 8)),
-                Err(GameSlotDropReason::InvalidMask {
-                    packet_type: 12,
-                    rule: GameSlotMaskRule::NonzeroLowSixteenBits,
-                    ..
-                })
-            ));
-        }
+    fn type_twelve_rejects_extra_pairs_wrong_shapes_ids_masks_and_envelopes() {
         assert!(matches!(
-            parse_game_slot_packet(&operation_packet(
+            parse_game_slot_packet(&operation_state_packet(1 << 16, WATERBOMB_PAIR, 1, 125,)),
+            Err(GameSlotDropReason::InvalidMask {
+                packet_type: 12,
+                rule: GameSlotMaskRule::LowSixteenBits,
+                ..
+            })
+        ));
+
+        let mut nonzero_reserved = operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125);
+        nonzero_reserved[14..16].copy_from_slice(&0xBEEF_u16.to_le_bytes());
+        assert!(matches!(
+            parse_game_slot_packet(&nonzero_reserved),
+            Err(GameSlotDropReason::InvalidItemOperationReservedWord { actual: 0xBEEF })
+        ));
+
+        assert!(matches!(
+            parse_game_slot_packet(&operation_state_packet(
                 PLAYER_MASK,
                 (WATERBOMB_PAIR.0, WATERFLY_BASE_HASH),
-                8,
+                1,
+                125,
             )),
             Err(GameSlotDropReason::UnsupportedItemOperation { .. })
         ));
 
-        for (pair, expected) in [
-            ((GOP_BANANA_HASH, GO_ITEM_BANANA_HASH), 30),
-            ((super::GOP_COURSE_HASH, super::GO_COURSE_HASH), 32),
-            ((GOP_ROCKET_HASH, GO_ITEM_ROCKET_HASH), 73),
-            ((GOP_BARRICADE_HASH, GO_ITEM_BARRICADE_HASH), 73),
-        ] {
-            assert!(matches!(
-                parse_game_slot_packet(&operation_packet(PLAYER_MASK, pair, 8)),
-                Err(GameSlotDropReason::InvalidKnownItemOperationLength {
-                    actual: 8,
-                    expected: actual_expected,
-                    ..
-                }) if actual_expected == expected
-            ));
-        }
+        let extra_name_derived_pair = (0x14E9_03F7, 0x222B_0516);
+        assert!(matches!(
+            parse_game_slot_packet(&operation_state_packet(
+                PLAYER_MASK,
+                extra_name_derived_pair,
+                1,
+                16,
+            )),
+            Err(GameSlotDropReason::UnsupportedItemOperation { .. })
+        ));
 
-        let mut trailing = operation_packet(PLAYER_MASK, WATERBOMB_PAIR, 8);
+        assert!(matches!(
+            parse_game_slot_packet(&operation_state_packet(
+                PLAYER_MASK,
+                (0x1129_038E, 0x1D4C_04AD),
+                1,
+                73,
+            )),
+            Err(GameSlotDropReason::ItemOperationValidation(
+                ItemOperationValidationError::InvalidLength {
+                    class_name: "GopRocket",
+                    state: 1,
+                    actual: 73,
+                    expected: 82,
+                }
+            ))
+        ));
+
+        let mut missing_id = operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125);
+        set_u32(&mut missing_id, 28, u32::MAX);
+        assert!(matches!(
+            parse_game_slot_packet(&missing_id),
+            Err(GameSlotDropReason::ItemOperationValidation(
+                ItemOperationValidationError::MissingObjectId {
+                    class_name: "GopWaterbomb"
+                }
+            ))
+        ));
+
+        let mut trailing = operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125);
         trailing.push(0);
         assert!(matches!(
             parse_game_slot_packet(&trailing),
             Err(GameSlotDropReason::BlobLengthMismatch {
                 packet_type: 12,
-                declared: 8,
-                actual: 9,
+                declared: 125,
+                actual: 126,
             })
         ));
 
-        let mut over_cap = operation_packet(PLAYER_MASK, WATERBOMB_PAIR, 8);
+        let mut over_cap = operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125);
         set_u32(
             &mut over_cap,
             16,
@@ -1482,15 +1862,13 @@ mod tests {
     }
 
     #[test]
-    fn barricade_body_is_typed_finite_and_sender_inclusive() {
+    fn barricade_body_is_typed_finite_and_trace_confirmed() {
         let wire = barricade_packet();
         let parsed = parse_game_slot_packet(&wire).unwrap();
         let GameSlotBody::ItemOperation(operation) = parsed.body() else {
             panic!("expected item operation");
         };
-        let ItemOperationShape::Barricade(placement) = operation.shape else {
-            panic!("expected barricade placement");
-        };
+        let placement = operation.barricade.expect("expected barricade placement");
         assert_eq!(placement.object_id, 0x1234_5678);
         assert_eq!(placement.tick, 0x9ABC_DEF0);
         assert_eq!(placement.owner_id, 3);
@@ -1499,7 +1877,7 @@ mod tests {
         assert_eq!(placement.z().to_bits(), 3.75_f32.to_bits());
         assert_eq!(
             parsed.action(),
-            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RoomIncludingSender)
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
         );
     }
 
@@ -1509,7 +1887,14 @@ mod tests {
         wrong_marker[32] = 0;
         assert!(matches!(
             parse_game_slot_packet(&wrong_marker),
-            Err(GameSlotDropReason::InvalidBarricadeMarker { actual: 0 })
+            Err(GameSlotDropReason::ItemOperationValidation(
+                ItemOperationValidationError::InvalidLength {
+                    class_name: "GopBarricade",
+                    state: 0,
+                    actual: 73,
+                    expected: 25,
+                }
+            ))
         ));
 
         let mut wrong_owner = barricade_packet();
@@ -1545,10 +1930,13 @@ mod tests {
         let fixtures = [
             pickup_packet(1, [0.0; 3], 0),
             pickup_packet(2, [0.0; 3], 0),
+            world_object_collection_packet(4),
+            world_object_collection_packet(6),
             item_vector_packet(PLAYER_MASK, &[1, 2, 3]),
-            item_use_packet(PLAYER_MASK, 1, 2, 3, 4, &[5, 6]),
+            item_use_packet(10, PLAYER_MASK, 1, 2, 3, 4, 5, 6, &[7, 8]),
+            item_use_packet(16, PLAYER_MASK, 1, 2, 3, 4, 5, 6, &[7, 8]),
             item_reaction_packet(PLAYER_MASK, 1, 2, &[3, 4]),
-            operation_packet(PLAYER_MASK, WATERBOMB_PAIR, 8),
+            operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125),
             barricade_packet(),
         ];
         for wire in fixtures {
@@ -1573,17 +1961,33 @@ mod tests {
     fn pickup_packet(packet_type: u8, position: [f32; 3], live_rank: i16) -> Vec<u8> {
         let mut packet = common_packet(PLAYER_ID, u32::MAX, packet_type);
         let mut context = [0; 25];
+        let (object_id, first_tick, second_tick, operation_tick) = if packet_type == 1 {
+            (0xf000_0001_u32, 1_000_u32, 2_500_u32, 1_000_u32)
+        } else {
+            (0x00ff_ffff_u32, 1_000_u32, 1_000_u32, 2_000_u32)
+        };
+        context[1..5].copy_from_slice(&object_id.to_le_bytes());
+        context[5..9].copy_from_slice(&first_tick.to_le_bytes());
+        context[9..13].copy_from_slice(&second_tick.to_le_bytes());
         for (index, value) in position.into_iter().enumerate() {
             context[13 + index * 4..17 + index * 4].copy_from_slice(&value.to_le_bytes());
         }
         packet.write_bytes(&context);
         packet.write_i16(live_rank);
-        packet.write_u8(0);
-        packet.write_u32(0);
+        if packet_type == 1 {
+            packet.write_u8(0);
+            packet.write_u32(0x0000_ffff);
+        } else {
+            packet.write_u8(8);
+            packet.write_u32(10);
+        }
         packet.write_u32(24);
         packet.write_u32(GOP_CUBE_HASH);
         packet.write_u32(GO_ITEM_CUBE_HASH);
-        packet.write_bytes(&[0; 16]);
+        packet.write_u32(object_id);
+        packet.write_u32(1);
+        packet.write_u32(u32::try_from(PLAYER_ID).unwrap());
+        packet.write_u32(operation_tick);
         packet.into_inner()
     }
 
@@ -1599,20 +2003,25 @@ mod tests {
         packet.into_inner()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn item_use_packet(
+        packet_type: u8,
         mask: u32,
-        uni: u8,
-        success: u8,
-        unknown: u8,
-        skill: i16,
+        common: u8,
+        status: u16,
+        item_or_skill: u16,
+        flag_18: u8,
+        flag_19: u8,
+        trailing_word: u16,
         blob: &[u8],
     ) -> Vec<u8> {
-        let mut packet = common_packet(PLAYER_ID, mask, 10);
-        packet.write_u8(uni);
-        packet.write_u8(success);
-        packet.write_u8(unknown);
-        packet.write_i16(skill);
-        packet.write_u32(0);
+        let mut packet = common_packet(PLAYER_ID, mask, packet_type);
+        packet.write_u8(common);
+        packet.write_u16(status);
+        packet.write_u16(item_or_skill);
+        packet.write_u8(flag_18);
+        packet.write_u8(flag_19);
+        packet.write_u16(trailing_word);
         packet.write_u32(u32::try_from(blob.len()).unwrap());
         packet.write_bytes(blob);
         packet.into_inner()
@@ -1637,6 +2046,52 @@ mod tests {
         packet.write_u32(pair.0);
         packet.write_u32(pair.1);
         packet.write_bytes(&vec![0; length - 8]);
+        packet.into_inner()
+    }
+
+    fn operation_state_packet(mask: u32, pair: (u32, u32), state: u32, length: usize) -> Vec<u8> {
+        assert!(length >= 16);
+        let mut packet = operation_packet(mask, pair, length);
+        set_u32(&mut packet, 28, 1);
+        set_u32(&mut packet, 32, state);
+        packet
+    }
+
+    fn course_packet(mask: u32, state: u32, count: u32) -> Vec<u8> {
+        let count_usize = usize::try_from(count).unwrap();
+        let mut packet = operation_state_packet(
+            mask,
+            (super::GOP_COURSE_HASH, super::GO_COURSE_HASH),
+            state,
+            24 + count_usize * 2,
+        );
+        set_u32(&mut packet, 36, count);
+        packet
+    }
+
+    fn world_object_collection_packet(packet_type: u8) -> Vec<u8> {
+        let (operation_hash, base_hash) = if packet_type == 4 {
+            (super::GOP_LUCCI_HASH, super::GO_LUCCI_HASH)
+        } else {
+            (super::GOP_BONUS_ITEM_HASH, super::GO_BONUS_ITEM_HASH)
+        };
+        let mut packet = common_packet(PLAYER_ID, u32::MAX, packet_type);
+        packet.write_u8(0);
+        packet.write_u32(0x1122_3344);
+        packet.write_u32(0x1020_3040);
+        packet.write_u32(0x5060_7080);
+        packet.write_f32(1.25);
+        packet.write_f32(-2.5);
+        packet.write_f32(3.75);
+        packet.write_u16(0x55AA);
+        packet.write_u32(25);
+        packet.write_u32(operation_hash);
+        packet.write_u32(base_hash);
+        packet.write_u32(0x1122_3344);
+        packet.write_u32(1);
+        packet.write_i32(PLAYER_ID);
+        packet.write_u32(0x1020_3040);
+        packet.write_u8(7);
         packet.into_inner()
     }
 

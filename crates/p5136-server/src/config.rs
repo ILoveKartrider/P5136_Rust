@@ -6,6 +6,8 @@ use std::{
 
 use p5136_core::{frame::DEFAULT_MAX_PAYLOAD, ports::PortTopology};
 
+use crate::{ItemProbabilityConfiguration, ItemProbabilityRankPolicy};
+
 pub const DEFAULT_MAX_LOGIN_SESSIONS: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,13 @@ pub struct ServerConfig {
     /// Optional stock-client `Data` directory containing the KR `*.rho5`
     /// archives used to load authoritative emblem definitions.
     pub client_data_dir: Option<PathBuf>,
+    /// Optional validated GUI/CLI override. `None` loads the stock
+    /// item.rho/RHO5 tables from `client_data_dir`, falling back to the
+    /// bounded safe table when no client data directory is configured.
+    pub item_probabilities: Option<ItemProbabilityConfiguration>,
+    /// Controls whether `Live` probability bands trust the rank carried by
+    /// the validated client pickup request.
+    pub item_probability_rank_policy: ItemProbabilityRankPolicy,
     pub first_message_delay: Duration,
     pub login_timeout: Duration,
     pub session_idle_timeout: Duration,
@@ -41,6 +50,8 @@ impl Default for ServerConfig {
             profile_root: PathBuf::from("Profile"),
             catalog_path: None,
             client_data_dir: None,
+            item_probabilities: None,
+            item_probability_rank_policy: ItemProbabilityRankPolicy::default(),
             first_message_delay: Duration::from_millis(250),
             login_timeout: Duration::from_secs(12),
             session_idle_timeout: Duration::from_secs(5 * 60),

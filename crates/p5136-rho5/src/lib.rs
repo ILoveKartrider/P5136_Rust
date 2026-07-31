@@ -1224,5 +1224,9 @@ impl DecryptReader {
     }
 }
 
+mod legacy;
+mod legacy_vectors;
 #[cfg(test)]
 mod tests;
+
+pub use legacy::{LegacyRhoArchive, LegacyRhoError, LegacyRhoLimits};
