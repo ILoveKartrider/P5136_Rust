@@ -274,11 +274,9 @@ fn create_log_file_in(directory: &Path, timestamp: u128, process: u32) -> Result
 }
 
 fn default_log_directory() -> Result<PathBuf> {
-    let executable = std::env::current_exe().context("failed to locate the p5136 executable")?;
-    let parent = executable
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("p5136 executable has no parent directory"))?;
-    Ok(parent.join("logs"))
+    Ok(std::env::current_dir()
+        .context("failed to locate the current working directory")?
+        .join("logs"))
 }
 
 async fn run_server(args: ServerArgs) -> Result<()> {
@@ -560,7 +558,15 @@ mod tests {
     use clap::Parser;
     use tempfile::tempdir;
 
-    use super::{Cli, Command, ConnectArgs, RunnerKind, run_connector};
+    use super::{Cli, Command, ConnectArgs, RunnerKind, default_log_directory, run_connector};
+
+    #[test]
+    fn logs_default_beneath_the_process_current_directory() {
+        assert_eq!(
+            default_log_directory().unwrap(),
+            std::env::current_dir().unwrap().join("logs")
+        );
+    }
 
     #[test]
     fn no_arguments_select_gui_and_any_argument_selects_cli() {

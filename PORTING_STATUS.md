@@ -234,8 +234,8 @@ policy gap.
   analysis artifact and authoritative object ownership remain documented
   evidence/tooling gaps rather than guessed runtime policy.
 - The fresh CLI/GUI E2E build is
-  `target\p5136-gameslot-static\release\p5136.exe` (16,265,728 bytes, SHA-256
-  `AC668AE6D7D9A8E6660696EDD6F6917EB2FD3D4BE5953A99F1D39E12BC727BDC`).
+  `target\p5136-current-dir\release\p5136.exe` (16,265,728 bytes, SHA-256
+  `0F8CB33F6DAE4AFC7DADA95539EBAEBB7DADE8BC3957954DE25EFF9ACCA0CA43`).
   It was built in a distinct target directory and its `--help` startup path
   exits successfully. Launch with no arguments for the Server/Connector GUI
   or use the documented `server`/`connect` CLI commands.
@@ -287,7 +287,7 @@ unchanged and is evidence only.
 ### File sink and complete packet diagnostics (2026-07-30)
 
 - Every CLI or GUI process reserves a new local log at
-  `<executable directory>\logs\p5136-<timestamp>-<pid>.log`; the GUI displays
+  `<current working directory>\logs\p5136-<timestamp>-<pid>.log`; the GUI displays
   the exact path. `P5136_LOG_DIR` overrides the directory for a test run.
   Creation/open failure is a startup error, never a silent console-only
   fallback. Files are intentionally not rotated or deleted automatically so a
