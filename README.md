@@ -196,6 +196,9 @@ cargo run -p p5136-cli
 cargo run -p p5136-cli -- server --catalog /path/to/KartRider_5136
 ```
 
+Tagged versions are built by GitHub Actions on Windows, Linux, and macOS. Each
+GitHub Release contains the three platform binaries plus `SHA256SUMS`.
+
 The configured port follows the original topology: login TCP is base `+ 1`,
 game UDP is base `+ 0`, P2P UDP is base `+ 1`, and messenger TCP is base `+ 2`.
 

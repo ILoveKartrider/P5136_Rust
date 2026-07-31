@@ -2727,11 +2727,17 @@ mod tests {
 
         let ambiguous_root = tempdir().unwrap();
         fs::create_dir(ambiguous_root.path().join("Rider")).unwrap();
-        fs::create_dir(ambiguous_root.path().join("rider")).unwrap();
-        assert!(matches!(
-            ProfileStore::new(ambiguous_root.path()).profile_exists("RIDER"),
-            Err(ProfileStoreError::AmbiguousProfileDirectories { .. })
-        ));
+        match fs::create_dir(ambiguous_root.path().join("rider")) {
+            Ok(()) => assert!(matches!(
+                ProfileStore::new(ambiguous_root.path()).profile_exists("RIDER"),
+                Err(ProfileStoreError::AmbiguousProfileDirectories { .. })
+            )),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // The default macOS filesystem is case-insensitive, so it
+                // cannot construct the ambiguous directory state.
+            }
+            Err(error) => panic!("failed to construct ambiguous directory fixture: {error}"),
+        }
 
         let symlink_root = tempdir().unwrap();
         let target = tempdir().unwrap();

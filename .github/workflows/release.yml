@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libxcb-render0-dev
+          libxcb-shape0-dev
+          libxcb-xfixes0-dev
+          libxkbcommon-dev
+          libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy,rustfmt
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build -p p5136-cli --release --locked
+
+      - name: Package release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          platform="$(printf '%s' "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+          arch="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp target/release/p5136.exe "dist/p5136-${platform}-${arch}.exe"
+          else
+            tar -czf "dist/p5136-${platform}-${arch}.tar.gz" \
+              -C target/release p5136
+          fi
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: p5136-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum p5136-* > SHA256SUMS
+          )
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --generate-notes
+          --title "P5136 Rust $GITHUB_REF_NAME"
