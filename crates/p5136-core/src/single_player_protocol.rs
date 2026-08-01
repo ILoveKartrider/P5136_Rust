@@ -62,9 +62,9 @@ pub struct StartSingleRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UseSingleItemRequest {
-    pub item_type: i16,
-    pub operation_type: i16,
-    pub slot_changer: u16,
+    pub slot_item_category: u16,
+    pub slot_item_id: u16,
+    pub remaining_quantity: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +181,9 @@ pub fn parse_single_player_request(
             })
         }
         SinglePlayerRequestKind::UseItem => SinglePlayerRequest::UseItem(UseSingleItemRequest {
-            item_type: reader.read_i16()?,
-            operation_type: reader.read_i16()?,
-            slot_changer: reader.read_u16()?,
+            slot_item_category: reader.read_u16()?,
+            slot_item_id: reader.read_u16()?,
+            remaining_quantity: reader.read_u16()?,
         }),
         SinglePlayerRequestKind::KartSpec => SinglePlayerRequest::KartSpec(KartSpecRequest {
             speed_type: reader.read_u8()?,
@@ -351,10 +351,11 @@ fn require_hash(
 mod tests {
     use super::{
         FINISH_TIME_ATTACK_REPLY_LENGTH, KART_SPEC_REPLY_LENGTH, SinglePlayerProtocolError,
-        SinglePlayerRequest, SinglePlayerRequestKind, classify_single_player_request,
-        parse_single_player_request, serialize_finish_time_attack_reply, serialize_kart_spec_reply,
+        SinglePlayerRequest, SinglePlayerRequestKind, USE_SINGLE_ITEM_REQUEST_NAME,
+        UseSingleItemRequest, classify_single_player_request, parse_single_player_request,
+        serialize_finish_time_attack_reply, serialize_kart_spec_reply,
     };
-    use crate::{adler32, race_start_protocol::P5136KartPhysicsBlock};
+    use crate::{adler32, packet::PacketWriter, race_start_protocol::P5136KartPhysicsBlock};
 
     fn captured(hex: &str) -> Vec<u8> {
         hex.split_ascii_whitespace()
@@ -449,6 +450,23 @@ mod tests {
                 expected: 10,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn use_item_fields_are_three_unsigned_words() {
+        let mut packet = PacketWriter::named(USE_SINGLE_ITEM_REQUEST_NAME);
+        packet.write_u16(0x8001);
+        packet.write_u16(0xFFFF);
+        packet.write_u16(0xBEEF);
+
+        assert!(matches!(
+            parse_single_player_request(SinglePlayerRequestKind::UseItem, packet.as_slice()),
+            Ok(SinglePlayerRequest::UseItem(UseSingleItemRequest {
+                slot_item_category: 0x8001,
+                slot_item_id: 0xFFFF,
+                remaining_quantity: 0xBEEF,
+            }))
         ));
     }
 }

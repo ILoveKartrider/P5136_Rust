@@ -1,6 +1,6 @@
 # Retained P5136 packet-trace coverage
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 This ledger records the read-only audit of
 `C:\Users\drash\Documents\kartrider\KartRider_5136\logs`. The capture files
@@ -27,16 +27,18 @@ remain external evidence and are not copied into this repository.
 | Request | Observed lengths | Status | Rust/C# disposition |
 | --- | ---: | --- | --- |
 | `ChGetCurrentCmpRequestPacket` | 4 | covered | Exact 17-byte empty competition reply |
-| `GameAiReportPacket` | 36 | covered | Exact hash/length plus bounded 32-byte producer report; authenticated diagnostic no-reply |
-| `GameReportPacket` | 361 | covered | Complete typed C# field decode plus exact 19-byte producer extension; diagnostic no-reply instead of trusting client anti-cheat counters |
+| `GameAiReportPacket` | 36 | covered | Exact hash/length plus eight client diagnostic metric words; authenticated no-reply |
+| `GameReportPacket` | 361 | covered | Complete diagnostic field consumption including the final 19-byte extension; no client counter becomes race authority |
 | `GrChangeTrackPacket` | 44 | covered | Actor-owned track/room-data mutation and atomic room slot-data fanout |
 | `GrRequestBasicAiPacket` | 9 | covered | Actor-owned bounded AI add/remove and exact AI/slot reply fanout |
 | `GrRequestClosePacket` | 21 | covered | Room-master-authorized actor slot closure/opening and exact reply fanout |
 | `GrRiderTalkPacket` | 14, 16, ..., 46 | covered | Bounded UTF-16 parse and actor-owned `GrRiderEchoPacket` room fanout |
 | `LoRqStartSinglePacket` | 41 | covered | Exact start tick plus retained 33-byte producer proof; authenticated no-reply |
-| `LoRqUseItemPacket` | 10 | covered | Exact typed item event; explicit non-mutating no-reply until authoritative effects exist |
-| `PcGameClientFramePacket` | 16 | covered | Exact three-counter telemetry decode and authenticated no-reply |
-| `PcGameRequestRelay` | 12 | covered | Exact value/route decode; no peer fanout because the C# relay branch is disabled |
+| `LoRqUseItemPacket` | 10 | covered | Exact three-`u16` SlotItem category/id/remaining-quantity event; explicit non-mutating no-reply until authoritative effects exist |
+| `PcGameClientFramePacket` | 16 | covered | Exact three neutral client-frame diagnostic metrics and authenticated no-reply |
+| `PcGameRequestRelay` | 12 | covered | Exact desired-peer/requester-slot decode; directional relay remains evidence-gated rather than room-broadcasting it |
+| `GameBoosterAddPacket` | 4 | covered | Exact empty booster signal and authenticated no-reply |
+| `PcReportStateInGame` | 20 | covered | Exact four-word heartbeat/tick diagnostic decode and authenticated no-reply |
 | `PcRideEventReportPacket` | 23 lengths, 57..383 | covered | Bounded count, UTF-16 strings, transforms, IDs, flags, values, and ticks; exact exhaustion |
 | `PcRidePathReportPacket` | 23 lengths, 35..1547 | covered | Bounded count and exact 27-byte sample-vector consumption |
 | `PqChallengerInfoPacket` | 4 | covered | Exact 93-byte challenger-stage reply |
@@ -47,13 +49,13 @@ remain external evidence and are not copied into this repository.
 | `PqGetTrainingMission` | 12 | covered | Exact 20-byte empty mission projection |
 | `PqKartSpec` | 15 | covered | Catalog-backed requested kart/speed physics with explicit bounded fallbacks for unavailable pet/plant/patch/tune contributions |
 | `PqLockedItemUpdate` | 9 | covered | Atomic ordered-set Add/Remove, durable canonical profile state, and lease-bound/no-follow one-time `Locked.json` import |
-| `PqNewCareerItemStatePacket` | 26 | covered | Exact typed career-state telemetry; authenticated diagnostic no-reply |
+| `PqNewCareerItemStatePacket` | 26, 36 | covered | Bounded counted item-state vector; authenticated diagnostic no-reply |
 | `PqNewCareerListPacket` | 4 | covered | Exact 24-byte empty career projection |
 | `PqReportUdpReconnect` | 4 | covered | Exact-generation UDP rebind authorization clears stale Game/P2P routes behind an arrival-epoch fence |
 | `PqSendMacroChat` | 13 | covered | Resolves the bound profile quick-message table and actor-fans out with team filtering |
 | `PqStartScenario` | 8 | covered | Exact reply plus canonical-lane durable `scenario_type` update |
 | `PqStartTimeAttack` | 39 | covered | Checked entry fee plus atomic mode/track state, requested physics build, active-run fence, then exact reply |
-| unknown hash `0x5815082A` | 64, 68, 76, 80 | covered | Isolated bounded opaque driving report for only these four captured lengths; not a generic unknown-packet escape hatch |
+| `PcRideSwithInfoPacket` (`0x5815082A`) | 56, 64, 68, 72, 76, 80, 88 observed | covered | Bounded typed elapsed/map/vector/eight-aggregate container; all producer bytes are consumed and the observed sizes are regression fixtures, not a generic unknown-packet escape hatch |
 
 ## Initialization result
 
@@ -77,6 +79,31 @@ Those requests were already owned by Rust domains before this audit. The 28
 rows above first appear after additional menu, scenario, time-attack, room, or
 race paths, but they are now covered as well.
 
+## Race completion control packet
+
+- The retained stock trace contains normal 406-byte incoming
+  `GameControlPacket` finish reports (`state=2`): after the 13-byte parsed
+  control prefix, the client carries a 393-byte result snapshot. Rust decodes
+  its confirmed `value1/value2`, seven-word session envelope, 54-byte
+  subobject, global metric, 243-byte physics snapshot, shared timestamp,
+  eight participant slots, local result, and terminal state. It is diagnostic
+  only: race settlement still uses the server-owned transition and finish
+  result. Other control extensions remain bounded at 512 bytes, while a
+  513-byte tail is rejected. This fixes the prior Rust-only 256-byte rejection
+  that disconnected the client at race completion.
+
+## Additional static-audit handlers
+
+- `PcStartMatching` now validates its exact 32-byte seven-word session/auth
+  envelope and returns the complete seven-byte `PcMatchingFound` empty/create
+  variant (`hash | 00 00 00`). `PcCancelMatching` is an exact hash-only
+  authenticated no-reply. Rust intentionally does not copy C#'s arbitrary
+  visible-room selection: actor-owned matchmaking needs an explicit pairing
+  policy and a two-client capture.
+- GameSlot type 10/16 preserves wire-offset bytes 18/19 and the ancillary
+  effect code as raw/effect-specific values. Type 16 is not treated as a
+  barricade-only packet.
+
 ## TCP GameSlot replay
 
 - The retained RX corpus contains 1,471 TCP `GameSlotPacket` records: type
@@ -98,11 +125,15 @@ race paths, but they are now covered as well.
   active frozen recipients including the sender. C# source plus deterministic
   Rust fixtures prove the response layout; a fresh two-client response capture
   remains an E2E gate.
-- The 30 type-12 records comprise Course state 0/1 with count 4, Banana state
-  2, Rocket state 2, and Barricade state 1 shapes. Those exact shapes carry
-  retained trace evidence. The other entries and Course counts in the
-  67-class static writer manifest remain typed `EvidencePending` forms and
-  cannot relay or mutate state.
+- The original 30 type-12 corpus records comprise Course state 0/1 with count
+  4, Banana state 2, Rocket state 2, and Barricade state 1 shapes. A subsequent
+  runtime capture (`p5136-1785508674395-18928.log`) adds reachable Barricade
+  state 3 and state 2 forms with exact 25-byte raw bodies after a collision.
+  Those exact state forms carry retained trace evidence and require their
+  nested owner to match the claimed sender. Other known type-12 pairs use the
+  bounded sender-excluded compatibility relay after common envelope and peer
+  mask validation; they cannot mutate Rust world state. The 67-class manifest
+  remains typed diagnostic evidence rather than a per-capture routing gate.
 - No retained RX record proves type 4, 6, or 16 routing, arbitrary
   static-writer state reachability, or object ownership. Those are explicit
   capture gaps rather than inferred compatibility claims.

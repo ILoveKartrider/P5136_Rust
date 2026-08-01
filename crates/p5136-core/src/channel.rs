@@ -10,6 +10,15 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_SWITCH_OPAQUE_LENGTH: usize = 1_048_576;
+/// P5136's special switch used when the lobby opens the Club UI.
+///
+/// This is deliberately distinct from `PqChannelSwitch`: its request body
+/// uses the same opaque hand-off envelope, but the stock server replies with
+/// a local Club transition (`mode = 1`, channel 13, zero endpoint) rather
+/// than issuing a reconnect migration permit.
+pub const CLUB_CHANNEL_SWITCH_REQUEST_NAME: &str = "PqClubChannelSwitch";
+pub const CLUB_CHANNEL_SWITCH_REQUEST_HASH: u32 = 0x4877_0772;
+pub const CLUB_CHANNEL_ID: u16 = 13;
 pub const CLIENT_P2P_ADDRESS_PACKET_NAME: &str = "ChClientP2pAddrPacket";
 pub const CLIENT_UDP_ADDRESS_PACKET_NAME: &str = "ChClientUdpAddrPacket";
 
@@ -116,6 +125,9 @@ pub enum ChannelError {
     #[error("PqChannelSwitch opaque length {length} exceeds configured maximum {maximum}")]
     OpaqueTooLarge { length: usize, maximum: usize },
 
+    #[error("PqClubChannelSwitch reserved suffix must be four zero bytes; received {length} bytes")]
+    InvalidClubSwitchReservedBytes { length: usize },
+
     #[error("{name} has {count} trailing bytes")]
     TrailingBytes { name: &'static str, count: usize },
 }
@@ -155,8 +167,35 @@ pub fn parse_pq_channel_switch_with_limit(
     packet: &[u8],
     maximum_opaque_length: usize,
 ) -> Result<PqChannelSwitch, ChannelError> {
+    parse_channel_switch_envelope(packet, "PqChannelSwitch", maximum_opaque_length)
+}
+
+/// Parses the Club-specific channel transition envelope.
+///
+/// Captured P5136 traffic carries four trailing reserved zero bytes after the
+/// normal channel-switch fields. They are consumed and checked so malformed
+/// requests cannot silently fall through to the generic compatibility path.
+pub fn parse_pq_club_channel_switch(packet: &[u8]) -> Result<PqChannelSwitch, ChannelError> {
+    let request = parse_channel_switch_envelope(
+        packet,
+        CLUB_CHANNEL_SWITCH_REQUEST_NAME,
+        DEFAULT_MAX_SWITCH_OPAQUE_LENGTH,
+    )?;
+    if request.trailing.len() != 4 || request.trailing.iter().any(|byte| *byte != 0) {
+        return Err(ChannelError::InvalidClubSwitchReservedBytes {
+            length: request.trailing.len(),
+        });
+    }
+    Ok(request)
+}
+
+fn parse_channel_switch_envelope(
+    packet: &[u8],
+    name: &'static str,
+    maximum_opaque_length: usize,
+) -> Result<PqChannelSwitch, ChannelError> {
     let mut reader = PacketReader::new(packet);
-    expect_hash(&mut reader, "PqChannelSwitch")?;
+    expect_hash(&mut reader, name)?;
     let signed_length = reader.read_i32()?;
     let length = usize::try_from(signed_length)
         .map_err(|_| ChannelError::NegativeOpaqueLength(signed_length))?;
@@ -190,6 +229,21 @@ pub fn serialize_pr_channel_switch(
     packet.write_u16(selected_channel_id);
     packet.write_u16(migration_token);
     write_endpoint(&mut packet, login_address, login_port);
+    packet.into_inner()
+}
+
+/// Serializes the C# reference server's local Club UI hand-off.
+///
+/// Unlike a normal `PrChannelSwitch`, the leading mode is one and the
+/// endpoint/token are both zero. The P5136 client uses this to enter the Club
+/// UI without disconnecting the authenticated login session.
+#[must_use]
+pub fn serialize_pr_club_channel_switch() -> Vec<u8> {
+    let mut packet = PacketWriter::named("PrChannelSwitch");
+    packet.write_i32(1);
+    packet.write_u16(CLUB_CHANNEL_ID);
+    packet.write_u16(0);
+    write_endpoint(&mut packet, Ipv4Addr::UNSPECIFIED, 0);
     packet.into_inner()
 }
 
@@ -245,10 +299,11 @@ mod tests {
 
     use super::{
         CLIENT_ENDPOINT_REPORTS, CLIENT_P2P_ADDRESS_PACKET_NAME, CLIENT_UDP_ADDRESS_PACKET_NAME,
-        ChannelError, ClientEndpointReportKind, classify_client_endpoint_report,
-        parse_client_endpoint_report, parse_pq_channel_movein, parse_pq_channel_switch,
-        parse_pq_channel_switch_with_limit, resolve_channel_id, serialize_pr_channel_move_in,
-        serialize_pr_channel_switch,
+        CLUB_CHANNEL_ID, CLUB_CHANNEL_SWITCH_REQUEST_HASH, ChannelError, ClientEndpointReportKind,
+        classify_client_endpoint_report, parse_client_endpoint_report, parse_pq_channel_movein,
+        parse_pq_channel_switch, parse_pq_channel_switch_with_limit, parse_pq_club_channel_switch,
+        resolve_channel_id, serialize_pr_channel_move_in, serialize_pr_channel_switch,
+        serialize_pr_club_channel_switch,
     };
 
     #[test]
@@ -287,6 +342,66 @@ mod tests {
             format!("{:X}", Sha256::digest(&reply)),
             "F690E0A1AE840730DC5614FF22161D184B91ACB0158DB5E11C8282DA8624431D"
         );
+    }
+
+    #[test]
+    fn club_channel_switch_matches_the_captured_request_and_csharp_local_handoff() {
+        let request = [
+            0x72, 0x07, 0x77, 0x48, 0x0e, 0x00, 0x00, 0x00, 0x53, 0x02, 0xd6, 0x01, 0x60, 0x05,
+            0xb3, 0xd3, 0x4b, 0xa7, 0xea, 0x9c, 0x62, 0x13, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        ];
+        let parsed = parse_pq_club_channel_switch(&request).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(request[..4].try_into().unwrap()),
+            CLUB_CHANNEL_SWITCH_REQUEST_HASH
+        );
+        assert_eq!(
+            parsed.opaque,
+            [
+                0x53, 0x02, 0xd6, 0x01, 0x60, 0x05, 0xb3, 0xd3, 0x4b, 0xa7, 0xea, 0x9c, 0x62, 0x13
+            ]
+        );
+        assert_eq!(parsed.requested_game_type, 52);
+        assert_eq!(parsed.preferred_channel_id, 0);
+        assert_eq!(parsed.trailing, [0; 4]);
+
+        let reply = serialize_pr_club_channel_switch();
+        assert_eq!(
+            reply,
+            [
+                0xed, 0x05, 0x17, 0x2e, 0x01, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            u16::from_le_bytes(reply[8..10].try_into().unwrap()),
+            CLUB_CHANNEL_ID
+        );
+    }
+
+    #[test]
+    fn club_channel_switch_rejects_wrong_hash_truncation_and_nonzero_reserved_bytes() {
+        let exact = [
+            0x72, 0x07, 0x77, 0x48, 0x00, 0x00, 0x00, 0x00, 52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for length in 0..exact.len() {
+            assert!(parse_pq_club_channel_switch(&exact[..length]).is_err());
+        }
+
+        let mut wrong_hash = exact;
+        wrong_hash[0] ^= 0xff;
+        assert!(matches!(
+            parse_pq_club_channel_switch(&wrong_hash),
+            Err(ChannelError::UnexpectedPacketHash { .. })
+        ));
+
+        let mut nonzero_reserved = exact;
+        nonzero_reserved[14] = 1;
+        assert!(matches!(
+            parse_pq_club_channel_switch(&nonzero_reserved),
+            Err(ChannelError::InvalidClubSwitchReservedBytes { length: 4 })
+        ));
     }
 
     #[test]

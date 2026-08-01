@@ -2,9 +2,9 @@
 //!
 //! These packets are diagnostics or client-side relay probes in the reference
 //! server; they do not authorize profile or world mutation. Known structured
-//! vectors are fully consumed. The one unidentified captured hash is isolated
-//! behind its four observed producer lengths instead of becoming a generic
-//! "accept unknown packet" escape hatch.
+//! vectors are fully consumed. In particular, `0x5815082A` is the stock
+//! client's misspelled `PcRideSwithInfoPacket`, not a generic unknown-packet
+//! escape hatch.
 
 use thiserror::Error;
 
@@ -17,19 +17,28 @@ pub const GAME_AI_REPORT_NAME: &str = "GameAiReportPacket";
 pub const GAME_REPORT_NAME: &str = "GameReportPacket";
 pub const GAME_CLIENT_FRAME_NAME: &str = "PcGameClientFramePacket";
 pub const GAME_REQUEST_RELAY_NAME: &str = "PcGameRequestRelay";
+pub const GAME_BOOSTER_ADD_NAME: &str = "GameBoosterAddPacket";
+pub const REPORT_STATE_IN_GAME_NAME: &str = "PcReportStateInGame";
 pub const RIDE_EVENT_REPORT_NAME: &str = "PcRideEventReportPacket";
 pub const RIDE_PATH_REPORT_NAME: &str = "PcRidePathReportPacket";
-pub const UNIDENTIFIED_DRIVING_REPORT_HASH: u32 = 0x5815_082A;
+pub const RIDE_SWITCH_INFO_NAME: &str = "PcRideSwithInfoPacket";
+pub const RIDE_SWITCH_INFO_HASH: u32 = 0x5815_082A;
 
 pub const GAME_AI_REPORT_LENGTH: usize = 36;
 pub const GAME_REPORT_LENGTH: usize = 361;
 pub const GAME_CLIENT_FRAME_LENGTH: usize = 16;
 pub const GAME_REQUEST_RELAY_LENGTH: usize = 12;
+pub const GAME_BOOSTER_ADD_LENGTH: usize = 4;
+pub const REPORT_STATE_IN_GAME_LENGTH: usize = 20;
 pub const MAX_RIDE_EVENT_COUNT: u32 = 64;
 pub const MAX_RIDE_EVENT_STRING_UNITS: usize = 64;
 pub const MAX_RIDE_PATH_SAMPLES: u32 = 64;
 pub const RIDE_PATH_SAMPLE_LENGTH: usize = 27;
-pub const UNIDENTIFIED_DRIVING_REPORT_LENGTHS: [usize; 4] = [64, 68, 76, 80];
+pub const MAX_RIDE_SWITCH_PARTICIPANTS: u32 = 8;
+pub const MAX_RIDE_SWITCH_NAME_UNITS: usize = 64;
+pub const MAX_RIDE_SWITCH_SAMPLES: u32 = 64;
+
+const GAME_REPORT_DIAGNOSTIC_CHANNEL_COUNT: u8 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryRequestKind {
@@ -37,9 +46,11 @@ pub enum TelemetryRequestKind {
     GameReport,
     GameClientFrame,
     GameRequestRelay,
+    GameBoosterAdd,
+    ReportStateInGame,
     RideEventReport,
     RidePathReport,
-    UnidentifiedDrivingReport,
+    RideSwitchInfo,
 }
 
 impl TelemetryRequestKind {
@@ -50,16 +61,18 @@ impl TelemetryRequestKind {
             Self::GameReport => GAME_REPORT_NAME,
             Self::GameClientFrame => GAME_CLIENT_FRAME_NAME,
             Self::GameRequestRelay => GAME_REQUEST_RELAY_NAME,
+            Self::GameBoosterAdd => GAME_BOOSTER_ADD_NAME,
+            Self::ReportStateInGame => REPORT_STATE_IN_GAME_NAME,
             Self::RideEventReport => RIDE_EVENT_REPORT_NAME,
             Self::RidePathReport => RIDE_PATH_REPORT_NAME,
-            Self::UnidentifiedDrivingReport => "unknown-0x5815082A",
+            Self::RideSwitchInfo => RIDE_SWITCH_INFO_NAME,
         }
     }
 
     #[must_use]
     pub fn request_hash(self) -> u32 {
         match self {
-            Self::UnidentifiedDrivingReport => UNIDENTIFIED_DRIVING_REPORT_HASH,
+            Self::RideSwitchInfo => RIDE_SWITCH_INFO_HASH,
             _ => adler32::packet_hash(self.request_name()),
         }
     }
@@ -67,19 +80,30 @@ impl TelemetryRequestKind {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TelemetryReport {
-    GameAiReport,
+    /// Eight client-owned diagnostic float bit patterns. Their individual
+    /// metric names are not established, so preserve bits rather than giving
+    /// them misleading semantic labels or rejecting non-finite diagnostics.
+    GameAiReport {
+        metric_bits: [u32; 8],
+    },
     GameReport {
-        plane_check: i32,
-        distance: f32,
+        protected_metric_0: i32,
+        protected_metric_1: i32,
+        diagnostic_channel_count: u8,
     },
     GameClientFrame {
-        local_frame: u32,
-        server_frame: u32,
-        acknowledged_frame: u32,
+        metric: [u32; 3],
     },
     GameRequestRelay {
-        value: i32,
-        route_hash: u32,
+        desired_peer_slot: u32,
+        requester_slot: u32,
+    },
+    GameBoosterAdd,
+    ReportStateInGame {
+        report_sequence: u32,
+        zero_or_reserved: u32,
+        transformed_tick: u32,
+        tick_validation_partner: u32,
     },
     RideEventReport {
         event_count: u32,
@@ -87,8 +111,11 @@ pub enum TelemetryReport {
     RidePathReport {
         sample_count: u32,
     },
-    UnidentifiedDrivingReport {
-        logical_length: usize,
+    RideSwitchInfo {
+        elapsed_or_total: f32,
+        participant_count: u32,
+        sample_count: u32,
+        aggregate_values: [u32; 8],
     },
 }
 
@@ -114,11 +141,6 @@ pub enum TelemetryProtocolError {
         expected: usize,
     },
 
-    #[error(
-        "unidentified 0x5815082A report has logical length {actual}; captured lengths are {allowed:?}"
-    )]
-    UnidentifiedLength { actual: usize, allowed: [usize; 4] },
-
     #[error("{packet} declares {actual} records; operational maximum is {maximum}")]
     RecordLimit {
         packet: &'static str,
@@ -140,9 +162,11 @@ pub fn classify_telemetry_request(hash: u32) -> Option<TelemetryRequestKind> {
         TelemetryRequestKind::GameReport,
         TelemetryRequestKind::GameClientFrame,
         TelemetryRequestKind::GameRequestRelay,
+        TelemetryRequestKind::GameBoosterAdd,
+        TelemetryRequestKind::ReportStateInGame,
         TelemetryRequestKind::RideEventReport,
         TelemetryRequestKind::RidePathReport,
-        TelemetryRequestKind::UnidentifiedDrivingReport,
+        TelemetryRequestKind::RideSwitchInfo,
     ]
     .into_iter()
     .find(|kind| kind.request_hash() == hash)
@@ -157,11 +181,11 @@ pub fn parse_telemetry_request(
         TelemetryRequestKind::GameReport => parse_game_report(packet),
         TelemetryRequestKind::GameClientFrame => parse_game_client_frame(packet),
         TelemetryRequestKind::GameRequestRelay => parse_game_request_relay(packet),
+        TelemetryRequestKind::GameBoosterAdd => parse_game_booster_add(packet),
+        TelemetryRequestKind::ReportStateInGame => parse_report_state_in_game(packet),
         TelemetryRequestKind::RideEventReport => parse_ride_event_report(packet),
         TelemetryRequestKind::RidePathReport => parse_ride_path_report(packet),
-        TelemetryRequestKind::UnidentifiedDrivingReport => {
-            parse_unidentified_driving_report(packet)
-        }
+        TelemetryRequestKind::RideSwitchInfo => parse_ride_switch_info(packet),
     }
 }
 
@@ -172,38 +196,46 @@ fn parse_game_ai_report(packet: &[u8]) -> Result<TelemetryReport, TelemetryProto
         GAME_AI_REPORT_LENGTH,
     )?;
     let mut reader = checked_reader(TelemetryRequestKind::GameAiReport, packet)?;
-    let _producer_payload = reader.read_bytes(32)?;
+    let mut metric_bits = [0_u32; 8];
+    for metric in &mut metric_bits {
+        *metric = reader.read_u32()?;
+    }
     finish(reader, TelemetryRequestKind::GameAiReport)?;
-    Ok(TelemetryReport::GameAiReport)
+    Ok(TelemetryReport::GameAiReport { metric_bits })
 }
 
 fn parse_game_report(packet: &[u8]) -> Result<TelemetryReport, TelemetryProtocolError> {
     require_exact_length(TelemetryRequestKind::GameReport, packet, GAME_REPORT_LENGTH)?;
     let mut reader = checked_reader(TelemetryRequestKind::GameReport, packet)?;
-    let _date_time = reader.read_bytes(18)?;
-    let _get_item = reader.read_i32()?;
-    let _use_item = reader.read_i32()?;
-    let _use_booster = reader.read_encoded_i32()?;
-    for _ in 0..60 {
+    let _shared_timestamp = reader.read_bytes(18)?;
+    let protected_metric_0 = reader.read_i32()?;
+    let protected_metric_1 = reader.read_i32()?;
+    let _encoded_header_metric = reader.read_encoded_i32()?;
+    for _ in 0..usize::from(GAME_REPORT_DIAGNOSTIC_CHANNEL_COUNT) * 3 {
         let _ = reader.read_encoded_i32()?;
     }
-    let _hash_1 = reader.read_encoded_i32()?;
-    let _hash_2 = reader.read_encoded_i32()?;
-    let _hash_3 = reader.read_encoded_i32()?;
-    let _single_1 = reader.read_encoded_f32()?;
-    let _single_2 = reader.read_encoded_f32()?;
-    let distance = reader.read_encoded_f32()?;
-    let plane_check = reader.read_i32()?;
-    let _hash_array_2 = reader.read_bytes(20)?;
-    let _hash_4 = reader.read_i32()?;
-    let _hash_array_3 = reader.read_bytes(16)?;
+    let _additional_encoded_metrics = [
+        reader.read_encoded_i32()?,
+        reader.read_encoded_i32()?,
+        reader.read_encoded_i32()?,
+    ];
+    let _protected_float_metrics = [
+        reader.read_encoded_f32()?,
+        reader.read_encoded_f32()?,
+        reader.read_encoded_f32()?,
+    ];
+    let _diagnostic_metric = reader.read_i32()?;
+    let _nested_diagnostic_prefix = reader.read_bytes(20)?;
+    let _nested_diagnostic_value = reader.read_i32()?;
+    let _nested_diagnostic_suffix = reader.read_bytes(16)?;
     // Every captured producer appends the same 19-byte post-5136 extension
     // that the current C# handler leaves unread.
     let _post_5136_extension = reader.read_bytes(19)?;
     finish(reader, TelemetryRequestKind::GameReport)?;
     Ok(TelemetryReport::GameReport {
-        plane_check,
-        distance,
+        protected_metric_0,
+        protected_metric_1,
+        diagnostic_channel_count: GAME_REPORT_DIAGNOSTIC_CHANNEL_COUNT,
     })
 }
 
@@ -215,9 +247,7 @@ fn parse_game_client_frame(packet: &[u8]) -> Result<TelemetryReport, TelemetryPr
     )?;
     let mut reader = checked_reader(TelemetryRequestKind::GameClientFrame, packet)?;
     let report = TelemetryReport::GameClientFrame {
-        local_frame: reader.read_u32()?,
-        server_frame: reader.read_u32()?,
-        acknowledged_frame: reader.read_u32()?,
+        metric: [reader.read_u32()?, reader.read_u32()?, reader.read_u32()?],
     };
     finish(reader, TelemetryRequestKind::GameClientFrame)?;
     Ok(report)
@@ -231,10 +261,38 @@ fn parse_game_request_relay(packet: &[u8]) -> Result<TelemetryReport, TelemetryP
     )?;
     let mut reader = checked_reader(TelemetryRequestKind::GameRequestRelay, packet)?;
     let report = TelemetryReport::GameRequestRelay {
-        value: reader.read_i32()?,
-        route_hash: reader.read_u32()?,
+        desired_peer_slot: reader.read_u32()?,
+        requester_slot: reader.read_u32()?,
     };
     finish(reader, TelemetryRequestKind::GameRequestRelay)?;
+    Ok(report)
+}
+
+fn parse_game_booster_add(packet: &[u8]) -> Result<TelemetryReport, TelemetryProtocolError> {
+    require_exact_length(
+        TelemetryRequestKind::GameBoosterAdd,
+        packet,
+        GAME_BOOSTER_ADD_LENGTH,
+    )?;
+    let reader = checked_reader(TelemetryRequestKind::GameBoosterAdd, packet)?;
+    finish(reader, TelemetryRequestKind::GameBoosterAdd)?;
+    Ok(TelemetryReport::GameBoosterAdd)
+}
+
+fn parse_report_state_in_game(packet: &[u8]) -> Result<TelemetryReport, TelemetryProtocolError> {
+    require_exact_length(
+        TelemetryRequestKind::ReportStateInGame,
+        packet,
+        REPORT_STATE_IN_GAME_LENGTH,
+    )?;
+    let mut reader = checked_reader(TelemetryRequestKind::ReportStateInGame, packet)?;
+    let report = TelemetryReport::ReportStateInGame {
+        report_sequence: reader.read_u32()?,
+        zero_or_reserved: reader.read_u32()?,
+        transformed_tick: reader.read_u32()?,
+        tick_validation_partner: reader.read_u32()?,
+    };
+    finish(reader, TelemetryRequestKind::ReportStateInGame)?;
     Ok(report)
 }
 
@@ -252,11 +310,11 @@ fn parse_ride_event_report(packet: &[u8]) -> Result<TelemetryReport, TelemetryPr
         let _position_y = reader.read_f32()?;
         let _position_z = reader.read_f32()?;
         let _event_state = reader.read_u32()?;
-        let _active = reader.read_u8()?;
-        let _event_id = reader.read_u16()?;
-        let _event_value = reader.read_u32()?;
-        let _event_subject = reader.read_utf16_bounded(MAX_RIDE_EVENT_STRING_UNITS)?;
-        let _tick = reader.read_u32()?;
+        let _phase_or_category = reader.read_u8()?;
+        let _event_or_item_id = reader.read_u16()?;
+        let _auxiliary_value = reader.read_u32()?;
+        let _subject_nickname = reader.read_utf16_bounded(MAX_RIDE_EVENT_STRING_UNITS)?;
+        let _race_tick = reader.read_u32()?;
     }
     finish(reader, TelemetryRequestKind::RideEventReport)?;
     Ok(TelemetryReport::RideEventReport { event_count })
@@ -288,19 +346,38 @@ fn parse_ride_path_report(packet: &[u8]) -> Result<TelemetryReport, TelemetryPro
     })
 }
 
-fn parse_unidentified_driving_report(
-    packet: &[u8],
-) -> Result<TelemetryReport, TelemetryProtocolError> {
-    if !UNIDENTIFIED_DRIVING_REPORT_LENGTHS.contains(&packet.len()) {
-        return Err(TelemetryProtocolError::UnidentifiedLength {
-            actual: packet.len(),
-            allowed: UNIDENTIFIED_DRIVING_REPORT_LENGTHS,
-        });
+fn parse_ride_switch_info(packet: &[u8]) -> Result<TelemetryReport, TelemetryProtocolError> {
+    let mut reader = checked_reader(TelemetryRequestKind::RideSwitchInfo, packet)?;
+    let elapsed_or_total = reader.read_f32()?;
+    let participant_count = reader.read_u32()?;
+    require_record_limit(
+        TelemetryRequestKind::RideSwitchInfo,
+        participant_count,
+        MAX_RIDE_SWITCH_PARTICIPANTS,
+    )?;
+    for _ in 0..participant_count {
+        let _nickname = reader.read_utf16_bounded(MAX_RIDE_SWITCH_NAME_UNITS)?;
+        let _participant_value = reader.read_u32()?;
     }
-    let reader = checked_reader(TelemetryRequestKind::UnidentifiedDrivingReport, packet)?;
-    let _bounded_opaque_body = reader.remaining();
-    Ok(TelemetryReport::UnidentifiedDrivingReport {
-        logical_length: packet.len(),
+    let sample_count = reader.read_u32()?;
+    require_record_limit(
+        TelemetryRequestKind::RideSwitchInfo,
+        sample_count,
+        MAX_RIDE_SWITCH_SAMPLES,
+    )?;
+    for _ in 0..sample_count {
+        let _u64_like_pair = reader.read_bytes(8)?;
+    }
+    let mut aggregate_values = [0_u32; 8];
+    for aggregate in &mut aggregate_values {
+        *aggregate = reader.read_u32()?;
+    }
+    finish(reader, TelemetryRequestKind::RideSwitchInfo)?;
+    Ok(TelemetryReport::RideSwitchInfo {
+        elapsed_or_total,
+        participant_count,
+        sample_count,
+        aggregate_values,
     })
 }
 
@@ -370,9 +447,9 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_RIDE_PATH_SAMPLES, TelemetryProtocolError, TelemetryReport, TelemetryRequestKind,
-        UNIDENTIFIED_DRIVING_REPORT_HASH, UNIDENTIFIED_DRIVING_REPORT_LENGTHS,
-        classify_telemetry_request, parse_telemetry_request,
+        MAX_RIDE_PATH_SAMPLES, MAX_RIDE_SWITCH_PARTICIPANTS, MAX_RIDE_SWITCH_SAMPLES,
+        RIDE_SWITCH_INFO_HASH, RIDE_SWITCH_INFO_NAME, TelemetryProtocolError, TelemetryReport,
+        TelemetryRequestKind, classify_telemetry_request, parse_telemetry_request,
     };
     use crate::{adler32, packet::PacketWriter};
 
@@ -390,16 +467,25 @@ mod tests {
         );
         assert_eq!(
             parse_telemetry_request(TelemetryRequestKind::GameAiReport, &ai).unwrap(),
-            TelemetryReport::GameAiReport
+            TelemetryReport::GameAiReport {
+                metric_bits: [
+                    0x0065_0074,
+                    0x0070_006D,
+                    0x0062_005F,
+                    0x0031_0067,
+                    0x0067_0000,
+                    0x0000_0072,
+                    0x0000_0066,
+                    0x0000_0067,
+                ],
+            }
         );
 
         let frame = captured("CF 08 0A 67 7E 00 00 00 91 00 00 00 8C 00 00 00");
         assert_eq!(
             parse_telemetry_request(TelemetryRequestKind::GameClientFrame, &frame).unwrap(),
             TelemetryReport::GameClientFrame {
-                local_frame: 126,
-                server_frame: 145,
-                acknowledged_frame: 140,
+                metric: [126, 145, 140],
             }
         );
 
@@ -407,8 +493,8 @@ mod tests {
         assert_eq!(
             parse_telemetry_request(TelemetryRequestKind::GameRequestRelay, &relay).unwrap(),
             TelemetryReport::GameRequestRelay {
-                value: 0,
-                route_hash: 0xA1B7_1C9D,
+                desired_peer_slot: 0,
+                requester_slot: 0xA1B7_1C9D,
             }
         );
     }
@@ -450,28 +536,150 @@ mod tests {
     }
 
     #[test]
-    fn unidentified_hash_is_bounded_to_only_captured_lengths() {
+    fn ride_switch_info_uses_the_recovered_containers() {
         assert_eq!(
-            classify_telemetry_request(UNIDENTIFIED_DRIVING_REPORT_HASH),
-            Some(TelemetryRequestKind::UnidentifiedDrivingReport)
+            classify_telemetry_request(RIDE_SWITCH_INFO_HASH),
+            Some(TelemetryRequestKind::RideSwitchInfo)
         );
-        for length in UNIDENTIFIED_DRIVING_REPORT_LENGTHS {
-            let mut packet = vec![0; length];
-            packet[..4].copy_from_slice(&UNIDENTIFIED_DRIVING_REPORT_HASH.to_le_bytes());
-            assert_eq!(
-                parse_telemetry_request(TelemetryRequestKind::UnidentifiedDrivingReport, &packet)
-                    .unwrap(),
-                TelemetryReport::UnidentifiedDrivingReport {
-                    logical_length: length,
-                }
-            );
-        }
-        let mut packet = vec![0; 72];
-        packet[..4].copy_from_slice(&UNIDENTIFIED_DRIVING_REPORT_HASH.to_le_bytes());
+        assert_eq!(
+            crate::adler32::packet_hash(RIDE_SWITCH_INFO_NAME),
+            RIDE_SWITCH_INFO_HASH
+        );
+        let captured_retire_report = [
+            0x2A, 0x08, 0x15, 0x58, 0xA6, 0xF4, 0xA1, 0x43, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0xBE, 0xE0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00,
+            0xD6, 0x6F, 0x14, 0x42, 0xC2, 0xDC, 0x44, 0x42, 0x64, 0xB8, 0x53, 0x34, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xB0, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(captured_retire_report.len(), 56);
+        assert_eq!(
+            parse_telemetry_request(
+                TelemetryRequestKind::RideSwitchInfo,
+                &captured_retire_report,
+            )
+            .unwrap(),
+            TelemetryReport::RideSwitchInfo {
+                elapsed_or_total: f32::from_bits(0x43A1_F4A6),
+                participant_count: 0,
+                sample_count: 1,
+                aggregate_values: [23, 0x4214_6FD6, 0x4244_DCC2, 0x3453_B864, 0, 0, 176, 21,],
+            }
+        );
+    }
+
+    #[test]
+    fn ride_switch_info_parses_the_captured_finish_container() {
+        let captured_finish_report = [
+            0x2A, 0x08, 0x15, 0x58, 0x12, 0xA7, 0xC4, 0x43, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x29, 0xAF, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xE8, 0x90, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0xC4, 0x8F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x00,
+            0x00, 0x00, 0x69, 0xF1, 0x31, 0x42, 0xE8, 0xBB, 0x2F, 0x43, 0xCA, 0x9A, 0x69, 0x40,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x22, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(captured_finish_report.len(), 72);
+        assert_eq!(
+            parse_telemetry_request(
+                TelemetryRequestKind::RideSwitchInfo,
+                &captured_finish_report,
+            )
+            .unwrap(),
+            TelemetryReport::RideSwitchInfo {
+                elapsed_or_total: f32::from_bits(0x43C4_A712),
+                participant_count: 0,
+                sample_count: 3,
+                aggregate_values: [35, 0x4231_F169, 0x432F_BBE8, 0x4069_9ACA, 0, 0, 14, 34,],
+            }
+        );
+    }
+
+    #[test]
+    fn ride_switch_info_parses_the_captured_post_goal_container() {
+        let captured_post_goal_report = captured(
+            "2A 08 15 58 67 51 80 43 01 00 00 00 04 00 00 00 \
+             59 00 61 00 6E 00 79 00 07 00 00 00 03 00 00 00 \
+             8C D0 01 00 00 00 00 00 28 75 00 00 00 00 00 00 \
+             92 B2 00 00 00 00 00 00 17 00 00 00 B8 5B 10 42 \
+             F7 32 80 42 41 59 88 3F 00 00 00 00 00 00 00 00 \
+             14 00 00 00 16 00 00 00",
+        );
+        assert_eq!(captured_post_goal_report.len(), 88);
+        assert_eq!(
+            parse_telemetry_request(
+                TelemetryRequestKind::RideSwitchInfo,
+                &captured_post_goal_report,
+            )
+            .unwrap(),
+            TelemetryReport::RideSwitchInfo {
+                elapsed_or_total: f32::from_bits(0x4380_5167),
+                participant_count: 1,
+                sample_count: 3,
+                aggregate_values: [23, 0x4210_5BB8, 0x4280_32F7, 0x3F88_5941, 0, 0, 20, 22,],
+            }
+        );
+    }
+
+    #[test]
+    fn ride_switch_info_bounds_container_counts_before_consumption() {
+        let mut too_many_participants = PacketWriter::named(RIDE_SWITCH_INFO_NAME);
+        too_many_participants.write_f32(0.0);
+        too_many_participants.write_u32(MAX_RIDE_SWITCH_PARTICIPANTS + 1);
         assert!(matches!(
-            parse_telemetry_request(TelemetryRequestKind::UnidentifiedDrivingReport, &packet),
-            Err(TelemetryProtocolError::UnidentifiedLength { actual: 72, .. })
+            parse_telemetry_request(
+                TelemetryRequestKind::RideSwitchInfo,
+                too_many_participants.as_slice(),
+            ),
+            Err(TelemetryProtocolError::RecordLimit {
+                actual,
+                maximum: MAX_RIDE_SWITCH_PARTICIPANTS,
+                ..
+            }) if actual == MAX_RIDE_SWITCH_PARTICIPANTS + 1
+        ));
+
+        let mut too_many_samples = PacketWriter::named(RIDE_SWITCH_INFO_NAME);
+        too_many_samples.write_f32(0.0);
+        too_many_samples.write_u32(0);
+        too_many_samples.write_u32(MAX_RIDE_SWITCH_SAMPLES + 1);
+        assert!(matches!(
+            parse_telemetry_request(
+                TelemetryRequestKind::RideSwitchInfo,
+                too_many_samples.as_slice(),
+            ),
+            Err(TelemetryProtocolError::RecordLimit {
+                actual,
+                maximum: MAX_RIDE_SWITCH_SAMPLES,
+                ..
+            }) if actual == MAX_RIDE_SWITCH_SAMPLES + 1
         ));
         assert!(classify_telemetry_request(adler32::packet_hash("actually unknown")).is_none());
+    }
+
+    #[test]
+    fn empty_booster_and_in_game_state_reports_are_strictly_consumed() {
+        let booster = PacketWriter::named("GameBoosterAddPacket");
+        assert_eq!(
+            parse_telemetry_request(TelemetryRequestKind::GameBoosterAdd, booster.as_slice())
+                .unwrap(),
+            TelemetryReport::GameBoosterAdd
+        );
+
+        let mut heartbeat = PacketWriter::named("PcReportStateInGame");
+        heartbeat.write_u32(17);
+        heartbeat.write_u32(0);
+        heartbeat.write_u32(18);
+        heartbeat.write_u32(19);
+        assert_eq!(
+            parse_telemetry_request(
+                TelemetryRequestKind::ReportStateInGame,
+                heartbeat.as_slice()
+            )
+            .unwrap(),
+            TelemetryReport::ReportStateInGame {
+                report_sequence: 17,
+                zero_or_reserved: 0,
+                transformed_tick: 18,
+                tick_validation_partner: 19,
+            }
+        );
     }
 }

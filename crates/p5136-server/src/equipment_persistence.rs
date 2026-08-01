@@ -676,6 +676,14 @@ pub(crate) mod tests {
                     <Emblem id="8" />
                     <Emblem id="9" />
                 </Emblems>
+                <Abilities total="4" resolved="4">
+                    <TransformByKart>
+                        <Rule kartId="1410" sourceId="5" targetId="103" probability="100" gitType="no_flag" />
+                        <Rule kartId="1410" sourceId="7" targetId="99" probability="100" gitType="no_flag" />
+                        <Rule kartId="1410" sourceId="127" targetId="99" probability="100" gitType="no_flag" />
+                        <Rule kartId="1411" sourceId="7" targetId="99" probability="50" gitType="no_flag" />
+                    </TransformByKart>
+                </Abilities>
             </KartCatalog>"#
         );
         CatalogInventory::from_xml(xml.as_bytes()).unwrap()

@@ -20,6 +20,7 @@ pub mod item_state_protocol;
 pub mod kart_physics;
 pub mod lobby_protocol;
 pub mod login;
+pub mod matching_protocol;
 pub mod messenger;
 pub mod myroom_protocol;
 pub mod nickname;

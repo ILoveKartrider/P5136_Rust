@@ -57,8 +57,8 @@ use p5136_core::{
     track::is_random_track_selector,
 };
 use p5136_profile::{
-    AppliedTimeReward, GlobalRaceEpoch, MAX_TIME_REWARD_LUCCI_ROLL, MAX_TIME_REWARD_RP_ROLL,
-    TimeReward, time_reward_from_rolls,
+    AppliedTimeReward, CatalogInventory, GlobalRaceEpoch, MAX_TIME_REWARD_LUCCI_ROLL,
+    MAX_TIME_REWARD_RP_ROLL, TimeReward, time_reward_from_rolls,
 };
 use rand::Rng;
 use thiserror::Error;
@@ -180,9 +180,10 @@ impl ItemRollSource for RandomItemRollSource {
 }
 
 #[derive(Debug, Clone)]
-struct ItemProbabilityService {
+pub(crate) struct ItemProbabilityService {
     configuration: Arc<ItemProbabilityConfiguration>,
     rank_policy: ItemProbabilityRankPolicy,
+    catalog: Option<Arc<CatalogInventory>>,
 }
 
 impl Default for ItemProbabilityService {
@@ -190,11 +191,24 @@ impl Default for ItemProbabilityService {
         Self {
             configuration: Arc::new(ItemProbabilityConfiguration::safe_fallback()),
             rank_policy: ItemProbabilityRankPolicy::default(),
+            catalog: None,
         }
     }
 }
 
 impl ItemProbabilityService {
+    pub(crate) fn new(
+        configuration: Arc<ItemProbabilityConfiguration>,
+        rank_policy: ItemProbabilityRankPolicy,
+        catalog: Option<Arc<CatalogInventory>>,
+    ) -> Self {
+        Self {
+            configuration,
+            rank_policy,
+            catalog,
+        }
+    }
+
     fn roll_total(
         &self,
         team_mode: bool,
@@ -224,6 +238,53 @@ impl ItemProbabilityService {
             self.rank_policy,
         )
     }
+
+    fn select_award(
+        &self,
+        team_mode: bool,
+        client_reported_rank: i16,
+        racer_count: usize,
+        kart_id: u16,
+        item_rolls: &mut impl ItemRollSource,
+    ) -> Result<ItemAwardSelection, ItemProbabilityError> {
+        let (rank_band, total) = self.roll_total(team_mode, client_reported_rank, racer_count)?;
+        let roll = item_rolls.draw_item(total);
+        let (base_item_id, selected_band) =
+            self.select_with_roll(team_mode, client_reported_rank, racer_count, roll)?;
+        debug_assert_eq!(rank_band, selected_band);
+        let transform = self
+            .catalog
+            .as_deref()
+            .and_then(|catalog| catalog.item_transform(kart_id, base_item_id, "no_flag"))
+            .map(|rule| (rule.target_item_id, rule.probability));
+        let (item_id, transform_probability, transform_applied) = match transform {
+            Some((target_item_id, probability))
+                if probability >= 100
+                    || item_rolls.draw_item(NonZeroU64::new(100).expect("100 is nonzero"))
+                        < u64::from(probability) =>
+            {
+                (target_item_id, Some(probability), true)
+            }
+            Some((_, probability)) => (base_item_id, Some(probability), false),
+            None => (base_item_id, None, false),
+        };
+        Ok(ItemAwardSelection {
+            rank_band,
+            base_item_id,
+            item_id,
+            transform_probability,
+            transform_applied,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ItemAwardSelection {
+    rank_band: ItemProbabilityRankBand,
+    base_item_id: i16,
+    item_id: i16,
+    transform_probability: Option<u8>,
+    transform_applied: bool,
 }
 
 /// One ordered write unit for a login session. A batch consumes one bounded
@@ -2053,6 +2114,17 @@ enum WorldCommand {
         snapshot: Box<[u8; 65]>,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
+    /// Replaces the race-start physics snapshot of a lobby member after its
+    /// durable rider-equipment selection has been reloaded and resolved.
+    ///
+    /// This deliberately has no wire side effect: the item snapshot has
+    /// already been published by the durable equipment completion.  Physics is
+    /// frozen once loading starts, so only a lobby member may be refreshed.
+    RefreshRoomKartPhysics {
+        session: SessionId,
+        kart_physics: Box<P5136KartPhysicsBlock>,
+        reply: oneshot::Sender<Result<bool, WorldError>>,
+    },
     RefreshMyRoomPresentation {
         session: SessionId,
         expected: IdentityBinding,
@@ -2373,8 +2445,7 @@ impl WorldHandle {
             messenger,
             udp,
             clock,
-            Arc::new(ItemProbabilityConfiguration::safe_fallback()),
-            ItemProbabilityRankPolicy::default(),
+            ItemProbabilityService::default(),
         )
     }
 
@@ -2384,8 +2455,7 @@ impl WorldHandle {
         messenger: MessengerServiceHandle,
         udp: UdpService,
         clock: ServerClock,
-        item_probabilities: Arc<ItemProbabilityConfiguration>,
-        item_probability_rank_policy: ItemProbabilityRankPolicy,
+        item_probability: ItemProbabilityService,
     ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
         let (udp_sender, udp_receiver) = mpsc::channel(udp_mailbox_capacity);
@@ -2410,10 +2480,6 @@ impl WorldHandle {
             udp_sender: Some(udp_sender),
             myroom_completions,
             identity_instance,
-        };
-        let item_probability = ItemProbabilityService {
-            configuration: item_probabilities,
-            rank_policy: item_probability_rank_policy,
         };
         let task = tokio::spawn(run_world(
             receiver,
@@ -3156,6 +3222,23 @@ impl AdmittedWorldHandle<'_> {
         self.send(WorldCommand::RoomProtocol {
             session: self.session_id(),
             payload: Box::new(payload),
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
+    /// Updates the caller's cached race-start physics only while it is still
+    /// safe to affect the next race.  `false` means the caller is not in a
+    /// lobby room (or its room has already moved past the lobby phase).
+    pub(crate) async fn refresh_room_kart_physics(
+        &self,
+        kart_physics: P5136KartPhysicsBlock,
+    ) -> Result<bool, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::RefreshRoomKartPhysics {
+            session: self.session_id(),
+            kart_physics: Box::new(kart_physics),
             reply,
         })
         .await?;
@@ -4670,6 +4753,23 @@ fn prepare_item_pickup_admission(
         next.objects_seen_at_tick.insert((kind, object_id));
     }
     Ok(next)
+}
+
+fn frozen_item_pickup_kart_id(sender: &FrozenRaceParticipant) -> Result<u16, RaceError> {
+    sender
+        .result
+        .map(|result| result.kart_id)
+        .ok_or(RaceError::GameSlotInvariant {
+            detail: "item-pickup sender has no frozen human result snapshot",
+        })
+}
+
+fn item_pickup_team_mode(game_type: u8) -> Result<bool, RaceError> {
+    match game_type {
+        2 => Ok(false),
+        4 => Ok(true),
+        game_type => Err(RaceError::ItemPickupModeRequired { game_type }),
+    }
 }
 
 fn reward_retry_delay(failure_count: u8) -> Duration {
@@ -8373,11 +8473,32 @@ impl World {
                 })
             })
             .collect::<Result<Vec<_>, RaceError>>()?;
-        Ok(serialize_game_result(&GameResult {
+        let result = serialize_game_result(&GameResult {
             winning_team: ranking.winning_team,
             humans: &humans,
             ais: &ais,
-        })?)
+        })?;
+
+        // This is a diagnostic projection of the immutable packet snapshot;
+        // it deliberately keeps DNF racers (`u32::MAX`) in the roster.  A
+        // missing racer would hide a client-compatibility problem rather than
+        // describe the race that the server actually settled.
+        tracing::info!(
+            room_id = room.id.0,
+            game_type = room.settings.game_type,
+            winning_team = ?ranking.winning_team,
+            human_results = ?humans
+                .iter()
+                .map(|racer| (racer.player_id, racer.finish_time, racer.rank, racer.team, racer.team_points))
+                .collect::<Vec<_>>(),
+            ai_results = ?ais
+                .iter()
+                .map(|racer| (racer.player_id, racer.finish_time, racer.kart_id, racer.rank, racer.team, racer.team_points))
+                .collect::<Vec<_>>(),
+            result_packet_bytes = result.len(),
+            "prepared P5136 ceremony result snapshot"
+        );
+        Ok(result)
     }
 
     fn settlement_ranking(room: &ProtocolRoomState) -> Result<SettlementRanking, RaceError> {
@@ -8795,6 +8916,35 @@ impl World {
         self.commit_room_equipment(plan)?;
         self.debug_assert_invariants();
         Ok(())
+    }
+
+    fn refresh_room_kart_physics(
+        &mut self,
+        session: SessionId,
+        kart_physics: P5136KartPhysicsBlock,
+    ) -> Result<bool, WorldOperationError> {
+        let identity = self.authorize_session_operation(session)?;
+        let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
+            return Ok(false);
+        };
+        let Some(room) = self.protocol_rooms.get_mut(&room_id) else {
+            return Ok(false);
+        };
+        if room.phase != RoomPhase::Lobby {
+            return Ok(false);
+        }
+        let Some(member) = room
+            .members_by_id
+            .iter_mut()
+            .chain(&mut room.observers)
+            .flatten()
+            .find(|member| member.user_no == identity.user_no)
+        else {
+            return Ok(false);
+        };
+        member.kart_physics = kart_physics;
+        self.debug_assert_invariants();
+        Ok(true)
     }
 
     fn plan_room_equipment(
@@ -9429,11 +9579,7 @@ impl World {
             .ok_or(RaceError::GameSlotInvariant {
                 detail: "item-pickup synthesis references a missing room",
             })?;
-        let team_mode = match room.settings.game_type {
-            2 => false,
-            4 => true,
-            game_type => return Err(RaceError::ItemPickupModeRequired { game_type }),
-        };
+        let team_mode = item_pickup_team_mode(room.settings.game_type)?;
         let frozen = room
             .frozen_race
             .as_ref()
@@ -9450,6 +9596,7 @@ impl World {
                 detail: "item-pickup sender changed during actor dispatch",
             });
         }
+        let kart_id = frozen_item_pickup_kart_id(sender)?;
         let pickup_admission = prepare_item_pickup_admission(
             room.race_progress.item_pickups.get(&sender_player_id),
             now,
@@ -9464,18 +9611,14 @@ impl World {
             .filter(|participant| !participant.observer)
             .count();
         let race_epoch = frozen.fence.race_epoch.get();
-        let (rank_band, total) =
-            self.item_probability
-                .roll_total(team_mode, client_reported_rank, racer_count)?;
-        let roll = item_rolls.draw_item(total);
-        let (item_id, selected_band) = self.item_probability.select_with_roll(
+        let award = self.item_probability.select_award(
             team_mode,
             client_reported_rank,
             racer_count,
-            roll,
+            kart_id,
+            item_rolls,
         )?;
-        debug_assert_eq!(rank_band, selected_band);
-        let raw = packet.into_item_pickup_award(item_id)?;
+        let raw = packet.into_item_pickup_award(award.item_id)?;
         let deliveries = self
             .active_frozen_recipient_sessions(room)
             .into_iter()
@@ -9497,8 +9640,13 @@ impl World {
             room_id = room_id.0,
             race_epoch,
             player_id = sender_player_id,
-            item_id,
-            ?rank_band,
+            kart_id,
+            base_item_id = award.base_item_id,
+            item_id = award.item_id,
+            transform_mode = "no_flag",
+            transform_probability = ?award.transform_probability,
+            transform_applied = award.transform_applied,
+            rank_band = ?award.rank_band,
             rank_policy = ?self.item_probability.rank_policy,
             client_reported_rank,
             pickup_kind = ?pickup_kind,
@@ -9511,8 +9659,8 @@ impl World {
         Ok(RaceCommandOutcome::GameSlotItemAwarded {
             room_id,
             race_epoch,
-            item_id,
-            rank_band,
+            item_id: award.item_id,
+            rank_band: award.rank_band,
             recipients,
         })
     }
@@ -10441,20 +10589,21 @@ impl World {
         let initial = serialize_initial_room_state(&room.session_data(), &room.slot_data())?;
         let session_packet = initial[0].logical_packet.clone();
         let slot_packet = initial[1].logical_packet.clone();
-        let users = room.user_nos();
 
-        let mut deliveries = Vec::with_capacity(users.len());
-        for user_no in users {
-            if user_no == identity.user_no {
-                deliveries.push((
-                    session,
-                    OutboundBatch::ordered(vec![session_packet.clone(), slot_packet.clone()]),
-                ));
-            } else if let Some(recipient) = self.identities.active_identity_by_user_no(user_no) {
-                deliveries.push((recipient.owner, OutboundBatch::single(slot_packet.clone())));
-            }
-        }
-        self.deliver(deliveries, Instant::now())?;
+        // `GrFirstRequestPacket` is a requester's scene rehydration, not a
+        // room-state mutation.  A peer has already received the authoritative
+        // slot snapshot when the requester joined or changed the room.  Queueing
+        // a duplicate peer snapshot here can let an old lobby state survive in
+        // that peer's TCP FIFO until after the race ceremony, where the stock
+        // client cannot safely apply it.  C# broadcasts this redundant packet,
+        // but Rust keeps the stronger requester-only ownership boundary.
+        self.deliver(
+            vec![(
+                session,
+                OutboundBatch::ordered(vec![session_packet, slot_packet]),
+            )],
+            Instant::now(),
+        )?;
         Ok(())
     }
 
@@ -11962,6 +12111,14 @@ async fn dispatch_unwrapped_command(
             let result = world.publish_room_equipment(session, *snapshot);
             reply_after_world_operation(world, sidecars, reply, result).await?;
         }
+        WorldCommand::RefreshRoomKartPhysics {
+            session,
+            kart_physics,
+            reply,
+        } => {
+            let result = world.refresh_room_kart_physics(session, *kart_physics);
+            reply_after_world_operation(world, sidecars, reply, result).await?;
+        }
         WorldCommand::RefreshMyRoomPresentation {
             session,
             expected,
@@ -12106,6 +12263,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
+        WorldCommand::RefreshRoomKartPhysics { reply, .. } => reject_quiesced_reply(reply),
         WorldCommand::Lobby { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
@@ -12142,6 +12300,11 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
         | WorldCommand::Shutdown { .. }
         | WorldCommand::ForceShutdown { .. }) => Some(command),
     }
+}
+
+fn reject_quiesced_reply<T>(reply: oneshot::Sender<Result<T, WorldError>>) -> Option<WorldCommand> {
+    let _ = reply.send(Err(WorldError::OutboundProductionClosed));
+    None
 }
 
 async fn dispatch_session_closed(
@@ -12516,6 +12679,7 @@ async fn dispatch_utility_command(
         | WorldCommand::BeginMigration { .. }
         | WorldCommand::RoomProtocol { .. }
         | WorldCommand::PublishRoomEquipment { .. }
+        | WorldCommand::RefreshRoomKartPhysics { .. }
         | WorldCommand::RefreshMyRoomPresentation { .. }
         | WorldCommand::Lobby { .. }
         | WorldCommand::Race { .. }
@@ -12882,7 +13046,7 @@ pub(crate) mod test_support {
 mod tests {
     use std::{
         array,
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         num::{NonZeroU64, NonZeroUsize},
         sync::{Arc, Barrier},
@@ -12896,8 +13060,8 @@ mod tests {
         game_slot_item_schema::item_operation_schema,
         game_slot_protocol::{
             GAME_KART_ITEM_INFO_HASH, GAME_SLOT_PACKET_HASH, GO_ITEM_BARRICADE_HASH,
-            GO_ITEM_CUBE_HASH, GOP_BARRICADE_HASH, GOP_CUBE_HASH, GameSlotEvidencePending,
-            ParsedGameSlotPacket, parse_game_slot_packet,
+            GO_ITEM_CUBE_HASH, GOP_BARRICADE_HASH, GOP_CUBE_HASH, ParsedGameSlotPacket,
+            parse_game_slot_packet,
         },
         lobby_protocol::{
             BASIC_AI_REPLY_NAME, BASIC_AI_SLOT_DATA_NAME, BasicAiRequest, CHANGE_TEAM_REPLY_NAME,
@@ -12990,6 +13154,22 @@ mod tests {
         fn draw_item(&mut self, total: NonZeroU64) -> u64 {
             assert!(self.0 < total.get());
             self.0
+        }
+    }
+
+    struct SequenceItemRolls(VecDeque<u64>);
+
+    impl SequenceItemRolls {
+        fn new(rolls: impl IntoIterator<Item = u64>) -> Self {
+            Self(rolls.into_iter().collect())
+        }
+    }
+
+    impl super::ItemRollSource for SequenceItemRolls {
+        fn draw_item(&mut self, total: NonZeroU64) -> u64 {
+            let roll = self.0.pop_front().expect("test supplied every item roll");
+            assert!(roll < total.get());
+            roll
         }
     }
 
@@ -13796,6 +13976,27 @@ mod tests {
         write_test_u32(&mut packet, 24, GO_ITEM_BARRICADE_HASH);
         packet[32] = 1;
         write_test_i32(&mut packet, 37, i32::from(player_id));
+        packet
+    }
+
+    fn barricade_transition_game_slot(player_id: u8, recipient_mask: u32, state: u8) -> Vec<u8> {
+        let (object_id, tick, trailing) = match state {
+            2 => (0x1000_004C, 0x0001_A79A, 0),
+            3 => (0x1000_0050, 0x0001_9E3A, 2),
+            _ => panic!("the captured barricade transition state must be 2 or 3"),
+        };
+        let mut packet = vec![0_u8; 45];
+        write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
+        write_test_i32(&mut packet, 4, i32::from(player_id));
+        write_test_u32(&mut packet, 8, recipient_mask);
+        packet[12] = 12;
+        write_test_u32(&mut packet, 16, 25);
+        write_test_u32(&mut packet, 20, GOP_BARRICADE_HASH);
+        write_test_u32(&mut packet, 24, GO_ITEM_BARRICADE_HASH);
+        write_test_u32(&mut packet, 28, object_id);
+        packet[32] = state;
+        write_test_u32(&mut packet, 33, tick);
+        write_test_u32(&mut packet, 41, trailing);
         packet
     }
 
@@ -15529,7 +15730,7 @@ mod tests {
 
         let raw_static = static_item_operation_game_slot(0, (1_u32 << 1) | (1_u32 << 2));
         let before = world.protocol_rooms[&room_id].clone();
-        assert!(matches!(
+        assert_eq!(
             world
                 .race_command(
                     sessions[0].session,
@@ -15537,20 +15738,16 @@ mod tests {
                     Instant::now(),
                 )
                 .unwrap(),
-            RaceCommandOutcome::GameSlotEvidencePending {
-                room_id: actual_room,
+            RaceCommandOutcome::GameSlotRelayed {
+                room_id,
                 race_epoch: 1,
-                player_id: 0,
-                reason: GameSlotEvidencePending::StaticItemOperation {
-                    class_name: "GopAngel",
-                    state: 0,
-                    ..
-                },
-            } if actual_room == room_id
-        ));
+                recipients: 3,
+            }
+        );
         assert_eq!(world.protocol_rooms[&room_id], before);
-        for session in &mut sessions {
-            assert!(session.outbound.try_recv().is_err());
+        assert!(sessions[0].outbound.try_recv().is_err());
+        for session in &mut sessions[1..] {
+            assert_eq!(take_single_packet(&mut session.outbound), raw_static);
         }
 
         let peer_racer_mask = (1_u32 << 1) | (1_u32 << 2);
@@ -15572,6 +15769,28 @@ mod tests {
         assert!(sessions[0].outbound.try_recv().is_err());
         for session in &mut sessions[1..] {
             assert_eq!(take_single_packet(&mut session.outbound), raw_barricade);
+        }
+
+        for state in [3, 2] {
+            let raw_transition = barricade_transition_game_slot(0, peer_racer_mask, state);
+            assert_eq!(
+                world
+                    .race_command(
+                        sessions[0].session,
+                        tcp_game_slot_request(&raw_transition),
+                        Instant::now(),
+                    )
+                    .unwrap(),
+                RaceCommandOutcome::GameSlotRelayed {
+                    room_id,
+                    race_epoch: 1,
+                    recipients: 3,
+                }
+            );
+            assert!(sessions[0].outbound.try_recv().is_err());
+            for session in &mut sessions[1..] {
+                assert_eq!(take_single_packet(&mut session.outbound), raw_transition);
+            }
         }
 
         let mismatched_barricade = barricade_game_slot(0, peer_racer_mask | (1_u32 << 8));
@@ -15667,6 +15886,97 @@ mod tests {
         ));
         for session in &mut sessions {
             assert!(session.outbound.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn item_pickup_applies_frozen_kart_catalog_transforms_once() {
+        for (case, kart_id, base_item_id, expected_item_id, rolls) in [
+            ("GigantesMagnet", 1_410, 5, 103, vec![0]),
+            ("GigantesRocket", 1_410, 7, 99, vec![0]),
+            ("GigantesRandomRocket", 1_410, 127, 99, vec![0]),
+            ("UnrelatedKart", 1_409, 7, 7, vec![0]),
+            ("PartialPass", 1_411, 7, 99, vec![0, 49]),
+            ("PartialMiss", 1_411, 7, 7, vec![0, 50]),
+        ] {
+            let (mut world, mut sessions, room_id) =
+                prepare_game_slot_race(case, 42_000 + kart_id, &[(false, 8)]);
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            room.settings.game_type = 2;
+            room.frozen_race.as_mut().unwrap().participants[0]
+                .result
+                .as_mut()
+                .unwrap()
+                .kart_id = kart_id;
+            world.item_probability.catalog = Some(Arc::new(test_equipment_catalog()));
+            world.item_probability.configuration = Arc::new(ItemProbabilityConfiguration {
+                rank_band: ItemProbabilityRankBand::Live,
+                individual: vec![ItemProbabilityEntry {
+                    item_id: base_item_id,
+                    name: "fixture".to_owned(),
+                    top_weight: 1,
+                    high_weight: 1,
+                    middle_weight: 1,
+                    low_weight: 1,
+                }],
+                team: Vec::new(),
+            });
+            world.item_probability.rank_policy = ItemProbabilityRankPolicy::TrustClientReported;
+
+            let request = item_pickup_game_slot(0);
+            let mut item_rolls = SequenceItemRolls::new(rolls);
+            let outcome = world
+                .race_command_with_clock_and_item_source(
+                    sessions[0].session,
+                    tcp_game_slot_request(&request),
+                    Instant::now(),
+                    &ServerClock::new(),
+                    &mut item_rolls,
+                )
+                .unwrap();
+            assert!(
+                item_rolls.0.is_empty(),
+                "{case} consumed the wrong roll count"
+            );
+            assert!(matches!(
+                outcome,
+                RaceCommandOutcome::GameSlotItemAwarded {
+                    item_id,
+                    recipients: 1,
+                    ..
+                } if item_id == expected_item_id
+            ));
+            let awarded = take_single_packet(&mut sessions[0].outbound);
+            assert_eq!(
+                i16::from_le_bytes(awarded[38..40].try_into().unwrap()),
+                expected_item_id,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_racer_barricade_transitions_accept_the_captured_zero_peer_mask() {
+        let (mut world, mut sessions, room_id) =
+            prepare_game_slot_race("GameSlotBarricadeSolo", 41_831, &[(false, 64)]);
+
+        for state in [3, 2] {
+            let raw = barricade_transition_game_slot(0, 0, state);
+            assert_eq!(
+                world
+                    .race_command(
+                        sessions[0].session,
+                        tcp_game_slot_request(&raw),
+                        Instant::now(),
+                    )
+                    .unwrap(),
+                RaceCommandOutcome::GameSlotRelayed {
+                    room_id,
+                    race_epoch: 1,
+                    recipients: 0,
+                }
+            );
+            assert!(sessions[0].outbound.try_recv().is_err());
         }
     }
 
@@ -20355,9 +20665,11 @@ mod tests {
             )
             .unwrap();
 
-        // Both one-item queues still contain their direct create/join replies.
-        // GrFirst fan-out overflows both, and each eviction can enqueue further
-        // cleanup broadcasts. The delivery work queue must converge safely.
+        // The joiner's one-item queue still contains its direct join reply.
+        // A requester-only GrFirst overflows that queue, then its removal
+        // broadcasts the new slot state to the already-full owner queue. The
+        // delivery work queue must converge safely without reviving the old
+        // peer-snapshot fan-out.
         world
             .room_protocol(joiner.session, RoomCommandPayload::FirstState)
             .unwrap();
@@ -20377,6 +20689,48 @@ mod tests {
                 .active_identity_by_user_no(joiner.identity.user_no)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn first_state_rehydrates_only_the_requester_without_a_peer_lobby_snapshot() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "FirstOwner", 67, 51_100, 16);
+        let mut joiner = register_channel_session(&mut world, "FirstJoiner", 67, 51_101, 16);
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("FirstState", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut owner.outbound);
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        world
+            .room_protocol(
+                joiner.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut joiner.outbound);
+
+        let room = world.protocol_rooms[&room_id].clone();
+        let expected = serialize_initial_room_state(&room.session_data(), &room.slot_data())
+            .unwrap()
+            .into_iter()
+            .map(|packet| packet.logical_packet)
+            .collect::<Vec<_>>();
+
+        world
+            .room_protocol(joiner.session, RoomCommandPayload::FirstState)
+            .unwrap();
+
+        assert_eq!(joiner.outbound.try_recv().unwrap().into_packets(), expected);
+        assert!(owner.outbound.try_recv().is_err());
     }
 
     #[tokio::test]

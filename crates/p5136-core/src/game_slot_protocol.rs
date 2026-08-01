@@ -14,7 +14,8 @@
 use thiserror::Error;
 
 use crate::game_slot_item_schema::{
-    ItemOperationEvidence, ItemOperationSchema, ItemOperationValidationError, item_operation_schema,
+    ItemOperationEvidence, ItemOperationSchema, ItemOperationValidationError,
+    is_known_item_operation_pair, item_operation_schema,
 };
 
 pub const GAME_SLOT_PACKET_NAME: &str = "GameSlotPacket";
@@ -62,11 +63,6 @@ pub enum GameSlotAction {
 pub enum GameSlotEvidencePending {
     WorldObjectCollectionAuthorization(WorldObjectCollectionKind),
     SpawnedItemUseRouting,
-    StaticItemOperation {
-        class_name: &'static str,
-        state: u32,
-        evidence: ItemOperationEvidence,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +144,15 @@ pub struct ItemUse {
     pub common: u8,
     pub status: u16,
     pub item_or_skill: u16,
-    pub flag_18: u8,
-    pub flag_19: u8,
-    pub trailing_word: u16,
+    /// Raw producer byte at wire offset 18. It is not a boolean: the stock
+    /// producer leaves it uninitialized for most item-use forms.
+    pub raw_byte_18: u8,
+    /// Raw producer byte at wire offset 19; receiver semantics are
+    /// effect-specific and not yet generalised by Rust.
+    pub raw_byte_19: u8,
+    /// Nonzero values select an additional client effect path. The individual
+    /// effect meanings remain packet-specific.
+    pub ancillary_effect_code: u16,
     pub blob: GameSlotPayloadRange,
 }
 
@@ -176,6 +178,20 @@ pub struct ItemOperation {
     pub state: u32,
     pub evidence: ItemOperationEvidence,
     pub barricade: Option<BarricadePlacement>,
+    pub payload: GameSlotPayloadRange,
+}
+
+/// A type-12 operation whose pair is known to the P5136 compatibility family,
+/// but whose body is not one of the recovered native-writer shapes.
+///
+/// This is deliberately opaque: type-12 has no Rust-side world mutation. The
+/// outer parser has already verified the exact envelope length, hash pair,
+/// claimed actor, and low-16 peer mask before the World actor may relay it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedItemOperation {
+    pub operation_hash: u32,
+    pub operation_base_hash: u32,
+    pub schema: Option<&'static ItemOperationSchema>,
     pub payload: GameSlotPayloadRange,
 }
 
@@ -214,6 +230,7 @@ pub enum GameSlotBody {
     ItemUse(ItemUse),
     ItemReaction(ItemReaction),
     ItemOperation(ItemOperation),
+    BoundedItemOperation(BoundedItemOperation),
 }
 
 impl GameSlotBody {
@@ -242,7 +259,7 @@ impl GameSlotBody {
                 ..
             }) => 10,
             Self::ItemReaction(_) => 11,
-            Self::ItemOperation(_) => 12,
+            Self::ItemOperation(_) | Self::BoundedItemOperation(_) => 12,
             Self::ItemUse(ItemUse {
                 kind: ItemUseKind::SpawnedWorldObject,
                 ..
@@ -258,6 +275,7 @@ impl GameSlotBody {
             Self::ItemUse(value) => value.blob,
             Self::ItemReaction(value) => value.blob,
             Self::ItemOperation(value) => value.payload,
+            Self::BoundedItemOperation(value) => value.payload,
         }
     }
 }
@@ -951,9 +969,9 @@ fn parse_item_use(
             common: packet[13],
             status: read_u16(packet, 14, "GameSlot item use status")?,
             item_or_skill: read_u16(packet, 16, "GameSlot item use item/skill")?,
-            flag_18: packet[18],
-            flag_19: packet[19],
-            trailing_word: read_u16(packet, 20, "GameSlot item use trailing word")?,
+            raw_byte_18: packet[18],
+            raw_byte_19: packet[19],
+            ancillary_effect_code: read_u16(packet, 20, "GameSlot item-use ancillary effect")?,
             blob,
         }),
         action,
@@ -1005,12 +1023,13 @@ fn parse_item_operation(
         PAYLOAD_OFFSET + 4,
         "GameSlot item base-operation hash",
     )?;
-    let Some(schema) = item_operation_schema(operation_hash, operation_base_hash) else {
+    let schema = item_operation_schema(operation_hash, operation_base_hash);
+    if schema.is_none() && !is_known_item_operation_pair(operation_hash, operation_base_hash) {
         return Err(GameSlotDropReason::UnsupportedItemOperation {
             operation_hash,
             operation_base_hash,
         });
-    };
+    }
     let payload_end = payload.offset.checked_add(payload.length).ok_or(
         GameSlotDropReason::BlobLengthOverCap {
             packet_type: 12,
@@ -1026,45 +1045,69 @@ fn parse_item_operation(
                 declared,
                 actual: packet.len().saturating_sub(payload.offset),
             })?;
-    let validated = schema.validate(raw)?;
-    let barricade = if operation_hash == GOP_BARRICADE_HASH && validated.state == 1 {
-        Some(parse_barricade(packet, player_id)?)
-    } else {
-        None
-    };
-    let action = if validated.evidence.relay_confirmed() {
-        GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
-    } else {
-        GameSlotAction::EvidencePending(GameSlotEvidencePending::StaticItemOperation {
-            class_name: schema.class_name,
-            state: validated.state,
-            evidence: validated.evidence,
-        })
-    };
+    // Preserve the stricter state/owner/finite-transform rules for the one
+    // type-12 family that creates a server-observable world object. All other
+    // known pairs are byte-preserving client events: C# relays them after the
+    // common envelope and pair checks, even when a recovered writer schema
+    // cannot describe that particular body.
+    if operation_hash == GOP_BARRICADE_HASH {
+        let schema = schema.expect("GopBarricade has a checked-in P5136 schema");
+        let validated = schema.validate(raw)?;
+        let barricade = match validated.state {
+            1 => Some(parse_barricade(packet, player_id)?),
+            2 | 3 => {
+                // The retained transition capture proves the owner field but
+                // not a stable domain for the final dword (state 2 used zero,
+                // state 3 used two), so do not invent a narrower value rule.
+                validate_barricade_owner(packet, player_id)?;
+                None
+            }
+            _ => None,
+        };
+        return Ok((
+            GameSlotBody::ItemOperation(ItemOperation {
+                operation_hash,
+                operation_base_hash,
+                schema,
+                object_id: validated.object_id,
+                state: validated.state,
+                evidence: validated.evidence,
+                barricade,
+                payload,
+            }),
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch),
+        ));
+    }
+
+    if let Some(validated) = schema.and_then(|schema| schema.validate(raw).ok()) {
+        return Ok((
+            GameSlotBody::ItemOperation(ItemOperation {
+                operation_hash,
+                operation_base_hash,
+                schema: validated.schema,
+                object_id: validated.object_id,
+                state: validated.state,
+                evidence: validated.evidence,
+                barricade: None,
+                payload,
+            }),
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch),
+        ));
+    }
 
     Ok((
-        GameSlotBody::ItemOperation(ItemOperation {
+        GameSlotBody::BoundedItemOperation(BoundedItemOperation {
             operation_hash,
             operation_base_hash,
             schema,
-            object_id: validated.object_id,
-            state: validated.state,
-            evidence: validated.evidence,
-            barricade,
             payload,
         }),
-        action,
+        GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch),
     ))
 }
 
 fn parse_barricade(packet: &[u8], player_id: u8) -> Result<BarricadePlacement, GameSlotDropReason> {
-    let owner_id = read_i32(packet, 37, "GameSlot barricade owner")?;
-    if owner_id != i32::from(player_id) {
-        return Err(GameSlotDropReason::InvalidBarricadeOwner {
-            player_id,
-            owner_id,
-        });
-    }
+    validate_barricade_owner(packet, player_id)?;
     let reserved = read_u32(packet, 41, "GameSlot barricade reserved field")?;
     if reserved != 0 {
         return Err(GameSlotDropReason::InvalidBarricadeReserved { actual: reserved });
@@ -1084,6 +1127,17 @@ fn parse_barricade(packet: &[u8], player_id: u8) -> Result<BarricadePlacement, G
         owner_id: player_id,
         transform,
     })
+}
+
+fn validate_barricade_owner(packet: &[u8], player_id: u8) -> Result<(), GameSlotDropReason> {
+    let owner_id = read_i32(packet, 37, "GameSlot barricade owner")?;
+    if owner_id != i32::from(player_id) {
+        return Err(GameSlotDropReason::InvalidBarricadeOwner {
+            player_id,
+            owner_id,
+        });
+    }
+    Ok(())
 }
 
 fn validate_mask(
@@ -1601,8 +1655,8 @@ mod tests {
         assert_eq!(fields.common, 7);
         assert_eq!(fields.status, 0x1002);
         assert_eq!(fields.item_or_skill, 0xFF85);
-        assert_eq!((fields.flag_18, fields.flag_19), (9, 10));
-        assert_eq!(fields.trailing_word, 0x1234);
+        assert_eq!((fields.raw_byte_18, fields.raw_byte_19), (9, 10));
+        assert_eq!(fields.ancillary_effect_code, 0x1234);
         assert_eq!(item_use.payload(), Some(use_blob.as_slice()));
         assert_eq!(
             item_use.action(),
@@ -1719,9 +1773,12 @@ mod tests {
     fn retained_type_twelve_shapes_are_strict_relay_capabilities() {
         let fixtures = [
             operation_state_packet(0, (0x1090_0367, 0x1CB3_0486), 2, 30),
+            operation_state_packet(PLAYER_MASK, (0x0A6B_02AF, 0x1450_03CE), 2, 29),
             course_packet(PLAYER_MASK, 0, 4),
             operation_state_packet(PLAYER_MASK, (0x1129_038E, 0x1D4C_04AD), 2, 73),
             barricade_packet(),
+            barricade_transition_packet(2),
+            barricade_transition_packet(3),
         ];
         for wire in fixtures {
             let parsed = parse_game_slot_packet(&wire).unwrap();
@@ -1738,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn static_only_type_twelve_shapes_are_typed_but_not_relay_capabilities() {
+    fn static_writer_type_twelve_shapes_relay_after_common_validation() {
         for wire in [
             operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125),
             operation_state_packet(
@@ -1758,18 +1815,16 @@ mod tests {
             let GameSlotBody::ItemOperation(operation) = parsed.body() else {
                 panic!("expected item operation");
             };
-            assert!(!operation.evidence.relay_confirmed());
-            assert!(matches!(
+            assert_ne!(operation.evidence, ItemOperationEvidence::RetainedTrace);
+            assert_eq!(
                 parsed.action(),
-                GameSlotAction::EvidencePending(
-                    GameSlotEvidencePending::StaticItemOperation { .. }
-                )
-            ));
+                GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
+            );
         }
     }
 
     #[test]
-    fn type_twelve_rejects_extra_pairs_wrong_shapes_ids_masks_and_envelopes() {
+    fn type_twelve_rejects_spoofed_envelopes_and_unknown_pairs_but_relays_known_fallbacks() {
         assert!(matches!(
             parse_game_slot_packet(&operation_state_packet(1 << 16, WATERBOMB_PAIR, 1, 125,)),
             Err(GameSlotDropReason::InvalidMask {
@@ -1797,43 +1852,32 @@ mod tests {
         ));
 
         let extra_name_derived_pair = (0x14E9_03F7, 0x222B_0516);
-        assert!(matches!(
-            parse_game_slot_packet(&operation_state_packet(
-                PLAYER_MASK,
-                extra_name_derived_pair,
-                1,
-                16,
-            )),
-            Err(GameSlotDropReason::UnsupportedItemOperation { .. })
-        ));
-
-        assert!(matches!(
-            parse_game_slot_packet(&operation_state_packet(
-                PLAYER_MASK,
-                (0x1129_038E, 0x1D4C_04AD),
-                1,
-                73,
-            )),
-            Err(GameSlotDropReason::ItemOperationValidation(
-                ItemOperationValidationError::InvalidLength {
-                    class_name: "GopRocket",
-                    state: 1,
-                    actual: 73,
-                    expected: 82,
-                }
-            ))
-        ));
+        for wire in [
+            operation_state_packet(PLAYER_MASK, extra_name_derived_pair, 1, 16),
+            operation_state_packet(PLAYER_MASK, (0x1129_038E, 0x1D4C_04AD), 1, 73),
+        ] {
+            let parsed = parse_game_slot_packet(&wire).unwrap();
+            assert!(matches!(
+                parsed.body(),
+                GameSlotBody::BoundedItemOperation(_)
+            ));
+            assert_eq!(
+                parsed.action(),
+                GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
+            );
+        }
 
         let mut missing_id = operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125);
         set_u32(&mut missing_id, 28, u32::MAX);
+        let parsed = parse_game_slot_packet(&missing_id).unwrap();
         assert!(matches!(
-            parse_game_slot_packet(&missing_id),
-            Err(GameSlotDropReason::ItemOperationValidation(
-                ItemOperationValidationError::MissingObjectId {
-                    class_name: "GopWaterbomb"
-                }
-            ))
+            parsed.body(),
+            GameSlotBody::BoundedItemOperation(_)
         ));
+        assert_eq!(
+            parsed.action(),
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
+        );
 
         let mut trailing = operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125);
         trailing.push(0);
@@ -1906,6 +1950,18 @@ mod tests {
                 owner_id: 2,
             })
         ));
+
+        for state in [2, 3] {
+            let mut wrong_transition_owner = barricade_transition_packet(state);
+            set_i32(&mut wrong_transition_owner, 37, 1);
+            assert!(matches!(
+                parse_game_slot_packet(&wrong_transition_owner),
+                Err(GameSlotDropReason::InvalidBarricadeOwner {
+                    player_id: 3,
+                    owner_id: 1,
+                })
+            ));
+        }
 
         let mut nonzero_reserved = barricade_packet();
         set_u32(&mut nonzero_reserved, 41, 1);
@@ -2010,18 +2066,18 @@ mod tests {
         common: u8,
         status: u16,
         item_or_skill: u16,
-        flag_18: u8,
-        flag_19: u8,
-        trailing_word: u16,
+        raw_byte_18: u8,
+        raw_byte_19: u8,
+        ancillary_effect_code: u16,
         blob: &[u8],
     ) -> Vec<u8> {
         let mut packet = common_packet(PLAYER_ID, mask, packet_type);
         packet.write_u8(common);
         packet.write_u16(status);
         packet.write_u16(item_or_skill);
-        packet.write_u8(flag_18);
-        packet.write_u8(flag_19);
-        packet.write_u16(trailing_word);
+        packet.write_u8(raw_byte_18);
+        packet.write_u8(raw_byte_19);
+        packet.write_u16(ancillary_effect_code);
         packet.write_u32(u32::try_from(blob.len()).unwrap());
         packet.write_bytes(blob);
         packet.into_inner()
@@ -2054,6 +2110,18 @@ mod tests {
         let mut packet = operation_packet(mask, pair, length);
         set_u32(&mut packet, 28, 1);
         set_u32(&mut packet, 32, state);
+        packet
+    }
+
+    fn barricade_transition_packet(state: u32) -> Vec<u8> {
+        let mut packet =
+            operation_state_packet(0, (GOP_BARRICADE_HASH, GO_ITEM_BARRICADE_HASH), state, 25);
+        set_i32(&mut packet, 37, PLAYER_ID);
+        match state {
+            2 => set_u32(&mut packet, 41, 0),
+            3 => set_u32(&mut packet, 41, 2),
+            _ => panic!("captured barricade transition state must be 2 or 3"),
+        }
         packet
     }
 

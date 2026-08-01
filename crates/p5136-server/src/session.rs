@@ -11,9 +11,11 @@ use p5136_core::{
         process_captured_query_request,
     },
     channel::{
-        ChannelError, ClientEndpointReportKind, classify_client_endpoint_report,
-        parse_client_endpoint_report, parse_pq_channel_movein, parse_pq_channel_switch,
-        resolve_channel_id, serialize_pr_channel_move_in, serialize_pr_channel_switch,
+        CLUB_CHANNEL_SWITCH_REQUEST_HASH, ChannelError, ClientEndpointReportKind,
+        classify_client_endpoint_report, parse_client_endpoint_report, parse_pq_channel_movein,
+        parse_pq_channel_switch, parse_pq_club_channel_switch, resolve_channel_id,
+        serialize_pr_channel_move_in, serialize_pr_channel_switch,
+        serialize_pr_club_channel_switch,
     },
     client_event_protocol::{
         ClientEvent, ClientEventProtocolError, ClientEventRequest, classify_client_event,
@@ -53,6 +55,10 @@ use p5136_core::{
         LegacyTime, LoginError, PrLoginFields, parse_pq_login, serialize_pr_cn_authen_login,
         serialize_pr_login,
     },
+    matching_protocol::{
+        MatchingProtocolError, MatchingRequest, classify_matching_request, parse_matching_request,
+        serialize_matching_found_create,
+    },
     myroom_protocol::{
         EnterMyRoomRequest, MYROOM_ITEM_CHUNK_SIZE, MyRoomInfo, MyRoomPlayerSlot,
         MyRoomProtocolError, MyRoomRequest, classify_myroom_request, parse_character_position,
@@ -67,7 +73,7 @@ use p5136_core::{
     packet::PacketError,
     race_protocol::{
         RaceProtocolError, RaceRequest, classify_race_request, parse_ai_goal_in_request,
-        parse_game_control_request, parse_team_booster_request,
+        parse_game_control_finish_snapshot, parse_game_control_request, parse_team_booster_request,
     },
     race_start_protocol::P5136KartPhysicsBlock,
     rider_info_protocol::{
@@ -259,6 +265,9 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     ClientEventProtocol(#[from] ClientEventProtocolError),
+
+    #[error(transparent)]
+    MatchingProtocol(#[from] MatchingProtocolError),
 
     #[error(transparent)]
     SinglePlayerProtocol(#[from] SinglePlayerProtocolError),
@@ -2248,10 +2257,8 @@ async fn handle_client_event(
                 nickname = %identity.nickname,
                 career_id = report.career_id,
                 state = report.state,
-                quantity = report.quantity,
-                category = report.category,
-                unknown_1 = report.unknown_1,
-                unknown_2 = report.unknown_2,
+                entry_count = report.entries.len(),
+                entries = ?report.entries,
                 "accepted bounded P5136 career item-state telemetry"
             );
         }
@@ -2292,9 +2299,9 @@ async fn handle_single_player_request(
             let _ = context.bound_profile_for(&identity)?;
             tracing::trace!(
                 nickname = %identity.nickname,
-                item_type = request.item_type,
-                operation_type = request.operation_type,
-                slot_changer = request.slot_changer,
+                slot_item_category = request.slot_item_category,
+                slot_item_id = request.slot_item_id,
+                remaining_quantity = request.remaining_quantity,
                 "accepted currently non-mutating P5136 single-player item event"
             );
             Ok(Vec::new())
@@ -2431,39 +2438,63 @@ async fn handle_telemetry_request(
     let identity = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&identity)?;
     match report {
-        TelemetryReport::GameAiReport => {
-            tracing::trace!(nickname = %identity.nickname, "accepted bounded GameAi report");
-        }
-        TelemetryReport::GameReport {
-            plane_check,
-            distance,
-        } => {
+        TelemetryReport::GameAiReport { metric_bits } => {
             tracing::trace!(
                 nickname = %identity.nickname,
-                plane_check,
-                distance,
-                "accepted bounded client anti-cheat report without granting authority"
+                metric_bits = ?metric_bits,
+                "accepted bounded client diagnostic float report"
             );
         }
-        TelemetryReport::GameClientFrame {
-            local_frame,
-            server_frame,
-            acknowledged_frame,
+        TelemetryReport::GameReport {
+            protected_metric_0,
+            protected_metric_1,
+            diagnostic_channel_count,
         } => {
             tracing::trace!(
                 nickname = %identity.nickname,
-                local_frame,
-                server_frame,
-                acknowledged_frame,
+                protected_metric_0,
+                protected_metric_1,
+                diagnostic_channel_count,
+                "accepted bounded client diagnostic report without granting authority"
+            );
+        }
+        TelemetryReport::GameClientFrame { metric } => {
+            tracing::trace!(
+                nickname = %identity.nickname,
+                metric = ?metric,
                 "accepted bounded client-frame telemetry"
             );
         }
-        TelemetryReport::GameRequestRelay { value, route_hash } => {
+        TelemetryReport::GameRequestRelay {
+            desired_peer_slot,
+            requester_slot,
+        } => {
             tracing::trace!(
                 nickname = %identity.nickname,
-                value,
-                route_hash,
-                "accepted disabled C# game-relay probe without peer fanout"
+                desired_peer_slot,
+                requester_slot,
+                "accepted validated P2P relay probe; directional relay remains evidence-gated"
+            );
+        }
+        TelemetryReport::GameBoosterAdd => {
+            tracing::trace!(
+                nickname = %identity.nickname,
+                "accepted empty booster-acquired signal without echo"
+            );
+        }
+        TelemetryReport::ReportStateInGame {
+            report_sequence,
+            zero_or_reserved,
+            transformed_tick,
+            tick_validation_partner,
+        } => {
+            tracing::trace!(
+                nickname = %identity.nickname,
+                report_sequence,
+                zero_or_reserved,
+                transformed_tick,
+                tick_validation_partner,
+                "accepted bounded in-game heartbeat without granting authority"
             );
         }
         TelemetryReport::RideEventReport { event_count } => {
@@ -2480,16 +2511,49 @@ async fn handle_telemetry_request(
                 "accepted bounded ride-path telemetry"
             );
         }
-        TelemetryReport::UnidentifiedDrivingReport { logical_length } => {
+        TelemetryReport::RideSwitchInfo {
+            elapsed_or_total,
+            participant_count,
+            sample_count,
+            aggregate_values,
+        } => {
             tracing::trace!(
                 nickname = %identity.nickname,
-                packet_hash = p5136_core::telemetry_protocol::UNIDENTIFIED_DRIVING_REPORT_HASH,
-                logical_length,
-                "accepted isolated captured driving report with unidentified semantics"
+                elapsed_or_total,
+                participant_count,
+                sample_count,
+                aggregate_values = ?aggregate_values,
+                "accepted bounded post-goal ride-switch telemetry"
             );
         }
     }
     Ok(Vec::new())
+}
+
+async fn handle_matching_request(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let request = parse_matching_request(packet)?;
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+    match request {
+        MatchingRequest::Start(_) => {
+            tracing::debug!(
+                nickname = %identity.nickname,
+                "accepted P5136 matching envelope; returning complete empty-match create state"
+            );
+            Ok(vec![serialize_matching_found_create()])
+        }
+        MatchingRequest::Cancel => {
+            tracing::trace!(
+                nickname = %identity.nickname,
+                "accepted P5136 matching cancellation"
+            );
+            Ok(Vec::new())
+        }
+    }
 }
 
 async fn handle_captured_query_request(
@@ -2544,6 +2608,9 @@ async fn dispatch_profile_bound_request(
     packet: &[u8],
     context: &mut SessionContext,
 ) -> Option<Result<Vec<Vec<u8>>, LoginSessionError>> {
+    if classify_matching_request(hash).is_some() {
+        return Some(handle_matching_request(world, packet, context).await);
+    }
     if let Some(request) = classify_equipment_request(hash) {
         return Some(
             dispatch_equipment_request(world, services.profiles, request, packet, context).await,
@@ -2592,6 +2659,9 @@ async fn dispatch_fail_closed_request(
 ) -> Option<Result<Vec<Vec<u8>>, LoginSessionError>> {
     if hash == GET_RIDER_INFO_REQUEST_HASH {
         return Some(handle_get_rider_info_failure(world, packet, context).await);
+    }
+    if hash == CLUB_CHANNEL_SWITCH_REQUEST_HASH {
+        return Some(handle_club_channel_switch(world, packet, context).await);
     }
     if classify_club_query_request(hash).is_some() {
         return Some(handle_club_query(world, packet, context).await);
@@ -2882,6 +2952,29 @@ async fn handle_channel_switch(
         config.advertised_address,
         config.ports.login_tcp(),
     )])
+}
+
+async fn handle_club_channel_switch(
+    world: &AdmittedWorldHandle<'_>,
+    packet: &[u8],
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    // The envelope is intentionally parsed in full before the identity check.
+    // This transition is local to the already-authenticated Club UI, unlike a
+    // normal PqChannelSwitch; creating a migration permit here would make the
+    // C#-compatible zero-endpoint reply unsafe and would incorrectly revoke
+    // the current login session.
+    let request = parse_pq_club_channel_switch(packet)?;
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+    tracing::debug!(
+        nickname = %identity.nickname,
+        requested_game_type = request.requested_game_type,
+        preferred_channel = request.preferred_channel_id,
+        opaque_length = request.opaque.len(),
+        "accepted local P5136 Club channel transition"
+    );
+    Ok(vec![serialize_pr_club_channel_switch()])
 }
 
 async fn handle_client_endpoint_report(
@@ -3204,7 +3297,18 @@ async fn handle_race_request_admitted(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let payload = match request {
         RaceRequest::GameControl => {
-            RaceCommandPayload::GameControl(parse_game_control_request(packet)?)
+            let control = parse_game_control_request(packet)?;
+            if let Some(snapshot) = parse_game_control_finish_snapshot(&control)? {
+                tracing::trace!(
+                    session_id = world.session_id().get(),
+                    value1 = snapshot.value1,
+                    value2 = snapshot.value2,
+                    result_global_metric = snapshot.result_global_metric,
+                    terminal_client_state = snapshot.terminal_client_state,
+                    "decoded non-authoritative P5136 finish snapshot"
+                );
+            }
+            RaceCommandPayload::GameControl(control)
         }
         RaceRequest::AiGoalIn => RaceCommandPayload::AiGoalIn(parse_ai_goal_in_request(packet)?),
         RaceRequest::TeamBoosterGauge => {
@@ -3834,6 +3938,18 @@ async fn update_rider_equipment(
 ) -> Result<(), LoginSessionError> {
     let before = world.authorize_identity().await?;
     let _ = context.profile_for(&before)?;
+    tracing::info!(
+        nickname = %before.nickname,
+        kart_id = selection.kart,
+        pet_id = selection.pet,
+        flying_pet_id = selection.flying_pet,
+        flying_pet_spec_available = selection.flying_pet == 0
+            || p5136_core::kart_physics::P5136FlyingPetSpecSnapshot::korean_5136(
+                selection.flying_pet,
+            )
+            .is_some(),
+        "accepted P5136 rider equipment"
+    );
     let admission = profiles
         .admit_for_operation(
             world.operation(),
@@ -3880,6 +3996,18 @@ async fn update_rider_equipment(
     }
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
+    let physics = room_physics_metadata(&profile.profile, profiles.catalog.as_deref())?;
+    let refreshed_room_physics = world
+        .refresh_room_kart_physics(physics.block.clone())
+        .await?;
+    tracing::info!(
+        nickname = %after.nickname,
+        kart_id = physics.kart_id,
+        base_resolution = ?physics.base_resolution,
+        physics_fallback = physics.physics_fallback(),
+        refreshed_room_physics,
+        "resolved P5136 rider equipment physics after durable selection"
+    );
     context.bind_profile(after, profile);
     drop(lane);
     Ok(())
@@ -3963,10 +4091,9 @@ enum RoomKartBaseResolution {
 enum RoomPhysicsFallbackReason {
     CatalogUnavailable,
     CatalogSpecUnavailable,
-    FlyingPetNotApplied { item_id: u16 },
+    FlyingPetSpecUnavailable { item_id: u16 },
     KartPlantNotApplied { slot: u8, item_id: u16 },
     SpeedPatchNotApplied { value: u8 },
-    TuneLevelV2SidecarsUninspected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4032,9 +4159,19 @@ fn selected_physics_metadata(
     };
 
     if flying_pet_id != 0 {
-        fallback_reasons.push(RoomPhysicsFallbackReason::FlyingPetNotApplied {
-            item_id: flying_pet_id,
-        });
+        if let Some(spec) =
+            p5136_core::kart_physics::P5136FlyingPetSpecSnapshot::korean_5136(flying_pet_id)
+        {
+            snapshot.flying_pet = spec;
+        } else {
+            // Match C# `FlyingPetSpec.FlyingPet_Spec`: an unknown ID keeps a
+            // zero/default contribution, but expose the omission in the
+            // bounded physics diagnostics instead of silently claiming a
+            // complete resolution.
+            fallback_reasons.push(RoomPhysicsFallbackReason::FlyingPetSpecUnavailable {
+                item_id: flying_pet_id,
+            });
+        }
     }
     if apply_profile_equipment && kart_id == items.kart {
         for (slot, item_id) in [
@@ -4058,10 +4195,6 @@ fn selected_physics_metadata(
             value: profile.server_setting.speed_patch_use,
         });
     }
-    if kart_id != 0 {
-        fallback_reasons.push(RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected);
-    }
-
     Ok(RoomPhysicsMetadata {
         kart_id,
         base_resolution,
@@ -4545,7 +4678,7 @@ mod tests {
     use p5136_core::{
         adler32,
         captured_query_protocol::{CAPTURED_QUERY_REQUESTS, CapturedQueryRequest},
-        channel::serialize_pr_channel_move_in,
+        channel::{ChannelError, serialize_pr_channel_move_in, serialize_pr_club_channel_switch},
         client_event_protocol::ClientEventProtocolError,
         club_query_protocol::{
             ClubQueryProtocolError, ClubQueryRequest, serialize_club_creation_unavailable_reply,
@@ -4571,6 +4704,9 @@ mod tests {
         },
         kart_physics::{P5136KartPhysicsSnapshot, build_p5136_kart_physics_block},
         lobby_protocol::{LobbyProtocolError, LobbyRequest, PlayerSlotState},
+        matching_protocol::{
+            MatchingProtocolError, START_MATCHING_REQUEST_NAME, serialize_matching_found_create,
+        },
         myroom_protocol::{
             CHAR_POSITION_NAME, CHECK_PASSWORD_REQUEST_NAME, CheckPasswordStatus,
             ENTER_MYROOM_REQUEST_NAME, ENTER_RANDOM_MYROOM_REQUEST_NAME, EnterMyRoomStatus,
@@ -4790,6 +4926,14 @@ mod tests {
         packet.into_inner()
     }
 
+    fn captured_club_channel_switch_request() -> Vec<u8> {
+        vec![
+            0x72, 0x07, 0x77, 0x48, 0x0e, 0x00, 0x00, 0x00, 0x53, 0x02, 0xd6, 0x01, 0x60, 0x05,
+            0xb3, 0xd3, 0x4b, 0xa7, 0xea, 0x9c, 0x62, 0x13, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        ]
+    }
+
     fn expected_club_query_reply(kind: ClubQueryRequest) -> Vec<u8> {
         match kind {
             ClubQueryRequest::CheckMyClubState => {
@@ -4882,8 +5026,8 @@ mod tests {
 
     fn captured_use_item_request() -> Vec<u8> {
         let mut packet = PacketWriter::named("LoRqUseItemPacket");
-        packet.write_i16(7);
-        packet.write_i16(1);
+        packet.write_u16(7);
+        packet.write_u16(1);
         packet.write_u16(u16::MAX);
         packet.into_inner()
     }
@@ -4975,11 +5119,13 @@ mod tests {
             || hash == adler32::packet_hash("PqLogin")
             || hash == adler32::packet_hash("PqChannelMovein")
             || hash == adler32::packet_hash("PqChannelSwitch")
+            || hash == super::CLUB_CHANNEL_SWITCH_REQUEST_HASH
             || hash == super::GET_RIDER_INFO_REQUEST_HASH
             || super::classify_club_query_request(hash).is_some()
             || super::classify_shop_buy_request(hash).is_some()
             || super::classify_client_endpoint_report(hash).is_some()
             || super::classify_client_event(hash).is_some()
+            || super::classify_matching_request(hash).is_some()
             || super::classify_room_protocol_request(hash).is_some()
             || super::classify_lobby_request(hash).is_some()
             || super::classify_race_request(hash).is_some()
@@ -6151,7 +6297,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn captured_career_and_udp_reconnect_events_are_strict_no_reply_operations() {
+    async fn matching_envelope_returns_the_complete_empty_create_variant() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_712))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "MatchingEnvelope")
+            .await
+            .unwrap();
+        ProfileStore::new(profile_root.path())
+            .load_or_create(&identity.nickname)
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let mut start = PacketWriter::named(START_MATCHING_REQUEST_NAME);
+        for word in 0..7 {
+            start.write_u32(word);
+        }
+        assert_eq!(
+            dispatch_packet(&services, start.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_matching_found_create()]
+        );
+        assert!(
+            dispatch_packet(
+                &services,
+                PacketWriter::named("PcCancelMatching").as_slice(),
+                &mut context,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        let mut malformed = start.into_inner();
+        malformed.push(0);
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut context).await,
+            Err(LoginSessionError::MatchingProtocol(
+                MatchingProtocolError::InvalidLength { .. }
+            ))
+        ));
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn captured_counted_career_and_udp_reconnect_events_are_strict_no_reply_operations() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -6179,10 +6390,20 @@ mod tests {
             0x25, 0x0A, 0xCF, 0x86, 0x0A, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 8, 0, 1, 0, 0, 0, 1, 0,
             0, 0,
         ];
+        let barricade_hit_career = [
+            0x25, 0x0A, 0xCF, 0x86, 1, 0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 113, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+        ];
         let reconnect = PacketWriter::named("PqReportUdpReconnect");
 
         assert!(
             dispatch_packet(&services, &career, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            dispatch_packet(&services, &barricade_hit_career, &mut context)
                 .await
                 .unwrap()
                 .is_empty()
@@ -6257,9 +6478,18 @@ mod tests {
         reports.push(frame.into_inner());
 
         let mut relay = PacketWriter::named("PcGameRequestRelay");
-        relay.write_i32(0);
+        relay.write_u32(0);
         relay.write_u32(0xA1B7_1C9D);
         reports.push(relay.into_inner());
+
+        reports.push(PacketWriter::named("GameBoosterAddPacket").into_inner());
+
+        let mut in_game_state = PacketWriter::named("PcReportStateInGame");
+        in_game_state.write_u32(17);
+        in_game_state.write_u32(0);
+        in_game_state.write_u32(18);
+        in_game_state.write_u32(19);
+        reports.push(in_game_state.into_inner());
 
         reports.push(vec![
             0x0D, 0x09, 0xF0, 0x69, 0x01, 0, 0, 0, 0x07, 0, 0, 0, 0x69, 0, 0x74, 0, 0x65, 0, 0x6D,
@@ -6270,11 +6500,15 @@ mod tests {
             0x98, 0x08, 0x40, 0x60, 1, 0, 0, 0, 0xDB, 0xA1, 0x0F, 0x43, 0x03, 0x2C, 0x02, 0x44,
             0x77, 0xCC, 0xD6, 0x41, 0xBD, 0xB4, 0x9A, 0x3F, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]);
-        for length in p5136_core::telemetry_protocol::UNIDENTIFIED_DRIVING_REPORT_LENGTHS {
-            let mut report = vec![0; length];
-            report[..4].copy_from_slice(&0x5815_082A_u32.to_le_bytes());
-            reports.push(report);
+        let mut ride_switch = PacketWriter::named("PcRideSwithInfoPacket");
+        ride_switch.write_f32(323.9113);
+        ride_switch.write_u32(0);
+        ride_switch.write_u32(1);
+        ride_switch.write_bytes(&0x0000_0003_0000_E0BE_u64.to_le_bytes());
+        for value in [23, 0x4214_6FD6, 0x4244_DCC2, 0x3453_B864, 0, 0, 176, 21] {
+            ride_switch.write_u32(value);
         }
+        reports.push(ride_switch.into_inner());
 
         for report in reports {
             assert!(
@@ -7214,6 +7448,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn club_channel_switch_uses_the_local_csharp_handoff_without_migrating_the_session() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_719))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ClubChannelSwitch")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let request = captured_club_channel_switch_request();
+
+        let mut unbound = SessionContext::default();
+        assert!(matches!(
+            dispatch_packet(&services, &request, &mut unbound).await,
+            Err(LoginSessionError::ProfileNotBound)
+        ));
+
+        let mut malformed = request.clone();
+        malformed[28] = 1;
+        assert!(matches!(
+            dispatch_packet(&services, &malformed, &mut unbound).await,
+            Err(LoginSessionError::ChannelProtocol(
+                ChannelError::InvalidClubSwitchReservedBytes { length: 4 }
+            ))
+        ));
+
+        let mut context = bind_test_profile(&profiles, &identity).await;
+        assert_eq!(
+            dispatch_packet(&services, &request, &mut context)
+                .await
+                .unwrap(),
+            vec![serialize_pr_club_channel_switch()]
+        );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity,
+            "the Club UI hand-off must leave this login generation authenticated"
+        );
+
+        let follow_up = PacketWriter::named("PqServerTime").into_inner();
+        assert_eq!(
+            dispatch_packet(&services, &follow_up, &mut context)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the same connection remains usable after the local Club transition"
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn delete_and_unlock_are_strict_read_only_no_reply_capabilities() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
@@ -8057,11 +8357,8 @@ mod tests {
             resolved.base_resolution,
             RoomKartBaseResolution::CatalogBaseSpec
         );
-        assert_eq!(
-            resolved.fallback_reasons,
-            vec![RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected]
-        );
-        assert!(resolved.physics_fallback());
+        assert!(resolved.fallback_reasons.is_empty());
+        assert!(!resolved.physics_fallback());
         assert_eq!(resolved.block.as_bytes().len(), 235);
         assert_ne!(resolved.block, baseline);
         assert_eq!(resolved.block, expected);
@@ -8083,10 +8380,7 @@ mod tests {
         );
         assert_eq!(
             missing_catalog.fallback_reasons,
-            vec![
-                RoomPhysicsFallbackReason::CatalogUnavailable,
-                RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected,
-            ]
+            vec![RoomPhysicsFallbackReason::CatalogUnavailable]
         );
         assert_eq!(missing_catalog.block, baseline);
 
@@ -8098,10 +8392,7 @@ mod tests {
         );
         assert_eq!(
             missing_spec.fallback_reasons,
-            vec![
-                RoomPhysicsFallbackReason::CatalogSpecUnavailable,
-                RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected,
-            ]
+            vec![RoomPhysicsFallbackReason::CatalogSpecUnavailable]
         );
         assert_eq!(missing_spec.block, baseline);
     }
@@ -8124,7 +8415,6 @@ mod tests {
         assert_eq!(
             resolved.fallback_reasons,
             vec![
-                RoomPhysicsFallbackReason::FlyingPetNotApplied { item_id: 83 },
                 RoomPhysicsFallbackReason::KartPlantNotApplied {
                     slot: 2,
                     item_id: 44,
@@ -8134,10 +8424,31 @@ mod tests {
                     item_id: 46,
                 },
                 RoomPhysicsFallbackReason::SpeedPatchNotApplied { value: 1 },
-                RoomPhysicsFallbackReason::TuneLevelV2SidecarsUninspected,
             ]
         );
 
+        let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected_snapshot.kart = *catalog.kart_spec(1_450).unwrap();
+        expected_snapshot.flying_pet =
+            p5136_core::kart_physics::P5136FlyingPetSpecSnapshot::korean_5136(83).unwrap();
+        assert_eq!(
+            resolved.block,
+            build_p5136_kart_physics_block(&expected_snapshot).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_flying_pet_id_keeps_csharp_zero_spec_and_reports_fallback() {
+        let catalog = test_catalog();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+        profile.rider_item.flying_pet = u16::MAX;
+
+        let resolved = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        assert_eq!(
+            resolved.fallback_reasons,
+            vec![RoomPhysicsFallbackReason::FlyingPetSpecUnavailable { item_id: u16::MAX }]
+        );
         let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
         expected_snapshot.kart = *catalog.kart_spec(1_450).unwrap();
         assert_eq!(
@@ -11052,7 +11363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equipment_publish_does_not_refresh_admission_physics_snapshot() {
+    async fn equipment_physics_refresh_replaces_lobby_admission_snapshot_before_start() {
         let catalog = test_catalog();
         let (world, world_task) = WorldHandle::spawn(16).expect("nonzero World mailbox capacity");
         let mut rider = register_lobby_session(&world, "PhysicsSnapshot", 49_735).await;
@@ -11079,6 +11390,20 @@ mod tests {
             .publish_room_equipment(rider.session, rider_item_snapshot(&profile.rider_item))
             .await
             .unwrap();
+        let baseline =
+            build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
+                .unwrap();
+        let operation = world.admit_identity_operation(rider.session).await.unwrap();
+        let refreshed = world
+            .admitted(&operation)
+            .refresh_room_kart_physics(baseline.clone())
+            .await
+            .unwrap();
+        assert!(
+            refreshed,
+            "a lobby equipment change must refresh its next-race physics"
+        );
+        drop(operation);
 
         let mut start = PacketWriter::named("GrRequestStartPacket");
         start.write_i32(0);
@@ -11092,18 +11417,17 @@ mod tests {
         .unwrap();
         let start_packets = rider.outbound.recv().await.unwrap().into_packets();
         let command = &start_packets[1];
-        let baseline =
-            build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
-                .unwrap();
         assert!(
             command
-                .windows(admission_physics.as_bytes().len())
-                .any(|window| window == admission_physics.as_bytes())
+                .windows(baseline.as_bytes().len())
+                .any(|window| window == baseline.as_bytes()),
+            "GrCommandStartPacket must contain the selection refreshed while the room was a lobby"
         );
         assert!(
             !command
-                .windows(baseline.as_bytes().len())
-                .any(|window| window == baseline.as_bytes())
+                .windows(admission_physics.as_bytes().len())
+                .any(|window| window == admission_physics.as_bytes()),
+            "the stale room-admission physics must not survive into GrCommandStartPacket"
         );
 
         world.session_closed(rider.session).await.unwrap();
@@ -11257,7 +11581,7 @@ mod tests {
         create_and_start_solo_loading(&world, &mut rider, "MalformedRace").await;
 
         let mut oversized_control = game_control_packet(0, 100);
-        oversized_control.extend_from_slice(&[0; 257]);
+        oversized_control.extend_from_slice(&[0; 513]);
         assert!(matches!(
             handle_race_request(
                 &world,
@@ -11268,8 +11592,8 @@ mod tests {
             .await,
             Err(LoginSessionError::RaceProtocol(
                 RaceProtocolError::GameControlTailTooLarge {
-                    actual: 257,
-                    maximum: 256,
+                    actual: 513,
+                    maximum: 512,
                 }
             ))
         ));

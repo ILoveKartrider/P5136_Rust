@@ -37,8 +37,8 @@ use crate::{
     },
     session::{ProfileCoordinator, run_login_session},
     world::{
-        RewardCompletionDisposition, RewardDrainStatus, RewardPersistenceCompletion,
-        RewardSettlementTask, RewardTerminalReason, WorldSidecarError,
+        ItemProbabilityService, RewardCompletionDisposition, RewardDrainStatus,
+        RewardPersistenceCompletion, RewardSettlementTask, RewardTerminalReason, WorldSidecarError,
     },
 };
 
@@ -379,6 +379,7 @@ impl BoundServer {
         let item_probability_rank_policy = config.item_probability_rank_policy;
         let remote_profile_creation = config.allow_remote_profile_creation;
         let catalog_loaded = catalog.is_some();
+        let catalog_item_transform_count = catalog_item_transform_count(catalog.as_deref());
         let emblem_catalog_loaded = emblems.is_some();
         let item_probability_rank_band = item_probabilities.rank_band;
         let individual_item_probability_count = item_probabilities.individual.len();
@@ -389,14 +390,13 @@ impl BoundServer {
         let clock = ServerClock::new();
         let udp = UdpRuntime::spawn_with_clock(game_udp, p2p_udp, udp_config, clock.clone())?;
         let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config)?;
-        let (world, world_task) = WorldHandle::spawn_with_services_and_item_probabilities(
-            1_024,
+        let item_probability = item_service(item_probabilities, &config, catalog.as_ref());
+        let (world, world_task) = spawn_world_services(
             udp_mailbox_capacity,
-            messenger.clone(),
-            udp.service(),
+            &messenger,
+            &udp,
             clock,
-            item_probabilities,
-            item_probability_rank_policy,
+            item_probability,
         );
         let (profile_io, profile_runtime) = profiles.spawn();
         let wire_operations = WireOperationGate::new();
@@ -444,6 +444,7 @@ impl BoundServer {
             profile_root = %profile_root.display(),
             catalog_path = ?catalog_path,
             catalog_loaded,
+            catalog_item_transform_count,
             client_data_dir = ?client_data_dir,
             emblem_catalog_loaded,
             item_probabilities_overridden,
@@ -456,6 +457,39 @@ impl BoundServer {
         );
         Ok(server)
     }
+}
+
+fn catalog_item_transform_count(catalog: Option<&CatalogInventory>) -> usize {
+    catalog.map_or(0, CatalogInventory::item_transform_count)
+}
+
+fn item_service(
+    configuration: Arc<ItemProbabilityConfiguration>,
+    config: &ServerConfig,
+    catalog: Option<&Arc<CatalogInventory>>,
+) -> ItemProbabilityService {
+    ItemProbabilityService::new(
+        configuration,
+        config.item_probability_rank_policy,
+        catalog.cloned(),
+    )
+}
+
+fn spawn_world_services(
+    udp_mailbox_capacity: usize,
+    messenger: &MessengerServiceHandle,
+    udp: &UdpRuntime,
+    clock: ServerClock,
+    item_probability: ItemProbabilityService,
+) -> (WorldHandle, JoinHandle<Result<(), WorldSidecarError>>) {
+    WorldHandle::spawn_with_services_and_item_probabilities(
+        1_024,
+        udp_mailbox_capacity,
+        messenger.clone(),
+        udp.service(),
+        clock,
+        item_probability,
+    )
 }
 
 const fn reward_persistence_worker_limit(maximum_sessions: usize) -> usize {
@@ -3646,6 +3680,9 @@ mod tests {
         let config = ServerConfig {
             profile_root: profile_root.path().to_owned(),
             client_data_dir: Some(client_data.path().to_owned()),
+            // Keep this fixture focused on the emblem preflight.  Production
+            // auto-loads the item table from the same client Data directory.
+            item_probabilities: Some(ItemProbabilityConfiguration::safe_fallback()),
             ..ServerConfig::default()
         };
 
@@ -4204,16 +4241,15 @@ mod tests {
             adler32::packet_hash("GrSessionDataPacket")
         );
         let joiner_slots = read_login_packet(&mut joiner, maximum).await;
-        let owner_slots = read_login_packet(&mut owner, maximum).await;
         assert_eq!(
             u32::from_le_bytes(joiner_slots[..4].try_into().unwrap()),
             adler32::packet_hash("GrSlotDataPacket")
         );
-        assert_eq!(owner_slots, joiner_slots);
 
         // The owner session had already consumed half of this encrypted frame
-        // when the joiner's slot broadcast arrived. Finishing it proves the
-        // read future remained pinned across the outbound write.
+        // while the joiner's independent rehydration completed. Finishing it
+        // proves the read future remained pinned without manufacturing a
+        // redundant peer lobby snapshot.
         owner
             .stream
             .write_all(&owner_first_wire[split..])
@@ -4221,10 +4257,8 @@ mod tests {
             .unwrap();
         let owner_session_data = read_login_packet(&mut owner, maximum).await;
         let owner_own_slots = read_login_packet(&mut owner, maximum).await;
-        let joiner_peer_slots = read_login_packet(&mut joiner, maximum).await;
         assert_eq!(owner_session_data, session_data);
         assert_eq!(owner_own_slots, joiner_slots);
-        assert_eq!(joiner_peer_slots, joiner_slots);
 
         exercise_equipment_over_real_tcp(&mut owner, &mut joiner, profile_root.path(), maximum)
             .await;
@@ -4240,7 +4274,7 @@ mod tests {
             u32::from_le_bytes(owner_after_leave[..4].try_into().unwrap()),
             adler32::packet_hash("GrSlotDataPacket")
         );
-        assert_ne!(owner_after_leave, owner_slots);
+        assert_ne!(owner_after_leave, owner_own_slots);
 
         drop(joiner);
         drop(owner);

@@ -12,8 +12,8 @@ pub mod store;
 
 pub use catalog::{
     CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogInventoryStats,
-    CatalogKartSpecStats, MAX_CATALOG_EMBLEMS, P5136KartSpecSnapshot, is_grant_category,
-    is_grant_item,
+    CatalogItemTransformRule, CatalogKartSpecStats, MAX_CATALOG_EMBLEMS,
+    MAX_CATALOG_ITEM_TRANSFORMS, P5136KartSpecSnapshot, is_grant_category, is_grant_item,
 };
 pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
 pub use equipment::{EquipmentExceptions, EquipmentProfileError, EquipmentStateError};

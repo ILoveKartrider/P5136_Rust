@@ -58,10 +58,10 @@ jobs:
           platform="$(printf '%s' "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
           arch="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cp target/release/p5136.exe "dist/p5136-${platform}-${arch}.exe"
+            cp target/p5136-finish-kart-abilities/release/p5136.exe "dist/p5136-${platform}-${arch}.exe"
           else
             tar -czf "dist/p5136-${platform}-${arch}.tar.gz" \
-              -C target/release p5136
+              -C target/p5136-finish-kart-abilities/release p5136
           fi
 
       - name: Upload release binary

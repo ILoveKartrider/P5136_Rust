@@ -148,20 +148,25 @@ but unknown business meanings and value ranges are deliberately not invented.
 TCP `GameSlotPacket` is handled separately from the opaque UDP packet that
 shares its name. Rust bounds the complete TCP packet at 1013 bytes and each
 nested blob at 960 bytes and validates P5136 types 1, 2, 4, 6, 9, 10, 11, 12,
-and 16. Type 12 uses a strict 67-class state/length/count manifest with typed
-evidence: only the exact Banana, Rocket, Barricade, and Course forms present
-in retained traces can relay, while static-writer-only shapes remain explicit
-no-side-effect evidence boundaries. The opt-in corpus test sends all 1,471
-retained TCP GameSlot records through this parser.
+and 16. Type 12 admits a known `Gop*`/`GoItem*` operation pair only after the
+claimed actor, low-16 peer mask, and exact bounded envelope pass. The 67-class
+native-writer manifest enriches matching bodies with typed state/object
+diagnostics; its 18 C# enum-derived pairs and shape drift use an explicitly
+opaque bounded relay capability instead of a capture-by-capture allow-list.
+No type-12 packet mutates Rust world state. Barricade remains the exception:
+its placement/transition owner and finite transform are still checked before
+relay. The opt-in corpus test sends all 1,471 original retained TCP GameSlot
+records through this parser; the later barricade-hit runtime capture supplies
+the state 2/3 fixtures.
 
 The World actor accepts only an exact frozen-generation human racer during
 `Running` or the still-open `Settling` window. Type 9/10/11 honor their
-recipient masks according to their captured sender rules. Trace-confirmed
-type-12 packets must carry the exact peer-racer mask derived by the server;
+recipient masks according to their captured sender rules. Type-12 packets
+must carry the exact peer-racer mask derived by the server;
 client omissions and extra bits are rejected. All recipient queues are
 reserved before byte-exact publication. Malformed, spoofed, unsupported,
-evidence-pending, inactive-generation, wrong-phase, and backpressured item
-events have no side effects; stale global identity ownership, actor
+inactive-generation, wrong-phase, and backpressured item events have no side
+effects; stale global identity ownership, actor
 termination, and invariant failures still propagate.
 
 Type 1/2 item-box requests are never relayed as-is because their rank field
@@ -174,13 +179,17 @@ queue is reserved. For the current LAN/friends trust model, the default
 mapping. Uncheck the GUI trust option, or pass
 `--trust-client-item-rank false`, to use Combined weights instead. The actor
 synthesizes the exact 73-byte success packet and broadcasts it to all active
-frozen participants including the sender. Type 10/11 remain byte-exact relay only:
-Rust does not copy speculative kart side effects, bonus-item synthesis, or the
-C# double-transformation risk.
+frozen participants including the sender. Before serialization it resolves
+the frozen race kart against the bounded `KartCatalog.xml`
+`Abilities/TransformByKart` table and applies the matching `no_flag` rule
+exactly once, including the stock Gigantes V1 magnet/rocket transforms. A
+100% rule consumes no second random value; partial rules use a separate
+unbiased `[0,100)` draw. Type 10/11 remain byte-exact relay only: Rust does
+not copy speculative kart side effects, bonus-item synthesis, or the C#
+double-transformation risk.
 
 The remaining compatibility work is concentrated in type 4/6/16 routing and
-type-12 ownership semantics, actor-owned item-slot/use effects, kart-specific
-pickup remapping, the remaining
+type-12 ownership semantics, actor-owned item-slot/use effects, the remaining
 MyRoom and economy requests, capture-derived movement sequencing and UDP
 first-bind capabilities, packet fixtures, green cross-platform CI evidence,
 and stock-client end-to-end validation. See
@@ -188,6 +197,10 @@ and stock-client end-to-end validation. See
 [PORTING.md](PORTING.md) for the feature ledger.
 
 ## Build
+
+Local Cargo output is fixed to `target/p5136-finish-kart-abilities` by
+`.cargo/config.toml`; debug and release builds reuse that directory instead of
+creating a new full target tree for each diagnostic run.
 
 ```text
 cargo test --workspace

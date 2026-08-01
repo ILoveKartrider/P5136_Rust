@@ -61,6 +61,8 @@ been demonstrated.
 - [x] duplicate nickname rejection and stable user number
 - [x] exact session generation and stale-owner rejection
 - [x] channel-switch permit and `PqChannelMovein` transfer
+- [x] C#-compatible local `PqClubChannelSwitch` UI hand-off (`mode=1`,
+  channel 13, zero endpoint) without invalidating the authenticated session
 - [x] source-disconnect deferral and permit expiry
 - [x] linear per-generation identity-operation leases
 - [x] actor/durable child leases survive requester cancellation
@@ -74,6 +76,9 @@ been demonstrated.
 - [x] strict `PqStartRiderSchool` and canonical 240-byte physics reply
 - [x] strict read-only club state/join/create/list/capacity query boundaries
 - [x] strict item-state wire parsing and safe no-reply delete/unlock boundaries
+- [x] strict `PcStartMatching` seven-word envelope and cancellation parsing,
+  with the complete three-byte empty/create `PcMatchingFound` state rather
+  than the C# server's truncated two-byte reply
 
 ## World, Messenger, and UDP
 
@@ -93,8 +98,12 @@ been demonstrated.
   arrival-epoch fence against stale datagrams
 - [x] bounded TCP GameSlot type 1/2/4/6/9/10/11/12/16 parsing and
   exact-generation atomic relay for evidence-backed audiences
-- [x] strict 67-class type-12 state/length/count manifest with typed
-  retained/static/default evidence and fail-closed static-only actions
+- [x] bounded type-12 compatibility relay: exact common envelope, authenticated
+  sender and peer mask, then a known operation/base pair from the 67-class
+  native-writer manifest plus 18 C# enum-derived pairs; native shapes retain
+  typed retained/static/default diagnostics without capture-gated routing
+- [x] capture-backed `GopBarricade` state 1 placement plus state 2/3
+  hit/removal relay, including the valid zero-peer single-racer audience
 - [x] Messenger identity validation, chat rooms, and single-writer queues
 - [x] Messenger split/coalesced frame and mid-frame generation fencing
 - [x] bounded actor-output flushing without read-loop starvation
@@ -108,6 +117,8 @@ been demonstrated.
   excluding named kart entries whose exported spec cannot be resolved and
   sanitizing persisted equipment/sidecars that still reference them
 - [x] durable rider equipment/plant selection with actor cache publication
+  and lobby-only next-race kart-physics refresh; Loading/Running physics remain
+  frozen against mid-race equipment changes
 - [x] MyRoom core topology and generation-aware cleanup/migration
 - [x] fresh MyRoom FirstState projection
 - [x] durable owner-info update and exact owner echo
@@ -125,6 +136,9 @@ been demonstrated.
 - [x] race start/grid/readiness with deterministic fallback track
 - [x] actor-owned room track, basic-AI, closed-slot, rider-talk, and macro-chat
   transitions with bounded atomic fanout
+- [x] requester-only `GrFirstRequestPacket` room-state rehydration, preventing
+  a redundant peer `GrSlotDataPacket` from crossing a later race/ceremony
+  scene boundary
 - [ ] live track-pool/mode/random-track control surface
 - [x] finish, ranking, settlement, team booster, and DNF deadline
 - [x] idempotent per-player reward persistence and retry/dead-letter state
@@ -148,16 +162,39 @@ been demonstrated.
   inferred failure reply for unpublished values or sidecar persistence errors
 - [x] requested kart/speed single-player physics with explicit bounded
   contribution fallbacks
+- [x] immutable Korean P5136 flying-pet physics table applied to room and
+  single-player kart-spec replies; normal-pet defense remains a client-side
+  `Set_Pet`/type-11 relay with no duplicate server probability roll
+- [x] deliberate P5136 exclusion of later-version V2 Exceed sidecars:
+  `Parts12Data.json` and `Level12Data.json` are per-account C# server files,
+  not client data, and their login/item streams are byte-incompatible with
+  Korean P5136
 - [x] atomic time-attack start/finish persistence, checked economy arithmetic,
   and one-shot finish replay protection
 - [x] bounded complete telemetry codecs for every retained report shape,
-  including the isolated four-length unidentified driving report
+  including counted career state, the empty booster signal, the four-word
+  in-game heartbeat, neutral client-frame metrics, and the named
+  `PcRideSwithInfoPacket` map/vector/eight-aggregate container
+- [x] diagnostic-only fixed state-2 `GameControlPacket` finish snapshot
+  parsing (session envelope, 54-byte subobject, 243-byte physics block,
+  timestamp, participant slots, and terminal state); only the server-owned
+  finish transition remains authoritative
+- [x] exact unsigned `LoRqUseItemPacket` category/id/remaining-quantity words
+  and raw GameSlot type-10/type-16 byte/effect-code labels without inventing
+  boolean or barricade-only semantics
 - [x] authoritative type-1/type-2 item pickup probability roll, exact response
   synthesis, strict captured request/token validation, replay/rate admission,
   and sender-inclusive atomic room broadcast in game types 2/4
+- [x] bounded `KartCatalog.xml` `TransformByKart` parsing and exactly-once
+  frozen-kart item acquisition remapping, including Gigantes V1
+  `5 -> 103`, `7/127 -> 99` and separate partial-probability rolls
 - [ ] actor-owned live race position and track-box spawn/collision authority
 - [ ] evidence-backed GameSlot item-use/reaction server side effects
-- [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow
+- [ ] actor-owned directional `PcGameRequestRelay` / `GameRelayBroadcasting`
+  pairing after a two-client capture fixes its output slot transformation
+- [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow;
+  the implemented local Club UI hand-off is intentionally not a fabricated
+  global club service
 - [x] exact MyRoom Career empty-list reply and kind-2 grant consumption
 - [x] durable single-player scenario start and bound-revision completion reply
 - [ ] evidence-backed nonempty MyRoom Career ownership and marker semantics
@@ -178,8 +215,8 @@ been demonstrated.
 - [ ] movement envelope, tick wrap, and fallback are capture-verified
 - [ ] production AI start and nonzero AI-master behavior are capture-verified
 - [x] all 1,471 retained TCP GameSlot records cross the strict parser
-- [ ] static-only type-12 reachability, source/target/object ownership, and
-  type 4/6/16 routing are capture-verified
+- [ ] type-12 source/target/object effect semantics and type 4/6/16 routing
+  are capture-verified; known bounded type-12 client events already relay
 - [ ] Windows, macOS, and Linux CI pass
 - [ ] native Windows connector launches a stock P5136 client
 - [ ] Wine or CrossOver connector launches the same client

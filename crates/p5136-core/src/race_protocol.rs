@@ -20,8 +20,19 @@ pub const TEAM_BOOSTER_REPLY_NAME: &str = "GameTeamBoosterSetGaugePacket";
 pub const GAME_AI_MASTER_NOTICE_NAME: &str = "GameAiMasterSlotNoticePacket";
 pub const GAME_NEXT_STAGE_PACKET_NAME: &str = "GameNextStagePacket";
 
-pub const MAX_GAME_CONTROL_TRAILING_BYTES: usize = 256;
+/// The retained P5136 finish producer sends a 406-byte `GameControlPacket`:
+/// 13 common bytes followed by a 393-byte state-2 result snapshot.  The
+/// request parser retains a small future-compatible margin for other control
+/// states without cloning the C# handler's unbounded ignored tail.
+pub const MAX_GAME_CONTROL_TRAILING_BYTES: usize = 512;
 pub const CANONICAL_GAME_CONTROL_BODY_LENGTH: usize = 81;
+pub const GAME_CONTROL_FINISH_TRAILING_LENGTH: usize = 393;
+
+const GAME_CONTROL_FINISH_SESSION_AUTH_WORDS: usize = 7;
+const GAME_CONTROL_FINISH_RESULT_SUBOBJECT_LENGTH: usize = 54;
+const GAME_CONTROL_FINISH_KART_PHYSICS_LENGTH: usize = 243;
+const GAME_CONTROL_FINISH_SHARED_TIMESTAMP_LENGTH: usize = 18;
+const GAME_CONTROL_FINISH_PARTICIPANT_SLOT_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaceRequest {
@@ -40,6 +51,24 @@ pub struct GameControlRequest {
     /// runtime does not interpret it, but the bounded copy keeps parsing
     /// forward-compatible.
     pub trailing: Vec<u8>,
+}
+
+/// The fixed state-2 portion of a captured P5136 `GameControlPacket`.
+///
+/// This is diagnostic input only. Race settlement remains authoritative on
+/// the server, and no field in this snapshot is used to alter the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameControlFinishSnapshot {
+    pub value1: u32,
+    pub value2: u32,
+    pub session_auth: [u32; GAME_CONTROL_FINISH_SESSION_AUTH_WORDS],
+    pub result_subobject: [u8; GAME_CONTROL_FINISH_RESULT_SUBOBJECT_LENGTH],
+    pub result_global_metric: u32,
+    pub kart_physics_snapshot: [u8; GAME_CONTROL_FINISH_KART_PHYSICS_LENGTH],
+    pub shared_timestamp: [u8; GAME_CONTROL_FINISH_SHARED_TIMESTAMP_LENGTH],
+    pub participant_slots: [u32; GAME_CONTROL_FINISH_PARTICIPANT_SLOT_COUNT],
+    pub local_kart_or_player_result: u32,
+    pub terminal_client_state: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +172,65 @@ pub fn parse_game_control_request(packet: &[u8]) -> Result<GameControlRequest, R
         value0,
         trailing: trailing.to_vec(),
     })
+}
+
+/// Decodes the observed fixed state-2 finish snapshot when the packet has the
+/// captured 406-byte shape. Other control-state extensions deliberately
+/// remain retained-but-uninterpreted for forward compatibility.
+pub fn parse_game_control_finish_snapshot(
+    request: &GameControlRequest,
+) -> Result<Option<GameControlFinishSnapshot>, RaceProtocolError> {
+    if request.state != 2
+        || request.optional_pair.is_some()
+        || request.trailing.len() != GAME_CONTROL_FINISH_TRAILING_LENGTH
+    {
+        return Ok(None);
+    }
+
+    let mut reader = PacketReader::new(&request.trailing);
+    let value1 = reader.read_u32()?;
+    let value2 = reader.read_u32()?;
+    if reader.read_u8()? == 0 {
+        // The captured 393-byte form necessarily contains seven session-auth
+        // words. Treat a different producer form as an unknown extension
+        // instead of consuming it with an invented layout.
+        return Ok(None);
+    }
+
+    let mut session_auth = [0; GAME_CONTROL_FINISH_SESSION_AUTH_WORDS];
+    for word in &mut session_auth {
+        *word = reader.read_u32()?;
+    }
+    let mut result_subobject = [0; GAME_CONTROL_FINISH_RESULT_SUBOBJECT_LENGTH];
+    result_subobject
+        .copy_from_slice(reader.read_bytes(GAME_CONTROL_FINISH_RESULT_SUBOBJECT_LENGTH)?);
+    let result_global_metric = reader.read_u32()?;
+    let mut kart_physics_snapshot = [0; GAME_CONTROL_FINISH_KART_PHYSICS_LENGTH];
+    kart_physics_snapshot
+        .copy_from_slice(reader.read_bytes(GAME_CONTROL_FINISH_KART_PHYSICS_LENGTH)?);
+    let mut shared_timestamp = [0; GAME_CONTROL_FINISH_SHARED_TIMESTAMP_LENGTH];
+    shared_timestamp
+        .copy_from_slice(reader.read_bytes(GAME_CONTROL_FINISH_SHARED_TIMESTAMP_LENGTH)?);
+    let mut participant_slots = [0; GAME_CONTROL_FINISH_PARTICIPANT_SLOT_COUNT];
+    for slot in &mut participant_slots {
+        *slot = reader.read_u32()?;
+    }
+    let local_kart_or_player_result = reader.read_u32()?;
+    let terminal_client_state = reader.read_u8()?;
+    ensure_exhausted(&reader, GAME_CONTROL_PACKET_NAME)?;
+
+    Ok(Some(GameControlFinishSnapshot {
+        value1,
+        value2,
+        session_auth,
+        result_subobject,
+        result_global_metric,
+        kart_physics_snapshot,
+        shared_timestamp,
+        participant_slots,
+        local_kart_or_player_result,
+        terminal_client_state,
+    }))
 }
 
 pub fn parse_ai_goal_in_request(packet: &[u8]) -> Result<AiGoalInRequest, RaceProtocolError> {
@@ -273,9 +361,10 @@ fn validate_player_id(player_id: i32) -> Result<(), RaceProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_GAME_CONTROL_BODY_LENGTH, GAME_AI_GOAL_IN_PACKET_NAME, GAME_CONTROL_PACKET_NAME,
-        RaceProtocolError, RaceRequest, RaceTeam, ServerGameControl, TEAM_BOOSTER_REQUEST_NAME,
-        classify_race_request, parse_ai_goal_in_request, parse_game_control_request,
+        CANONICAL_GAME_CONTROL_BODY_LENGTH, GAME_AI_GOAL_IN_PACKET_NAME,
+        GAME_CONTROL_FINISH_TRAILING_LENGTH, GAME_CONTROL_PACKET_NAME, RaceProtocolError,
+        RaceRequest, RaceTeam, ServerGameControl, TEAM_BOOSTER_REQUEST_NAME, classify_race_request,
+        parse_ai_goal_in_request, parse_game_control_finish_snapshot, parse_game_control_request,
         parse_team_booster_request, serialize_ai_master_notice, serialize_game_control,
         serialize_game_next_stage, serialize_race_time, serialize_team_booster_gauge,
     };
@@ -325,6 +414,43 @@ mod tests {
         assert_eq!(finish.optional_pair, Some((1, -1)));
         assert_eq!(finish.value0, 0xDEAD_BEEF);
         assert_eq!(finish.trailing, [0xaa, 0x55]);
+
+        let mut captured_finish = PacketWriter::named(GAME_CONTROL_PACKET_NAME);
+        captured_finish.write_i32(2);
+        captured_finish.write_u8(0);
+        captured_finish.write_u32(0x0001_C9F8);
+        captured_finish.write_u32(0xAABB_CCDD);
+        captured_finish.write_u32(0x0102_0304);
+        captured_finish.write_u8(1);
+        for word in 0..7 {
+            captured_finish.write_u32(word);
+        }
+        captured_finish.write_bytes(&[0x11; 54]);
+        captured_finish.write_u32(0x5566_7788);
+        captured_finish.write_bytes(&[0x22; 243]);
+        captured_finish.write_bytes(&[0x33; 18]);
+        for slot in 10..18 {
+            captured_finish.write_u32(slot);
+        }
+        captured_finish.write_u32(0x99AA_BBCC);
+        captured_finish.write_u8(7);
+        let captured_finish = parse_game_control_request(captured_finish.as_slice()).unwrap();
+        assert_eq!(captured_finish.state, 2);
+        assert_eq!(captured_finish.value0, 0x0001_C9F8);
+        assert_eq!(
+            captured_finish.trailing.len(),
+            GAME_CONTROL_FINISH_TRAILING_LENGTH
+        );
+        let snapshot = parse_game_control_finish_snapshot(&captured_finish)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.value1, 0xAABB_CCDD);
+        assert_eq!(snapshot.value2, 0x0102_0304);
+        assert_eq!(snapshot.session_auth, [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(snapshot.result_global_metric, 0x5566_7788);
+        assert_eq!(snapshot.participant_slots, [10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(snapshot.local_kart_or_player_result, 0x99AA_BBCC);
+        assert_eq!(snapshot.terminal_client_state, 7);
     }
 
     #[test]
@@ -371,12 +497,12 @@ mod tests {
         oversized.write_i32(0);
         oversized.write_u8(0);
         oversized.write_u32(0);
-        oversized.write_bytes(&[0; 257]);
+        oversized.write_bytes(&[0; 513]);
         assert!(matches!(
             parse_game_control_request(oversized.as_slice()),
             Err(RaceProtocolError::GameControlTailTooLarge {
-                actual: 257,
-                maximum: 256,
+                actual: 513,
+                maximum: 512,
             })
         ));
 

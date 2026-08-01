@@ -1,10 +1,11 @@
 //! Static Korean P5136 `GameSlotPacket` type-12 writer schemas.
 //!
 //! The native writer census is useful wire evidence, but it is not equivalent
-//! to a live compatibility trace. Each successful validation therefore carries
-//! an [`ItemOperationEvidence`] value. Only retained-trace forms may currently
-//! cross the server's relay boundary; static-only branches remain typed,
-//! bounded diagnostics until their routing and reachability are confirmed.
+//! to a complete live compatibility trace. Each successful validation therefore
+//! carries an [`ItemOperationEvidence`] value for diagnostics. Relay admission
+//! belongs to the outer `GameSlot` envelope: a known operation pair may be
+//! relayed only after its bounded envelope, authenticated sender, and audience
+//! mask have all been validated.
 
 use thiserror::Error;
 
@@ -23,13 +24,6 @@ pub enum ItemOperationEvidence {
     /// This proves a serializer shape, not that an arbitrary state is reachable
     /// or safe for a peer's class-specific native handler.
     StaticWriterDefault,
-}
-
-impl ItemOperationEvidence {
-    #[must_use]
-    pub const fn relay_confirmed(self) -> bool {
-        matches!(self, Self::RetainedTrace)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,8 +403,9 @@ macro_rules! c {
 
 /// Candidate schemas recovered from the native writer census.
 ///
-/// Entries with only static evidence validate into an evidence-pending action;
-/// they are not silently promoted to relay support.
+/// A successful schema validation enriches an operation with its object/state
+/// diagnostics. A known-pair operation that does not fit a recovered writer
+/// shape can still use the bounded compatibility relay path in the outer codec.
 pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
     ItemOperationSchema::mapped_u32(
         "GopAngel",
@@ -449,7 +444,7 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         0x1D86_04A3,
         0x2D06_05C2,
         12,
-        &[c!(trace & [1], 73), c!(&[4], 26)],
+        &[c!(trace & [1], 73), c!(trace & [2, 3], 25), c!(&[4], 26)],
         25,
     ),
     ItemOperationSchema::fixed_u8("GopBigTimebomb", 0x276B_0567, 0x3929_0686, 12, 29),
@@ -681,7 +676,12 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         0x0A6B_02AF,
         0x1450_03CE,
         12,
-        &[c!(&[1], 77), c!(&[2, 3, 4, 5], 29), c!(&[6], 68)],
+        &[
+            c!(&[1], 77),
+            c!(trace & [2], 29),
+            c!(&[3, 4, 5], 29),
+            c!(&[6], 68),
+        ],
         16,
     ),
     ItemOperationSchema::mapped_u32(
@@ -1001,6 +1001,42 @@ pub fn item_operation_schema(
         .find(|schema| schema.pair() == (operation_hash, base_hash))
 }
 
+/// Named `Gop*`/`GoItem*` pairs accepted by the C# P5136 relay parser but not
+/// represented in the recovered native-writer schema census above.
+///
+/// The C# source derives its broader set from the checked-in `PacketName` enum
+/// rather than from individual packet captures. Keep this small difference set
+/// explicit so the Rust parser can use the same family rule without weakening
+/// unknown-hash rejection.
+const CSHARP_RELAY_ONLY_OPERATION_PAIRS: &[(u32, u32)] = &[
+    (0x07AE_0248, 0x1074_0367), // GopEmp/GoItemEmp
+    (0x0D69_031A, 0x186D_0439), // GopDevil/GoItemDevil
+    (0x0D6A_030E, 0x186E_042D), // GopDrmad/GoItemDrmad
+    (0x0D82_031D, 0x1886_043C), // GopJewel/GoItemJewel
+    (0x0D8B_032B, 0x188F_044A), // GopGhost/GoItemGhost
+    (0x0DAE_0334, 0x18B2_0453), // GopFrost/GoItemFrost
+    (0x10CA_034F, 0x1CED_046E), // GopCloud2/GoItemCloud2
+    (0x10DE_0382, 0x1D01_04A1), // GopMagnet/GoItemMagnet
+    (0x116F_0399, 0x1D92_04B8), // GopSpring/GoItemSpring
+    (0x1476_03D8, 0x21B8_04F7), // GopMqDevil/GoItemMqDevil
+    (0x14E9_03F7, 0x222B_0516), // GopChopper/GoItemChopper
+    (0x18D8_0444, 0x2739_0563), // GopNewDevil/GoItemNewDevil
+    (0x1942_0457, 0x27A3_0576), // GopScanning/GoItemScanning
+    (0x196B_0451, 0x27CC_0570), // GopSlotLock/GoItemSlotLock
+    (0x1DB2_04AF, 0x2D32_05CE), // GopSpeedDown/GoItemSpeedDown
+    (0x2271_0505, 0x3310_0624), // GopGoldShield/GoItemGoldShield
+    (0x2E54_05E8, 0x4131_0707), // GopSpecialSiren/GoItemSpecialSiren
+    (0x3C6F_06D4, 0x518A_07F3), // GopStraightRocket/GoItemStraightRocket
+];
+
+/// Returns whether the operation/base pair belongs to the bounded P5136 type-12
+/// compatibility family.
+#[must_use]
+pub fn is_known_item_operation_pair(operation_hash: u32, base_hash: u32) -> bool {
+    item_operation_schema(operation_hash, base_hash).is_some()
+        || CSHARP_RELAY_ONLY_OPERATION_PAIRS.contains(&(operation_hash, base_hash))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1150,6 +1186,32 @@ mod tests {
         assert_eq!(
             banana.validate(&writer_default).unwrap().evidence,
             ItemOperationEvidence::StaticWriterDefault
+        );
+
+        let barricade = item_operation_schema(0x1D86_04A3, 0x2D06_05C2).unwrap();
+        for state in [2, 3] {
+            assert_eq!(
+                barricade
+                    .validate(&raw_for(barricade, state, 25))
+                    .unwrap()
+                    .evidence,
+                ItemOperationEvidence::RetainedTrace
+            );
+        }
+        assert_eq!(
+            barricade
+                .validate(&raw_for(barricade, 5, 25))
+                .unwrap()
+                .evidence,
+            ItemOperationEvidence::StaticWriterDefault
+        );
+
+        // Live two-client P5136 capture: a mine hit is a state-2, 29-byte
+        // operation. It must reach the peer that owns the installed object.
+        let mine = item_operation_schema(0x0A6B_02AF, 0x1450_03CE).unwrap();
+        assert_eq!(
+            mine.validate(&raw_for(mine, 2, 29)).unwrap().evidence,
+            ItemOperationEvidence::RetainedTrace
         );
     }
 

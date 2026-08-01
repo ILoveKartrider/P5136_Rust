@@ -30,6 +30,7 @@ pub const MAX_ITEM_NAME_BYTES: usize = 1_024;
 pub const MAX_KART_NAMES: usize = 10_000;
 pub const MAX_KART_SPECS: usize = 10_000;
 pub const MAX_KART_NAME_BYTES: usize = 256;
+pub const MAX_CATALOG_ITEM_TRANSFORMS: usize = 4_096;
 pub const MAX_XML_TEXT_BYTES: usize = 4 * 1024;
 pub const MAX_XML_ATTRIBUTE_VALUE_BYTES: usize = 4 * 1024;
 pub const MAX_XML_ATTRIBUTES_PER_ELEMENT: usize = 256;
@@ -96,6 +97,19 @@ pub struct CatalogKartSpecStats {
     pub unreferenced_specs: usize,
 }
 
+/// One resolved `TransformByKart` rule exported from the stock P5136 data.
+///
+/// Item IDs are signed on the game wire; source ID zero is valid for the
+/// ordinary cloud item, so parsing intentionally does not impose positivity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogItemTransformRule {
+    pub kart_id: u16,
+    pub source_item_id: i16,
+    pub target_item_id: i16,
+    pub probability: u8,
+    pub mode: String,
+}
+
 impl fmt::Display for CatalogKartSpecStats {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -118,6 +132,7 @@ pub struct CatalogInventory {
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
     kart_spec_stats: CatalogKartSpecStats,
     emblem_catalog: Option<EmblemCatalog>,
+    item_transforms: BTreeMap<(u16, i16), Vec<CatalogItemTransformRule>>,
 }
 
 // Catalog parsing rejects non-finite values, so the floating-point snapshots
@@ -192,6 +207,35 @@ impl CatalogInventory {
     #[must_use]
     pub const fn kart_spec_stats(&self) -> CatalogKartSpecStats {
         self.kart_spec_stats
+    }
+
+    /// Resolves a kart-specific item-box transform for the requested mode.
+    /// An exact ASCII case-insensitive mode wins over a rule with an empty
+    /// mode, matching the reference server's selection semantics.
+    #[must_use]
+    pub fn item_transform(
+        &self,
+        kart_id: u16,
+        source_item_id: i16,
+        mode: &str,
+    ) -> Option<&CatalogItemTransformRule> {
+        let candidates = self.item_transforms.get(&(kart_id, source_item_id))?;
+        candidates
+            .iter()
+            .find(|rule| !mode.is_empty() && rule.mode.eq_ignore_ascii_case(mode))
+            .or_else(|| candidates.iter().find(|rule| rule.mode.is_empty()))
+    }
+
+    /// Returns whether the catalog defines this kart/item pair in any mode.
+    #[must_use]
+    pub fn has_item_transform_definition(&self, kart_id: u16, source_item_id: i16) -> bool {
+        self.item_transforms
+            .contains_key(&(kart_id, source_item_id))
+    }
+
+    #[must_use]
+    pub fn item_transform_count(&self) -> usize {
+        self.item_transforms.values().map(Vec::len).sum()
     }
 
     /// Returns the optional, source-ordered `MyRoom` emblem catalog.
@@ -346,6 +390,27 @@ pub enum CatalogInventoryError {
     #[error("kart catalog XML has more than one Emblems element")]
     MultipleEmblems,
 
+    #[error("kart catalog XML has more than one Abilities element")]
+    MultipleAbilities,
+
+    #[error("kart catalog XML has more than one Abilities/TransformByKart element")]
+    MultipleTransformByKart,
+
+    #[error("kart catalog TransformByKart contains more than {maximum} rules")]
+    TooManyItemTransforms { maximum: usize },
+
+    #[error("kart catalog XML has an invalid TransformByKart/Rule {attribute}")]
+    InvalidItemTransformAttribute { attribute: &'static str },
+
+    #[error(
+        "kart catalog XML has duplicate TransformByKart rule for kart {kart_id}, item {source_item_id}, mode {mode:?}"
+    )]
+    DuplicateItemTransform {
+        kart_id: u16,
+        source_item_id: i16,
+        mode: String,
+    },
+
     #[error("kart catalog Emblems contains more than {maximum} entries")]
     TooManyEmblems { maximum: usize },
 
@@ -477,6 +542,10 @@ struct CatalogParser {
     spec_keys: HashSet<String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
     active_spec: Option<PendingKartSpec>,
+    transform_section_seen: bool,
+    in_transform_section: bool,
+    item_transform_keys: HashSet<(u16, i16, String)>,
+    item_transforms: BTreeMap<(u16, i16), Vec<CatalogItemTransformRule>>,
 }
 
 #[derive(Debug)]
@@ -492,6 +561,7 @@ enum CatalogSection {
     Names,
     Specs,
     Emblems,
+    Abilities,
 }
 
 const ROOT_SEEN: u8 = 1 << 0;
@@ -499,6 +569,7 @@ const INVENTORY_SEEN: u8 = 1 << 1;
 const NAMES_SEEN: u8 = 1 << 2;
 const SPECS_SEEN: u8 = 1 << 3;
 const EMBLEMS_SEEN: u8 = 1 << 4;
+const ABILITIES_SEEN: u8 = 1 << 5;
 
 impl CatalogParser {
     fn new(policy: ValidationPolicy) -> Self {
@@ -518,6 +589,10 @@ impl CatalogParser {
             spec_keys: HashSet::new(),
             kart_specs: BTreeMap::new(),
             active_spec: None,
+            transform_section_seen: false,
+            in_transform_section: false,
+            item_transform_keys: HashSet::new(),
+            item_transforms: BTreeMap::new(),
         }
     }
 
@@ -542,10 +617,12 @@ impl CatalogParser {
                     if self.depth == 1
                         && matches!(
                             element.name().as_ref(),
-                            b"Inventory" | b"Names" | b"Specs" | b"Emblems"
+                            b"Inventory" | b"Names" | b"Specs" | b"Emblems" | b"Abilities"
                         )
                     {
                         self.active_section = None;
+                    } else if self.depth == 2 && element.name() == QName(b"TransformByKart") {
+                        self.in_transform_section = false;
                     } else if self.depth == 2 && element.name() == QName(b"Spec") {
                         self.finish_spec()?;
                     }
@@ -581,6 +658,14 @@ impl CatalogParser {
         } else if self.depth == 1 && element.name() == QName(b"Emblems") {
             self.read_emblems_header(reader, element)?;
             self.active_section = Some(CatalogSection::Emblems);
+        } else if self.depth == 1 && element.name() == QName(b"Abilities") {
+            self.read_abilities_header()?;
+            self.active_section = Some(CatalogSection::Abilities);
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Abilities)
+            && element.name() == QName(b"TransformByKart")
+        {
+            self.start_transform_section()?;
         } else if self.depth == 2
             && self.active_section == Some(CatalogSection::Inventory)
             && element.name() == QName(b"Item")
@@ -603,6 +688,12 @@ impl CatalogParser {
             self.read_emblem(reader, element)?;
         } else if self.active_spec.is_some() && element.name() == QName(b"BodyParam") {
             self.read_body_param(reader, element)?;
+        } else if self.depth == 3
+            && self.active_section == Some(CatalogSection::Abilities)
+            && self.in_transform_section
+            && element.name() == QName(b"Rule")
+        {
+            self.read_item_transform(reader, element)?;
         }
         Ok(())
     }
@@ -622,6 +713,14 @@ impl CatalogParser {
             self.read_specs_header()?;
         } else if self.depth == 1 && element.name() == QName(b"Emblems") {
             self.read_emblems_header(reader, element)?;
+        } else if self.depth == 1 && element.name() == QName(b"Abilities") {
+            self.read_abilities_header()?;
+        } else if self.depth == 2
+            && self.active_section == Some(CatalogSection::Abilities)
+            && element.name() == QName(b"TransformByKart")
+        {
+            self.start_transform_section()?;
+            self.in_transform_section = false;
         } else if self.depth == 2
             && self.active_section == Some(CatalogSection::Inventory)
             && element.name() == QName(b"Item")
@@ -645,6 +744,12 @@ impl CatalogParser {
             self.read_emblem(reader, element)?;
         } else if self.active_spec.is_some() && element.name() == QName(b"BodyParam") {
             self.read_body_param(reader, element)?;
+        } else if self.depth == 3
+            && self.active_section == Some(CatalogSection::Abilities)
+            && self.in_transform_section
+            && element.name() == QName(b"Rule")
+        {
+            self.read_item_transform(reader, element)?;
         }
         Ok(())
     }
@@ -734,6 +839,80 @@ impl CatalogParser {
             }
             None => None,
         };
+        Ok(())
+    }
+
+    fn read_abilities_header(&mut self) -> Result<(), CatalogInventoryError> {
+        if self.sections_seen & ABILITIES_SEEN != 0 {
+            return Err(CatalogInventoryError::MultipleAbilities);
+        }
+        self.sections_seen |= ABILITIES_SEEN;
+        Ok(())
+    }
+
+    fn start_transform_section(&mut self) -> Result<(), CatalogInventoryError> {
+        if self.transform_section_seen {
+            return Err(CatalogInventoryError::MultipleTransformByKart);
+        }
+        self.transform_section_seen = true;
+        self.in_transform_section = true;
+        Ok(())
+    }
+
+    fn read_item_transform<R: BufRead>(
+        &mut self,
+        reader: &Reader<R>,
+        element: &BytesStart<'_>,
+    ) -> Result<(), CatalogInventoryError> {
+        if self.item_transform_keys.len() >= MAX_CATALOG_ITEM_TRANSFORMS {
+            return Err(CatalogInventoryError::TooManyItemTransforms {
+                maximum: MAX_CATALOG_ITEM_TRANSFORMS,
+            });
+        }
+        let kart_id = attribute(reader, element, b"kartId")?
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|id| *id != 0)
+            .ok_or(CatalogInventoryError::InvalidItemTransformAttribute {
+                attribute: "kartId",
+            })?;
+        let source_item_id = attribute(reader, element, b"sourceId")?
+            .and_then(|value| value.parse::<i16>().ok())
+            .ok_or(CatalogInventoryError::InvalidItemTransformAttribute {
+                attribute: "sourceId",
+            })?;
+        let target_item_id = attribute(reader, element, b"targetId")?
+            .and_then(|value| value.parse::<i16>().ok())
+            .ok_or(CatalogInventoryError::InvalidItemTransformAttribute {
+                attribute: "targetId",
+            })?;
+        let probability = attribute(reader, element, b"probability")?
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|probability| *probability <= 100)
+            .ok_or(CatalogInventoryError::InvalidItemTransformAttribute {
+                attribute: "probability",
+            })?;
+        let mode = attribute(reader, element, b"gitType")?.unwrap_or_default();
+        let mode_key = mode.to_ascii_lowercase();
+        if !self
+            .item_transform_keys
+            .insert((kart_id, source_item_id, mode_key))
+        {
+            return Err(CatalogInventoryError::DuplicateItemTransform {
+                kart_id,
+                source_item_id,
+                mode,
+            });
+        }
+        self.item_transforms
+            .entry((kart_id, source_item_id))
+            .or_default()
+            .push(CatalogItemTransformRule {
+                kart_id,
+                source_item_id,
+                target_item_id,
+                probability,
+                mode,
+            });
         Ok(())
     }
 
@@ -1016,6 +1195,7 @@ impl CatalogParser {
             kart_specs: std::mem::take(&mut self.kart_specs),
             kart_spec_stats,
             emblem_catalog,
+            item_transforms: std::mem::take(&mut self.item_transforms),
         })
     }
 }
@@ -1883,6 +2063,89 @@ mod tests {
         assert!(matches!(
             parse_structural(&excessive),
             Err(CatalogInventoryError::TooManyEmblems { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_and_resolves_bounded_kart_item_transforms() {
+        let catalog = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Inventory total="0" categories="0" />
+                <Abilities total="5" resolved="5">
+                    <TransformByKart>
+                        <Rule kartId="1410" sourceId="5" targetId="103" probability="100" gitType="no_flag" />
+                        <Rule kartId="1410" sourceId="7" targetId="99" probability="100" gitType="no_flag" />
+                        <Rule kartId="1410" sourceId="127" targetId="99" probability="100" gitType="no_flag" />
+                        <Rule kartId="42" sourceId="7" targetId="30" probability="25" />
+                        <Rule kartId="42" sourceId="7" targetId="31" probability="50" gitType="NO_FLAG" />
+                    </TransformByKart>
+                    <FiringToGain>
+                        <Rule kartId="1410" sourceId="7" targetId="103" probability="100" />
+                    </FiringToGain>
+                </Abilities>
+            </KartCatalog>"#,
+        )
+        .unwrap();
+
+        assert_eq!(catalog.item_transform_count(), 5);
+        for (source_item_id, target_item_id) in [(5, 103), (7, 99), (127, 99)] {
+            let rule = catalog
+                .item_transform(1_410, source_item_id, "no_flag")
+                .unwrap();
+            assert_eq!(rule.target_item_id, target_item_id);
+            assert_eq!(rule.probability, 100);
+        }
+        assert_eq!(
+            catalog
+                .item_transform(42, 7, "no_flag")
+                .unwrap()
+                .target_item_id,
+            31
+        );
+        assert_eq!(
+            catalog
+                .item_transform(42, 7, "FlagIndi")
+                .unwrap()
+                .target_item_id,
+            30
+        );
+        assert!(catalog.has_item_transform_definition(1_410, 5));
+        assert!(!catalog.has_item_transform_definition(1_409, 5));
+    }
+
+    #[test]
+    fn rejects_malformed_or_duplicate_kart_item_transforms() {
+        let malformed = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Inventory total="0" categories="0" />
+                <Abilities><TransformByKart>
+                    <Rule kartId="1410" sourceId="7" targetId="99" probability="101" gitType="no_flag" />
+                </TransformByKart></Abilities>
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            malformed,
+            Err(CatalogInventoryError::InvalidItemTransformAttribute {
+                attribute: "probability"
+            })
+        ));
+
+        let duplicate = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Inventory total="0" categories="0" />
+                <Abilities><TransformByKart>
+                    <Rule kartId="1410" sourceId="7" targetId="99" probability="100" gitType="no_flag" />
+                    <Rule kartId="1410" sourceId="7" targetId="30" probability="25" gitType="NO_FLAG" />
+                </TransformByKart></Abilities>
+            </KartCatalog>"#,
+        );
+        assert!(matches!(
+            duplicate,
+            Err(CatalogInventoryError::DuplicateItemTransform {
+                kart_id: 1410,
+                source_item_id: 7,
+                ..
+            })
         ));
     }
 
