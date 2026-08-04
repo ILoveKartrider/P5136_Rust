@@ -73,7 +73,10 @@ use p5136_core::{
     packet::PacketError,
     race_protocol::{
         RaceProtocolError, RaceRequest, classify_race_request, parse_ai_goal_in_request,
-        parse_game_control_finish_snapshot, parse_game_control_request, parse_team_booster_request,
+        parse_game_control_finish_snapshot, parse_game_control_request,
+        parse_report_game_collected_record_request, parse_start_collect_record_request,
+        parse_team_booster_request, parse_user_collected_record_report,
+        serialize_start_collect_record_reply,
     },
     race_start_protocol::P5136KartPhysicsBlock,
     rider_info_protocol::{
@@ -133,8 +136,8 @@ use tokio::{
 };
 
 use crate::{
-    ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ServerConfig, SessionId,
-    UserNo, WorldError, WorldHandle,
+    ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ResolvedRandomTracks,
+    ServerConfig, SessionId, UserNo, WorldError, WorldHandle,
     equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
         RiderEquipmentWriteError, catalog_grants, kart_is_owned,
@@ -171,8 +174,8 @@ use crate::{
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
         MyRoomEntryInput, MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole,
-        OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload, RoomParticipant,
-        StartRoomPlan,
+        OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload,
+        RoomKartPhysicsVariants, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -397,9 +400,6 @@ pub enum LoginSessionError {
 
     #[error("logical login packet is shorter than its four-byte name hash")]
     MissingPacketHash,
-
-    #[error("unsupported identity-bound packet hash 0x{hash:08X}")]
-    UnsupportedIdentityPacket { hash: u32 },
 
     #[error(
         "P5136 static channel catalog has no record for game type {game_type} and preferred channel {preferred_channel}"
@@ -2182,12 +2182,13 @@ async fn dispatch_packet_admitted(
             packet,
             Some(context),
             services.profiles.catalog(),
+            services.config.resolved_random_tracks.clone(),
         )
         .await;
     }
 
     if let Some(request) = classify_race_request(hash) {
-        return handle_race_request_admitted(&world, request, packet).await;
+        return handle_race_request_admitted(&world, request, packet, context).await;
     }
 
     if let Some(request) = classify_myroom_request(hash) {
@@ -2216,21 +2217,26 @@ async fn dispatch_packet_admitted(
         return handle_startup_noop(&world, context).await;
     }
 
-    // Identity-bound packets cannot be processed by a stale connection.
-    // Unknown packets fail explicitly instead of impersonating a successful
-    // no-reply handler. Deliberate compatibility no-ops remain classified by
-    // `is_startup_noop` above.
-    reject_unsupported_identity_packet(&world, hash, context).await
+    consume_unknown_identity_packet(&world, hash, packet, context).await
 }
 
-async fn reject_unsupported_identity_packet(
+async fn consume_unknown_identity_packet(
     world: &AdmittedWorldHandle<'_>,
     hash: u32,
+    packet: &[u8],
     context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
-    Err(LoginSessionError::UnsupportedIdentityPacket { hash })
+    tracing::warn!(
+        target: "p5136_packet",
+        session_id = world.session_id().get(),
+        nickname = %identity.nickname,
+        packet_hash = format_args!("0x{hash:08X}"),
+        packet_length = packet.len(),
+        "consumed an unknown authenticated packet without a response; the preceding logical receive record contains its raw payload"
+    );
+    Ok(Vec::new())
 }
 
 async fn handle_startup_noop(
@@ -3177,6 +3183,7 @@ async fn handle_lobby_request_admitted(
     packet: &[u8],
     context: Option<&SessionContext>,
     catalog: Option<&CatalogInventory>,
+    random_tracks: Option<Arc<ResolvedRandomTracks>>,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let payload = match request {
         LobbyRequest::SetSlotState => {
@@ -3190,10 +3197,10 @@ async fn handle_lobby_request_admitted(
         }
         LobbyRequest::StartRoom => {
             let _ = parse_start_room_request(packet)?;
-            LobbyCommandPayload::StartRoom(StartRoomPlan::new(
-                vec![P5136_FALLBACK_TRACK_ID],
-                Vec::new(),
-            ))
+            LobbyCommandPayload::StartRoom(
+                StartRoomPlan::new(vec![P5136_FALLBACK_TRACK_ID], Vec::new())
+                    .with_random_tracks(random_tracks),
+            )
         }
         LobbyRequest::ChangeTrack => {
             LobbyCommandPayload::ChangeTrack(parse_change_track_request(packet)?)
@@ -3294,6 +3301,7 @@ async fn handle_race_request_admitted(
     world: &AdmittedWorldHandle<'_>,
     request: RaceRequest,
     packet: &[u8],
+    context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let payload = match request {
         RaceRequest::GameControl => {
@@ -3315,6 +3323,52 @@ async fn handle_race_request_admitted(
             RaceCommandPayload::TeamBoosterGauge(parse_team_booster_request(packet)?)
         }
         RaceRequest::GameSlot => return handle_game_slot_request_admitted(world, packet).await,
+        RaceRequest::StartCollectRecord => {
+            parse_start_collect_record_request(packet)?;
+            let identity = world.authorize_identity().await?;
+            let rider_items = &context.profile_for(&identity)?.rider_item;
+            let camera_item_id = rider_items.replay_recording_camera_id();
+            let recording_permitted = rider_items.has_replay_recording_camera();
+            tracing::trace!(
+                nickname = %identity.nickname,
+                camera_item_id,
+                recording_permitted,
+                "answered native PqStartCollectRecord from the bound category-12 equipment"
+            );
+
+            // The stock client creates/retains its KartRecorder when the
+            // local rider has category 12 equipped. Pr(false) asks the guarded
+            // consumer to release an ordinary collector; special/forced
+            // recorders remain protected by the client's independent guard.
+            return Ok(vec![serialize_start_collect_record_reply(
+                recording_permitted,
+            )]);
+        }
+        RaceRequest::ReportUserCollectedRecord => {
+            let report = parse_user_collected_record_report(packet)?;
+            let identity = world.authorize_identity().await?;
+            let _ = context.profile_for(&identity)?;
+            tracing::trace!(
+                nickname = %identity.nickname,
+                elapsed_ms = report.elapsed_ms,
+                recorder_metric_1 = report.recorder_metric_1,
+                recorder_metric_2 = report.recorder_metric_2,
+                recorder_metric_3 = report.recorder_metric_3,
+                recorder_metric_4 = report.recorder_metric_4,
+                "consumed non-authoritative PcReportUserCollectedRecord"
+            );
+            return Ok(Vec::new());
+        }
+        RaceRequest::ReportGameCollectedRecord => {
+            parse_report_game_collected_record_request(packet)?;
+            let identity = world.authorize_identity().await?;
+            let _ = context.profile_for(&identity)?;
+            tracing::trace!(
+                nickname = %identity.nickname,
+                "consumed base-only PqReportGameCollectedRecord without a reply"
+            );
+            return Ok(Vec::new());
+        }
     };
     match world.race_command(payload).await {
         Ok(_) => {}
@@ -3350,10 +3404,49 @@ async fn handle_game_slot_request_admitted(
     let packet_type = parsed.body().packet_type();
     let item_or_recipient_mask = parsed.item_or_recipient_mask();
 
-    match world
+    let outcome = world
         .race_command(RaceCommandPayload::GameSlot(parsed))
-        .await
-    {
+        .await;
+    trace_game_slot_outcome(
+        world.session_id().get(),
+        packet.len(),
+        player_id,
+        packet_type,
+        item_or_recipient_mask,
+        outcome,
+    )?;
+    Ok(Vec::new())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive outcome match keeps every GameSlot terminal path auditable"
+)]
+fn trace_game_slot_outcome(
+    session_id: u64,
+    packet_length: usize,
+    player_id: u8,
+    packet_type: u8,
+    item_or_recipient_mask: u32,
+    outcome: Result<RaceCommandOutcome, WorldError>,
+) -> Result<(), LoginSessionError> {
+    match outcome {
+        Ok(RaceCommandOutcome::GameSlotConsumed {
+            room_id,
+            race_epoch,
+            ..
+        }) => {
+            tracing::trace!(
+                session_id,
+                room_id = room_id.0,
+                race_epoch,
+                packet_length,
+                player_id,
+                packet_type,
+                item_or_recipient_mask,
+                "consumed a validated no-reply TCP GameSlot notification"
+            );
+        }
         Ok(RaceCommandOutcome::GameSlotEvidencePending {
             room_id,
             race_epoch,
@@ -3361,15 +3454,37 @@ async fn handle_game_slot_request_admitted(
             ..
         }) => {
             tracing::debug!(
-                session_id = world.session_id().get(),
+                session_id,
                 room_id = room_id.0,
                 race_epoch,
-                packet_length = packet.len(),
+                packet_length,
                 player_id,
                 packet_type,
                 item_or_recipient_mask,
                 ?reason,
                 "holding a validated TCP GameSlot packet at an explicit evidence boundary"
+            );
+        }
+        Ok(RaceCommandOutcome::GameSlotObjectDuplicateSuppressed {
+            room_id,
+            race_epoch,
+            object_id,
+            state,
+            kind,
+            ..
+        }) => {
+            tracing::debug!(
+                session_id,
+                room_id = room_id.0,
+                race_epoch,
+                packet_length,
+                player_id,
+                packet_type,
+                item_or_recipient_mask,
+                object_id = format_args!("0x{object_id:08X}"),
+                state,
+                ?kind,
+                "suppressed a duplicate authoritative race object transition"
             );
         }
         Ok(RaceCommandOutcome::GameSlotRelayed {
@@ -3378,11 +3493,11 @@ async fn handle_game_slot_request_admitted(
             recipients,
         }) => {
             tracing::trace!(
-                session_id = world.session_id().get(),
+                session_id,
                 room_id = room_id.0,
                 race_epoch,
                 recipients,
-                packet_length = packet.len(),
+                packet_length,
                 player_id,
                 packet_type,
                 item_or_recipient_mask,
@@ -3397,7 +3512,7 @@ async fn handle_game_slot_request_admitted(
             recipients,
         }) => {
             tracing::debug!(
-                session_id = world.session_id().get(),
+                session_id,
                 room_id = room_id.0,
                 race_epoch,
                 recipients,
@@ -3411,7 +3526,7 @@ async fn handle_game_slot_request_admitted(
         Ok(outcome) => {
             tracing::error!(
                 ?outcome,
-                session_id = world.session_id().get(),
+                session_id,
                 player_id,
                 packet_type,
                 "the World actor returned an invalid outcome for a TCP GameSlot command"
@@ -3421,8 +3536,8 @@ async fn handle_game_slot_request_admitted(
         Err(WorldError::Race(error)) if error.is_expected_rejection() => {
             tracing::debug!(
                 %error,
-                session_id = world.session_id().get(),
-                packet_length = packet.len(),
+                session_id,
+                packet_length,
                 player_id,
                 packet_type,
                 item_or_recipient_mask,
@@ -3431,7 +3546,7 @@ async fn handle_game_slot_request_admitted(
         }
         Err(error) => return Err(error.into()),
     }
-    Ok(Vec::new())
+    Ok(())
 }
 
 async fn handle_myroom_request(
@@ -3998,7 +4113,7 @@ async fn update_rider_equipment(
     ensure_identity_fence(&before, &after)?;
     let physics = room_physics_metadata(&profile.profile, profiles.catalog.as_deref())?;
     let refreshed_room_physics = world
-        .refresh_room_kart_physics(physics.block.clone())
+        .refresh_room_kart_physics(physics.variants.clone())
         .await?;
     tracing::info!(
         nickname = %after.nickname,
@@ -4102,6 +4217,7 @@ struct RoomPhysicsMetadata {
     base_resolution: RoomKartBaseResolution,
     fallback_reasons: Vec<RoomPhysicsFallbackReason>,
     block: P5136KartPhysicsBlock,
+    variants: RoomKartPhysicsVariants,
 }
 
 impl RoomPhysicsMetadata {
@@ -4119,7 +4235,10 @@ fn room_physics_metadata(
         catalog,
         profile.rider_item.kart,
         profile.rider_item.flying_pet,
-        profile.rider.speed_type,
+        // Multiplayer rooms keep the historical S7/C# default unless the
+        // room title selects an S0-S7 variant at race start. Rider.speed_type
+        // is a persisted rider field and is not the room-title override.
+        7,
         true,
     )
 }
@@ -4134,14 +4253,12 @@ fn selected_physics_metadata(
 ) -> Result<RoomPhysicsMetadata, KartPhysicsBuildError> {
     let items = &profile.rider_item;
     let mut snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
-    // The catalog currently carries kart bodies, while the exported runtime
-    // settings select the S7 speed preset. The request byte still controls the
-    // two S4/S6 sentinel branches in the reference serializer.
-    snapshot.speed_type = if matches!(requested_speed_type, 4 | 6) {
-        requested_speed_type
-    } else {
-        7
-    };
+    if let Some(speed) =
+        p5136_core::kart_physics::P5136SpeedSpecSnapshot::csharp_modern(requested_speed_type)
+    {
+        snapshot.speed_type = requested_speed_type;
+        snapshot.speed = speed;
+    }
     let mut fallback_reasons = Vec::new();
     let base_resolution = if kart_id == 0 {
         RoomKartBaseResolution::KartZeroBaseline
@@ -4195,11 +4312,25 @@ fn selected_physics_metadata(
             value: profile.server_setting.speed_patch_use,
         });
     }
+    let block = build_p5136_kart_physics_block(&snapshot)?;
+    let variants = (0_u8..8)
+        .map(|speed_type| {
+            let mut variant = snapshot;
+            variant.speed_type = speed_type;
+            variant.speed =
+                p5136_core::kart_physics::P5136SpeedSpecSnapshot::csharp_modern(speed_type)
+                    .expect("every protocol speed byte from 0 through 7 has a modern preset");
+            build_p5136_kart_physics_block(&variant)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .expect("the fixed 0 through 7 speed range produces eight blocks");
     Ok(RoomPhysicsMetadata {
         kart_id,
         base_resolution,
         fallback_reasons,
-        block: build_p5136_kart_physics_block(&snapshot)?,
+        variants: RoomKartPhysicsVariants::new(block.clone(), variants),
+        block,
     })
 }
 
@@ -4248,6 +4379,7 @@ fn room_participant_from_profile_with_p2p_port(
         },
         observer,
         kart_physics: physics.block,
+        kart_physics_variants: Some(physics.variants),
     })
 }
 
@@ -4594,7 +4726,15 @@ async fn handle_lobby_request(
     packet: &[u8],
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let operation = world.admit_identity_operation(session_id).await?;
-    handle_lobby_request_admitted(&world.admitted(&operation), request, packet, None, None).await
+    handle_lobby_request_admitted(
+        &world.admitted(&operation),
+        request,
+        packet,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -4605,7 +4745,8 @@ async fn handle_race_request(
     packet: &[u8],
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let operation = world.admit_identity_operation(session_id).await?;
-    handle_race_request_admitted(&world.admitted(&operation), request, packet).await
+    let context = SessionContext::default();
+    handle_race_request_admitted(&world.admitted(&operation), request, packet, &context).await
 }
 
 #[cfg(test)]
@@ -5921,7 +6062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_dispatch_replies_to_startup_queries_and_rejects_unknown_packets() {
+    async fn authenticated_dispatch_handles_startup_queries_and_consumes_unknown_packets() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -5987,11 +6128,98 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+        assert!(
+            dispatch_packet(&services, &hash.to_le_bytes(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            world.authorize_identity(session_id).await.unwrap(),
+            identity
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_dispatch_handles_record_collection_lifecycle() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_726))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "RecordCollectionLifecycle")
+            .await
+            .unwrap();
+        ProfileStore::new(profile_root.path())
+            .load_or_create(&identity.nickname)
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let start = PacketWriter::named("PqStartCollectRecord");
+        assert_eq!(
+            dispatch_packet(&services, start.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![vec![0xF5, 0x07, 0xA4, 0x52, 0]]
+        );
+        context
+            .profile
+            .as_mut()
+            .unwrap()
+            .profile
+            .profile
+            .rider_item
+            .head_phone = 5;
+        assert_eq!(
+            dispatch_packet(&services, start.as_slice(), &mut context)
+                .await
+                .unwrap(),
+            vec![vec![0xF5, 0x07, 0xA4, 0x52, 1]]
+        );
+        let mut malformed_start = PacketWriter::named("PqStartCollectRecord");
+        malformed_start.write_u8(0);
         assert!(matches!(
-            dispatch_packet(&services, &hash.to_le_bytes(), &mut context).await,
-            Err(LoginSessionError::UnsupportedIdentityPacket { hash: actual })
-                if actual == hash
+            dispatch_packet(&services, malformed_start.as_slice(), &mut context).await,
+            Err(LoginSessionError::RaceProtocol(
+                RaceProtocolError::TrailingBytes {
+                    name: "PqStartCollectRecord",
+                    count: 1,
+                }
+            ))
         ));
+
+        let report = [
+            0xBC, 0x0A, 0xF4, 0x94, 0xD2, 0x94, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x00,
+            0x00, 0x00, 0x5F, 0x00, 0x00, 0x00, 0x39, 0x01, 0x00, 0x00,
+        ];
+        assert!(
+            dispatch_packet(&services, &report, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let finish = PacketWriter::named("PqReportGameCollectedRecord");
+        assert!(
+            dispatch_packet(&services, finish.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),
             identity
@@ -6101,7 +6329,7 @@ mod tests {
         let mut all_hashes = BTreeSet::new();
         let mut tcp_hashes = BTreeSet::new();
         let mut gap_hashes = BTreeSet::new();
-        let mut game_slot_type_counts = [0_usize; 17];
+        let mut game_slot_type_counts = [0_usize; 18];
         let mut type_twelve_trace_routes = BTreeMap::new();
         for (transport, hash, packet) in &packets {
             all_hashes.insert(*hash);
@@ -6256,7 +6484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packet_hashes_outside_the_covered_corpus_remain_fail_closed() {
+    async fn packet_hashes_outside_the_covered_corpus_are_logged_no_reply_noops() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -6281,11 +6509,13 @@ mod tests {
         let mut context = bind_test_profile(&profiles, &identity).await;
 
         let unknown_hash = 0xDEAD_BEEF_u32;
-        assert!(matches!(
-            dispatch_packet(&services, &unknown_hash.to_le_bytes(), &mut context).await,
-            Err(LoginSessionError::UnsupportedIdentityPacket { hash })
-                if hash == unknown_hash
-        ));
+        let unknown_packet = [unknown_hash.to_le_bytes().as_slice(), &[1, 2, 3, 4]].concat();
+        assert!(
+            dispatch_packet(&services, &unknown_packet, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             world.authorize_identity(session_id).await.unwrap(),
             identity
@@ -11394,9 +11624,13 @@ mod tests {
             build_p5136_kart_physics_block(&P5136KartPhysicsSnapshot::csharp_s7_baseline())
                 .unwrap();
         let operation = world.admit_identity_operation(rider.session).await.unwrap();
+        let variants = crate::world::RoomKartPhysicsVariants::new(
+            baseline.clone(),
+            array::from_fn(|_| baseline.clone()),
+        );
         let refreshed = world
             .admitted(&operation)
-            .refresh_room_kart_physics(baseline.clone())
+            .refresh_room_kart_physics(variants)
             .await
             .unwrap();
         assert!(

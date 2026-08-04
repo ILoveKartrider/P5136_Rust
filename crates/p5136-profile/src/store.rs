@@ -122,6 +122,19 @@ pub struct RaceRunLease {
     lock_file: File,
 }
 
+/// Short-lived exclusive capability used by offline profile editors.
+///
+/// It shares the server's race-run lock but deliberately does not allocate a
+/// run generation. This prevents an inventory edit from racing live
+/// plant/parts sidecar writes, including a server running in another process.
+#[derive(Debug)]
+pub(crate) struct OfflineProfileEditLease {
+    canonical_root: PathBuf,
+    store_id: ProfileStoreId,
+    root_capability: CapabilityDir,
+    lock_file: File,
+}
+
 impl RaceRunLease {
     #[must_use]
     pub const fn generation(&self) -> RaceRunGeneration {
@@ -140,6 +153,12 @@ impl RaceRunLease {
 }
 
 impl Drop for RaceRunLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
+impl Drop for OfflineProfileEditLease {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock_file);
     }
@@ -474,6 +493,65 @@ impl ProfileStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Acquires the server's process-wide profile-root lock without creating a
+    /// race generation. Operator inventory edits use this lease so serial
+    /// allocation sees a stable set of enhancement sidecars.
+    pub(crate) fn acquire_offline_edit_lease(
+        &self,
+    ) -> Result<OfflineProfileEditLease, ProfileStoreError> {
+        create_dir_all_durable(&self.root)?;
+        let canonical_root =
+            fs::canonicalize(&self.root).map_err(|source| ProfileStoreError::Io {
+                operation: "canonicalize profile root for offline edit",
+                path: self.root.clone(),
+                source,
+            })?;
+        let lock_path = canonical_root.join(RACE_RUN_LOCK_FILENAME);
+        let (lock_file, created) = open_or_create_lock_file(&lock_path)?;
+        if created {
+            lock_file
+                .sync_all()
+                .map_err(|source| ProfileStoreError::Io {
+                    operation: "sync offline-edit lock file",
+                    path: lock_path.clone(),
+                    source,
+                })?;
+            sync_directory(&canonical_root).map_err(|source| ProfileStoreError::Io {
+                operation: "sync offline-edit lock directory entry",
+                path: canonical_root.clone(),
+                source,
+            })?;
+        }
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(source) if is_lock_contended(&source) => {
+                return Err(ProfileStoreError::RaceRunLeaseBusy {
+                    root: canonical_root,
+                });
+            }
+            Err(source) => {
+                return Err(ProfileStoreError::Io {
+                    operation: "acquire exclusive offline-edit lease",
+                    path: lock_path,
+                    source,
+                });
+            }
+        }
+        let store_id = load_or_create_store_id(&canonical_root)?;
+        let root_capability = CapabilityDir::open_ambient_dir(&canonical_root, ambient_authority())
+            .map_err(|source| ProfileStoreError::Io {
+                operation: "open offline-edit profile-root capability",
+                path: canonical_root.clone(),
+                source,
+            })?;
+        Ok(OfflineProfileEditLease {
+            canonical_root,
+            store_id,
+            root_capability,
+            lock_file,
+        })
     }
 
     /// Loads equipment sidecars through the run-bound root capability. The
@@ -872,6 +950,70 @@ impl ProfileStore {
         F: FnMut(&Profile) -> ProfileMutation<T>,
     {
         self.transaction_with_context(nickname, |profile, _context| transaction(profile))
+    }
+
+    /// Runs an offline transaction with one no-follow snapshot of the rider's
+    /// plant and parts sidecars for each CAS evaluation.
+    pub(crate) fn transaction_with_equipment_exceptions<T, F>(
+        &self,
+        lease: &OfflineProfileEditLease,
+        nickname: &str,
+        mut transaction: F,
+    ) -> Result<ProfileTransaction<T>, EquipmentProfileError>
+    where
+        F: FnMut(&Profile, &EquipmentExceptions) -> ProfileMutation<T>,
+    {
+        create_dir_all_durable(&self.root)?;
+        let canonical_root =
+            fs::canonicalize(&self.root).map_err(|source| ProfileStoreError::Io {
+                operation: "canonicalize profile root during offline edit",
+                path: self.root.clone(),
+                source,
+            })?;
+        if canonical_root != lease.canonical_root {
+            return Err(ProfileStoreError::RaceRunLeaseStoreMismatch {
+                issued_for: lease.canonical_root.clone(),
+                used_with: canonical_root,
+            }
+            .into());
+        }
+        let actual_store_id = read_store_id(&canonical_root)?;
+        if actual_store_id != lease.store_id {
+            return Err(ProfileStoreError::ProfileStoreIdentityChanged {
+                expected: lease.store_id,
+                actual: actual_store_id,
+            }
+            .into());
+        }
+
+        let nickname = Self::normalize_storage_nickname(nickname)?;
+        let profile_lock = self.profile_lock(&nickname)?;
+        let _guard = lock(&profile_lock)?;
+        self.transaction_with_snapshot_locked(&nickname, None, |snapshot, _context| {
+            let directory_name =
+                snapshot
+                    .directory
+                    .file_name()
+                    .ok_or(ProfileStoreError::InternalInvariant {
+                        message: "offline-edit profile directory must have one terminal component",
+                    })?;
+            let profile_directory = lease
+                .root_capability
+                .open_dir_nofollow(directory_name)
+                .map_err(|source| ProfileStoreError::Io {
+                    operation: "open offline-edit profile directory without following links",
+                    path: snapshot.directory.clone(),
+                    source,
+                })?;
+            let canonical_profile_directory = lease.canonical_root.join(directory_name);
+            let equipment = EquipmentExceptions::load_from_capabilities(
+                &lease.root_capability,
+                &profile_directory,
+                &lease.canonical_root,
+                &canonical_profile_directory,
+            )?;
+            Ok(transaction(&snapshot.profile, &equipment))
+        })
     }
 
     /// Runs one optimistic conditional read-modify-write transaction and
@@ -3403,6 +3545,34 @@ mod tests {
                 expected,
                 actual,
             }) if expected == lease.store_id() && actual == replacement
+        ));
+    }
+
+    #[test]
+    fn offline_edit_lease_detects_profile_store_identity_replacement() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let lease = store.acquire_offline_edit_lease().unwrap();
+        let replacement = if lease.store_id == ProfileStoreId::new([4; 16]).unwrap() {
+            ProfileStoreId::new([5; 16]).unwrap()
+        } else {
+            ProfileStoreId::new([4; 16]).unwrap()
+        };
+        fs::write(
+            root.path().join(STORE_ID_FILENAME),
+            store_id_file_bytes(replacement),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.transaction_with_equipment_exceptions(
+                &lease,
+                "Rider",
+                |profile, _equipment| ProfileMutation::Unchanged(profile.rider.lucci),
+            ),
+            Err(EquipmentProfileError::Store(
+                ProfileStoreError::ProfileStoreIdentityChanged { expected, actual }
+            )) if expected == lease.store_id && actual == replacement
         ));
     }
 

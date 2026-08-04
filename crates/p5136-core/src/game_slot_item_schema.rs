@@ -11,7 +11,16 @@ use thiserror::Error;
 
 /// Maximum nested raw body accepted by the outer `GameSlot` codec.
 pub const MAX_ITEM_OPERATION_RAW_LENGTH: usize = 0x3c0;
-pub const P5136_TYPE12_SCHEMA_COUNT: usize = 67;
+pub const P5136_TYPE12_SCHEMA_COUNT: usize = 80;
+
+/// Independent evidence that a named operation class belongs to the bounded
+/// P5136 type-12 family. This says nothing about whether a modern gameplay-page
+/// heading is the same item; that association is graded separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemOperationClassEvidence {
+    NativeWriterSchema,
+    CSharpRelayOnly,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemOperationEvidence {
@@ -188,7 +197,7 @@ impl ItemOperationSchema {
         (self.operation_hash, self.base_hash)
     }
 
-    pub fn validate(
+    pub(crate) fn validate(
         &'static self,
         raw: &[u8],
     ) -> Result<ValidatedItemOperation, ItemOperationValidationError> {
@@ -290,11 +299,33 @@ impl ItemOperationSchema {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValidatedItemOperation {
-    pub schema: &'static ItemOperationSchema,
-    pub object_id: u32,
-    pub state: u32,
-    pub evidence: ItemOperationEvidence,
+pub(crate) struct ValidatedItemOperation {
+    schema: &'static ItemOperationSchema,
+    object_id: u32,
+    state: u32,
+    evidence: ItemOperationEvidence,
+}
+
+impl ValidatedItemOperation {
+    #[must_use]
+    pub(crate) const fn schema(self) -> &'static ItemOperationSchema {
+        self.schema
+    }
+
+    #[must_use]
+    pub(crate) const fn object_id(self) -> u32 {
+        self.object_id
+    }
+
+    #[must_use]
+    pub(crate) const fn state(self) -> u32 {
+        self.state
+    }
+
+    #[must_use]
+    pub(crate) const fn evidence(self) -> ItemOperationEvidence {
+        self.evidence
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -447,7 +478,10 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         &[c!(trace & [1], 73), c!(trace & [2, 3], 25), c!(&[4], 26)],
         25,
     ),
-    ItemOperationSchema::fixed_u8("GopBigTimebomb", 0x276B_0567, 0x3929_0686, 12, 29),
+    // Unlike the ordinary state-mapped item operations, raw byte 12 is a
+    // class-specific discriminator.  The peer consumer passes the dword at
+    // raw offset 13 to the native phase helper.
+    ItemOperationSchema::fixed_u32("GopBigTimebomb", 0x276B_0567, 0x3929_0686, 13, 29),
     ItemOperationSchema::mapped_u32(
         "GopBlock",
         0x0D59_0311,
@@ -489,6 +523,14 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         16,
     ),
     ItemOperationSchema::mapped_u32(
+        "GopCloud2",
+        0x10CA_034F,
+        0x1CED_046E,
+        12,
+        &[c!(&[1], 73), c!(&[2], 20)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
         "GopCokeRocket",
         0x2261_0510,
         0x3300_062F,
@@ -511,6 +553,9 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         &[c!(&[1], 120), c!(&[2, 3, 4], 28)],
         16,
     ),
+    // Raw 12 is the course object ID rather than a lifecycle state; the final
+    // dword after the counted UTF-16 string is the transition token. The generic
+    // state-field slot remains only as the validated raw-dword projection.
     ItemOperationSchema {
         class_name: "GopCourse",
         operation_hash: 0x1139_0397,
@@ -535,8 +580,11 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         0x273E_0563,
         0x38FC_0682,
         12,
-        &[c!(&[1], 73)],
-        65,
+        // Writer 0x00A0C630 always emits state + vec3 + one dword + matrix3x3
+        // + byte. State 1 additionally emits token and target. The previous
+        // 73/65 census omitted the dword at native member +36.
+        &[c!(&[1], 77)],
+        69,
     ),
     ItemOperationSchema::mapped_u32(
         "GopDinoClawRocket",
@@ -561,6 +609,18 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         &[c!(&[1], 30), c!(&[2], 29)],
         16,
     ),
+    ItemOperationSchema::mapped_u32("GopEmp", 0x07AE_0248, 0x1074_0367, 12, &[c!(&[0], 26)], 16),
+    ItemOperationSchema::mapped_u32(
+        "GopDevil",
+        0x0D69_031A,
+        0x186D_0439,
+        12,
+        &[c!(&[1], 31)],
+        16,
+    ),
+    // Raw 12 is an event object/kart ID rather than a lifecycle state. The
+    // generic state-field representation is retained for shape validation;
+    // the semantic decoder exposes the actual role.
     ItemOperationSchema::fixed_u32("GopEventObject", 0x2856_057F, 0x3A14_069E, 12, 20),
     ItemOperationSchema::mapped_u32(
         "GopFalling",
@@ -580,6 +640,14 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
     ),
     ItemOperationSchema::fixed_u32("GopGiantTalisman", 0x3442_0652, 0x483E_0771, 12, 28),
     ItemOperationSchema::mapped_u32(
+        "GopGhost",
+        0x0D8B_032B,
+        0x188F_044A,
+        12,
+        &[c!(&[1], 29)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
         "GopGoldRocket",
         0x228A_0514,
         0x3329_0633,
@@ -593,6 +661,17 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
             c!(&[7], 24),
             c!(&[8, 9, 10], 20),
         ],
+        16,
+    ),
+    // `GoItemGoldShield` uses one packet union for activation and successful
+    // defense impacts. The state-2 tail is also reused by `GoItemSirenShield`,
+    // which writes the u16 item-id override 106 at raw offset 32.
+    ItemOperationSchema::mapped_u32(
+        "GopGoldShield",
+        0x2271_0505,
+        0x3310_0624,
+        12,
+        &[c!(&[0], 28), c!(&[2], 34)],
         16,
     ),
     ItemOperationSchema::mapped_u32(
@@ -664,6 +743,14 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         13,
     ),
     ItemOperationSchema::mapped_u32(
+        "GopMagnet",
+        0x10DE_0382,
+        0x1D01_04A1,
+        12,
+        &[c!(&[1], 30)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
         "GopLucci",
         0x0D89_0316,
         0x0A33_02A6,
@@ -690,6 +777,22 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         0x2DD2_05DF,
         12,
         &[c!(&[1], 72), c!(&[2], 24)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
+        "GopMqDevil",
+        0x1476_03D8,
+        0x21B8_04F7,
+        12,
+        &[c!(&[1], 31)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
+        "GopNewDevil",
+        0x18D8_0444,
+        0x2739_0563,
+        12,
+        &[c!(&[1], 27)],
         16,
     ),
     ItemOperationSchema::mapped_u32(
@@ -764,6 +867,14 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         16,
     ),
     ItemOperationSchema::mapped_u32(
+        "GopScanning",
+        0x1942_0457,
+        0x27A3_0576,
+        12,
+        &[c!(&[1], 30)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
         "GopShield",
         0x1110_037F,
         0x1D33_049E,
@@ -795,6 +906,7 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         &[c!(&[0, 2], 25), c!(&[1], 24)],
         16,
     ),
+    ItemOperationSchema::fixed_u32("GopSlotLock", 0x196B_0451, 0x27CC_0570, 12, 29),
     ItemOperationSchema::mapped_u32(
         "GopSnowWaterfly",
         0x2F69_061B,
@@ -849,11 +961,35 @@ pub static P5136_TYPE12_SCHEMAS: &[ItemOperationSchema] = &[
         17,
     ),
     ItemOperationSchema::mapped_u32(
+        "GopSpecialSiren",
+        0x2E54_05E8,
+        0x4131_0707,
+        12,
+        &[c!(&[0], 26)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
         "GopSpecialSmall",
         0x2E3D_05E0,
         0x411A_06FF,
         12,
         &[c!(&[0], 30), c!(&[1], 29), c!(&[2], 17)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
+        "GopSpeedDown",
+        0x1DB2_04AF,
+        0x2D32_05CE,
+        12,
+        &[c!(&[1], 24), c!(&[2], 20)],
+        16,
+    ),
+    ItemOperationSchema::mapped_u32(
+        "GopStraightRocket",
+        0x3C6F_06D4,
+        0x518A_07F3,
+        12,
+        &[c!(&[1], 58), c!(&[2, 3], 24)],
         16,
     ),
     ItemOperationSchema::mapped_u32(
@@ -1008,33 +1144,41 @@ pub fn item_operation_schema(
 /// rather than from individual packet captures. Keep this small difference set
 /// explicit so the Rust parser can use the same family rule without weakening
 /// unknown-hash rejection.
-const CSHARP_RELAY_ONLY_OPERATION_PAIRS: &[(u32, u32)] = &[
-    (0x07AE_0248, 0x1074_0367), // GopEmp/GoItemEmp
-    (0x0D69_031A, 0x186D_0439), // GopDevil/GoItemDevil
-    (0x0D6A_030E, 0x186E_042D), // GopDrmad/GoItemDrmad
-    (0x0D82_031D, 0x1886_043C), // GopJewel/GoItemJewel
-    (0x0D8B_032B, 0x188F_044A), // GopGhost/GoItemGhost
-    (0x0DAE_0334, 0x18B2_0453), // GopFrost/GoItemFrost
-    (0x10CA_034F, 0x1CED_046E), // GopCloud2/GoItemCloud2
-    (0x10DE_0382, 0x1D01_04A1), // GopMagnet/GoItemMagnet
-    (0x116F_0399, 0x1D92_04B8), // GopSpring/GoItemSpring
-    (0x1476_03D8, 0x21B8_04F7), // GopMqDevil/GoItemMqDevil
-    (0x14E9_03F7, 0x222B_0516), // GopChopper/GoItemChopper
-    (0x18D8_0444, 0x2739_0563), // GopNewDevil/GoItemNewDevil
-    (0x1942_0457, 0x27A3_0576), // GopScanning/GoItemScanning
-    (0x196B_0451, 0x27CC_0570), // GopSlotLock/GoItemSlotLock
-    (0x1DB2_04AF, 0x2D32_05CE), // GopSpeedDown/GoItemSpeedDown
-    (0x2271_0505, 0x3310_0624), // GopGoldShield/GoItemGoldShield
-    (0x2E54_05E8, 0x4131_0707), // GopSpecialSiren/GoItemSpecialSiren
-    (0x3C6F_06D4, 0x518A_07F3), // GopStraightRocket/GoItemStraightRocket
+const CSHARP_RELAY_ONLY_OPERATIONS: &[(&str, u32, u32)] = &[
+    ("GopDrmad", 0x0D6A_030E, 0x186E_042D),
+    ("GopJewel", 0x0D82_031D, 0x1886_043C),
+    ("GopFrost", 0x0DAE_0334, 0x18B2_0453),
+    ("GopSpring", 0x116F_0399, 0x1D92_04B8),
+    ("GopChopper", 0x14E9_03F7, 0x222B_0516),
 ];
+
+/// Returns the evidence by which a class name is admitted to the bounded
+/// P5136 item-operation family.
+#[must_use]
+pub fn item_operation_class_evidence(class_name: &str) -> Option<ItemOperationClassEvidence> {
+    if P5136_TYPE12_SCHEMAS
+        .iter()
+        .any(|schema| schema.class_name == class_name)
+    {
+        Some(ItemOperationClassEvidence::NativeWriterSchema)
+    } else if CSHARP_RELAY_ONLY_OPERATIONS
+        .iter()
+        .any(|(name, _, _)| *name == class_name)
+    {
+        Some(ItemOperationClassEvidence::CSharpRelayOnly)
+    } else {
+        None
+    }
+}
 
 /// Returns whether the operation/base pair belongs to the bounded P5136 type-12
 /// compatibility family.
 #[must_use]
 pub fn is_known_item_operation_pair(operation_hash: u32, base_hash: u32) -> bool {
     item_operation_schema(operation_hash, base_hash).is_some()
-        || CSHARP_RELAY_ONLY_OPERATION_PAIRS.contains(&(operation_hash, base_hash))
+        || CSHARP_RELAY_ONLY_OPERATIONS
+            .iter()
+            .any(|(_, operation, base)| (*operation, *base) == (operation_hash, base_hash))
 }
 
 #[cfg(test)]
@@ -1154,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_has_67_unique_exact_pairs() {
+    fn manifest_has_80_unique_exact_pairs() {
         assert_eq!(P5136_TYPE12_SCHEMAS.len(), P5136_TYPE12_SCHEMA_COUNT);
         let pairs = P5136_TYPE12_SCHEMAS
             .iter()
@@ -1270,6 +1414,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn cube_for_boss_includes_the_class_dword_in_both_writer_shapes() {
+        let cube = item_operation_schema(0x273E_0563, 0x38FC_0682).unwrap();
+
+        assert!(cube.validate(&raw_for(cube, 0, 69)).is_ok());
+        assert!(cube.validate(&raw_for(cube, 1, 77)).is_ok());
+
+        for (state, stale_length, corrected_length) in [(0, 65, 69), (1, 73, 77)] {
+            assert!(matches!(
+                cube.validate(&raw_for(cube, state, stale_length)),
+                Err(ItemOperationValidationError::InvalidLength {
+                    class_name: "GopCubeForBoss",
+                    actual,
+                    expected,
+                    ..
+                }) if actual == stale_length && expected == corrected_length
+            ));
+        }
     }
 
     #[test]

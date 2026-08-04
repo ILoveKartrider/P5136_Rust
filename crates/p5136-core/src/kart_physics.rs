@@ -247,6 +247,223 @@ impl P5136SpeedSpecSnapshot {
             boost_accel_factor: -0.006,
         }
     }
+
+    /// Exact modern Korean room-speed preset selected by the C# server's
+    /// S0-S7 title tokens. The input is the protocol speed byte, not the
+    /// visible grade number (`S0` maps to byte 3, `S1` to 0, and so on).
+    #[must_use]
+    // Keeping the eight reverse-engineered C# records adjacent makes byte-
+    // level review safer than hiding individual fields behind a builder.
+    #[allow(clippy::too_many_lines)]
+    pub const fn csharp_modern(speed_type: u8) -> Option<Self> {
+        let preset = match speed_type {
+            3 => Self {
+                add_spec_steer_constraint: -0.3,
+                add_spec_drift_escape_force: -350.0,
+                add_spec_trans_accel_factor: -0.015,
+                mass: 100.0,
+                air_friction: 3.0,
+                drag_factor: 0.7,
+                forward_accel_force: 1_620.0,
+                backward_accel_force: 1_500.0,
+                grip_brake_force: 1_500.0,
+                slip_brake_force: 1_200.0,
+                max_steer_angle: 10.0,
+                steer_constraint: 20.0,
+                front_grip_factor: 5.0,
+                rear_grip_factor: 5.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 1_850.0,
+                corner_draw_factor: 0.13,
+                drift_max_gauge: 5_050.0,
+                trans_accel_factor: -0.22,
+                ..Self::csharp_zero()
+            },
+            0 => Self {
+                add_spec_steer_constraint: 1.7,
+                add_spec_drift_escape_force: 150.0,
+                add_spec_trans_accel_factor: 0.199,
+                mass: 100.0,
+                air_friction: 3.0,
+                drag_factor: 0.735,
+                forward_accel_force: 1_950.0,
+                backward_accel_force: 1_500.0,
+                grip_brake_force: 1_800.0,
+                slip_brake_force: 1_250.0,
+                max_steer_angle: 10.0,
+                steer_constraint: 22.0,
+                front_grip_factor: 5.0,
+                rear_grip_factor: 5.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 2_350.0,
+                corner_draw_factor: 0.15,
+                drift_max_gauge: 3_970.0,
+                trans_accel_factor: -0.006,
+                ..Self::csharp_zero()
+            },
+            1 => Self {
+                add_spec_steer_constraint: 2.2,
+                add_spec_drift_escape_force: 1_100.0,
+                add_spec_trans_accel_factor: 0.202,
+                mass: 100.0,
+                air_friction: 3.0,
+                drag_factor: 0.7621,
+                forward_accel_force: 2_350.0,
+                backward_accel_force: 1_950.0,
+                grip_brake_force: 2_340.0,
+                slip_brake_force: 1_580.0,
+                max_steer_angle: 10.0,
+                steer_constraint: 22.5,
+                front_grip_factor: 5.0,
+                rear_grip_factor: 5.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 3_300.0,
+                corner_draw_factor: 0.18,
+                drift_max_gauge: 4_880.0,
+                trans_accel_factor: -0.003,
+                ..Self::csharp_zero()
+            },
+            2 => Self {
+                add_spec_steer_constraint: 2.7,
+                add_spec_drift_escape_force: 1_500.0,
+                add_spec_trans_accel_factor: 0.2,
+                mass: 100.0,
+                air_friction: 3.0,
+                drag_factor: 0.79,
+                forward_accel_force: 2_900.0,
+                backward_accel_force: 2_175.0,
+                grip_brake_force: 2_610.0,
+                slip_brake_force: 1_740.0,
+                max_steer_angle: 10.0,
+                steer_constraint: 23.0,
+                front_grip_factor: 5.0,
+                rear_grip_factor: 5.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 3_700.0,
+                corner_draw_factor: 0.16,
+                drift_max_gauge: 6_000.0,
+                trans_accel_factor: -0.005,
+                ..Self::csharp_zero()
+            },
+            4 => {
+                let mut value = Self::csharp_default();
+                value.drift_max_gauge = 1.0;
+                value
+            }
+            5 => Self {
+                add_spec_steer_constraint: 2.7,
+                add_spec_drift_escape_force: 1_500.0,
+                add_spec_trans_accel_factor: 0.2,
+                mass: 100.0,
+                air_friction: 2.7,
+                drag_factor: 0.15,
+                forward_accel_force: 1_700.0,
+                backward_accel_force: 300.0,
+                grip_brake_force: 2_000.0,
+                steer_lean_factor: 0.0015,
+                slip_brake_force: 1_300.0,
+                max_steer_angle: 12.5,
+                steer_constraint: 25.5,
+                front_grip_factor: 10.0,
+                rear_grip_factor: 10.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 2_350.0,
+                corner_draw_factor: 0.1,
+                drift_max_gauge: 3_970.0,
+                trans_accel_factor: -0.5,
+                ..Self::csharp_zero()
+            },
+            6 => Self {
+                add_spec_steer_constraint: 1.7,
+                add_spec_drift_escape_force: 150.0,
+                add_spec_trans_accel_factor: 0.199,
+                mass: 100.0,
+                air_friction: 3.0,
+                drag_factor: 0.735,
+                forward_accel_force: 1_950.0,
+                backward_accel_force: 1_500.0,
+                grip_brake_force: 1_800.0,
+                slip_brake_force: 1_250.0,
+                max_steer_angle: 10.0,
+                steer_constraint: 22.0,
+                front_grip_factor: 5.0,
+                rear_grip_factor: 5.0,
+                drift_trigger_factor: 0.2,
+                drift_trigger_time: 0.2,
+                drift_slip_factor: 0.2,
+                drift_escape_force: 2_300.0,
+                corner_draw_factor: 0.15,
+                drift_max_gauge: 1.0,
+                trans_accel_factor: 0.4,
+                normal_booster_time: P5136_S6_BOOSTER_TIME,
+                team_booster_time: P5136_S6_BOOSTER_TIME,
+                ..Self::csharp_zero()
+            },
+            7 => Self::csharp_default(),
+            _ => return None,
+        };
+        Some(preset)
+    }
+
+    const fn csharp_zero() -> Self {
+        Self {
+            mass: 0.0,
+            air_friction: 0.0,
+            drag_factor: 0.0,
+            forward_accel_force: 0.0,
+            backward_accel_force: 0.0,
+            grip_brake_force: 0.0,
+            slip_brake_force: 0.0,
+            max_steer_angle: 0.0,
+            steer_constraint: 0.0,
+            add_spec_steer_constraint: 0.0,
+            front_grip_factor: 0.0,
+            rear_grip_factor: 0.0,
+            drift_trigger_factor: 0.0,
+            drift_trigger_time: 0.0,
+            drift_slip_factor: 0.0,
+            drift_escape_force: 0.0,
+            add_spec_drift_escape_force: 0.0,
+            corner_draw_factor: 0.0,
+            steer_lean_factor: 0.0,
+            drift_max_gauge: 0.0,
+            normal_booster_time: 0.0,
+            team_booster_time: 0.0,
+            trans_accel_factor: 0.0,
+            add_spec_trans_accel_factor: 0.0,
+            boost_accel_factor: 0.0,
+        }
+    }
+}
+
+/// Parses the C# server's case-insensitive, ASCII-alphanumeric-bounded S0-S7
+/// room-title token and returns its protocol speed byte.
+#[must_use]
+pub fn csharp_room_title_speed_type(room_name: &str) -> Option<u8> {
+    const SPEED_TYPES: [u8; 8] = [3, 0, 1, 2, 4, 5, 6, 7];
+    let bytes = room_name.as_bytes();
+    for index in 0..bytes.len().saturating_sub(1) {
+        if !matches!(bytes[index], b'S' | b's') || !matches!(bytes[index + 1], b'0'..=b'7') {
+            continue;
+        }
+        let left_is_alphanumeric = index != 0 && bytes[index - 1].is_ascii_alphanumeric();
+        let right = index + 2;
+        let right_is_alphanumeric = right < bytes.len() && bytes[right].is_ascii_alphanumeric();
+        if !left_is_alphanumeric && !right_is_alphanumeric {
+            return Some(SPEED_TYPES[usize::from(bytes[index + 1] - b'0')]);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1443,7 +1660,7 @@ mod tests {
         P5136Plant43SpecSnapshot, P5136Plant44SpecSnapshot, P5136Plant45SpecSnapshot,
         P5136Plant46SpecSnapshot, P5136SpeedPatchSnapshot, P5136SpeedSpecSnapshot,
         P5136TuneSpecSnapshot, P5136V2SpecSnapshot, build_p5136_kart_physics_block,
-        calculate_p5136_start_forward_accel_force,
+        calculate_p5136_start_forward_accel_force, csharp_room_title_speed_type,
     };
     use crate::{
         encoded,
@@ -1541,6 +1758,46 @@ mod tests {
 
         let block = build_p5136_kart_physics_block(&baseline).unwrap();
         assert_eq!(block.as_bytes().len(), P5136_KART_PHYSICS_BLOCK_LENGTH);
+    }
+
+    #[test]
+    fn modern_room_title_tokens_match_the_csharp_ascii_boundaries() {
+        assert_eq!(csharp_room_title_speed_type("S0 초보"), Some(3));
+        assert_eq!(csharp_room_title_speed_type("친선 s1"), Some(0));
+        assert_eq!(csharp_room_title_speed_type("[S4] 무한"), Some(4));
+        assert_eq!(csharp_room_title_speed_type("S6-연습"), Some(6));
+        assert_eq!(csharp_room_title_speed_type("S7"), Some(7));
+        assert_eq!(csharp_room_title_speed_type("TESTS1ROOM"), None);
+        assert_eq!(csharp_room_title_speed_type("S10"), None);
+        assert_eq!(csharp_room_title_speed_type("S8"), None);
+    }
+
+    #[test]
+    fn modern_s0_through_s7_presets_keep_the_reference_distinguishers() {
+        let s0 = P5136SpeedSpecSnapshot::csharp_modern(3).unwrap();
+        let s1 = P5136SpeedSpecSnapshot::csharp_modern(0).unwrap();
+        let s3 = P5136SpeedSpecSnapshot::csharp_modern(2).unwrap();
+        let s4 = P5136SpeedSpecSnapshot::csharp_modern(4).unwrap();
+        let s5 = P5136SpeedSpecSnapshot::csharp_modern(5).unwrap();
+        let s6 = P5136SpeedSpecSnapshot::csharp_modern(6).unwrap();
+        assert_eq!(s0.forward_accel_force.to_bits(), 1_620.0_f32.to_bits());
+        assert_eq!(s1.drag_factor.to_bits(), 0.735_f32.to_bits());
+        assert_eq!(s3.drift_max_gauge.to_bits(), 6_000.0_f32.to_bits());
+        assert_eq!(
+            s4.drift_max_gauge.to_bits(),
+            P5136_S4_DRIFT_MAX_GAUGE.to_bits()
+        );
+        assert_eq!(s5.steer_lean_factor.to_bits(), 0.0015_f32.to_bits());
+        assert_eq!(s6.drift_escape_force.to_bits(), 2_300.0_f32.to_bits());
+        assert_eq!(
+            s6.normal_booster_time.to_bits(),
+            P5136_S6_BOOSTER_TIME.to_bits()
+        );
+        assert_eq!(
+            P5136SpeedSpecSnapshot::csharp_modern(7),
+            Some(P5136SpeedSpecSnapshot::csharp_default())
+        );
+        assert_eq!(P5136SpeedSpecSnapshot::csharp_modern(8), None);
     }
 
     #[test]

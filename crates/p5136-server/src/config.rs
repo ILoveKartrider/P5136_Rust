@@ -1,12 +1,16 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
 use p5136_core::{frame::DEFAULT_MAX_PAYLOAD, ports::PortTopology};
 
-use crate::{ItemProbabilityConfiguration, ItemProbabilityRankPolicy};
+use crate::{
+    ItemProbabilityConfiguration, ItemProbabilityRankPolicy, RandomTrackConfiguration,
+    ResolvedRandomTracks,
+};
 
 pub const DEFAULT_MAX_LOGIN_SESSIONS: usize = 256;
 
@@ -27,6 +31,12 @@ pub struct ServerConfig {
     /// Controls whether `Live` probability bands trust the rank carried by
     /// the validated client pickup request.
     pub item_probability_rank_policy: ItemProbabilityRankPolicy,
+    /// Optional pool overrides for the stock `track_common.rho` random-track
+    /// catalog. An empty configuration uses the client defaults.
+    pub random_tracks: RandomTrackConfiguration,
+    /// Pre-resolved client catalog installed transactionally by
+    /// [`crate::BoundServer::bind`]. Normal callers should leave this `None`.
+    pub resolved_random_tracks: Option<Arc<ResolvedRandomTracks>>,
     pub first_message_delay: Duration,
     pub login_timeout: Duration,
     pub session_idle_timeout: Duration,
@@ -52,6 +62,8 @@ impl Default for ServerConfig {
             client_data_dir: None,
             item_probabilities: None,
             item_probability_rank_policy: ItemProbabilityRankPolicy::default(),
+            random_tracks: RandomTrackConfiguration::default(),
+            resolved_random_tracks: None,
             first_message_delay: Duration::from_millis(250),
             login_timeout: Duration::from_secs(12),
             session_idle_timeout: Duration::from_secs(5 * 60),

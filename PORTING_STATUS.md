@@ -1,9 +1,51 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-07-31
+Last updated: 2026-08-04
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
+
+## 2026-08-04 deployment UI, random tracks, and room-title physics
+
+- Rewrote README as the Korean deployment guide. It now leads with GUI startup,
+  client-path discovery, LAN ports, logs, IP/domain constraints, item-table
+  provenance, random tracks, and S0-S7 title physics instead of the historical
+  implementation narrative.
+- Localized the native GUI and added a LAN IPv4 discovery/apply control.
+  Loopback, link-local, unspecified, and multicast addresses are excluded;
+  physical adapters are preferred before RFC1918 subnet ranking. Common WSL,
+  Hyper-V, VMware, VirtualBox, VPN, and Tailscale names are demoted. The chosen
+  literal is applied to both bind and advertised address; unusable advertised
+  values are rejected. Hostnames remain rejected because the client endpoint
+  codec carries exactly four IPv4 bytes. Korean system-font discovery now
+  covers Windows, macOS, and common Linux Noto/Nanum installations.
+- Automatic item probabilities are now verified on the GUI start boundary.
+  The selected client Data directory is actually parsed, the individual/team
+  row counts and source path are shown, and a parse failure prevents startup.
+  The exact verified snapshot is passed to that server start attempt, avoiding
+  a second mutable-file read between the GUI report and runtime application.
+- Extended the bounded no-unsafe legacy RHO reader to `Rh layer spec 1.0`.
+  Version 1.0 uses the data cipher for its header and the archived 32-byte XOR
+  key for block metadata; 1.1 retains the existing header-info path. An opt-in
+  smoke test successfully reads the real KR `Data/track_common.rho`.
+- Ported the C# random-track catalog semantics for speed/item selectors
+  0,1,3..8,23,30,33,40, including reverse/crazy/new/league/speed-only pools,
+  validated GUI overrides, basic-AI preference with empty fallback, and
+  actor-owned per-room used/last history. Selection uses process entropy like
+  C# `Random.Shared`; the requested selector stays in room state while one
+  concrete hash is frozen for the start transaction. Nonempty overrides now
+  require a client Data catalog instead of being silently ignored.
+- The random-track GUI now mirrors the C# checked-list workflow: every selected
+  pool displays its effective client defaults immediately, individual checks
+  create a manual override lazily, and select-all, clear-all, and restore-client-
+  defaults actions are available. An empty manual selection remains visible for
+  correction but is rejected before server startup.
+- Ported the exact C# ASCII-boundary S0-S7 parser, protocol-byte mapping
+  `[3,0,1,2,4,5,6,7]`, and all modern speed-base fields. Each participant now
+  carries eight prebuilt equipment-specific 235-byte physics blocks; World
+  selects the title variant at race start and refreshes all eight variants
+  after durable equipment changes. `TESTS1ROOM`, `S10`, and out-of-scope S8 do
+  not trigger an override.
 
 ## Scope and source policy
 
@@ -27,9 +69,12 @@ short feature ledger is in [PORTING.md](PORTING.md).
 Branch: `main`
 
 State: retained-corpus implementation complete, independently reviewed, and
-release-validated. The next live action after this checkpoint is a fresh
-stock-client startup run, followed by the two-machine LAN multiplayer E2E.
-Protocol coverage is not presented as proof of those live client gates.
+release-validated. Server startup against the real stock catalog/Data tree is
+now smoke-validated. The next live action is a stock-client login followed by
+the two-machine LAN multiplayer E2E, including a speed-team start that emits
+`PqStartCollectRecord` and two or more defended impacts during one timed Angel
+activation. Protocol coverage is not presented as proof of those live client
+gates.
 
 Current implementation checkpoint:
 uncommitted retained-corpus completion work on `main` +
@@ -44,14 +89,503 @@ uncommitted retained-corpus completion work on `main` +
 
 ## Current Rust checkpoint
 
+### Native client consumer census (2026-08-03)
+
+A reproducible IDAPython scan now inventories the client from its typed packet
+consumers rather than deriving expected packets from the Rust or C# server.
+The scan follows the generated `Packet -> T` cast adapters to their callers;
+without that second hop, normal login, room, and ceremony consumers disappear
+from a direct-RTTI-xref report.  The external analysis artifact contains 2,886
+RTTI-backed serialized classes, 534 consumer-reachable classes, 749 adapter
+callers, 212 direct cast sites, and 88 reachable nested `Gop*` classes.
+
+The LAN multiplayer completion scope is now explicit in
+`CLIENT_CONSUMER_AUDIT.md`: 63 outer consumers across bootstrap/rider state,
+channel/room state, Game/P2P topology, speed/item race lifecycle, and
+race-affecting loadout mutation, plus all 80 strictly decoded type-12 item
+operation schemas.  Event, social, commerce, test-server, and unrelated
+minigame consumers remain in the raw census but are not completion gates;
+specialized gameplay modes are parked and can be promoted later.
+
+Lucci world objects, bonus-item world objects, and team flags are now an
+explicit product-scope exclusion. Their `GameSlot` types 4/5/6/7/8 retain
+strict bounded parsing and diagnostics, but actor-owned spawn/collection/flag
+state, relay release, and stock-client E2E are not port-completion gates.
+
+Strictly decoded type-12 item operations now pass through a bounded
+race-epoch object registry before relay. The registry binds object ID to the
+operation/base class and original installer generation, but no longer treats
+state 1/2/3 as a protocol-wide install/hit/remove enum. A class-specific
+semantic decoder drives installation, impact, resolution, retargeting,
+respawn, and terminal admission. Duplicate impacts compare the exact state,
+transition token and target, so a valid later phase on the same object is not
+suppressed. The retained barricade trace is respected: player 1 may report a
+state-2 impact while nested owner 0 remains the installer; state 3 is a
+post-impact transition and state 4 is terminal. Every outbound permit is
+reserved before the registry commit, so backpressure cannot publish or commit
+a partial authoritative transition.
+
+### Type-12 item source/target/state semantics (2026-08-03)
+
+The pinned IDB was re-probed through each `GoItem*` vtable offset `+0x24` and
+joined to both the native producer and `Gop*` writer. The resulting ledger is
+`analysis/P5136_ITEM_OPERATION_SEMANTICS.md`; the reproducible probe and full
+output are `analysis/ida_5136_type12_semantics_probe.py` and
+`analysis/ida_5136_type12_semantics_probe_v5.log`.
+
+Rust now has class-specific field decoders for 79 of the 80 direct-writer
+classes. The original fifteen are Barricade, Banana, Mine, Rocket, CokeRocket,
+GoldRocket, DinoClawRocket, TigerRocket, Snowman, SuperMag, Waterbomb,
+Waterfly, InfectedWaterfly, SnowWaterfly, and WaterbombFly. The next passes add
+Cokebomb, Snowbomb, InfectedBomb, RollingCokebomb, RollingInfectedbomb,
+Rollingbomb, WaterMine, TimeMine, ItemTimeFlybomb, TimeCokebomb,
+TimeInfectedBomb, TimeSnowbomb, Timebomb, BigTimebomb, AreaUfo, MovingUfo, Ufo,
+Shield, SpecialShield, LockdownRocket, Thunderbolt, ForceZone, Oil, Silence,
+Siren, SirenShield, SpecialSmall, Cloud, Cloud2, Magnet, SpeedDown, Devil,
+MqDevil, and NewDevil. The fourth pass adds Angel, Emp, Ghost, Icefly,
+Scanning, SlotLock, SpecialSiren, SpaceCraft, and StraightRocket. The fifth
+pass adds Balloon, HeadBand, Dynamite, Hammer, Press, RobotBeam, TombStone,
+Block, BoundWall, Cube, CubeForBoss, EventObject, GiantTalisman,
+WitchUnionMagic, and TargetKart. The sixth pass adds BossPrison, BoundRoad,
+Course, Falling, and Piratebomb. Seventy-four classes yield at least one named
+lifecycle meaning plus native phase, source object, target object,
+transition token, variant, and evidence grade. BigTimebomb exposes its exact
+`variant:u8@12 | native phase:u32@13 | token@17 | target@21 | source@25`
+consumer binding, conditional on both actor lookups succeeding, but deliberately
+retains `Unknown` lifecycle meaning.
+Angel state 0 is a proven team-effect activation. A targeted IDB follow-up
+closed state 2 as a repeatable, non-terminal defense-impact branch: its 28-byte
+body is `token@16, source@20, target@24`, and the consumer binds both actors and
+advances native phase 2. The source-only producer does not explicitly overwrite
+the target member, and the consumer normalizes object member +40 but passes the
+stale state-0 member +28 as the phase argument. Those native quirks are now
+documented without discarding the proven wire roles. A second lifetime audit
+shows that the shared resolver's `sub_4E83E0` is a container-insertion wrapper:
+it records the protected kart in the attack object's processed-target set and
+does not remove Angel from the kart's timed active-effect collection. The same
+evidence corrects ordinary Shield state 2 from removal to defense impact.
+StraightRocket state 1 is a proven phase-1 launch; writer-supported states 2
+and 3 have no matching producer/consumer meaning. Those two branches remain
+strictly length checked and explicitly `Unknown`, so they relay without
+mutating the authoritative registry. RobotBeam/TombStone state 2
+and Block state 2 likewise read a source member which their writer does not
+serialize; Rust records only the token/target/native phase present on the
+wire. EventObject and Course raw 12 are object IDs rather than lifecycle
+states. CubeForBoss's exact writer lengths are 77/69, not 73/65: the earlier
+census omitted its four-byte class dword.
+The sixth pass used the corrected primary-vtable RTTI scan in
+`analysis/ida_5136_five_unknown_occurrence_probe.py`. BossPrison is emitted by
+GoBossKart target selection; BoundRoad by BombRobot/MechanicBall timer and lane
+patterns; Falling by PetitMeteor/SpaceBombing lane patterns; and Piratebomb by
+controller branch 12 after per-entry target filtering. Course carries a
+subject ID, counted UTF-16 `goal`/`Ev_*` event name, and trailing token; its
+concrete peer consumer intentionally releases it without a gameplay action.
+This establishes client occurrence and FSM meaning, not authority for Rust to
+simulate boss AI, controller timers, or course collision physics.
+
+### Ordinary `_R/_I` course-gimmick census (2026-08-04)
+
+The stock client's complete ordinary-track archive set was scanned directly:
+218 `_Rnn/_Inn` archives (94 speed, 124 item), 534 `.1s` scenes, and no archive
+read failures. The resulting external ledger is
+`analysis/P5136_RI_TRACK_GIMMICK_AUDIT.md`.
+
+Base scenes explicitly place `banana`, `itemCube`, `mine`, `waterMine`,
+`event`, `obstacle`, and `dummy` object types. The first four instantiate the
+same GoItem classes already covered by exact `GopBanana`, `GopCube`,
+`GopMine`, and `GopWaterMine` validation/semantics. `event` instantiates
+`GoItemEventObject` and confirms real ordinary-track occurrence, but its
+fixed notification body still is not a lifecycle FSM. `obstacle` and `dummy`
+are local scene objects. The course dispatcher independently treats
+warp/snow/rain/rail/lens-flare/flash/shake/wave/pet controls as local client
+state; only `event*` sends `GopCourse`, whose peer consumer is a no-op.
+
+Therefore this census does not add a server-side track-physics simulator or
+new permissive packet class. It confirms that the current exact shared-object
+schemas cover the ordinary static network effects and that BossPrison,
+BoundRoad, Falling, and Piratebomb remain special-controller scope.
+
+The semantics decoder is now crate-private and accepts a private-field
+`ValidatedItemOperation` capability created only by exact schema validation.
+This makes the length/state precondition a Rust type boundary rather than a
+public-API documentation convention.
+Important corrections include
+SuperMag raw offsets 16/20/24 as token/source/target, compact Waterbomb offsets
+16/20/25 as token/target/source, Mine state 3 as an explicit client no-op and
+state 6 as respawn, Rocket states 4/5 as retarget/removal rather than a
+generic numeric transition, TimeMine's conditional target flag, and timed
+bomb state-3/4 same-ID source/target binding. The only fully unresolved exact
+schema is the deliberately scope-excluded `GopLucci`; it may relay through the
+existing bounded path but does not create an authoritative object record
+merely because its state number is 0 or 1. The registry preserves Barricade
+initialize -> place and Mine removal ->
+respawn, keeps unresolved/no-op packets from overwriting authoritative hit
+fingerprints, suppresses unsupported post-terminal updates, and refuses to
+mint unseen tombstones from consumer-only terminal evidence. WaterbombFly
+state 6 records its phase-5-or-reset branch as conditional. A 15-class table
+now uses IDB-ledger literal pairs, class names, state offsets, and field
+offsets to exercise exact outer GameSlot parsing, distinct semantic fields,
+and registry admission together. A separate real Mine wire sequence covers
+state 1 -> 5 -> 6 -> 2 through parse, commit, reactivation, and later impact.
+An additional 29-state literal table hard-codes pair, raw length, state offset,
+and actor/variant offsets without consulting the production schema, then runs
+each frame through outer GameSlot parsing and registry admission. A World test
+also proves that `StartRoom` replaces `RaceProgress` and releases prior-race
+registry capacity rather than accumulating the 1,024-object bound across the
+server lifetime. The RTTI/caller recovery is reproducible via
+`analysis/ida_5136_type12_runtime_consumer_probe.py` and its `.log` output.
+The shield/UFO/Lockdown/Thunderbolt pass adds a separate 23-state literal
+wire-to-registry table. Thunderbolt's counted target vector uses a validated
+raw-range descriptor and is decoded on demand; it is never reduced to a
+single arbitrary target.
+The ordinary-effect pass adds a separate 27-state literal wire-to-registry
+table. Oil's zero success byte selects teardown, while ForceZone's zero branch
+remains nonterminal because a client-runtime flag selects phase 4 or teardown;
+Silence state 2 remains an explicit client
+no-op; and SpecialSmall state 2 is modeled as a class-local runtime-flag update
+rather than a lifecycle transition. Cloud and Cloud2 keep raw 16 as an
+installation token in state 1 but reinterpret the compact state-2 raw 16 as
+the affected target; Magnet binds distinct raw-20 source/raw-24 target actors;
+SpeedDown state 2 is the phase-2 terminal teardown. Devil/MqDevil bind a
+secondary target only when discriminator 5 selects it; NewDevil retains the
+same source/token activation without serializing that target.
+`GopGoldShield` is now promoted from the C# compatibility-only set to the
+80-class exact manifest. Its state-0 28-byte body activates a timed defense;
+its state-2 34-byte body records a non-terminal successful block. Kind 0 maps
+to Gold Shield item 36, kind 3 maps to Protect Shield item 81, and trailing
+`u16=106` on state 2 is the Siren Shield override. The independent oracle and
+FSM retain the activation while accepting repeated impact objects; unknown
+kinds relay without authoritative registry mutation.
+The normal-dependency-free `p5136-client-oracle::item_operation` module repeats
+the recovered expansion's pair table, state locations, lengths, conditional
+branches, counted targets, and actor offsets without importing core. Its
+differential tests run all 166 recovered external branches and distinct actor
+values. The independent oracle rejects every truncated prefix and extra suffix;
+the production outer GameSlot parser likewise refuses to promote those shapes
+to strict `ItemOperation` (while retaining its bounded opaque fallback policy).
+Lucci, BonusItem and TeamFlag remain scope-excluded.
+
+`p5136-client-oracle::item_client_fsm` now executes the original 149 consumer
+fixtures as state transitions rather than decode-only assertions. The pinned
+outcome census is 71 `LocalOnly`, 69 `DeferredOutbound`, zero
+`ImmediateOutbound`, and 9 `UnknownSideEffect`. Angel state 0 is deferred
+because its defense-hit continuation is proven; state 2 records a local
+defense impact while retaining the timed Angel effect. The 14 later
+BossPrison/BoundRoad/Falling/Piratebomb branches and the variable-length Course
+consumer plus the two GoldShield branches share the same executor, so all 166
+recovered branches are accepted.
+Deferred results enqueue only a class/object/state scheduler marker: no next
+state, timer expiration, collision, or packet byte is invented, and a newer
+known lifecycle transition for the same object cancels the stale marker.
+Known lifecycle state is stored by class/object key, `Remove` clears it, and
+unknown or explicit no-op consumers leave it and any pending marker unchanged.
+Strict decode failure is transactional across object state, deferred markers,
+and counters.
+
+The original 149 fixtures now also cross an executable production-server
+boundary. `audit_game_slot_item_operation` uses the real outer `GameSlot`
+decoder, validates the synthetic frozen-roster reporter/mask, invokes the same
+item-to-registry operation mapping as `World::relay_game_slot`, commits any
+planned mutation in an isolated race registry, and returns the owned relay
+bytes. The pinned census is 87 `PublishTracked`, 62 `PublishUntracked`, and
+zero `SuppressDuplicate`; all 149 relay byte-for-byte unchanged. This composes
+with the existing actor/outbound-queue integration tests, but it deliberately
+does not claim live execution of every rare stock-client visual, timer, boss,
+or course-controller side effect.
+
+The fourth-pass literal tests additionally cross Angel, Emp, Ghost, Icefly,
+Scanning, SlotLock, SpecialSiren, SpaceCraft, and StraightRocket through exact
+writer-shape validation, the independent client oracle, production parsing,
+and race-object registry admission. Known activations/impacts are tracked;
+Angel state 2 now produces a tracked non-terminal hit observation, while
+StraightRocket states 2/3 publish untracked and leave the existing object
+fingerprint unchanged.
+
+### Complete gameplay-page item catalog (2026-08-03)
+
+The user-supplied Korean item page is now represented by
+`p5136_core::item_gameplay_catalog`. Its 54 heading entries are a complete,
+uniqueness-tested catalog across acceleration (6), attack (22), defense (7),
+placement (11), status (5), and utility (3). Each entry records a stable slug,
+Korean name, target scope, effect hints, a concise Korean summary, established
+P5136 symbol/ID pairs, and evidence-graded `Gop*` links. Forty numeric
+name/ID pairs are currently anchored as 18 retained fallback-table pairs, 20
+Korean-executable initializer pairs, and two verified profile supplements
+(`siren=24`, `superMagnet=103`). Exact literal tests pin all 54 per-heading
+category/target/effect tuples and the ordered 56-pair evidence manifest.
+
+Target semantics now distinguish the immediately preceding opponent, every
+opponent ahead, nearby other karts, nearby karts including a possible source,
+a fixed track area, and non-allied karts. This prevents the waterfly family
+from collapsing into Thunderbolt semantics, captures bomb-waterfly self-hit
+risk, and keeps Doctor R's allied-team exclusion explicit. Documented mode
+availability is stored separately from target scope, and `None` explicitly
+means unrecorded rather than unrestricted. Native operation-class evidence
+and modern heading-association evidence are also separate axes; an unresolved
+rolling waterbomb variant can no longer be promoted merely because both
+candidate classes have recovered native writers.
+
+The attached page was last edited in 2026, so it is never used to synthesize
+P5136 offsets, states, durations, probabilities, or defense rules. Ambiguous
+joins remain visible: Jiangshi versus first-place Devil classes, Icefly versus
+SnowWaterfly generation naming, guide/random missile projectile classes,
+cloud variants and Net. GoldShield is no longer in this unresolved set: its
+anonymous vtable was recovered as the exact Gold/Protect/Siren defense envelope. The full
+ledger and source hash are in
+[ITEM_GAMEPLAY_COVERAGE.md](ITEM_GAMEPLAY_COVERAGE.md).
+
+The current independent oracle represents 12 of those 63 outer consumers and
+does so at deliberately mixed evidence grades.  Fifty-one core outer
+consumers, `GameSlotPacket` outer-type coverage, and the emitted nested item
+schemas therefore remain open semantic-oracle work even where production
+serializers and server-side integration tests already exist.  The new census
+is an inventory and prioritization proof, not a claim of wire-semantic
+completion.
+
+### Start-collect-record codec and speed-team compatibility (2026-08-04)
+
+The speed-team disconnect in runtime log
+`p5136-1785851850557-11152.log` is now tied to the four-byte logical hash
+`0x529107F4`, which is `PqStartCollectRecord`. Rust previously classified that
+identity-bound hash as unsupported and actively ended the TCP session. The
+retained C# dispatcher has only the packet-name enum entry and falls through
+without a reply, which explains why the older deployed C# build did not fail
+at the same point.
+
+The installed P5136 executable establishes both native classes exactly. The
+request uses the 16-byte base-only vtable at `0x01064E78`, so its wire shape is
+only the hash. `PrStartCollectRecord` is a 20-byte object with vtable
+`0x01064E9C`; native readers `0x00593260`/`0x00593590` write one raw byte to
+object offset `0x10`, and writers `0x005938C0`/`0x00593BF0` emit that member
+through the raw one-byte primitive at `0x00520660`. Its complete wire shape is
+therefore `F5 07 A4 52 <flag>`, with no encoding or suffix.
+
+Common `GameStage` consumer `0x00AD59F0` casts through `0x00AE8310`, verifies
+only that the typed packet exists, and calls `0x00AE69A0`. That routine passes
+`flag == 0` to `0x00AE6A00` and then stores the unnormalized flag in its owned
+race state. The client accepts every nonzero byte as true, while the Rust
+writer deliberately emits only canonical 0/1. A normal-dependency-free oracle
+decoder pins the hash, exact five-byte completion boundary, truthiness, inverse
+collector-gate argument, wrong-hash rejection, every truncation boundary, and
+suffix rejection. The high-level FSM accepts the side effect in Loading,
+Racing, or Settling without changing scenes and resets it at race/room boundaries.
+
+The reply policy is now tied to the same equipment condition used by the stock
+client. During race-state construction, `0x00B4A07C` calls
+`sub_8E0970(12)` and treats any nonzero category-12 item ID as the condition
+for retaining/creating `KartRecorder` at race-state offset `0x8C`.
+`KartCatalog.xml` category 12 contains the replay recording cameras (IDs 1 and
+5, plus client-defined variants). In the retained 65-byte equipment block this
+is the ninth `u16`, persisted under the legacy C# JSON name `Set_HeadPhone`;
+the Rust profile model keeps that serialized name but exposes a semantic
+`replay_recording_camera_id()` accessor.
+
+Production dispatch strictly parses the request, re-authorizes the exact
+session generation, reads only its bound profile, and returns canonical
+`PrStartCollectRecord(false)` when category 12 is empty or
+`PrStartCollectRecord(true)` when it is nonzero. This does not synthesize or
+trust a client flag. The client's independent special/forced-recorder guard
+still prevents a false reply from deleting protected recorder modes. Focused
+authenticated dispatch tests pin both five-byte replies and prove that a
+request with a spurious suffix fails as a typed race-protocol error.
+
+### Recorded-race finish disconnect and unknown-packet policy (2026-08-04)
+
+Runtime log `p5136-1785855133322-26316.log` did not reach server settlement or
+podium serialization for the local rider. At the speed-team finish the client
+sent the exact 24-byte logical packet
+`BC0AF494D294010000000000670000005F00000039010000`, hash `0x94F40ABC`.
+Rust returned `UnsupportedIdentityPacket` and terminated that TCP session;
+the later 367-byte room snapshot to the peer was cleanup after this server-side
+disconnect, not the initiating crash.
+
+The hash is `PcReportUserCollectedRecord`. The pinned IDB establishes a
+36-byte object, five consecutive wire dwords after the base hash, and native
+readers/writers at `0x00728430`/`0x0072B780` and
+`0x0072E4A0`/`0x00730F30`. Producer `0x00A84930` identifies the first value
+as elapsed collection time; the captured fields decode to
+`103634, 0, 103, 95, 313`. The other four metrics remain diagnostic rather
+than being given invented gameplay semantics. Neighbor
+`PqReportGameCollectedRecord` is proven base-only/hash-only. Both retained C#
+requests fall through without a response, and Rust now exactly parses,
+re-authorizes, logs, and consumes them without mutating authoritative results
+or emitting a fabricated reply.
+
+The broader authenticated fallback now follows the requested compatibility
+policy. Classified packets still use strict complete-consumption codecs and a
+malformed known packet remains an error. A genuinely unknown hash is checked
+against the admitted identity generation and bound profile, then produces a
+`p5136_packet` warning and no response while the session stays alive. Its raw
+payload is already preserved by the immediately preceding bounded logical
+receive record. This replaces the former arbitrary-unknown fail-closed policy
+without weakening typed handlers.
+
+### Protocol-visible client FSM reconstruction (2026-08-03)
+
+`CLIENT_PROTOCOL_FSM.md` separates the native packet-consumer graph from
+the compatibility-safe semantic order. RTTI and decompilation establish the
+delegation chain `ChannelStage -> SessionStage -> SessionReadyStage`, with
+`GameReadyStage` and `GameFinalStage` applying their own branches.
+
+The ordinary speed/item solo/team stages all delegate to the common
+`GameStage` consumer and then add mode-specific `GameSlot`, leave, race-time,
+and control effects. `sub_A847F0` switches exactly on server `GameControl`
+states 1, 3, and 4 and invokes virtual slots 97, 98, and 99. The state-4
+speed/item callbacks move the internal mode phase from 2 to 3 before invoking
+the final UI/effect helpers. This upgrades the 1/3/4 dispatch from a generic
+partial-consumer claim to a native state-effect anchor without inventing
+names for every internal field.
+
+The independent `protocol_fsm` module models transport and scene separately:
+server-first login, rider bootstrap, normal channel reconnect, same-socket
+club UI hand-off, room admission/snapshots, Loading, Racing, Settling, and the
+three ceremony phases. `GrCommandStartPacket` is correctly treated as
+self-contained because `sub_CF3F30` reapplies its nested session and slot
+packets; prior standalone room snapshots are not an artificial start guard.
+UDP time-sync is recorded as readiness evidence but not required for server
+state 1 because the bounded timeout path is intentional.
+
+The compatibility FSM enforces the deployed ceremony sequence
+`GameControl(4) -> GameNextStage -> GameResult`, rejects standalone lobby
+snapshots after Loading, permits leave-room across all room/race phases, and
+preserves only an established migration epoch across reconnect. Ten focused
+transition tests cover success, timeout, rejection, rollback, and cross-scene
+failure paths.
+
+The podium scheduler follow-up is now statically closed for the standard
+individual and team stages. `GameFinalIndiStage::update` calls `sub_B42500`;
+`GameFinalTeamStage::update` calls `sub_B507D0`. Their final phases copy the
+RTTI-checked saved `GameFinalIndiParam`/`GameFinalParam` into virtual slot 103
+(`sub_B49BB0`), which calls `sub_BED050 -> sub_BED1D0` and replaces the stage
+with `GameReadyStage` or a game-mode-specific ready stage. Global flag `0x40`
+selects `ObserverReadyStage` and the longer individual observer presentation.
+
+The ordinary individual fixed delays are strict `>1000`, `>100`, and `>5000`
+milliseconds around an offset-2132 animation-completion gate. The ordinary
+team path uses strict `>1000`, `>100`, and `>7000` millisecond gates. Team mode
+flag `0x80` stops after the last delay until local action 13 advances its phase
+4 to phase 5. Exact final-stage RHO extraction found UI resources but no
+duration or Room callback, confirming that these conditions live in the
+executable. Four independent `final_stage_scheduler` tests now pin timer
+boundaries, animation gates, observer stage selection, and the manual team
+confirmation path. The high-level transition is named
+`ClientPodiumSchedulerCompleted`; no server packet is fabricated for the
+local room installation.
+
+### Independent client-semantics oracle (2026-08-03)
+
+The workspace now contains `p5136-client-oracle`, a separate non-published
+crate that reconstructs selected client-side packet readers without importing
+the production `PacketReader`, Adler hash function, wire constants, encoded
+scalar table, or serializer models. `p5136-core` is a dev-dependency only for
+integration-test input; `cargo tree -p p5136-client-oracle --edges normal`
+shows no normal dependency at all. This prevents a server writer and its test
+reader from sharing the same offset or hash bug.
+
+The primary native-evidence tests do not obtain their input from the server
+serializer. Checked-in synthetic raw fixtures transcribed from the recovered
+IDB layouts cover one team human plus one DNF AI `GameResult` and the complete
+`GameNextStage` body. Serializer-produced packets are retained only as
+differential coverage against those independent readers.
+
+The oracle records evidence grade per packet instead of treating every exact
+byte test as native semantic proof:
+
+- `GameResultPacket` is `IdbLayoutExactPartialSemantics`, based on
+  `sub_726CC0`, human reader `sub_71BF00`, and AI reader `sub_71BAD0`. The
+  independent reader consumes the full 212-byte human and 22-byte AI records,
+  recovers and tests every exposed identity/result/team/points/character/club
+  field, checks exact completion, rejects every truncated prefix and extra
+  suffix, and explicitly rejects the old malformed 217-byte C# result record.
+  Unnamed record spans and the 34-byte outer result state remain opaque and are
+  length-checked without assigning invented semantics.
+- `GameNextStagePacket` is `IdbCodecAndConsumerExact`: the oracle independently
+  checks its 13-byte codec and stage fields. The ceremony state machine then
+  enforces the deployed acceptance order
+  `GameControl(state=4) -> GameNextStage -> GameResult`; `GameControl` state
+  dispatch for states 1/3/4 now has a native common-handler anchor, while the
+  full meaning of every callback and internal field remains only partially
+  reconstructed.
+- `PrStartCollectRecord` is `IdbCodecAndConsumerExact`: a hard-coded-hash
+  oracle consumes its single raw flag byte, models the common-`GameStage`
+  inverse gate argument and stored truthiness, and rejects every truncated
+  prefix and extra suffix independently of the production serializer.
+- Room list/create/join, `GrSessionData`/`GrSlotData`, authentication/login/
+  migration, and the initial room snapshot have independent structural readers
+  with distinctive nonzero/UTF-16/endpoint fixtures and exhaustive truncation
+  on the highest-risk variable packets. Their evidence remains
+  `CSharpGoldenPlusLiveTrace` because a retained native consumer decoder has
+  not yet been recovered.
+- The five read-only club replies additionally model both sides of the
+  evidenced stock consumer branches: absent/present membership, failed/empty/
+  present pending join, every known create-condition status, zero/nonzero list
+  count, and both `current < capacity` and full/unavailable admission.
+
+The oracle integration suite passes. Its policy tests prevent silent
+promotion of evidence grades and prevent `p5136-core` from becoming a normal
+oracle dependency. The complete workspace
+passes `cargo test --workspace --all-features`; full all-target/all-feature
+Clippy passes with `-D warnings`; formatting and the no-normal-dependency check
+also pass. This is the first high-risk semantic slice, not a claim that every
+server-to-client serializer now has a reconstructed client consumer. The
+remaining global oracle and stock-client LAN E2E gates stay open in
+`PORTING.md`.
+
+### Ceremony packet-order correction from deployed C# evidence (2026-08-03)
+
+The two-machine Rust log
+`target\p5136-finish-kart-abilities\release\logs\p5136-1785768755004-28608.log`
+records an item-team settlement at `14:55:31.804Z`: Rust sent
+`GameNextStage` (13 bytes), the old 486-byte `GameResult`, then final
+`GameControl(state=4)` (85 bytes). The local client continued writing for
+roughly 13 seconds and then reset TCP; the server-side Windows error 10054 is
+the consequence of that client exit, not its initiating cause.
+
+Static analysis confirms that the modern C#-derived human-result record is not
+the P5136 layout. `sub_71BF00` consumes 212 bytes when all four bounded nested
+vectors are empty. At wire offset 63 it reads the team as one byte, then reads
+dwords at offsets 64, 68, and 72. The old writer instead put `team_points` at
+63 and the team byte at 67, and appended five bytes beyond the decoded record.
+For `team_points=10, team=1`, the next dword consequently became
+`0x01000000`.
+
+- The previously deployed C# server emitted the same malformed 269-byte
+  one-human and 486-byte two-human layout. The exact two-human fixture is in
+  `KartRider_5136\logs\packet-trace_20260717_210737_188_13040.log` at packet
+  sequences 2173/2176. Every retained historical result has
+  `winning_team=0`; those solo zeroes mask the team-field corruption, so the
+  old packet bytes are not a valid team-result golden fixture.
+- That working trace instead differs in packet order. It sends final
+  `GameControl(state=4)` at sequences 2161/2164, `GameNextStage` at
+  2167/2170, and `GameResult` at 2173/2176.
+- Rust now follows that deployed order exactly:
+  `GameControl(state=4) -> GameNextStage -> GameResult`. Its human codec now
+  emits the decoder's 212-byte record, places `team` at 63 and `team_points`
+  at 64, and no longer appends the five unconsumed bytes. The immutable result
+  snapshot, complete DNF roster, final-stage tick, and atomic all-recipient
+  publication are unchanged; the two-human/no-AI packet is now 476 bytes.
+- The current read-only C# source contains a later Korean5136-specific branch
+  that selects the opposite order. It is not treated as stronger evidence
+  than the user's known-working deployed trace, and no C# file was changed.
+
+The core codec test asserts the decoder offsets and fixed length. The focused
+pending-fanout and DNF/retry tests assert all three packet hashes in the
+deployed order. Core all-target tests pass 251 unit plus one frame-boundary
+integration test. Server all-target tests pass 485 unit tests with two local
+proprietary-data tests ignored plus nine UDP integration tests, and
+all-target Clippy with `-D warnings` passes. A fresh two-machine ceremony run
+remains the live acceptance gate.
+
 ### Post-ceremony stale lobby-snapshot crash fix (2026-07-31)
 
 The two-machine log
 `target\\p5136-finish-kart-abilities\\release\\logs\\p5136-1785542687403-33332.log`
-shows that the ceremony itself completed correctly: at `00:08:56Z` Rust sent
-the ordered `GameNextStage` (13 bytes), two-human `GameResult` (486 bytes),
-and final `GameControl` (85 bytes) to both clients. Neither client reset at
-that point.
+shows that, at `00:08:56Z`, Rust sent the then-current `GameNextStage` (13
+bytes), two-human `GameResult` (486 bytes), and final `GameControl` (85 bytes)
+to both clients without an immediate reset. That delayed reset did not prove
+the settlement order correct; the 2026-08-03 deployed-C# comparison above now
+controls the order. The stale lobby-snapshot finding below remains an
+independent cross-scene defect.
 
 The only subsequent server-to-client application packet was a 367-byte
 `GrSlotDataPacket` (`0x337C062D`) delivered to the peer at `00:09:09Z`, then
@@ -98,15 +632,16 @@ was not modified.
   diagnostic labels. None can affect race results or item authority.
 - The normal 406-byte `GameControlPacket(state=2)` now has a typed diagnostic
   decoder for the complete 393-byte snapshot: follow-on values, seven-word
-  session envelope, 54-byte result subobject, global metric, 243-byte
-  kart/physics block, timestamp, participant slots, local result, and terminal
-  state. World settlement still trusts only its server-owned state transition
-  and the existing finish-time policy.
+  session envelope, 54-byte result subobject, 235-byte effective KartSpec,
+  a validated `length=22` shared-object payload, participant slots, global
+  metric, local result, and terminal state. World settlement still trusts only
+  its server-owned state transition and the existing finish-time policy.
 - `LoRqUseItemPacket` is corrected to three unsigned words:
   SlotItem category, SlotItem ID, and remaining quantity. GameSlot type 10/16
-  now exposes raw producer bytes 18/19 and an ancillary effect code rather
-  than misleading boolean/trailing-word labels; type 16 remains a shared
-  effect packet, not a barricade alias.
+  now exposes uninitialized raw bytes 13/18, producer-supplied byte 19, the
+  full status word, and the post-consume ancillary effect code rather than
+  misleading boolean/trailing-word labels; type 16 remains a shared effect
+  packet, not a barricade alias.
 - `PcStartMatching` and `PcCancelMatching` are now exact authenticated
   codecs. A start receives the complete seven-byte empty/create
   `PcMatchingFound` variant (`hash | 00 00 00`) rather than C#'s truncated
@@ -156,11 +691,13 @@ normal result participant with `finish_time = u32::MAX`, its assigned rank,
 kart, team, and team points. Rust must not remove or synthesize away that
 entry merely to avoid a client crash.
 
-- Static comparison confirms the 357-byte `GameResult` packet has the same
-  human/AI field order as C# and retains all four AI entries. The P5136
-  settlement order is `GameNextStage`, `GameResult`, then final
-  `GameControl(type=4)`; it is intentionally not replaced by the older
-  captured ordering.
+- Static comparison and the deployed C# packet traces confirm the result
+  roster retains all four AI entries, including the DNF entry. Removing the
+  old human record's five unconsumed bytes changes this one-human/four-AI
+  packet from 357 to 352 bytes without removing a racer.
+  The deployed P5136 settlement order is final `GameControl(type=4)`,
+  `GameNextStage`, then `GameResult`; Rust now uses that captured order rather
+  than the later source-only Korean5136 branch.
 - C# excludes the first human finisher from the earlier
   `GameControl(type=3)` broadcast. Rust preserves that recipient exclusion;
   adding it back would be a speculative incompatibility change.
@@ -283,6 +820,17 @@ transport or client disconnect error in that interval.
   equip fix both work in the stock client. The next stock run should verify
   visible item acquisition; a two-machine LAN run remains necessary for
   sender-inclusive peer delivery.
+- Live item probability bands now use the stock fixed 2-8-racer matrix rather
+  than an inferred even three-way split. The count includes frozen AI racers
+  (but not observers), so client-reported placements among mixed human/AI
+  fields remain valid. In particular, two-player second place is `Middle`,
+  and the corrected matrix also changes the old 4-, 5-, and 8-racer boundary
+  mistakes.
+- The same server-owned pickup transformation path covers the stock Sebek V1
+  (`kartId=1395`) rules: UFO, water fly, magnet, booster, rocket, water bomb,
+  EMP, and time bomb each independently become `goldShield(36)` on a 25%
+  `no_flag` roll. The authoritative type-1/type-2 award must carry the final
+  item ID; this is not delegated to an unverified second client-side roll.
 
 ### Live MyRoom/X-parts/room-mode fixes (2026-07-30)
 
@@ -382,9 +930,11 @@ policy gap.
   56/64/68/72/76/80/88-byte form. The 56-byte compact-retire fixture comes
   from `p5136-1785514451491-14604.log`, the 72-byte finish-adjacent fixture
   from `p5136-1785511619293-33416.log`, and the 88-byte post-goal fixture from
-  `p5136-1785526711472-27784.log`. Arbitrary unknown hashes still fail closed.
-  Rust does not copy C# client-authoritative anti-cheat mutation or fabricate
-  the disabled relay branch.
+  `p5136-1785526711472-27784.log`. At that checkpoint arbitrary unknown hashes
+  still failed closed; the recorded-race finish correction above supersedes
+  that fallback with authenticated logged no-reply consumption. Rust does not
+  copy C# client-authoritative anti-cheat mutation or fabricate the disabled
+  relay branch.
 - Strict Windows gates pass, with three ignored local opt-in tests. The opt-in
   set covers both proprietary client-data extractors and the complete external
   packet corpus. Workspace
@@ -394,22 +944,28 @@ policy gap.
   `unsafe`.
 - The independent GameSlot re-review found no P0. Its native-zero reserved
   word and stale-frozen-recipient findings were corrected and revalidated.
-  The 67 manifest pairs and count formulas were independently matched against
+  The then-current 73 manifest pairs and count formulas were independently matched against
   the external matrix. Automatic future synchronization with that external
   analysis artifact and authoritative object ownership remain documented
   evidence/tooling gaps rather than guessed runtime policy.
 - The current CLI/GUI E2E build is
-  `target\p5136-finish-kart-abilities\release\p5136.exe` (16,368,128 bytes,
+  `target\p5136-finish-kart-abilities\release\p5136.exe` (16,631,296 bytes,
   SHA-256
-  `BE60ADCF48DE1D7E90D14163618A9158C00293C76CACA9730CDF2053D2542093`).
+  `EF202819DC2CD7262844154428C1C73D62AD9BA802D9A0402C114BDDB8DE5D34`).
   `--version` reports `p5136 0.1.0`; the release target is the single fixed
-  Cargo output directory. The preceding bounded smoke with the user's real
-  catalog started all four transports with `catalog_item_transform_count=493`
-  and the expected 14/18 item-probability rows. Launch with no arguments for
-  the Server/Connector GUI or use the documented `server`/`connect` commands.
+  Cargo output directory. The 2026-08-04 bounded smoke with the user's real
+  `KartRider_5136` root started all four transports, resolved
+  `Profile/KartCatalog.xml` and sibling `Data`, loaded 493 catalog transforms
+  and the emblem catalog, and passed messenger reachability. The installed
+  legacy `item.rho` opt-in test separately confirmed 14/18 probability rows
+  and combined weights 400/410. The server smoke log is
+  `target\p5136-finish-kart-abilities\release\logs\p5136-1785851010010-9888.log`.
+  Launch with no arguments for the Server/Connector GUI or use the documented
+  `server`/`connect` commands.
 - No C# files were modified. C# remains protocol/product evidence; checked
   arithmetic, persist-before-success, replay denial, actor state ownership,
-  and explicit unknown rejection intentionally improve unsafe C# behavior.
+  strict known-packet codecs, and authenticated logged unknown consumption
+  intentionally improve unsafe C# behavior.
 - Local Cargo output is fixed to the same
   `target\p5136-finish-kart-abilities` directory through
   `.cargo/config.toml`; older diagnostic build trees were removed after this
@@ -469,8 +1025,11 @@ unchanged and is evidence only.
   non-authoritative diagnostics; it does not trust client result, physics, or
   session-attestation fields to decide settlement. The 512-byte cap remains
   for other versioned control extensions and a 513-byte tail is rejected.
-  Parser and session regression coverage preserve the exact 406-byte shape,
-  the typed fields, and the cap boundary.
+  The corrected internal boundary is 235-byte KartSpec plus a four-byte
+  `22` length prefix and 22-byte shared object; the former 243+18 split had the
+  same total length but shifted every nested boundary by eight bytes. Parser
+  and session regression coverage preserve the exact 406-byte shape, the
+  shared-object prefix, the typed fields, and the cap boundary.
 
 ### Desktop server and connector GUI
 
@@ -612,7 +1171,8 @@ unchanged and is evidence only.
   authoritative for the sequence above; C# establishes the response shapes
   and the wider set of possible on-demand queries. Gift actions, purchases,
   coupon/exchange pages, and competitive-mode requests remain separate
-  feature paths and still fail closed unless already implemented. The next
+  feature paths and remain unimplemented/logged no-reply unless already
+  classified. The next
   stock-client run must prove progress beyond `SpRqGetMaxGiftIdPacket`; this
   audit does not claim that every later UI path is complete.
 - Independent reviewer audit found no P1/P2 issue in the C# wire comparison,
@@ -1098,35 +1658,53 @@ unchanged and is evidence only.
   bytes before copying it. This codec is independent of the opaque UDP relay
   envelope that happens to use the same packet name; the TCP cap is never
   applied to UDP movement traffic.
-- The accepted Korean P5136 wire types are `1`, `2`, `4`, `6`, `9`, `10`,
-  `11`, `12`, and `16`. Claimed player IDs must be in `0..=15`;
+- The accepted Korean P5136 wire types are `1`, `2`, `4`, `5`, `6`, `7`,
+  `8`, `9`, `10`, `11`, `12`, `13`, `16`, and `17`. Claimed player IDs must
+  be in `0..=15`;
   type-specific masks, declared lengths, complete consumption, item-vector
   counts, object IDs, known operation hashes, and finite coordinates are
   checked before an actor command exists. Unsupported types are nonfatal
   no-side-effect drops.
 - Type 12 first validates the complete bounded envelope, claimed player ID,
   low-16 mask, zero native-reserved outer word, and exact declared payload
-  length. It then admits a known operation/base pair from the 67 native writer
-  schemas or 18 additional C# `PacketName` enum-derived `Gop*`/`GoItem*`
+  length. It then admits a known operation/base pair from the 80 native writer
+  schemas or five additional C# `PacketName` enum-derived `Gop*`/`GoItem*`
   pairs. Unknown pairs, malformed envelopes, invalid masks, and bodies above
   960 bytes fail closed.
-- A body that fits one of the 67 recovered writer shapes retains typed object,
+- A body that fits one of the 80 recovered writer shapes retains typed object,
   state, and retained/static/default evidence for logs and tests. Shape drift
   and C#-only named pairs become an explicit `BoundedItemOperation`: opaque,
   bounded, byte-preserving, and relay-only. This replaces the prior
-  capture-by-capture `EvidencePending` routing gate; it does not create a
-  Rust-side item effect or world mutation.
+  capture-by-capture `EvidencePending` routing gate. Only strictly decoded
+  bodies enter the common object registry; fallback bodies do not create
+  Rust-side lifecycle state.
 - `GopBarricade` remains deliberately stricter because it creates or updates a
   server-observable world object. State 1 validates object ID, owner, reserved
-  field, and all twelve finite transform floats; states 2 and 3 validate the
-  nested owner against the claimed sender before relay. The shorter
-  hit/removal transitions retain their exact captured bytes.
+  field, and all twelve finite transform floats. States 2 and 3 validate the
+  nested owner as an active frozen racer but do not require it to equal the
+  outer sender: retained traffic proves that a remote victim reports state 2
+  while the nested owner remains the installer. State 3 is the native phase-4
+  post-impact transition; state 4 carries the terminal phase-5/6 variant. The
+  shorter transitions retain their exact bytes.
 - Types 4 and 6 preserve the fixed collection envelope and nested
   `GopLucci`/`GopBonusItem` body, including matching nonmissing object IDs,
   state 1, bounded collector ID, ticks, finite position, variant, and exact
-  25-byte body. Type 16 shares the full type-10 codec without inheriting
-  type-10 policy. All three remain `EvidencePending` because actor
-  authorization and recipient behavior are not evidenced.
+  25-byte body. Types 5/7/8 likewise validate the exact `GopTeamFlag` state-1
+  attach, state-3 drop/position, and state-4 return/position bodies. These five
+  world-object transitions deliberately remain non-mutating
+  `EvidencePending` diagnostics: Lucci/bonus-item world objects and team flags
+  are outside the supported gameplay scope, so no spawn/ownership registry is
+  planned unless that scope is explicitly reopened.
+- Type 13 accepts only the exact empty nested body emitted by `sub_9E33E0`.
+  Because no client receiver consumes it, the World actor authenticates and
+  consumes the notification without reply, relay, or mutation. Type 16 shares
+  the full type-10 codec but keeps its original type and never runs type-10
+  held-slot behavior.
+- Type 17 validates nested `GameKartPacket` (`0x27250564`) and
+  `GameKartQuadPacket` (`0x406006EF`) with their native flag-derived length
+  formula. Full precision is `116 + optional 16/4/4`; quad is
+  `76 + optional 4/2/2`. Accepted movement fallback frames are relayed
+  byte-for-byte only to the sender-excluding low-16 peer mask.
 - `ParsedGameSlotPacket` is a parser-minted, move-only capability. Its raw
   bytes, actor action, body, claimed ID, and mask are private; read-only
   accessors expose the validated facts and `into_raw(self)` consumes the
@@ -1142,9 +1720,29 @@ unchanged and is evidence only.
   `AwaitingDeadline`. The open Settling path is required because Rust enters
   Settling at the first finish while other racers may still send late item
   events.
-- Type 9 and type 11 honor the low-16 recipient mask and exclude the sender.
-  Type 10 preserves its full `u16` status and other producer fields, honors
-  the exact recipient mask, and may include the sender. For every admitted
+- Strict type-12 operations use `(race_epoch, object_id)` as the registry key
+  and retain the operation/base class, original owner identity generation,
+  last reporter, semantic meaning, source, target, transition token, phase,
+  and last native state. There is no protocol-wide numeric lifecycle: the
+  recovered class contract decides initialize/place/launch/impact/resolve/
+  retarget/remove/rebind/respawn. Barricade 0 -> 1 and Mine 5 -> 6 are explicit
+  valid transitions. Repeated exact impacts and removals are normal logged
+  suppressions with no fanout; unsupported post-terminal updates are also
+  suppressed except for proven respawn. Producer-backed orphan terminal
+  transitions may create bounded tombstones, but consumer-only terminal
+  evidence cannot mint an unseen record. Class or explicit-owner rebinding
+  fails closed, and the registry is capped at 1,024 entries per race progress
+  instance.
+- Unknown semantics, explicit client no-op branches, and
+  `BoundedItemOperation` fallback bodies remain byte-exact relay-only. They do
+  not create or mutate authoritative records and therefore cannot erase an
+  impact fingerprint or inherit meaning from the same numeric state in a
+  different class.
+- Type 9 requires its sender-inclusive held-item synchronization mask. Types
+  10 and 16 permit the empty solo audience or a low-16 remote-peer mask but
+  reject the sender bit; type 11 requires a nonempty remote-peer mask. All
+  three relay only to masked peers and never echo the sender. Type 10 preserves
+  its full `u16` status and other producer fields. For every admitted
   type-12 form, the World actor derives the expected mask
   from all other active exact-generation non-observer racers and rejects any
   omission or extra bit; accepted bytes go to every active exact-generation
@@ -1157,9 +1755,17 @@ unchanged and is evidence only.
   zero. Rust therefore requires the peer-racer mask and excludes the sender.
   Observer delivery follows the room-observation fanout, but an
   observer-present stock trace is still an explicit verification gap.
+- File-correlated runtime evidence prevents treating a zero type-16 mask as a
+  room-global broadcast: all 86 type-16 captures came from two solo logs,
+  while multi-client type-10 logs used the opposite player's bit. The newest
+  log adds 174 type-17 quad frames, all 96 bytes outer / 76 bytes nested, from
+  player 0 to mask `0x2`; all satisfy the recovered native length formula.
 - All recipient queue permits are reserved before the first publication. One
   full queue drops the whole time-sensitive event, releases earlier permits,
-  leaves race state unchanged, and does not enqueue a heartbeat retry. An
+  leaves race state including the object registry unchanged, and does not
+  enqueue a heartbeat retry. For a tracked type-12 transition, registry commit
+  happens only after all permits are held and before their infallible publish.
+  An
   empty audience is a valid zero-recipient outcome. Quiesce continues to block
   the enclosing `WorldCommand::Race` before publication.
 - Valid type-1/type-2 pickup frames are not relayed. The parser mints a
@@ -1174,7 +1780,8 @@ unchanged and is evidence only.
   LAN/friends default, or Combined fallback when disabled. Speed rooms reject
   synthesis.
 - Rust still omits the C# type-10/type-11 kart side effects, bonus-item
-  synthesis, and actor-owned item-slot/use effects. Kart-specific pickup
+  synthesis, and actor-owned held-slot/use and reaction effects. Bonus-item world-object
+  gameplay is explicitly out of scope. Kart-specific pickup
   remapping is now derived from the bounded catalog and is applied exactly
   once after base selection. The stability audit identifies double
   transformation and synthetic packet behavior as failure risks; the
@@ -1187,13 +1794,16 @@ unchanged and is evidence only.
   bounded metadata and typed reasons; the dedicated local `p5136_packet` file
   sink additionally retains bounded raw packet diagnostics as documented
   above.
-- The opt-in external audit now sends all 1,471 retained TCP GameSlot RX
+- The opt-in external audit sends the older 1,471 retained TCP GameSlot RX
   records through the strict parser: type 1=`43`, type 2=`22`, type
   9=`1,337`, type 10=`38`, type 11=`1`, and type 12=`30`. The external
-  capture directory remains uncommitted. This proves parser compatibility
-  with that corpus, not type 4/6/16 routing, type-12 object ownership,
-  source/target effect semantics, kart side effects,
-  visible stock-client pickup E2E, or stock-client multiplayer E2E.
+  capture directory remains uncommitted. The separate newest-log audit adds
+  174 type-17 frames. This proves parser compatibility with those corpora. The
+  78 class-specific type-12 field contracts instead come from the pinned
+  producer/writer/consumer IDB join (74 have named lifecycle meanings); the
+  scope-excluded Lucci semantics, kart side effects,
+  visible stock-client pickup E2E, and stock-client multiplayer E2E are still
+  open.
 
 ### Canonical protected-item state
 
@@ -1234,16 +1844,26 @@ unchanged and is evidence only.
   ingress remains the authority for the separate game transport table; a TCP
   self-report is not proof of NAT reachability and cannot overwrite the first
   UDP bind.
+- An accepted P2P UDP datagram also supplies a runtime-only P2P source port
+  for its exact active identity. Admission has already checked the source IP,
+  transport kind, logical arrival epoch, and generation, so that observed
+  `u16` takes precedence in live room/MyRoom slot projections when a stock
+  client omits `ChClientP2pAddrPacket`. Rust combines that authenticated UDP
+  source port with the authenticated TCP IPv4 address; it never trusts the
+  datagram payload or the client-claimed IPv4 bytes.
 - The P2P report persists only the `u16` port through the canonical profile
   lane, `ProfileStore::transaction`, exact immutable-receipt confirmation, and
   a pre-reserved actor completion slot. Once submitted, the write and terminal
   publication survive requester cancellation. An identical value reuses the
-  existing revision; port zero is an absolute durable clear.
+  existing revision; port zero is an absolute durable clear. A durable report
+  remains a presentation fallback and cannot overwrite an authenticated
+  runtime P2P observation.
 - Runtime endpoint authority is separate from the historical profile field.
   Every login generation and same-channel replacement starts with runtime port
-  zero, regardless of the value loaded from disk. Later profile/equipment,
-  reward, and `PqGetRider` refreshes preserve only the exact live generation's
-  runtime value and cannot resurrect a stored port.
+  zero, regardless of the value loaded from disk. The observed P2P source is
+  cleared with that identity on migration, release, and reconnect. Later
+  profile/equipment, reward, and `PqGetRider` refreshes preserve only the
+  exact live generation's runtime value and cannot resurrect a stored port.
 - After durability, World revalidates the exact identity binding. Only an
   actively owned exact generation updates runtime state. Ownerless,
   superseded, or released outcomes remain durable but do not revive a cache or
@@ -1265,9 +1885,34 @@ unchanged and is evidence only.
   policy.
 - The C# direct-P2P/Game-UDP shortcut trusts client-reported endpoint data and
   may skip relay without proving reachability. Rust does not reproduce that
-  behavior. Its reported presentation port and observed UDP routing authority
-  remain intentionally separate until stock-client/NAT captures justify a
-  stronger link.
+  behavior: it keeps relay routing transport-local, uses an authenticated P2P
+  source port only for the exact live room-slot presentation, and never
+  persists a transient NAT binding.
+
+### LAN relay readiness (2026-08-01)
+
+- Two-machine capture `p5136-1785562566890-30896.log` confirms the server
+  forwards the real 112-byte GameSlot UDP envelope from `192.168.1.10:63367`
+  to `192.168.1.15:61002`; the relay is not a missing P2P implementation.
+  The inverse direction exposed two compatibility gaps instead: `.15` sent
+  P2P UDP from `61003` without a TCP P2P-port report, and after start it
+  echoed UDP time-sync but did not send its own 24-byte time-sync request.
+- `GameControl(state=0)` only arms the frozen-roster readiness handshake, as
+  in C#. A successful `PrUdpTimeSync` send marks that exact participant ready;
+  all-ready schedules the normal one-second-delayed `RaceStart`, while the
+  bounded 30-second fallback remains for a client that never originates its
+  own time-sync request.
+- Capture `p5136-1785767798854-25476.log` disproved the temporary eager-ready
+  experiment: `GrCommandStart` reached both clients at `14:43:11.023`, their
+  state-0 controls arrived at `14:43:12.815` and `14:43:15.147`, and Rust sent
+  state 1 at `14:43:16.156` before UDP preparation completed. Both clients
+  subsequently disconnected. The state-0 readiness shortcut was therefore
+  removed; duplicate state-0 controls remain idempotent and cannot advance the
+  ready set.
+- Regressions cover authenticated P2P-source publication without a TCP report
+  (including migration cleanup and durable-report precedence), plus the C#
+  loading gate where the ready set stays empty until an exact successful UDP
+  time-sync outcome.
 
 ### MyRoom emblem catalog and main selection
 
@@ -1828,6 +2473,48 @@ these areas:
 - Bounded mailboxes, collections, wire fields, and identity counts must remain
   bounded on all error paths.
 
+### Nickname-scoped duplicate-kart inventory editor (2026-08-04)
+
+The desktop server GUI now exposes an inventory editor for the concrete
+multiple-enhancement use case. It loads only usable category-3 grants from the
+selected stock `Profile/KartCatalog.xml`, searches the real Korean display
+name with case/whitespace-insensitive substring ranking or an exact decimal
+ID, and shows the name-to-ID resolution before mutation.
+
+The persistence rule is owned by `p5136-profile`, not the GUI. Each addition
+first acquires a short-lived offline lease on the same profile-root lock held
+by a live server, captures and revalidates the durable profile-store identity,
+then runs through the immutable-revision profile transaction. This prevents a
+renamed/replaced root from mixing an old sidecar capability with a new ambient
+profile CAS.
+Each CAS evaluation loads the nickname's bounded plant/parts sidecars through
+no-follow directory capabilities, recomputes the lowest free client-safe
+serial, reserves current grants, the legacy equipped serial, and orphaned
+sidecar serials, and appends one nickname-local `GrantedKart`. The base catalog
+instance remains serial 1; duplicates start at serial 2 and are bounded to
+4,096 records per profile. Different nicknames allocate independently.
+Existing malformed or duplicate legacy grants are preserved on disk but
+omitted from the operator view exactly as they are omitted from the runtime
+inventory stream.
+
+The resulting `(kart_id, serial)` is the same identity used by rider equipment
+and the plant/parts sidecars, so two copies of one kart can retain different
+enhancement state without cloning a global inventory. The GUI is disabled
+while its server is active and explains that an already connected client must
+reconnect. A committed-but-directory-sync-uncertain outcome is reported as a
+distinct warning with a refresh instruction, avoiding an unsafe blind retry.
+The loaded catalog's canonical path and bounded content fingerprint are
+retained as part of the GUI snapshot; changing the client path invalidates the
+catalog and selection, and addition re-reads and compares both before
+mutation. Unit coverage fixes
+Korean/ID search, serial 2/3 allocation, case-insensitive per-nickname
+isolation, legacy equipped/orphan sidecar serial reservation, active-server
+lease rejection, replaced-store identity rejection, catalog path/content
+drift rejection, unknown kart rejection, and the profile grant bound. General
+quantity/economy grants remain out of scope
+because normal catalog items are already provided and purchase semantics
+require separate currency, expiry, replay, and authorization rules.
+
 ## Validation snapshot
 
 The current worktree passed on Windows:
@@ -1835,22 +2522,27 @@ The current worktree passed on Windows:
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-$env:P5136_CLIENT_DATA_DIR='C:\Users\drash\Documents\kartrider\KartRider_5136\Data'
-cargo test -p p5136-server configured_stock_client_archive_tables_match_the_known_p5136_totals
-# 893 regular tests passed; the installed item.rho 14/18-row, 400/410-total gate passed
+P5136_CLIENT_DATA_DIR=<stock Data> cargo test --workspace --all-features
+P5136_KART_CATALOG=<stock KartCatalog.xml> cargo test -p p5136-profile inventory_editor::tests::stock_client_catalog_name_search_smoke -- --ignored --exact
+P5136_CLIENT_DATA=<stock Data> cargo test -p p5136-server random_track::tests::stock_client_catalog_smoke -- --ignored --exact
+# 1,031 regular tests and the real catalog-name data gate passed;
+# 5 external-data-only tests remained ignored in the regular workspace run
 git diff --check
 ```
 
-The 893 regular passing tests comprise 16 CLI, 35 connector, 234 core, 105
-profile, 17 RHO/RHO5, 478 server unit, and 8 server integration tests. The three
-opt-in tests exercise local proprietary RHO5 metadata, the full
+The current deployment-tweak release build is
+`target/p5136-finish-kart-abilities/release/p5136.exe` (16,822,272 bytes),
+SHA-256
+`EB918B7D345993545942F90A1FD8F97B56A459FF4B2573088CC92A3DF2CBB0C7`.
+
+The remaining opt-in tests exercise local proprietary RHO5 metadata, the full
 RHO5-to-`EmblemCatalog` runtime path, and all 19,496 retained inbound packet
-records including the strict 1,471-record TCP GameSlot replay. They pass when
-explicitly enabled with the installed client data and external trace
-directory. The environment-selected non-ignored item archive gate additionally
-reads the installed legacy `item.rho` and checks both row counts and combined
-weight totals. Doc-tests also passed.
+records including the strict 1,471-record TCP GameSlot replay. They require
+their explicitly configured client data or external trace directory. The
+environment-selected item archive gate reads the installed legacy `item.rho`
+and checks both row counts and combined weight totals; the new random-track
+gate reads the installed legacy `track_common.rho` and resolves every default
+pool.
 
 Focused regressions cover:
 
@@ -1901,21 +2593,24 @@ Focused regressions cover:
 - cross-World capability rejection on ordinary and durable paths;
 - typed zero-capacity World startup and observable actor termination;
 - malformed room/race packets before mutation;
-- TCP GameSlot hash classification; strict type 1/2/4/6/9/10/11/12/16
+- TCP GameSlot hash classification; strict type
+  1/2/4/5/6/7/8/9/10/11/12/13/16/17
   parsing;
   1013-byte logical and 960-byte blob limits; every supported-frame
   truncation; nonfatal malformed/unsupported dispatch followed by a live
   request; and no direct synthetic response;
-- all 67 type-12 manifest pairs, 18 additional C# enum-derived operation
+- all 80 type-12 manifest pairs, five additional C# enum-derived operation
   pairs, every explicit/default/count-derived writer shape, uniqueness,
   truncation rejection, typed diagnostics, bounded fallback relay, and the
   retained stricter Barricade owner/transform boundaries;
-- exact frozen-generation GameSlot routing for type 9/10/11/12, observer
+- exact frozen-generation GameSlot routing for type 9/10/11/12/16/17,
+  authenticated no-reply type-13 consumption, observer
   receive-only policy, claimed-ID spoof rejection, Loading and closed
   settlement rejection, open Settling relay, pickup/static-operation
   deferral, exact type-10/type-11 masks, server-derived type-12 peer masks,
   byte-exact sender inclusion/exclusion, masked observer delivery, stale
-  replacement exclusion, and all-recipient queue rollback/retry;
+  replacement exclusion, native movement length validation, and all-recipient
+  queue rollback/retry;
 - exact MyRoom owner-item packets for owner, visitor, empty owner, and missing
   owner, plus strict malformed input;
 - owner-item generation/topology/visibility revalidation, requester
@@ -2001,11 +2696,12 @@ These items prevent a "port complete" claim.
 
 3. **Remaining MyRoom/economy surface**
 
-   The identity-bound dispatcher now rejects an unclassified hash explicitly;
-   the MyRoom match is exhaustive, so adding a classified request without a
-   handler is a compile error. The retained-corpus deliberate no-reply ledger
-   is complete; future packet families require their own evidence and owning
-   domain before admission.
+   The identity-bound dispatcher now logs and consumes an unclassified hash
+   without a reply after exact-generation/profile authorization; the MyRoom
+   match is exhaustive, so adding a classified request without a handler is a
+   compile error. The retained-corpus deliberate no-reply ledger is complete;
+   future packet families still require their own evidence and owning domain
+   before they may mutate state or produce a response.
 
    The exact terminal empty `RmOwnerCareerListPacket` and matching kind-2
    grant path are implemented. Static client analysis establishes that safe
@@ -2045,9 +2741,11 @@ These items prevent a "port complete" claim.
 4. **Evidence-dependent packet behavior**
 
    TCP GameSlot now strictly parses every one of the 1,471 retained records
-   and models all 67 statically recovered type-12 writer schemas plus the
-   C# enum-derived named-pair compatibility set. Capture type 4/6/16 routing
-   and source/target/object effect semantics; known type-12 client events
+   and models all 80 statically recovered type-12 writer schemas plus the
+   C# enum-derived named-pair compatibility set. A separate newest-log audit
+   validates all 174 type-17 quad snapshots. Capture multiplayer type-16
+   routing and finish the type-12 source/target/object-effect ledger beyond
+   the 58 currently reconstructed contracts; known type-12 client events
    already relay after bounded envelope and peer-mask validation. Type-1/type-2 selection and synthesis now follow
    the C# writer and installed client probability data; capture a fresh visible
    pickup plus two-client sender-inclusive reply before calling that E2E
@@ -2091,14 +2789,18 @@ These items prevent a "port complete" claim.
 2. Use a second physical LAN machine for the first multiplayer run. Verify
    two distinct clients login, migrate, join one room, exchange ready/team/
    track/chat state, start, exchange UDP/P2P traffic, finish, persist, and
-   shut down. One local installation is not a safe multi-client target.
+   shut down. Confirm the ceremony TX order is `GameControl(state=4)`,
+   `GameNextStage`, then `GameResult`, and that both clients return to the
+   room. One local installation is not a safe multi-client target.
 3. Verify the new type-1/type-2 award in the stock client: collect the request,
    synthesized reply, selected item, effective rank band, and visible slot
    result. The first two-machine LAN run must confirm the same sender-inclusive
-   73-byte reply reaches both exact generations. Separately collect type 4/6/16
-   routing fixtures and trace source, target, and `(base_hash, object_id)`
-   ownership/effect semantics. Known bounded type-12 pairs already relay. Never
-   apply the TCP cap to the separate opaque UDP movement envelope.
+   73-byte reply reaches both exact generations. Separately collect a
+   multiplayer type-16 mask and a two-client visible type-17 movement result;
+   trace source, target, and
+   `(base_hash, object_id)` ownership/effect semantics. Known bounded type-12
+   pairs already relay. Never apply the TCP cap to the separate opaque UDP
+   movement envelope.
 4. Capture endpoint-report behavior with two stock clients and NAT-relevant
    topologies before adding a live peer-refresh/fanout packet or coupling the
    durable presentation port to observed UDP routing. Existing peers may

@@ -5,6 +5,7 @@ pub mod emblem_catalog;
 pub mod equipment;
 pub mod favorite_items;
 pub mod inventory;
+pub mod inventory_editor;
 pub mod model;
 pub mod myroom_items;
 pub mod progression;
@@ -12,7 +13,7 @@ pub mod store;
 
 pub use catalog::{
     CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogInventoryStats,
-    CatalogItemTransformRule, CatalogKartSpecStats, MAX_CATALOG_EMBLEMS,
+    CatalogItemTransformRule, CatalogKartSpecStats, MAX_CATALOG_BYTES, MAX_CATALOG_EMBLEMS,
     MAX_CATALOG_ITEM_TRANSFORMS, P5136KartSpecSnapshot, is_grant_category, is_grant_item,
 };
 pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
@@ -25,6 +26,11 @@ pub use favorite_items::{
 pub use inventory::{
     InventoryBuildError, apply_rider_item_selection, build_inventory_snapshot,
     build_inventory_snapshot_with_equipment, generated_x_part_is_granted, rider_item_snapshot,
+};
+pub use inventory_editor::{
+    AddKartOutcome, AdditionalKart, KartCatalogSearchResult, KartInventoryEditError,
+    MAX_ADDITIONAL_KARTS_PER_PROFILE, MAX_KART_SEARCH_QUERY_CHARS, MAX_KART_SEARCH_RESULTS,
+    add_kart, additional_karts, search_karts,
 };
 pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,

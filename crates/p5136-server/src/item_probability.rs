@@ -34,6 +34,62 @@ pub enum ItemProbabilityRankBand {
     Combined,
 }
 
+// Stock P5136 uses a fixed participant-count matrix, not an even three-way
+// split of every rank below first place. The index within each row is the
+// zero-based rank reported by the client.
+const LIVE_RANK_BANDS: [&[ItemProbabilityRankBand]; 8] = [
+    &[ItemProbabilityRankBand::Top],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::Middle,
+    ],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Low,
+    ],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Low,
+    ],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::High,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Low,
+    ],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::High,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Low,
+        ItemProbabilityRankBand::Low,
+    ],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::High,
+        ItemProbabilityRankBand::High,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Low,
+        ItemProbabilityRankBand::Low,
+    ],
+    &[
+        ItemProbabilityRankBand::Top,
+        ItemProbabilityRankBand::High,
+        ItemProbabilityRankBand::High,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Middle,
+        ItemProbabilityRankBand::Low,
+        ItemProbabilityRankBand::Low,
+    ],
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ItemProbabilityRankPolicy {
     /// LAN/friends compatibility mode: use the rank carried by the validated
@@ -170,19 +226,12 @@ impl ItemProbabilityConfiguration {
         let Ok(live_rank) = usize::try_from(client_reported_rank) else {
             return ItemProbabilityRankBand::Combined;
         };
-        if racer_count == 0 || live_rank >= racer_count {
-            return ItemProbabilityRankBand::Combined;
-        }
-        if live_rank == 0 {
-            return ItemProbabilityRankBand::Top;
-        }
-        let remaining = racer_count - 1;
-        let bucket = live_rank.saturating_mul(3).saturating_add(remaining - 1) / remaining;
-        match bucket.saturating_sub(1) {
-            0 => ItemProbabilityRankBand::High,
-            1 => ItemProbabilityRankBand::Middle,
-            _ => ItemProbabilityRankBand::Low,
-        }
+        racer_count
+            .checked_sub(1)
+            .and_then(|row| LIVE_RANK_BANDS.get(row))
+            .and_then(|bands| bands.get(live_rank))
+            .copied()
+            .unwrap_or(ItemProbabilityRankBand::Combined)
     }
 
     pub fn roll_total(
@@ -771,31 +820,35 @@ mod tests {
     };
 
     #[test]
-    fn live_rank_policy_switches_between_csharp_mapping_and_combined_fallback() {
-        let trusted = (0..8)
-            .map(|rank| {
-                ItemProbabilityConfiguration::resolve_rank_band(
-                    ItemProbabilityRankBand::Live,
-                    rank,
-                    8,
-                    ItemProbabilityRankPolicy::TrustClientReported,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            trusted,
-            [
-                ItemProbabilityRankBand::Top,
-                ItemProbabilityRankBand::High,
-                ItemProbabilityRankBand::High,
-                ItemProbabilityRankBand::Middle,
-                ItemProbabilityRankBand::Middle,
-                ItemProbabilityRankBand::Low,
-                ItemProbabilityRankBand::Low,
-                ItemProbabilityRankBand::Low,
-            ]
-        );
-        for (rank, racer_count) in [(-1, 8), (8, 8), (0, 0)] {
+    fn live_rank_policy_uses_the_stock_participant_matrix_or_combined_fallback() {
+        use ItemProbabilityRankBand::{High, Low, Middle, Top};
+
+        let expected: &[(usize, &[ItemProbabilityRankBand])] = &[
+            (1, &[Top]),
+            (2, &[Top, Middle]),
+            (3, &[Top, Middle, Low]),
+            (4, &[Top, Middle, Middle, Low]),
+            (5, &[Top, High, Middle, Middle, Low]),
+            (6, &[Top, High, Middle, Middle, Low, Low]),
+            (7, &[Top, High, High, Middle, Middle, Low, Low]),
+            (8, &[Top, High, High, Middle, Middle, Middle, Low, Low]),
+        ];
+        for &(racer_count, bands) in expected {
+            let actual = bands
+                .iter()
+                .enumerate()
+                .map(|(rank, _)| {
+                    ItemProbabilityConfiguration::resolve_rank_band(
+                        ItemProbabilityRankBand::Live,
+                        i16::try_from(rank).unwrap(),
+                        racer_count,
+                        ItemProbabilityRankPolicy::TrustClientReported,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, bands, "{racer_count}-racer matrix");
+        }
+        for (rank, racer_count) in [(-1, 8), (8, 8), (0, 0), (0, 9)] {
             assert_eq!(
                 ItemProbabilityConfiguration::resolve_rank_band(
                     ItemProbabilityRankBand::Live,

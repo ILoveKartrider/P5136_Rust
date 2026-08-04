@@ -16,6 +16,8 @@ mod packet_log;
 mod profile_durability;
 mod profile_io;
 mod profile_presentation_persistence;
+mod race_object_registry;
+mod random_track;
 mod runtime;
 mod session;
 mod udp_runtime;
@@ -49,6 +51,15 @@ pub use messenger_runtime::{
 };
 pub use profile_io::{
     ProfileIoConfigError, ProfileIoError, ProfileIoRuntimeError, ProfileIoShutdownError,
+};
+pub use race_object_registry::{
+    ItemOperationAuditDisposition, ItemOperationServerAudit, ItemOperationServerAuditError,
+    audit_game_slot_item_operation,
+};
+pub use random_track::{
+    RandomTrackCatalog, RandomTrackConfiguration, RandomTrackDefinition, RandomTrackError,
+    RandomTrackPool, RandomTrackPoolOverride, ResolvedRandomTracks,
+    load_client_random_track_catalog,
 };
 pub use runtime::{BoundServer, RewardPersistenceRuntimeError, ServerError, ServerHandle};
 pub use session::{LoginSessionError, read_encrypted_frame};

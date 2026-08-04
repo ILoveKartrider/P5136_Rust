@@ -1,0 +1,15 @@
+[package]
+name = "p5136-client-oracle"
+description = "Independent reconstructed P5136 client packet consumers"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dev-dependencies]
+p5136-core = { path = "../p5136-core" }
+p5136-server = { path = "../p5136-server" }
+
+[lints]
+workspace = true

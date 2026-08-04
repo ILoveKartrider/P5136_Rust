@@ -19,7 +19,7 @@ been demonstrated.
 - [x] bounded Messenger framing and logical packet codecs
 - [x] per-run bounded file logging at every transport packet boundary, server
   configuration validation, and typed TCP-session failure boundary
-- [x] GUI Windows Korean system-font fallback for localized OS errors
+- [x] GUI platform Korean system-font fallback for Windows, macOS, and Linux
 - [x] stock-client/`Profile` path resolution for the C#-exported catalog and
   sibling client `Data` directory
 - [x] exact `PqGetRiderTaskContext` startup reply from the stock-client crash
@@ -51,6 +51,14 @@ been demonstrated.
   explicit load-and-pin before editing
 - [x] explicit client-reported live-rank trust toggle, enabled by default for
   the current LAN/friends model with Combined fallback when disabled
+- [x] Korean GUI labels, LAN IPv4 discovery/apply control, explicit IP-only
+  bind/advertise guidance, invalid advertised-address rejection, and exact
+  server-start item.rho snapshot confirmation
+- [x] bounded legacy RHO 1.0/1.1 reader and client `track_common.rho` random
+  catalog with per-mode/selector pools, GUI overrides, AI filtering, and
+  process-RNG selection and room-owned no-repeat history
+- [x] C#-exact ASCII-boundary S0-S7 room-title parser and per-equipment modern
+  speed-physics variants selected transactionally at race start
 - [ ] verified launch of a stock client on Windows
 - [ ] verified launch of the same client through Wine or CrossOver
 
@@ -90,20 +98,76 @@ been demonstrated.
   and matching newbie channels
 - [x] ready, team, master, and observer actor state
 - [x] bounded AI slot/wire primitives
-- [x] loading readiness, timeout, start ordering, and frozen race roster
-- [x] generation-bound Game/P2P endpoint registration and relay
+- [x] C#-compatible frozen-roster loading handshake: `GameControl(state=0)`
+  arms, successful UDP time-sync marks ready, then timeout and ordered start
+- [x] generation-bound Game/P2P endpoint registration, authenticated runtime
+  P2P-source fallback, and relay
 - [x] synchronized UDP receive/activation order across generation boundaries
 - [x] exact-generation actor-owned UDP audience selection
 - [x] exact-generation UDP reconnect reset for both Game/P2P routes with an
   arrival-epoch fence against stale datagrams
-- [x] bounded TCP GameSlot type 1/2/4/6/9/10/11/12/16 parsing and
+- [x] bounded TCP GameSlot type 1/2/4/5/6/7/8/9/10/11/12/13/16/17 parsing and
   exact-generation atomic relay for evidence-backed audiences
 - [x] bounded type-12 compatibility relay: exact common envelope, authenticated
-  sender and peer mask, then a known operation/base pair from the 67-class
-  native-writer manifest plus 18 C# enum-derived pairs; native shapes retain
+  sender and peer mask, then a known operation/base pair from the 80-class
+  native-writer manifest plus five C# enum-derived pairs; native shapes retain
   typed retained/static/default diagnostics without capture-gated routing
-- [x] capture-backed `GopBarricade` state 1 placement plus state 2/3
-  hit/removal relay, including the valid zero-peer single-racer audience
+- [x] capture-backed `GopBarricade` state 1 placement, state 2 impact, state 3
+  post-impact resolution, and state 4 terminal relay, including the valid
+  zero-peer single-racer audience
+- [x] race-epoch-bound object registry for strictly decoded type-12 operations:
+  class/owner/generation binding, class-specific lifecycle admission, exact
+  `(state, transition token, target)` duplicate-impact suppression, terminal
+  suppression, and commit only after the complete exact-generation peer
+  audience has been reserved
+- [x] producer/consumer-derived source/target/state semantics for 79 of 80
+  direct-writer classes: the original 15 common contracts plus Coke/Snow/
+  Infected bombs, rolling variants, WaterMine/TimeMine, timed bomb variants,
+  BigTimebomb's actor-guarded native phase pass-through, Shield/SpecialShield,
+  three UFO forms, LockdownRocket, Thunderbolt's counted target set, ForceZone,
+  Oil, Silence, Siren/SirenShield, SpecialSmall, Cloud/Cloud2, Magnet, and
+  SpeedDown, Devil/MqDevil/NewDevil, Angel, GoldShield, EMP, Ghost, Icefly, Scanning,
+  SlotLock, SpecialSiren, SpaceCraft, StraightRocket, Balloon, HeadBand,
+  Dynamite, Hammer, Press, RobotBeam, TombStone, Block, BoundWall, Cube,
+  CubeForBoss, EventObject, GiantTalisman, WitchUnionMagic, TargetKart,
+  BossPrison, BoundRoad, Course, Falling, and Piratebomb; 74 have a named
+  lifecycle transition. Native source omissions in Block,
+  RobotBeam, and TombStone remain explicit instead of fabricating raw fields
+- [x] corrected `GopCubeForBoss` writer lengths to 77/69 (the earlier 73/65
+  census omitted a class dword), and recorded that Course/EventObject raw 12
+  is an object ID rather than a shared lifecycle state
+- [x] recovered occurrence paths for the last five in-scope classes:
+  BossPrison from GoBossKart target selection; BoundRoad from BombRobot/
+  MechanicBall lane patterns; Falling from PetitMeteor/SpaceBombing lane
+  patterns; Piratebomb from controller branch 12 target selection; and Course
+  from `goal`/`Ev_*` notifications whose concrete peer consumer is a no-op
+- [x] audited all 218 ordinary `_Rnn/_Inn` track archives and separated static
+  shared objects from client-local course effects: base scenes place Banana,
+  Cube, Mine, WaterMine, and EventObject runtime classes already covered by
+  exact schemas, while obstacle/dummy, warp/weather/rail/lens-flare/flash
+  controls remain client scene/physics state; see
+  `analysis/P5136_RI_TRACK_GIMMICK_AUDIT.md`
+- [x] semantic decoding is crate-private and requires the private-field
+  `ValidatedItemOperation` capability returned by exact schema validation;
+  callers cannot bypass state/length validation with an arbitrary raw slice
+- [x] semantic registry transitions preserve Barricade initialize -> place and
+  Mine remove -> respawn -> impact; unresolved/no-op bodies cannot mutate hit
+  fingerprints, post-terminal updates are suppressed, and consumer-only
+  removal evidence cannot mint unseen tombstones
+- [x] IDB-ledger-literal 15-class type-12 wire -> parser -> semantic -> registry
+  table plus an independent 29-state second-pass literal table, real Barricade
+  0 -> 1 World fanout, Mine 1 -> 5 -> 6 -> 2 parse/commit, and per-race
+  registry reset regression paths
+- [x] shield/UFO/Lockdown/Thunderbolt 23-state and ordinary-effect 27-state
+  literal wire -> parser -> semantic -> registry tables, including conditional
+  ForceZone/Oil success guards, Silence's explicit no-op, SpecialSmall's
+  runtime-only flag update, Cloud's target-only hit, and SpeedDown teardown
+- [x] all 54 headings from the supplied Korean item page represented in a
+  typed gameplay-reference catalog with category/target/effect hints, 40
+  proven P5136 numeric/name links, evidence-graded `Gop*` candidates, literal
+  54-row semantic and 40-pair ID manifests, separate class/heading evidence,
+  and an explicit rule that modern page timers/probabilities never define the
+  wire codec; see [ITEM_GAMEPLAY_COVERAGE.md](ITEM_GAMEPLAY_COVERAGE.md)
 - [x] Messenger identity validation, chat rooms, and single-writer queues
 - [x] Messenger split/coalesced frame and mid-frame generation fencing
 - [x] bounded actor-output flushing without read-loop starvation
@@ -116,6 +180,12 @@ been demonstrated.
 - [x] rider/account initialization and catalog-backed inventory preload,
   excluding named kart entries whose exported spec cannot be resolved and
   sanitizing persisted equipment/sidecars that still reference them
+- [x] nickname-scoped duplicate-kart inventory grants with Korean catalog-name/
+  decimal-ID search, retry-safe atomic serial allocation, immutable revision
+  publication, offline root leasing, orphan sidecar-serial reservation,
+  store-identity validation, catalog path/content snapshot fencing, and GUI
+  inspection; serial-2+ copies share the existing `(kart_id, serial)`
+  equipment/plant/parts identity
 - [x] durable rider equipment/plant selection with actor cache publication
   and lobby-only next-race kart-physics refresh; Loading/Running physics remain
   frozen against mid-race equipment changes
@@ -139,17 +209,21 @@ been demonstrated.
 - [x] requester-only `GrFirstRequestPacket` room-state rehydration, preventing
   a redundant peer `GrSlotDataPacket` from crossing a later race/ceremony
   scene boundary
-- [ ] live track-pool/mode/random-track control surface
-- [x] finish, ranking, settlement, team booster, and DNF deadline
+- [x] live track-pool/mode/random-track control surface
+- [x] finish, ranking, settlement, team booster, and DNF deadline, including
+  the deployed C# ceremony order `GameControl(state=4) -> GameNextStage ->
+  GameResult`
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
 - [x] bounded read-only native RHO5 emblem-definition extraction
-- [x] bounded read-only legacy Rh-layer-1.1 `item.rho` probability extraction,
-  authenticated block decoding, BML parsing, and strict bounded portable XML
-  override
-- [x] exhaustive MyRoom dispatch and explicit rejection of unclassified identity packets
+- [x] bounded read-only legacy Rh-layer-1.0/1.1 `item.rho` and
+  `track_common.rho` extraction, authenticated block decoding, BML parsing,
+  and strict bounded portable XML override
+- [x] exhaustive MyRoom dispatch plus authorized/logged/no-reply consumption
+  of genuinely unclassified identity packets
 - [ ] stock-client RequestEmblems/main-emblem E2E
-- [x] generation-bound P2P-port report, persistence, and cache refresh
+- [x] generation-bound P2P-port report, durable presentation fallback, and
+  authenticated runtime cache refresh
 - [x] strict terminal empty protected-item list
 - [x] exact normal/preset shop-buy parsing and fail-closed failure reply
 - [x] atomic durable canonical favorite-item Get/Update and session-cache refresh
@@ -176,20 +250,32 @@ been demonstrated.
   in-game heartbeat, neutral client-frame metrics, and the named
   `PcRideSwithInfoPacket` map/vector/eight-aggregate container
 - [x] diagnostic-only fixed state-2 `GameControlPacket` finish snapshot
-  parsing (session envelope, 54-byte subobject, 243-byte physics block,
-  timestamp, participant slots, and terminal state); only the server-owned
-  finish transition remains authoritative
+  parsing (session envelope, 54-byte subobject, 235-byte effective KartSpec,
+  length-prefixed 22-byte shared-object payload, participant slots, global
+  metric, and terminal state); only the server-owned finish transition remains
+  authoritative
 - [x] exact unsigned `LoRqUseItemPacket` category/id/remaining-quantity words
   and raw GameSlot type-10/type-16 byte/effect-code labels without inventing
   boolean or barricade-only semantics
+- [x] native-length type-17 `GameKartPacket`/`GameKartQuadPacket` fallback
+  movement relay, exact empty-body type-13 no-reply consumption, and exact
+  evidence-gated type-5/7/8 team-flag transition codecs
 - [x] authoritative type-1/type-2 item pickup probability roll, exact response
   synthesis, strict captured request/token validation, replay/rate admission,
-  and sender-inclusive atomic room broadcast in game types 2/4
+  sender-inclusive atomic room broadcast in game types 2/4, and the stock
+  2-8-racer Top/High/Middle/Low matrix over frozen humans plus AI racers
 - [x] bounded `KartCatalog.xml` `TransformByKart` parsing and exactly-once
   frozen-kart item acquisition remapping, including Gigantes V1
-  `5 -> 103`, `7/127 -> 99` and separate partial-probability rolls
+  `5 -> 103`, `7/127 -> 99`, Sebek V1's eight 25% `-> goldShield(36)`
+  paths, and separate partial-probability rolls
 - [ ] actor-owned live race position and track-box spawn/collision authority
-- [ ] evidence-backed GameSlot item-use/reaction server side effects
+- [ ] evidence-backed held-slot/type-10 use and type-11 reaction side effects;
+  common type-12 object lifecycle admission is actor-owned, while
+  class-specific state 0/4+ meanings remain evidence-gated
+- [x] explicit scope exclusion for Lucci world objects, bonus-item world
+  objects, and team flags (`GameSlot` types 4/5/6/7/8); their strict codecs
+  remain diagnostic/evidence boundaries, but no actor-owned spawn registry or
+  gameplay support is required for this port
 - [ ] actor-owned directional `PcGameRequestRelay` / `GameRelayBroadcasting`
   pairing after a two-client capture fixes its output slot transformation
 - [ ] authoritative actor-owned club repository and atomic membership/create/join/rename flow;
@@ -209,14 +295,82 @@ been demonstrated.
 
 ## Evidence and completion gates
 
+- [x] reproducible native-client consumer reachability census: 2,886
+  RTTI-backed serialized classes, 534 consumer-reachable classes, generated
+  typed-cast adapters followed to their actual callers, and an explicit
+  event/social/commerce-excluded LAN baseline of 63 outer packet classes plus
+  the 80 emitted type-12 item-operation schemas; see
+  [CLIENT_CONSUMER_AUDIT.md](CLIENT_CONSUMER_AUDIT.md)
+- [x] dependency-isolated `p5136-client-oracle` crate with no normal
+  `p5136-core` dependency or shared packet reader/hash/layout constants
+- [x] native-client exact layout/consumption oracle with selected recovered
+  semantics for `GameResultPacket`, plus exact native codec/consumer coverage
+  for `GameNextStagePacket`; immutable IDB-derived raw fixtures, truncation,
+  suffix-drift, and rejection of the malformed C# 217-byte result record are
+  covered while opaque result fields remain explicitly unmodeled
+- [x] exact native `PqStartCollectRecord` hash-only request and
+  `PrStartCollectRecord` hash-plus-raw-boolean codec, common-`GameStage`
+  consumer truthiness/side-effect oracle, plus a server reply policy tied to
+  the authenticated rider's category-12 replay-camera equipment
+- [x] exact native 24-byte `PcReportUserCollectedRecord` finish report and
+  hash-only `PqReportGameCollectedRecord`; both are authenticated,
+  non-authoritative diagnostic no-reply inputs, matching retained C# fallthrough
+- [x] forward-compatible unknown authenticated packet policy: preserve the
+  bounded raw logical receive record and hash/identity warning, emit no reply,
+  and keep the session alive; classified malformed packets remain typed errors
+- [x] evidence-graded structural oracle for ceremony ordering, room
+  list/admission/initial state, login/migration, and read-only club consumer
+  branches; C#-golden/live-trace cases are not labeled IDB-exact
+- [x] protocol-visible hierarchical client FSM for login/reconnect, room
+  admission, self-contained command-start, UDP readiness, ordinary speed/item
+  race control, settlement, podium ordering, leave, and disconnect; native
+  state effects and deployed-order assumptions are recorded separately in
+  [CLIENT_PROTOCOL_FSM.md](CLIENT_PROTOCOL_FSM.md)
+- [x] executable independent `ItemClientFsm` for the fixed 149-branch item
+  consumer corpus (71 local, 69 deferred, zero immediate, 9 unknown), plus
+  the 15 later boss/controller/Course branches; lifecycle observation,
+  deferred scheduler markers, and transactional malformed-input rejection are
+  tested without synthesizing unproven outbound packets
+- [x] production-server cross-wire gate for all original 149 branches: each
+  fixture passes the real `GameSlot` decoder and the same item-to-registry
+  admission mapping used by the World actor, then retains byte-exact relay
+  output. The pinned server census is 87 tracked, 62 relay-only/untracked, and
+  zero fresh-registry suppressions. Representative World/network tests remain
+  the integration proof; this exhaustive synthetic gate does not claim that
+  every rare native client animation or controller condition was live-fired
+- [x] `GopAngel` state 2 re-audited against the pinned IDB: exact
+  `token@16/source@20/target@24`, native phase 2, and repeatable defense impact
+  are modeled; the shared resolver inserts the protected kart into the
+  attack-owned processed-target container rather than removing the timed
+  Angel effect, and the client's stale phase-argument member is
+  retained as a documented native quirk instead of making the branch unknown
+- [x] post-Angel-correction release validation: complete workspace tests and
+  warnings-as-errors Clippy pass; the fixed release binary starts all four
+  transports against the real `KartRider_5136` catalog/Data tree, messenger
+  probing succeeds, and the installed `item.rho` yields the expected 14/18
+  rows with combined weights 400/410
+- [x] IDB-reconstructed local podium scheduler for individual/team final
+  stages, including strict timer boundaries, animation-completion gates,
+  flag-`0x80` manual confirmation, virtual-slot-103 handoff, and
+  `GameReadyStage`/`ObserverReadyStage` selection; executable oracle tests are
+  independent of the production server
 - [ ] every supported packet serializer has a C#-derived golden fixture
 - [x] C# and Rust synthetic PIN fixture compatibility
 - [ ] differential request/response harness passes for the supported flow
+- [ ] every supported server-to-client serializer is covered by an
+  independently reconstructed client consumer; current oracle coverage is a
+  high-risk first slice (12 of the 63 core outer consumers, at mixed evidence
+  grades), not global semantic compatibility
 - [ ] movement envelope, tick wrap, and fallback are capture-verified
 - [ ] production AI start and nonzero AI-master behavior are capture-verified
 - [x] all 1,471 retained TCP GameSlot records cross the strict parser
-- [ ] type-12 source/target/object effect semantics and type 4/6/16 routing
-  are capture-verified; known bounded type-12 client events already relay
+- [x] all 174 newest type-17 quad snapshots cross the native flag-derived
+  length rule and sender-excluding peer-mask relay codec
+- [ ] remaining class-specific type-12 source/target/effect meanings and
+  multiplayer type-16 routing are capture-verified; 78 direct-writer classes
+  now expose recovered field semantics (74 with named lifecycle transitions), while unknown
+  and bounded fallback bodies do not acquire invented authority;
+  scope-excluded types 4/5/6/7/8 are not a completion gate
 - [ ] Windows, macOS, and Linux CI pass
 - [ ] native Windows connector launches a stock P5136 client
 - [ ] Wine or CrossOver connector launches the same client

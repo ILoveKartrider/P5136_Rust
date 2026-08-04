@@ -17,6 +17,9 @@ use crate::game_slot_item_schema::{
     ItemOperationEvidence, ItemOperationSchema, ItemOperationValidationError,
     is_known_item_operation_pair, item_operation_schema,
 };
+use crate::game_slot_item_semantics::{
+    ItemOperationSemantics, decode_validated_item_operation_semantics,
+};
 
 pub const GAME_SLOT_PACKET_NAME: &str = "GameSlotPacket";
 pub const GAME_SLOT_PACKET_HASH: u32 = 0x27C0_0574;
@@ -27,6 +30,8 @@ pub const MAX_GAME_SLOT_PLAYER_ID: u8 = 15;
 pub const GOP_CUBE_HASH: u32 = 0x0A4F_02A5;
 pub const GO_ITEM_CUBE_HASH: u32 = 0x1434_03C4;
 pub const GAME_KART_ITEM_INFO_HASH: u32 = 0x5FC3_087F;
+pub const GAME_KART_PACKET_HASH: u32 = 0x2725_0564;
+pub const GAME_KART_QUAD_PACKET_HASH: u32 = 0x4060_06EF;
 
 pub const GOP_BANANA_HASH: u32 = 0x1090_0367;
 pub const GO_ITEM_BANANA_HASH: u32 = 0x1CB3_0486;
@@ -41,6 +46,8 @@ pub const GOP_LUCCI_HASH: u32 = 0x0D89_0316;
 pub const GO_LUCCI_HASH: u32 = 0x0A33_02A6;
 pub const GOP_BONUS_ITEM_HASH: u32 = 0x1DF9_04BC;
 pub const GO_BONUS_ITEM_HASH: u32 = 0x18E3_044C;
+pub const GOP_TEAM_FLAG_HASH: u32 = 0x18A2_0427;
+pub const GO_TEAM_FLAG_HASH: u32 = 0x13FC_03B7;
 
 const COMMON_ENVELOPE_LENGTH: usize = 13;
 const P5136_PLAYER_MASK: u32 = 0x0000_ffff;
@@ -49,6 +56,9 @@ const PICKUP_BLOB_LENGTH: usize = 24;
 /// The only actions implied by a successful P5136 decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameSlotAction {
+    /// Accept a statically proven client notification without replying,
+    /// relaying, or mutating shared race state.
+    ConsumeNoReply,
     /// The actor must select an item from its immutable probability snapshot
     /// and synthesize a sender-inclusive authoritative pickup response.
     SynthesizeItemPickup,
@@ -62,7 +72,7 @@ pub enum GameSlotAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameSlotEvidencePending {
     WorldObjectCollectionAuthorization(WorldObjectCollectionKind),
-    SpawnedItemUseRouting,
+    TeamFlagAuthorization(TeamFlagTransitionKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +80,6 @@ pub enum GameSlotRelayAudience {
     /// The actor must derive the complete current racer peer mask and require
     /// the client mask to match it before publishing.
     AllRacePeersMaskMatch,
-    RecipientMaskIncludingSender,
     RecipientMaskExceptSender,
 }
 
@@ -119,6 +128,27 @@ pub struct WorldObjectCollection {
     pub blob: GameSlotPayloadRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamFlagTransitionKind {
+    PickupAttach,
+    DropRelocate,
+    ReturnReset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TeamFlagTransition {
+    pub kind: TeamFlagTransitionKind,
+    pub object_id: u32,
+    pub current_tick: u32,
+    pub expiry_tick: u32,
+    pub outer_position: [f32; 3],
+    pub trailing_word: u16,
+    pub carrier_id: Option<u8>,
+    pub transition_tick: u32,
+    pub transition_position: Option<[f32; 3]>,
+    pub payload: GameSlotPayloadRange,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemVector {
     items: [u32; 3],
@@ -141,17 +171,22 @@ impl ItemVector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemUse {
     pub kind: ItemUseKind,
-    pub common: u8,
+    /// Raw wire byte 13. `sub_842180` does not initialise it; captures vary
+    /// for the same effect and confirm that it is not a stable enum.
+    pub raw_byte_13: u8,
+    /// Full phase/status word. In particular, 0x0010 selects the receiver's
+    /// held-slot reconciliation path; 0x1001/0x1002/0x1004 are distinct.
     pub status: u16,
     pub item_or_skill: u16,
     /// Raw producer byte at wire offset 18. It is not a boolean: the stock
     /// producer leaves it uninitialized for most item-use forms.
     pub raw_byte_18: u8,
-    /// Raw producer byte at wire offset 19; receiver semantics are
-    /// effect-specific and not yet generalised by Rust.
+    /// Producer-supplied byte at wire offset 19 (`sub_842180` argument 7).
+    /// Every retained P5136 sample is zero; no broader enum is inferred.
     pub raw_byte_19: u8,
-    /// Nonzero values select an additional client effect path. The individual
-    /// effect meanings remain packet-specific.
+    /// After successful local slot reconciliation, a nonzero value runs
+    /// `sub_AC3060` followed by `sub_AC3AC0`. Individual effect IDs remain
+    /// packet-specific, so Rust only preserves the value.
     pub ancillary_effect_code: u16,
     pub blob: GameSlotPayloadRange,
 }
@@ -169,6 +204,31 @@ pub struct ItemReaction {
     pub blob: GameSlotPayloadRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DashboardAllocationNotice {
+    /// `sub_842180` does not initialise this generic envelope byte.
+    pub raw_byte_13: u8,
+    pub payload: GameSlotPayloadRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KartSnapshotKind {
+    FullPrecision,
+    QuantizedQuad,
+}
+
+/// Type-17 remote-kart state. The protected/quantized numerical members stay
+/// byte-preserving; the recovered native writer determines their exact length
+/// from these three flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KartSnapshot {
+    pub kind: KartSnapshotKind,
+    pub common: u8,
+    pub object_id: u32,
+    pub flags: [u8; 3],
+    pub payload: GameSlotPayloadRange,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ItemOperation {
     pub operation_hash: u32,
@@ -177,7 +237,8 @@ pub struct ItemOperation {
     pub object_id: u32,
     pub state: u32,
     pub evidence: ItemOperationEvidence,
-    pub barricade: Option<BarricadePlacement>,
+    pub semantics: ItemOperationSemantics,
+    pub barricade: Option<BarricadeOperation>,
     pub payload: GameSlotPayloadRange,
 }
 
@@ -196,6 +257,12 @@ pub struct BoundedItemOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BarricadeOperation {
+    Placement(BarricadePlacement),
+    Transition(BarricadeTransition),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BarricadePlacement {
     pub object_id: u32,
     pub tick: u32,
@@ -203,6 +270,18 @@ pub struct BarricadePlacement {
     /// Twelve finite little-endian floats at body offsets 25..73. The first
     /// three are the placement position.
     pub transform: [f32; 12],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarricadeTransition {
+    pub object_id: u32,
+    pub state: u8,
+    pub tick: u32,
+    /// The original installer carried by the native operation. A remote kart
+    /// may report the hit, so this deliberately need not equal the outer
+    /// `GameSlot` sender.
+    pub owner_id: u8,
+    pub trailing: u32,
 }
 
 impl BarricadePlacement {
@@ -226,9 +305,12 @@ impl BarricadePlacement {
 pub enum GameSlotBody {
     ItemPickup(ItemPickup),
     WorldObjectCollection(WorldObjectCollection),
+    TeamFlagTransition(TeamFlagTransition),
     ItemVector(ItemVector),
     ItemUse(ItemUse),
     ItemReaction(ItemReaction),
+    DashboardAllocationNotice(DashboardAllocationNotice),
+    KartSnapshot(KartSnapshot),
     ItemOperation(ItemOperation),
     BoundedItemOperation(BoundedItemOperation),
 }
@@ -253,6 +335,18 @@ impl GameSlotBody {
                 kind: WorldObjectCollectionKind::BonusItem,
                 ..
             }) => 6,
+            Self::TeamFlagTransition(TeamFlagTransition {
+                kind: TeamFlagTransitionKind::PickupAttach,
+                ..
+            }) => 5,
+            Self::TeamFlagTransition(TeamFlagTransition {
+                kind: TeamFlagTransitionKind::DropRelocate,
+                ..
+            }) => 7,
+            Self::TeamFlagTransition(TeamFlagTransition {
+                kind: TeamFlagTransitionKind::ReturnReset,
+                ..
+            }) => 8,
             Self::ItemVector(_) => 9,
             Self::ItemUse(ItemUse {
                 kind: ItemUseKind::Ordinary,
@@ -260,10 +354,12 @@ impl GameSlotBody {
             }) => 10,
             Self::ItemReaction(_) => 11,
             Self::ItemOperation(_) | Self::BoundedItemOperation(_) => 12,
+            Self::DashboardAllocationNotice(_) => 13,
             Self::ItemUse(ItemUse {
                 kind: ItemUseKind::SpawnedWorldObject,
                 ..
             }) => 16,
+            Self::KartSnapshot(_) => 17,
         }
     }
 
@@ -271,9 +367,12 @@ impl GameSlotBody {
         match self {
             Self::ItemPickup(value) => value.blob,
             Self::WorldObjectCollection(value) => value.blob,
+            Self::TeamFlagTransition(value) => value.payload,
             Self::ItemVector(value) => value.payload,
             Self::ItemUse(value) => value.blob,
             Self::ItemReaction(value) => value.blob,
+            Self::DashboardAllocationNotice(value) => value.payload,
+            Self::KartSnapshot(value) => value.payload,
             Self::ItemOperation(value) => value.payload,
             Self::BoundedItemOperation(value) => value.payload,
         }
@@ -384,8 +483,10 @@ impl ParsedGameSlotPacket {
 pub enum GameSlotMaskRule {
     AllBitsSet,
     LowSixteenBits,
+    LowSixteenBitsExcludingSender,
     NonzeroLowSixteenBits,
     NonzeroLowSixteenBitsIncludingSender,
+    NonzeroLowSixteenBitsExcludingSender,
 }
 
 /// Every error is a validated no-side-effect drop decision.
@@ -431,6 +532,27 @@ pub enum GameSlotDropReason {
         packet_type: u8,
         declared: u32,
         actual: usize,
+    },
+
+    #[error("GameSlot type 17 reserved word is 0x{actual:04X}; expected zero")]
+    InvalidKartSnapshotReservedWord { actual: u16 },
+
+    #[error("GameSlot type 13 reserved word is 0x{actual:04X}; expected zero")]
+    InvalidDashboardAllocationReservedWord { actual: u16 },
+
+    #[error("GameSlot type 13 has a {actual}-byte nested body; expected an empty body")]
+    InvalidDashboardAllocationBodyLength { actual: usize },
+
+    #[error("GameSlot type 17 nested hash 0x{actual:08X} is not a P5136 kart snapshot")]
+    UnexpectedKartSnapshotHash { actual: u32 },
+
+    #[error(
+        "GameSlot type 17 {kind:?} snapshot has {actual} payload bytes; flags require exactly {expected}"
+    )]
+    InvalidKartSnapshotLength {
+        kind: KartSnapshotKind,
+        actual: usize,
+        expected: usize,
     },
 
     #[error("item-pickup blob has {actual} bytes; expected exactly {expected}")]
@@ -547,8 +669,51 @@ pub enum GameSlotDropReason {
     #[error("GameSlot type {packet_type} collection coordinate {axis} is not finite")]
     NonFiniteCollectionPosition { packet_type: u8, axis: usize },
 
-    #[error("barricade owner ID {owner_id} does not match claimed player ID {player_id}")]
-    InvalidBarricadeOwner { player_id: u8, owner_id: i32 },
+    #[error(
+        "GameSlot type {packet_type} team-flag body has {actual} bytes; expected exactly {expected}"
+    )]
+    InvalidTeamFlagBlobLength {
+        packet_type: u8,
+        actual: usize,
+        expected: usize,
+    },
+
+    #[error(
+        "GameSlot type {packet_type} team-flag operation pair 0x{operation_hash:08X}/0x{operation_base_hash:08X} is invalid"
+    )]
+    InvalidTeamFlagOperation {
+        packet_type: u8,
+        operation_hash: u32,
+        operation_base_hash: u32,
+    },
+
+    #[error(
+        "GameSlot type {packet_type} outer team-flag ID {outer} differs from nested ID {nested}"
+    )]
+    TeamFlagObjectIdMismatch {
+        packet_type: u8,
+        outer: u32,
+        nested: u32,
+    },
+
+    #[error("GameSlot type {packet_type} team-flag state is {actual}; expected {expected}")]
+    InvalidTeamFlagState {
+        packet_type: u8,
+        actual: u32,
+        expected: u32,
+    },
+
+    #[error("GameSlot type {packet_type} team-flag carrier ID {carrier} is outside 0..=15")]
+    InvalidTeamFlagCarrier { packet_type: u8, carrier: i32 },
+
+    #[error("GameSlot type {packet_type} team-flag coordinate {axis} is not finite")]
+    NonFiniteTeamFlagPosition { packet_type: u8, axis: usize },
+
+    #[error("barricade placement owner ID {owner_id} does not match claimed player ID {player_id}")]
+    InvalidBarricadePlacementOwner { player_id: u8, owner_id: i32 },
+
+    #[error("barricade transition owner ID {owner_id} is outside 0..=15")]
+    InvalidBarricadeTransitionOwner { owner_id: i32 },
 
     #[error("barricade reserved field is 0x{actual:08X}; expected zero")]
     InvalidBarricadeReserved { actual: u32 },
@@ -613,10 +778,13 @@ pub fn parse_game_slot_packet(packet: &[u8]) -> GameSlotDisposition {
         4 | 6 => {
             parse_world_object_collection(packet, packet_type, player_id, item_or_recipient_mask)?
         }
+        5 | 7 | 8 => parse_team_flag_transition(packet, packet_type, item_or_recipient_mask)?,
         9 => parse_item_vector(packet, player_id, item_or_recipient_mask)?,
-        10 | 16 => parse_item_use(packet, packet_type, item_or_recipient_mask)?,
-        11 => parse_item_reaction(packet, item_or_recipient_mask)?,
+        10 | 16 => parse_item_use(packet, packet_type, player_id, item_or_recipient_mask)?,
+        11 => parse_item_reaction(packet, player_id, item_or_recipient_mask)?,
         12 => parse_item_operation(packet, player_id, item_or_recipient_mask)?,
+        13 => parse_dashboard_allocation_notice(packet, player_id, item_or_recipient_mask)?,
+        17 => parse_kart_snapshot(packet, player_id, item_or_recipient_mask)?,
         unsupported => return Err(GameSlotDropReason::UnsupportedType(unsupported)),
     };
 
@@ -879,6 +1047,158 @@ fn parse_world_object_collection(
     ))
 }
 
+fn parse_team_flag_transition(
+    packet: &[u8],
+    packet_type: u8,
+    mask: u32,
+) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
+    const PAYLOAD_LENGTH_OFFSET: usize = 40;
+    const PAYLOAD_OFFSET: usize = 44;
+    ensure_minimum(packet, "GameSlot team-flag transition", PAYLOAD_OFFSET)?;
+    validate_mask(packet_type, mask, 0, GameSlotMaskRule::AllBitsSet)?;
+    let declared = read_u32(
+        packet,
+        PAYLOAD_LENGTH_OFFSET,
+        "GameSlot team-flag transition",
+    )?;
+    let payload = validate_blob(packet, packet_type, PAYLOAD_OFFSET, declared)?;
+    let (kind, expected_state, expected_length) = match packet_type {
+        5 => (TeamFlagTransitionKind::PickupAttach, 1, 24),
+        7 => (TeamFlagTransitionKind::DropRelocate, 3, 32),
+        8 => (TeamFlagTransitionKind::ReturnReset, 4, 32),
+        _ => unreachable!("team-flag parser is only dispatched for types 5, 7, and 8"),
+    };
+    if payload.length != expected_length {
+        return Err(GameSlotDropReason::InvalidTeamFlagBlobLength {
+            packet_type,
+            actual: payload.length,
+            expected: expected_length,
+        });
+    }
+    let operation_hash = read_u32(packet, PAYLOAD_OFFSET, "team-flag operation hash")?;
+    let operation_base_hash = read_u32(packet, PAYLOAD_OFFSET + 4, "team-flag base hash")?;
+    if (operation_hash, operation_base_hash) != (GOP_TEAM_FLAG_HASH, GO_TEAM_FLAG_HASH) {
+        return Err(GameSlotDropReason::InvalidTeamFlagOperation {
+            packet_type,
+            operation_hash,
+            operation_base_hash,
+        });
+    }
+    let object_id = read_u32(packet, 14, "team-flag outer object ID")?;
+    let nested_object_id = read_u32(packet, PAYLOAD_OFFSET + 8, "team-flag nested object ID")?;
+    if object_id != nested_object_id {
+        return Err(GameSlotDropReason::TeamFlagObjectIdMismatch {
+            packet_type,
+            outer: object_id,
+            nested: nested_object_id,
+        });
+    }
+    let state = read_u32(packet, PAYLOAD_OFFSET + 12, "team-flag state")?;
+    if state != expected_state {
+        return Err(GameSlotDropReason::InvalidTeamFlagState {
+            packet_type,
+            actual: state,
+            expected: expected_state,
+        });
+    }
+
+    let outer_position = read_finite_team_flag_position(packet, packet_type, 26, 0)?;
+    let TeamFlagVariantFields {
+        carrier_id,
+        transition_tick,
+        transition_position,
+    } = parse_team_flag_variant_fields(packet, packet_type, kind, PAYLOAD_OFFSET)?;
+
+    Ok((
+        GameSlotBody::TeamFlagTransition(TeamFlagTransition {
+            kind,
+            object_id,
+            current_tick: read_u32(packet, 18, "team-flag current tick")?,
+            expiry_tick: read_u32(packet, 22, "team-flag expiry tick")?,
+            outer_position,
+            trailing_word: read_u16(packet, 38, "team-flag trailing word")?,
+            carrier_id,
+            transition_tick,
+            transition_position,
+            payload,
+        }),
+        GameSlotAction::EvidencePending(GameSlotEvidencePending::TeamFlagAuthorization(kind)),
+    ))
+}
+
+struct TeamFlagVariantFields {
+    carrier_id: Option<u8>,
+    transition_tick: u32,
+    transition_position: Option<[f32; 3]>,
+}
+
+fn parse_team_flag_variant_fields(
+    packet: &[u8],
+    packet_type: u8,
+    kind: TeamFlagTransitionKind,
+    payload_offset: usize,
+) -> Result<TeamFlagVariantFields, GameSlotDropReason> {
+    Ok(match kind {
+        TeamFlagTransitionKind::PickupAttach => {
+            let carrier = read_i32(packet, payload_offset + 16, "team-flag carrier ID")?;
+            let carrier_id = u8::try_from(carrier)
+                .ok()
+                .filter(|value| *value <= MAX_GAME_SLOT_PLAYER_ID)
+                .ok_or(GameSlotDropReason::InvalidTeamFlagCarrier {
+                    packet_type,
+                    carrier,
+                })?;
+            TeamFlagVariantFields {
+                carrier_id: Some(carrier_id),
+                transition_tick: read_u32(packet, payload_offset + 20, "team-flag pickup tick")?,
+                transition_position: None,
+            }
+        }
+        TeamFlagTransitionKind::DropRelocate => TeamFlagVariantFields {
+            carrier_id: None,
+            transition_tick: read_u32(packet, payload_offset + 28, "team-flag drop tick")?,
+            transition_position: Some(read_finite_team_flag_position(
+                packet,
+                packet_type,
+                payload_offset + 16,
+                3,
+            )?),
+        },
+        TeamFlagTransitionKind::ReturnReset => TeamFlagVariantFields {
+            carrier_id: None,
+            transition_tick: read_u32(packet, payload_offset + 16, "team-flag return tick")?,
+            transition_position: Some(read_finite_team_flag_position(
+                packet,
+                packet_type,
+                payload_offset + 20,
+                3,
+            )?),
+        },
+    })
+}
+
+fn read_finite_team_flag_position(
+    packet: &[u8],
+    packet_type: u8,
+    offset: usize,
+    axis_base: usize,
+) -> Result<[f32; 3], GameSlotDropReason> {
+    let position = [
+        read_f32(packet, offset, "team-flag position")?,
+        read_f32(packet, offset + 4, "team-flag position")?,
+        read_f32(packet, offset + 8, "team-flag position")?,
+    ];
+    for (axis, value) in position.into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(GameSlotDropReason::NonFiniteTeamFlagPosition {
+                packet_type,
+                axis: axis_base + axis,
+            });
+        }
+    }
+    Ok(position)
+}
+
 fn parse_item_vector(
     packet: &[u8],
     player_id: u8,
@@ -941,12 +1261,18 @@ fn parse_item_vector(
 fn parse_item_use(
     packet: &[u8],
     packet_type: u8,
+    player_id: u8,
     mask: u32,
 ) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
     const BLOB_LENGTH_OFFSET: usize = 22;
     const BLOB_OFFSET: usize = 26;
     ensure_minimum(packet, "GameSlot item use", BLOB_OFFSET)?;
-    validate_mask(packet_type, mask, 0, GameSlotMaskRule::LowSixteenBits)?;
+    validate_mask(
+        packet_type,
+        mask,
+        player_id,
+        GameSlotMaskRule::LowSixteenBitsExcludingSender,
+    )?;
     let declared = read_u32(packet, BLOB_LENGTH_OFFSET, "GameSlot item use")?;
     let blob = validate_blob(packet, packet_type, BLOB_OFFSET, declared)?;
     let kind = if packet_type == 10 {
@@ -955,18 +1281,15 @@ fn parse_item_use(
         ItemUseKind::SpawnedWorldObject
     };
     let action = match kind {
-        ItemUseKind::Ordinary => {
-            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskIncludingSender)
-        }
-        ItemUseKind::SpawnedWorldObject => {
-            GameSlotAction::EvidencePending(GameSlotEvidencePending::SpawnedItemUseRouting)
+        ItemUseKind::Ordinary | ItemUseKind::SpawnedWorldObject => {
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender)
         }
     };
 
     Ok((
         GameSlotBody::ItemUse(ItemUse {
             kind,
-            common: packet[13],
+            raw_byte_13: packet[13],
             status: read_u16(packet, 14, "GameSlot item use status")?,
             item_or_skill: read_u16(packet, 16, "GameSlot item use item/skill")?,
             raw_byte_18: packet[18],
@@ -980,12 +1303,18 @@ fn parse_item_use(
 
 fn parse_item_reaction(
     packet: &[u8],
+    player_id: u8,
     mask: u32,
 ) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
     const BLOB_LENGTH_OFFSET: usize = 19;
     const BLOB_OFFSET: usize = 23;
     ensure_minimum(packet, "GameSlot item reaction", BLOB_OFFSET)?;
-    validate_mask(11, mask, 0, GameSlotMaskRule::NonzeroLowSixteenBits)?;
+    validate_mask(
+        11,
+        mask,
+        player_id,
+        GameSlotMaskRule::NonzeroLowSixteenBitsExcludingSender,
+    )?;
     let declared = read_u32(packet, BLOB_LENGTH_OFFSET, "GameSlot item reaction")?;
     let blob = validate_blob(packet, 11, BLOB_OFFSET, declared)?;
 
@@ -996,6 +1325,118 @@ fn parse_item_reaction(
             blob,
         }),
         GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender),
+    ))
+}
+
+fn parse_kart_snapshot(
+    packet: &[u8],
+    player_id: u8,
+    mask: u32,
+) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
+    const PAYLOAD_LENGTH_OFFSET: usize = 16;
+    const PAYLOAD_OFFSET: usize = 20;
+    const FLAGS_OFFSET_IN_PAYLOAD: usize = 8;
+    const MINIMUM_HEADER_LENGTH: usize = PAYLOAD_OFFSET + FLAGS_OFFSET_IN_PAYLOAD + 3;
+    ensure_minimum(packet, "GameSlot kart snapshot", MINIMUM_HEADER_LENGTH)?;
+    validate_mask(
+        17,
+        mask,
+        player_id,
+        GameSlotMaskRule::NonzeroLowSixteenBitsExcludingSender,
+    )?;
+
+    let reserved_word = read_u16(packet, 14, "GameSlot kart snapshot reserved word")?;
+    if reserved_word != 0 {
+        return Err(GameSlotDropReason::InvalidKartSnapshotReservedWord {
+            actual: reserved_word,
+        });
+    }
+    let declared = read_u32(
+        packet,
+        PAYLOAD_LENGTH_OFFSET,
+        "GameSlot kart snapshot payload length",
+    )?;
+    let payload = validate_blob(packet, 17, PAYLOAD_OFFSET, declared)?;
+    let nested_hash = read_u32(packet, PAYLOAD_OFFSET, "GameSlot kart snapshot hash")?;
+    let kind = match nested_hash {
+        GAME_KART_PACKET_HASH => KartSnapshotKind::FullPrecision,
+        GAME_KART_QUAD_PACKET_HASH => KartSnapshotKind::QuantizedQuad,
+        actual => return Err(GameSlotDropReason::UnexpectedKartSnapshotHash { actual }),
+    };
+    let flags = [
+        packet[PAYLOAD_OFFSET + FLAGS_OFFSET_IN_PAYLOAD],
+        packet[PAYLOAD_OFFSET + FLAGS_OFFSET_IN_PAYLOAD + 1],
+        packet[PAYLOAD_OFFSET + FLAGS_OFFSET_IN_PAYLOAD + 2],
+    ];
+    let (base_length, secondary_orientation, optional_scalar) = match kind {
+        KartSnapshotKind::FullPrecision => (116, 16, 4),
+        KartSnapshotKind::QuantizedQuad => (76, 4, 2),
+    };
+    let expected = base_length
+        + usize::from(flags[1] & 0x07 != 0) * secondary_orientation
+        + usize::from(flags[0] & 0x04 != 0) * optional_scalar
+        + usize::from(flags[0] & 0x08 != 0) * optional_scalar;
+    if payload.length != expected {
+        return Err(GameSlotDropReason::InvalidKartSnapshotLength {
+            kind,
+            actual: payload.length,
+            expected,
+        });
+    }
+
+    Ok((
+        GameSlotBody::KartSnapshot(KartSnapshot {
+            kind,
+            common: packet[13],
+            object_id: read_u32(
+                packet,
+                PAYLOAD_OFFSET + 4,
+                "GameSlot kart snapshot object ID",
+            )?,
+            flags,
+            payload,
+        }),
+        GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender),
+    ))
+}
+
+fn parse_dashboard_allocation_notice(
+    packet: &[u8],
+    player_id: u8,
+    mask: u32,
+) -> Result<(GameSlotBody, GameSlotAction), GameSlotDropReason> {
+    const PAYLOAD_LENGTH_OFFSET: usize = 16;
+    const PAYLOAD_OFFSET: usize = 20;
+    ensure_minimum(packet, "GameSlot dashboard allocation", PAYLOAD_OFFSET)?;
+    validate_mask(
+        13,
+        mask,
+        player_id,
+        GameSlotMaskRule::LowSixteenBitsExcludingSender,
+    )?;
+    let reserved_word = read_u16(packet, 14, "GameSlot dashboard allocation reserved word")?;
+    if reserved_word != 0 {
+        return Err(GameSlotDropReason::InvalidDashboardAllocationReservedWord {
+            actual: reserved_word,
+        });
+    }
+    let declared = read_u32(
+        packet,
+        PAYLOAD_LENGTH_OFFSET,
+        "GameSlot dashboard allocation payload length",
+    )?;
+    let payload = validate_blob(packet, 13, PAYLOAD_OFFSET, declared)?;
+    if !payload.is_empty() {
+        return Err(GameSlotDropReason::InvalidDashboardAllocationBodyLength {
+            actual: payload.len(),
+        });
+    }
+    Ok((
+        GameSlotBody::DashboardAllocationNotice(DashboardAllocationNotice {
+            raw_byte_13: packet[13],
+            payload,
+        }),
+        GameSlotAction::ConsumeNoReply,
     ))
 }
 
@@ -1053,15 +1494,15 @@ fn parse_item_operation(
     if operation_hash == GOP_BARRICADE_HASH {
         let schema = schema.expect("GopBarricade has a checked-in P5136 schema");
         let validated = schema.validate(raw)?;
-        let barricade = match validated.state {
-            1 => Some(parse_barricade(packet, player_id)?),
-            2 | 3 => {
-                // The retained transition capture proves the owner field but
-                // not a stable domain for the final dword (state 2 used zero,
-                // state 3 used two), so do not invent a narrower value rule.
-                validate_barricade_owner(packet, player_id)?;
-                None
-            }
+        let semantics = decode_validated_item_operation_semantics(validated, raw);
+        let barricade = match validated.state() {
+            1 => Some(BarricadeOperation::Placement(parse_barricade_placement(
+                packet, player_id,
+            )?)),
+            2..=4 => Some(BarricadeOperation::Transition(parse_barricade_transition(
+                packet,
+                validated.state(),
+            )?)),
             _ => None,
         };
         return Ok((
@@ -1069,9 +1510,10 @@ fn parse_item_operation(
                 operation_hash,
                 operation_base_hash,
                 schema,
-                object_id: validated.object_id,
-                state: validated.state,
-                evidence: validated.evidence,
+                object_id: validated.object_id(),
+                state: validated.state(),
+                evidence: validated.evidence(),
+                semantics,
                 barricade,
                 payload,
             }),
@@ -1080,14 +1522,16 @@ fn parse_item_operation(
     }
 
     if let Some(validated) = schema.and_then(|schema| schema.validate(raw).ok()) {
+        let semantics = decode_validated_item_operation_semantics(validated, raw);
         return Ok((
             GameSlotBody::ItemOperation(ItemOperation {
                 operation_hash,
                 operation_base_hash,
-                schema: validated.schema,
-                object_id: validated.object_id,
-                state: validated.state,
-                evidence: validated.evidence,
+                schema: validated.schema(),
+                object_id: validated.object_id(),
+                state: validated.state(),
+                evidence: validated.evidence(),
+                semantics,
                 barricade: None,
                 payload,
             }),
@@ -1106,8 +1550,11 @@ fn parse_item_operation(
     ))
 }
 
-fn parse_barricade(packet: &[u8], player_id: u8) -> Result<BarricadePlacement, GameSlotDropReason> {
-    validate_barricade_owner(packet, player_id)?;
+fn parse_barricade_placement(
+    packet: &[u8],
+    player_id: u8,
+) -> Result<BarricadePlacement, GameSlotDropReason> {
+    validate_barricade_placement_owner(packet, player_id)?;
     let reserved = read_u32(packet, 41, "GameSlot barricade reserved field")?;
     if reserved != 0 {
         return Err(GameSlotDropReason::InvalidBarricadeReserved { actual: reserved });
@@ -1129,15 +1576,47 @@ fn parse_barricade(packet: &[u8], player_id: u8) -> Result<BarricadePlacement, G
     })
 }
 
-fn validate_barricade_owner(packet: &[u8], player_id: u8) -> Result<(), GameSlotDropReason> {
+fn validate_barricade_placement_owner(
+    packet: &[u8],
+    player_id: u8,
+) -> Result<(), GameSlotDropReason> {
     let owner_id = read_i32(packet, 37, "GameSlot barricade owner")?;
     if owner_id != i32::from(player_id) {
-        return Err(GameSlotDropReason::InvalidBarricadeOwner {
+        return Err(GameSlotDropReason::InvalidBarricadePlacementOwner {
             player_id,
             owner_id,
         });
     }
     Ok(())
+}
+
+fn parse_barricade_transition(
+    packet: &[u8],
+    state: u32,
+) -> Result<BarricadeTransition, GameSlotDropReason> {
+    let owner_id = read_i32(packet, 37, "GameSlot barricade transition owner")?;
+    let owner_id = u8::try_from(owner_id)
+        .ok()
+        .filter(|owner_id| *owner_id <= MAX_GAME_SLOT_PLAYER_ID)
+        .ok_or(GameSlotDropReason::InvalidBarricadeTransitionOwner { owner_id })?;
+    Ok(BarricadeTransition {
+        object_id: read_u32(packet, 28, "GameSlot barricade transition object ID")?,
+        state: u8::try_from(state).map_err(|_| {
+            GameSlotDropReason::ItemOperationValidation(
+                ItemOperationValidationError::InvalidLength {
+                    class_name: "GopBarricade",
+                    state,
+                    actual: packet.len().saturating_sub(20),
+                    expected: 25,
+                },
+            )
+        })?,
+        tick: read_u32(packet, 33, "GameSlot barricade transition tick")?,
+        owner_id,
+        // Captures prove zero for state 2 and both one and two for state 3.
+        // Keep the complete bounded word instead of inventing an enum.
+        trailing: read_u32(packet, 41, "GameSlot barricade transition trailing word")?,
+    })
 }
 
 fn validate_mask(
@@ -1150,9 +1629,15 @@ fn validate_mask(
     let valid = match rule {
         GameSlotMaskRule::AllBitsSet => mask == u32::MAX,
         GameSlotMaskRule::LowSixteenBits => low_only,
+        GameSlotMaskRule::LowSixteenBitsExcludingSender => {
+            low_only && mask & (1_u32 << player_id) == 0
+        }
         GameSlotMaskRule::NonzeroLowSixteenBits => low_only && mask != 0,
         GameSlotMaskRule::NonzeroLowSixteenBitsIncludingSender => {
             low_only && mask != 0 && mask & (1_u32 << player_id) != 0
+        }
+        GameSlotMaskRule::NonzeroLowSixteenBitsExcludingSender => {
+            low_only && mask != 0 && mask & (1_u32 << player_id) == 0
         }
     };
     if valid {
@@ -1287,12 +1772,13 @@ fn read_array<const LENGTH: usize>(
 #[cfg(test)]
 mod tests {
     use super::{
-        GAME_KART_ITEM_INFO_HASH, GAME_SLOT_PACKET_HASH, GAME_SLOT_PACKET_NAME,
+        BarricadeOperation, GAME_KART_ITEM_INFO_HASH, GAME_KART_PACKET_HASH,
+        GAME_KART_QUAD_PACKET_HASH, GAME_SLOT_PACKET_HASH, GAME_SLOT_PACKET_NAME,
         GO_ITEM_BARRICADE_HASH, GO_ITEM_CUBE_HASH, GOP_BANANA_HASH, GOP_BARRICADE_HASH,
         GOP_CUBE_HASH, GameSlotAction, GameSlotBody, GameSlotDropReason, GameSlotEvidencePending,
-        GameSlotMaskRule, GameSlotRelayAudience, ItemPickupKind, ItemUseKind,
-        MAX_GAME_SLOT_BLOB_LENGTH, MAX_GAME_SLOT_LOGICAL_LENGTH, WorldObjectCollectionKind,
-        parse_game_slot_packet,
+        GameSlotMaskRule, GameSlotRelayAudience, ItemPickupKind, ItemUseKind, KartSnapshotKind,
+        MAX_GAME_SLOT_BLOB_LENGTH, MAX_GAME_SLOT_LOGICAL_LENGTH, TeamFlagTransitionKind,
+        WorldObjectCollectionKind, parse_game_slot_packet,
     };
     use crate::{
         game_slot_item_schema::{ItemOperationEvidence, ItemOperationValidationError},
@@ -1398,7 +1884,7 @@ mod tests {
                 Err(GameSlotDropReason::InvalidPlayerId(actual)) if actual == player_id
             ));
         }
-        for packet_type in [0, 3, 5, 7, 8, 13, 17, u8::MAX] {
+        for packet_type in [0, 3, u8::MAX] {
             let packet = common_packet(PLAYER_ID, PLAYER_MASK, packet_type).into_inner();
             assert!(matches!(
                 parse_game_slot_packet(&packet),
@@ -1584,6 +2070,108 @@ mod tests {
     }
 
     #[test]
+    fn team_flag_types_have_exact_typed_transition_shapes() {
+        for (packet_type, kind, state, length) in [
+            (5, TeamFlagTransitionKind::PickupAttach, 1, 24),
+            (7, TeamFlagTransitionKind::DropRelocate, 3, 32),
+            (8, TeamFlagTransitionKind::ReturnReset, 4, 32),
+        ] {
+            let parsed = parse_game_slot_packet(&team_flag_packet(packet_type)).unwrap();
+            let GameSlotBody::TeamFlagTransition(transition) = parsed.body() else {
+                panic!("expected team-flag transition");
+            };
+            assert_eq!(transition.kind, kind);
+            assert_eq!(transition.object_id, 0x1234_5678);
+            assert_eq!(transition.payload.len(), length);
+            assert_eq!(transition.current_tick, 1_000);
+            assert_eq!(transition.expiry_tick, 2_000);
+            assert_eq!(
+                transition.outer_position.map(f32::to_bits),
+                [1.0_f32.to_bits(), 2.0_f32.to_bits(), 3.0_f32.to_bits()]
+            );
+            assert_eq!(transition.transition_tick, 1_500);
+            assert_eq!(
+                transition.carrier_id,
+                (packet_type == 5).then_some(u8::try_from(PLAYER_ID).unwrap())
+            );
+            assert_eq!(
+                transition
+                    .transition_position
+                    .map(|position| position.map(f32::to_bits)),
+                (packet_type != 5).then_some([
+                    4.0_f32.to_bits(),
+                    5.0_f32.to_bits(),
+                    6.0_f32.to_bits(),
+                ])
+            );
+            assert_eq!(
+                parsed.action(),
+                GameSlotAction::EvidencePending(GameSlotEvidencePending::TeamFlagAuthorization(
+                    kind
+                ))
+            );
+
+            let mut wrong_state = team_flag_packet(packet_type);
+            set_u32(&mut wrong_state, 56, state + 1);
+            assert!(matches!(
+                parse_game_slot_packet(&wrong_state),
+                Err(GameSlotDropReason::InvalidTeamFlagState {
+                    packet_type: actual_type,
+                    actual,
+                    expected,
+                }) if actual_type == packet_type && actual == state + 1 && expected == state
+            ));
+        }
+    }
+
+    #[test]
+    fn team_flag_transitions_reject_spoofed_objects_carriers_and_positions() {
+        let mut wrong_pair = team_flag_packet(5);
+        set_u32(&mut wrong_pair, 44, 0);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_pair),
+            Err(GameSlotDropReason::InvalidTeamFlagOperation { packet_type: 5, .. })
+        ));
+
+        let mut wrong_object = team_flag_packet(7);
+        set_u32(&mut wrong_object, 52, 9);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_object),
+            Err(GameSlotDropReason::TeamFlagObjectIdMismatch { packet_type: 7, .. })
+        ));
+
+        let mut wrong_carrier = team_flag_packet(5);
+        set_i32(&mut wrong_carrier, 60, 16);
+        assert!(matches!(
+            parse_game_slot_packet(&wrong_carrier),
+            Err(GameSlotDropReason::InvalidTeamFlagCarrier {
+                packet_type: 5,
+                carrier: 16,
+            })
+        ));
+
+        let mut non_finite_outer = team_flag_packet(8);
+        set_f32(&mut non_finite_outer, 30, f32::NAN);
+        assert!(matches!(
+            parse_game_slot_packet(&non_finite_outer),
+            Err(GameSlotDropReason::NonFiniteTeamFlagPosition {
+                packet_type: 8,
+                axis: 1,
+            })
+        ));
+
+        let mut non_finite_transition = team_flag_packet(7);
+        set_f32(&mut non_finite_transition, 64, f32::INFINITY);
+        assert!(matches!(
+            parse_game_slot_packet(&non_finite_transition),
+            Err(GameSlotDropReason::NonFiniteTeamFlagPosition {
+                packet_type: 7,
+                axis: 4,
+            })
+        ));
+    }
+
+    #[test]
     fn item_vector_has_a_bounded_typed_item_list_and_peer_relay() {
         for items in [vec![], vec![7], vec![7, 11], vec![7, 11, 13]] {
             let wire = item_vector_packet(PLAYER_MASK | 1, &items);
@@ -1652,7 +2240,7 @@ mod tests {
             panic!("expected item use");
         };
         assert_eq!(fields.kind, ItemUseKind::Ordinary);
-        assert_eq!(fields.common, 7);
+        assert_eq!(fields.raw_byte_13, 7);
         assert_eq!(fields.status, 0x1002);
         assert_eq!(fields.item_or_skill, 0xFF85);
         assert_eq!((fields.raw_byte_18, fields.raw_byte_19), (9, 10));
@@ -1660,34 +2248,24 @@ mod tests {
         assert_eq!(item_use.payload(), Some(use_blob.as_slice()));
         assert_eq!(
             item_use.action(),
-            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskIncludingSender)
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender)
         );
 
-        let type_16 = parse_game_slot_packet(&item_use_packet(
-            16,
-            PLAYER_MASK,
-            7,
-            1,
-            0x71,
-            0,
-            0,
-            0,
-            &use_blob,
-        ))
-        .unwrap();
+        let type_16 =
+            parse_game_slot_packet(&item_use_packet(16, 0, 7, 1, 0x71, 0, 0, 0, &use_blob))
+                .unwrap();
         let GameSlotBody::ItemUse(fields) = type_16.body() else {
             panic!("expected spawned-world-object item use");
         };
         assert_eq!(fields.kind, ItemUseKind::SpawnedWorldObject);
         assert_eq!(
             type_16.action(),
-            GameSlotAction::EvidencePending(GameSlotEvidencePending::SpawnedItemUseRouting)
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender)
         );
 
         let reaction_blob = [0xAA, 0x55];
         let reaction =
-            parse_game_slot_packet(&item_reaction_packet(PLAYER_MASK | 1, 4, 9, &reaction_blob))
-                .unwrap();
+            parse_game_slot_packet(&item_reaction_packet(1, 4, 9, &reaction_blob)).unwrap();
         let GameSlotBody::ItemReaction(fields) = reaction.body() else {
             panic!("expected item reaction");
         };
@@ -1707,16 +2285,24 @@ mod tests {
             parse_game_slot_packet(&item_use_packet(10, 1 << 16, 0, 0, 0, 0, 0, 0, &[])),
             Err(GameSlotDropReason::InvalidMask {
                 packet_type: 10,
-                rule: GameSlotMaskRule::LowSixteenBits,
+                rule: GameSlotMaskRule::LowSixteenBitsExcludingSender,
                 ..
             })
         ));
-        for mask in [0, 1 << 16] {
+        assert!(matches!(
+            parse_game_slot_packet(&item_use_packet(16, PLAYER_MASK, 0, 0, 0, 0, 0, 0, &[])),
+            Err(GameSlotDropReason::InvalidMask {
+                packet_type: 16,
+                rule: GameSlotMaskRule::LowSixteenBitsExcludingSender,
+                ..
+            })
+        ));
+        for mask in [0, PLAYER_MASK, 1 << 16] {
             assert!(matches!(
                 parse_game_slot_packet(&item_reaction_packet(mask, 0, 0, &[])),
                 Err(GameSlotDropReason::InvalidMask {
                     packet_type: 11,
-                    rule: GameSlotMaskRule::NonzeroLowSixteenBits,
+                    rule: GameSlotMaskRule::NonzeroLowSixteenBitsExcludingSender,
                     ..
                 })
             ));
@@ -1724,32 +2310,12 @@ mod tests {
 
         let maximum_blob = vec![0x5a; MAX_GAME_SLOT_BLOB_LENGTH];
         assert!(
-            parse_game_slot_packet(&item_use_packet(
-                10,
-                PLAYER_MASK,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                &maximum_blob,
-            ))
-            .is_ok()
+            parse_game_slot_packet(&item_use_packet(10, 1, 0, 0, 0, 0, 0, 0, &maximum_blob,))
+                .is_ok()
         );
         let oversized_blob = vec![0; MAX_GAME_SLOT_BLOB_LENGTH + 1];
         assert!(matches!(
-            parse_game_slot_packet(&item_use_packet(
-                10,
-                PLAYER_MASK,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                &oversized_blob,
-            )),
+            parse_game_slot_packet(&item_use_packet(10, 1, 0, 0, 0, 0, 0, 0, &oversized_blob,)),
             Err(GameSlotDropReason::BlobLengthOverCap {
                 packet_type: 10,
                 declared: 961,
@@ -1757,7 +2323,7 @@ mod tests {
             })
         ));
 
-        let mut trailing = item_reaction_packet(PLAYER_MASK, 0, 0, &[1]);
+        let mut trailing = item_reaction_packet(1, 0, 0, &[1]);
         trailing.push(2);
         assert!(matches!(
             parse_game_slot_packet(&trailing),
@@ -1765,6 +2331,160 @@ mod tests {
                 packet_type: 11,
                 declared: 1,
                 actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn retained_quad_snapshot_is_typed_and_relayed_to_other_masked_peers() {
+        let wire = hex_bytes(
+            "7405C0270000000002000000116000004C000000EF0660403659150303808CFF36C0439B87F043988A7D4168FFEF7F0000000000000000000000000000000000000000000000007200000000000018000000784D7CCD00000000000000000000",
+        );
+        let parsed = parse_game_slot_packet(&wire).unwrap();
+        let GameSlotBody::KartSnapshot(snapshot) = parsed.body() else {
+            panic!("expected kart snapshot");
+        };
+        assert_eq!(snapshot.kind, KartSnapshotKind::QuantizedQuad);
+        assert_eq!(snapshot.common, 0x60);
+        assert_eq!(snapshot.object_id, 0x0315_5936);
+        assert_eq!(snapshot.flags, [0x03, 0x80, 0x8c]);
+        assert_eq!(snapshot.payload.len(), 76);
+        assert_eq!(parsed.payload(), Some(&wire[20..]));
+        assert_eq!(
+            parsed.action(),
+            GameSlotAction::RelayOriginal(GameSlotRelayAudience::RecipientMaskExceptSender)
+        );
+        assert_eq!(parsed.raw(), wire);
+    }
+
+    #[test]
+    fn both_kart_snapshot_codecs_enforce_the_native_flag_length_formula() {
+        for (hash, kind, base, secondary, scalar) in [
+            (
+                GAME_KART_PACKET_HASH,
+                KartSnapshotKind::FullPrecision,
+                116,
+                16,
+                4,
+            ),
+            (
+                GAME_KART_QUAD_PACKET_HASH,
+                KartSnapshotKind::QuantizedQuad,
+                76,
+                4,
+                2,
+            ),
+        ] {
+            for flags in [[0, 0, 0], [0, 1, 0], [4, 0, 0], [8, 0, 0], [12, 7, 0]] {
+                let wire = kart_snapshot_packet(hash, flags);
+                let parsed = parse_game_slot_packet(&wire).unwrap();
+                let GameSlotBody::KartSnapshot(snapshot) = parsed.body() else {
+                    panic!("expected kart snapshot");
+                };
+                let expected = base
+                    + usize::from(flags[1] & 7 != 0) * secondary
+                    + usize::from(flags[0] & 4 != 0) * scalar
+                    + usize::from(flags[0] & 8 != 0) * scalar;
+                assert_eq!(snapshot.kind, kind);
+                assert_eq!(snapshot.payload.len(), expected);
+
+                let mut drifted = wire;
+                drifted[28] ^= 4;
+                let toggled_expected = if flags[0] & 4 == 0 {
+                    expected + scalar
+                } else {
+                    expected - scalar
+                };
+                assert!(matches!(
+                    parse_game_slot_packet(&drifted),
+                    Err(GameSlotDropReason::InvalidKartSnapshotLength {
+                        kind: actual_kind,
+                        expected: actual_expected,
+                        ..
+                    }) if actual_kind == kind && actual_expected == toggled_expected
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn kart_snapshot_rejects_spoofed_mask_reserved_hash_and_blob_length() {
+        let base = kart_snapshot_packet(GAME_KART_QUAD_PACKET_HASH, [0; 3]);
+
+        let mut sender_in_mask = base.clone();
+        set_u32(&mut sender_in_mask, 8, PLAYER_MASK | 1);
+        assert!(matches!(
+            parse_game_slot_packet(&sender_in_mask),
+            Err(GameSlotDropReason::InvalidMask {
+                packet_type: 17,
+                rule: GameSlotMaskRule::NonzeroLowSixteenBitsExcludingSender,
+                ..
+            })
+        ));
+
+        let mut reserved = base.clone();
+        reserved[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(matches!(
+            parse_game_slot_packet(&reserved),
+            Err(GameSlotDropReason::InvalidKartSnapshotReservedWord { actual: 1 })
+        ));
+
+        let mut unknown_hash = base.clone();
+        set_u32(&mut unknown_hash, 20, 0xDEAD_BEEF);
+        assert!(matches!(
+            parse_game_slot_packet(&unknown_hash),
+            Err(GameSlotDropReason::UnexpectedKartSnapshotHash {
+                actual: 0xDEAD_BEEF
+            })
+        ));
+
+        let mut trailing = base;
+        trailing.push(0);
+        assert!(matches!(
+            parse_game_slot_packet(&trailing),
+            Err(GameSlotDropReason::BlobLengthMismatch {
+                packet_type: 17,
+                declared: 76,
+                actual: 77,
+            })
+        ));
+    }
+
+    #[test]
+    fn dashboard_allocation_notice_is_an_exact_empty_no_reply_event() {
+        let wire = dashboard_allocation_packet(1);
+        let parsed = parse_game_slot_packet(&wire).unwrap();
+        let GameSlotBody::DashboardAllocationNotice(notice) = parsed.body() else {
+            panic!("expected dashboard allocation notice");
+        };
+        assert_eq!(notice.raw_byte_13, 0x7e);
+        assert!(notice.payload.is_empty());
+        assert_eq!(parsed.action(), GameSlotAction::ConsumeNoReply);
+        assert_eq!(parsed.payload(), Some(&[][..]));
+
+        let mut reserved = wire.clone();
+        reserved[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(matches!(
+            parse_game_slot_packet(&reserved),
+            Err(GameSlotDropReason::InvalidDashboardAllocationReservedWord { actual: 1 })
+        ));
+
+        let mut body = wire.clone();
+        body.push(0xaa);
+        set_u32(&mut body, 16, 1);
+        assert!(matches!(
+            parse_game_slot_packet(&body),
+            Err(GameSlotDropReason::InvalidDashboardAllocationBodyLength { actual: 1 })
+        ));
+
+        let mut sender_mask = wire;
+        set_u32(&mut sender_mask, 8, PLAYER_MASK);
+        assert!(matches!(
+            parse_game_slot_packet(&sender_mask),
+            Err(GameSlotDropReason::InvalidMask {
+                packet_type: 13,
+                rule: GameSlotMaskRule::LowSixteenBitsExcludingSender,
+                ..
             })
         ));
     }
@@ -1912,7 +2632,9 @@ mod tests {
         let GameSlotBody::ItemOperation(operation) = parsed.body() else {
             panic!("expected item operation");
         };
-        let placement = operation.barricade.expect("expected barricade placement");
+        let Some(BarricadeOperation::Placement(placement)) = operation.barricade else {
+            panic!("expected barricade placement");
+        };
         assert_eq!(placement.object_id, 0x1234_5678);
         assert_eq!(placement.tick, 0x9ABC_DEF0);
         assert_eq!(placement.owner_id, 3);
@@ -1923,6 +2645,26 @@ mod tests {
             parsed.action(),
             GameSlotAction::RelayOriginal(GameSlotRelayAudience::AllRacePeersMaskMatch)
         );
+    }
+
+    #[test]
+    fn retained_remote_barricade_hit_preserves_installer_distinct_from_reporter() {
+        let wire = hex_bytes(
+            "7405C02701000000010000000CFF000019000000A304861DC205062D48000010025B3804000000000000000000",
+        );
+        let parsed = parse_game_slot_packet(&wire).unwrap();
+        assert_eq!(parsed.player_id(), 1);
+        let GameSlotBody::ItemOperation(operation) = parsed.body() else {
+            panic!("expected item operation");
+        };
+        let Some(BarricadeOperation::Transition(transition)) = operation.barricade else {
+            panic!("expected barricade transition");
+        };
+        assert_eq!(transition.object_id, 0x1000_0048);
+        assert_eq!(transition.state, 2);
+        assert_eq!(transition.owner_id, 0);
+        assert_eq!(transition.tick, 0x0004_385B);
+        assert_eq!(transition.trailing, 0);
     }
 
     #[test]
@@ -1945,21 +2687,29 @@ mod tests {
         set_i32(&mut wrong_owner, 37, 2);
         assert!(matches!(
             parse_game_slot_packet(&wrong_owner),
-            Err(GameSlotDropReason::InvalidBarricadeOwner {
+            Err(GameSlotDropReason::InvalidBarricadePlacementOwner {
                 player_id: 3,
                 owner_id: 2,
             })
         ));
 
         for state in [2, 3] {
-            let mut wrong_transition_owner = barricade_transition_packet(state);
-            set_i32(&mut wrong_transition_owner, 37, 1);
+            let mut bounded_transition_owner = barricade_transition_packet(state);
+            set_i32(&mut bounded_transition_owner, 37, 1);
+            let parsed = parse_game_slot_packet(&bounded_transition_owner).unwrap();
+            let GameSlotBody::ItemOperation(operation) = parsed.body() else {
+                panic!("expected item operation");
+            };
+            let Some(BarricadeOperation::Transition(transition)) = operation.barricade else {
+                panic!("expected barricade transition");
+            };
+            assert_eq!(transition.owner_id, 1);
+            assert_eq!(u32::from(transition.state), state);
+
+            set_i32(&mut bounded_transition_owner, 37, 16);
             assert!(matches!(
-                parse_game_slot_packet(&wrong_transition_owner),
-                Err(GameSlotDropReason::InvalidBarricadeOwner {
-                    player_id: 3,
-                    owner_id: 1,
-                })
+                parse_game_slot_packet(&bounded_transition_owner),
+                Err(GameSlotDropReason::InvalidBarricadeTransitionOwner { owner_id: 16 })
             ));
         }
 
@@ -1987,11 +2737,17 @@ mod tests {
             pickup_packet(1, [0.0; 3], 0),
             pickup_packet(2, [0.0; 3], 0),
             world_object_collection_packet(4),
+            team_flag_packet(5),
             world_object_collection_packet(6),
+            team_flag_packet(7),
+            team_flag_packet(8),
             item_vector_packet(PLAYER_MASK, &[1, 2, 3]),
             item_use_packet(10, PLAYER_MASK, 1, 2, 3, 4, 5, 6, &[7, 8]),
-            item_use_packet(16, PLAYER_MASK, 1, 2, 3, 4, 5, 6, &[7, 8]),
-            item_reaction_packet(PLAYER_MASK, 1, 2, &[3, 4]),
+            item_use_packet(16, 0, 1, 2, 3, 4, 5, 6, &[7, 8]),
+            item_reaction_packet(1, 1, 2, &[3, 4]),
+            dashboard_allocation_packet(1),
+            kart_snapshot_packet(GAME_KART_PACKET_HASH, [0; 3]),
+            kart_snapshot_packet(GAME_KART_QUAD_PACKET_HASH, [12, 7, 0]),
             operation_state_packet(PLAYER_MASK, WATERBOMB_PAIR, 1, 125),
             barricade_packet(),
         ];
@@ -2094,6 +2850,46 @@ mod tests {
         packet.into_inner()
     }
 
+    fn kart_snapshot_packet(hash: u32, flags: [u8; 3]) -> Vec<u8> {
+        let (base, secondary, scalar) = match hash {
+            GAME_KART_PACKET_HASH => (116, 16, 4),
+            GAME_KART_QUAD_PACKET_HASH => (76, 4, 2),
+            _ => panic!("test helper requires a known kart snapshot hash"),
+        };
+        let length = base
+            + usize::from(flags[1] & 7 != 0) * secondary
+            + usize::from(flags[0] & 4 != 0) * scalar
+            + usize::from(flags[0] & 8 != 0) * scalar;
+        let mut payload = vec![0; length];
+        payload[..4].copy_from_slice(&hash.to_le_bytes());
+        payload[4..8].copy_from_slice(&0x1020_3040_u32.to_le_bytes());
+        payload[8..11].copy_from_slice(&flags);
+
+        let mut packet = common_packet(PLAYER_ID, 1, 17);
+        packet.write_u8(0x5a);
+        packet.write_u16(0);
+        packet.write_u32(u32::try_from(payload.len()).unwrap());
+        packet.write_bytes(&payload);
+        packet.into_inner()
+    }
+
+    fn dashboard_allocation_packet(mask: u32) -> Vec<u8> {
+        let mut packet = common_packet(PLAYER_ID, mask, 13);
+        packet.write_u8(0x7e);
+        packet.write_u16(0);
+        packet.write_u32(0);
+        packet.into_inner()
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(compact.len() % 2, 0);
+        (0..compact.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&compact[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
     fn operation_packet(mask: u32, pair: (u32, u32), length: usize) -> Vec<u8> {
         assert!(length >= 8);
         let mut packet = common_packet(PLAYER_ID, mask, 12);
@@ -2160,6 +2956,49 @@ mod tests {
         packet.write_i32(PLAYER_ID);
         packet.write_u32(0x1020_3040);
         packet.write_u8(7);
+        packet.into_inner()
+    }
+
+    fn team_flag_packet(packet_type: u8) -> Vec<u8> {
+        let (state, payload_length) = match packet_type {
+            5 => (1, 24),
+            7 => (3, 32),
+            8 => (4, 32),
+            _ => panic!("team-flag fixture requires type 5, 7, or 8"),
+        };
+        let mut packet = common_packet(PLAYER_ID, u32::MAX, packet_type);
+        packet.write_u8(0);
+        packet.write_u32(0x1234_5678);
+        packet.write_u32(1_000);
+        packet.write_u32(2_000);
+        for value in [1.0, 2.0, 3.0] {
+            packet.write_f32(value);
+        }
+        packet.write_u16(0x55aa);
+        packet.write_u32(payload_length);
+        packet.write_u32(super::GOP_TEAM_FLAG_HASH);
+        packet.write_u32(super::GO_TEAM_FLAG_HASH);
+        packet.write_u32(0x1234_5678);
+        packet.write_u32(state);
+        match packet_type {
+            5 => {
+                packet.write_i32(PLAYER_ID);
+                packet.write_u32(1_500);
+            }
+            7 => {
+                for value in [4.0, 5.0, 6.0] {
+                    packet.write_f32(value);
+                }
+                packet.write_u32(1_500);
+            }
+            8 => {
+                packet.write_u32(1_500);
+                for value in [4.0, 5.0, 6.0] {
+                    packet.write_f32(value);
+                }
+            }
+            _ => unreachable!(),
+        }
         packet.into_inner()
     }
 

@@ -1,6 +1,6 @@
 //! Exact P5136 race-settlement packet encoding.
 //!
-//! The Korean P5136 client expects a fixed 217-byte record for each human
+//! The Korean P5136 client consumes a fixed 212-byte record for each human
 //! racer and a fixed 22-byte record for each AI racer. Later clients added a
 //! trailing dword, so this module deliberately emits only the five-byte
 //! P5136 tail.
@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::packet::PacketWriter;
 
 pub const GAME_RESULT_PACKET_NAME: &str = "GameResultPacket";
-pub const HUMAN_RESULT_RECORD_LENGTH: usize = 217;
+pub const HUMAN_RESULT_RECORD_LENGTH: usize = 212;
 pub const AI_RESULT_RECORD_LENGTH: usize = 22;
 pub const EMPTY_GAME_RESULT_LENGTH: usize = 52;
 pub const MAX_RACE_RESULT_PARTICIPANTS: usize = 8;
@@ -206,12 +206,12 @@ fn write_human_result(packet: &mut PacketWriter, result: HumanRaceResult) {
     packet.write_u32(result.earned_lucci);
     packet.write_u32(result.current_lucci);
     packet.write_bytes(&[0; 29]);
+    packet.write_u8(result.team.map_or(0, |team| team as u8));
     packet.write_i32(if result.team.is_some() {
         result.team_points
     } else {
         0
     });
-    packet.write_u8(result.team.map_or(0, |team| team as u8));
     packet.write_bytes(&[0; 12]);
     packet.write_i32(1);
     packet.write_u8(0);
@@ -220,7 +220,7 @@ fn write_human_result(packet: &mut PacketWriter, result: HumanRaceResult) {
     packet.write_u8(u8::MAX);
     packet.write_bytes(&[0; 37]);
     packet.write_i32(result.club_mark_logo);
-    packet.write_bytes(&[0; 39]);
+    packet.write_bytes(&[0; 34]);
     debug_assert_eq!(packet.as_slice().len() - start, HUMAN_RESULT_RECORD_LENGTH);
 }
 
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn human_and_ai_records_use_the_csharp_offsets_and_fixed_lengths() {
+    fn human_and_ai_records_use_the_p5136_decoder_offsets_and_fixed_lengths() {
         let human = HumanRaceResult {
             player_id: 2,
             finish_time: 0x1234_5678,
@@ -335,11 +335,11 @@ mod tests {
             &packet[human_start + 15..human_start + 17],
             &2_i16.to_le_bytes()
         );
+        assert_eq!(packet[human_start + 63], ResultTeam::Red as u8);
         assert_eq!(
-            &packet[human_start + 63..human_start + 67],
+            &packet[human_start + 64..human_start + 68],
             &human.team_points.to_le_bytes()
         );
-        assert_eq!(packet[human_start + 67], ResultTeam::Red as u8);
         assert_eq!(
             &packet[human_start + 80..human_start + 84],
             &1_i32.to_le_bytes()
@@ -394,8 +394,8 @@ mod tests {
         .unwrap();
         let start = 9;
         assert_eq!(&packet[start + 15..start + 17], &[0, 0]);
-        assert_eq!(&packet[start + 63..start + 67], &[0, 0, 0, 0]);
-        assert_eq!(packet[start + 67], 0);
+        assert_eq!(packet[start + 63], 0);
+        assert_eq!(&packet[start + 64..start + 68], &[0, 0, 0, 0]);
     }
 
     #[test]

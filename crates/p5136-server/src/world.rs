@@ -12,10 +12,13 @@ use std::{
 
 use p5136_core::{
     equipment_protocol::{EquipmentProtocolError, serialize_room_slot_items},
+    game_slot_item_semantics::ItemLifecycleMeaning,
     game_slot_protocol::{
-        GameSlotAction, GameSlotBody, GameSlotEvidencePending, GameSlotRelayAudience,
-        GameSlotSynthesisError, ItemPickupKind, ParsedGameSlotPacket,
+        BarricadeOperation, GameSlotAction, GameSlotBody, GameSlotEvidencePending,
+        GameSlotRelayAudience, GameSlotSynthesisError, ItemOperation, ItemPickupKind,
+        ParsedGameSlotPacket,
     },
+    kart_physics::csharp_room_title_speed_type,
     lobby_protocol::{
         BasicAiRequest, ChangeTrackRequest, CloseSlotRequest, LobbyProtocolError, MacroChatRequest,
         PlayerSlotState, RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, StartRoomStatus,
@@ -113,11 +116,16 @@ use crate::profile_presentation_persistence::{
     ProfilePresentationCompletion, ProfilePresentationMutation, ProfilePresentationPublication,
     ProfilePresentationWriteError,
 };
+use crate::race_object_registry::{
+    RaceObjectActor, RaceObjectAdmission, RaceObjectDuplicateKind, RaceObjectMutation,
+    RaceObjectRegistry, RaceObjectRegistryError, plan_item_operation,
+};
+use crate::random_track::ResolvedRandomTracks;
 use crate::udp_runtime::{
     ServerClock, UdpDispatchAction, UdpDispatchOutcome, UdpDispatchRequest, UdpIngress,
     UdpIngressBody, UdpService, UdpServiceError,
 };
-use crate::udp_state::UdpEndpointStateError;
+use crate::udp_state::{UdpEndpointStateError, UdpTransport};
 
 pub const ROOM_CAPACITY: usize = 8;
 pub(crate) const SESSION_OUTBOUND_CAPACITY: usize = 64;
@@ -728,6 +736,32 @@ pub(crate) struct RoomParticipant {
     pub(crate) player: RoomPlayer,
     pub(crate) observer: bool,
     pub(crate) kart_physics: P5136KartPhysicsBlock,
+    pub(crate) kart_physics_variants: Option<RoomKartPhysicsVariants>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomKartPhysicsVariants {
+    default: P5136KartPhysicsBlock,
+    by_speed_type: Arc<[P5136KartPhysicsBlock; 8]>,
+}
+
+impl RoomKartPhysicsVariants {
+    #[must_use]
+    pub(crate) fn new(
+        default: P5136KartPhysicsBlock,
+        by_speed_type: [P5136KartPhysicsBlock; 8],
+    ) -> Self {
+        Self {
+            default,
+            by_speed_type: Arc::new(by_speed_type),
+        }
+    }
+
+    fn for_room_title(&self, room_name: &str) -> &P5136KartPhysicsBlock {
+        csharp_room_title_speed_type(room_name).map_or(&self.default, |speed_type| {
+            &self.by_speed_type[usize::from(speed_type)]
+        })
+    }
 }
 
 /// Actor-owned room metadata corresponding to the C# `GameRoom` fields used
@@ -755,6 +789,7 @@ pub enum RoomPhase {
 #[derive(Debug, Clone)]
 pub(crate) struct StartRoomPlan {
     random_track_candidates: Vec<u32>,
+    random_tracks: Option<Arc<ResolvedRandomTracks>>,
     ai_specs: Vec<AiRaceSpec>,
     maximum_payload_length: usize,
 }
@@ -764,9 +799,19 @@ impl StartRoomPlan {
     pub(crate) fn new(random_track_candidates: Vec<u32>, ai_specs: Vec<AiRaceSpec>) -> Self {
         Self {
             random_track_candidates,
+            random_tracks: None,
             ai_specs,
             maximum_payload_length: MAX_GR_COMMAND_START_PAYLOAD_LENGTH,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_random_tracks(
+        mut self,
+        random_tracks: Option<Arc<ResolvedRandomTracks>>,
+    ) -> Self {
+        self.random_tracks = random_tracks;
+        self
     }
 
     #[cfg(test)]
@@ -876,6 +921,11 @@ pub(crate) enum RaceCommandOutcome {
         race_epoch: u64,
         recipients: usize,
     },
+    GameSlotConsumed {
+        room_id: RoomId,
+        race_epoch: u64,
+        player_id: u8,
+    },
     GameSlotItemAwarded {
         room_id: RoomId,
         race_epoch: u64,
@@ -888,6 +938,14 @@ pub(crate) enum RaceCommandOutcome {
         race_epoch: u64,
         player_id: u8,
         reason: GameSlotEvidencePending,
+    },
+    GameSlotObjectDuplicateSuppressed {
+        room_id: RoomId,
+        race_epoch: u64,
+        player_id: u8,
+        object_id: u32,
+        state: u32,
+        kind: RaceObjectDuplicateKind,
     },
 }
 
@@ -1027,6 +1085,42 @@ pub enum RaceError {
     )]
     GameSlotRecipientMaskMismatch { actual: u32, expected: u32 },
 
+    #[error(
+        "race {race_epoch} object registry is full at {maximum} entries while admitting 0x{object_id:08X}"
+    )]
+    RaceObjectRegistryFull {
+        race_epoch: u64,
+        object_id: u32,
+        maximum: usize,
+    },
+
+    #[error(
+        "race {race_epoch} object 0x{object_id:08X} changed native class from 0x{expected_operation_hash:08X}/0x{expected_base_hash:08X} to 0x{actual_operation_hash:08X}/0x{actual_base_hash:08X}"
+    )]
+    RaceObjectClassMismatch {
+        race_epoch: u64,
+        object_id: u32,
+        expected_operation_hash: u32,
+        expected_base_hash: u32,
+        actual_operation_hash: u32,
+        actual_base_hash: u32,
+    },
+
+    #[error(
+        "race {race_epoch} object 0x{object_id:08X} changed owner from player {expected_player_id} generation {expected_generation} to player {actual_player_id} generation {actual_generation}"
+    )]
+    RaceObjectOwnerMismatch {
+        race_epoch: u64,
+        object_id: u32,
+        expected_player_id: u8,
+        expected_generation: u64,
+        actual_player_id: u8,
+        actual_generation: u64,
+    },
+
+    #[error("race object owner player {player_id} is not a frozen human racer")]
+    RaceObjectOwnerNotFrozen { player_id: u8 },
+
     #[error("item pickup requires item individual/team game type 2 or 4; got {game_type}")]
     ItemPickupModeRequired { game_type: u8 },
 
@@ -1118,6 +1212,10 @@ impl RaceError {
                 | Self::HumanRacerRequired
                 | Self::GameSlotPlayerMismatch { .. }
                 | Self::GameSlotRecipientMaskMismatch { .. }
+                | Self::RaceObjectRegistryFull { .. }
+                | Self::RaceObjectClassMismatch { .. }
+                | Self::RaceObjectOwnerMismatch { .. }
+                | Self::RaceObjectOwnerNotFrozen { .. }
                 | Self::ItemPickupModeRequired { .. }
                 | Self::StaleItemPickup { .. }
                 | Self::DuplicateItemPickup { .. }
@@ -2122,7 +2220,7 @@ enum WorldCommand {
     /// frozen once loading starts, so only a lobby member may be refreshed.
     RefreshRoomKartPhysics {
         session: SessionId,
-        kart_physics: Box<P5136KartPhysicsBlock>,
+        kart_physics: Box<RoomKartPhysicsVariants>,
         reply: oneshot::Sender<Result<bool, WorldError>>,
     },
     RefreshMyRoomPresentation {
@@ -3233,7 +3331,7 @@ impl AdmittedWorldHandle<'_> {
     /// lobby room (or its room has already moved past the lobby phase).
     pub(crate) async fn refresh_room_kart_physics(
         &self,
-        kart_physics: P5136KartPhysicsBlock,
+        kart_physics: RoomKartPhysicsVariants,
     ) -> Result<bool, WorldError> {
         let (reply, response) = oneshot::channel();
         self.send(WorldCommand::RefreshRoomKartPhysics {
@@ -3610,6 +3708,11 @@ struct World {
     room_by_identity: HashMap<String, RoomId>,
     protocol_rooms: HashMap<RoomId, ProtocolRoomState>,
     protocol_room_by_user: HashMap<UserNo, RoomId>,
+    /// The authenticated source port last observed on the P2P UDP transport
+    /// for an exact live identity. This is intentionally runtime-only: a
+    /// transient NAT binding must not overwrite the profile's client-reported
+    /// presentation value on disk.
+    observed_p2p_ports: HashMap<UserNo, (IdentityBinding, u16)>,
     free_protocol_room_ids: BTreeSet<u16>,
     identity_lifecycle: VecDeque<IdentityLifecycleEvent>,
     identity_capacity: NonZeroUsize,
@@ -3713,6 +3816,7 @@ struct ProtocolRoomMember {
     user_no: UserNo,
     player: RoomPlayer,
     kart_physics: P5136KartPhysicsBlock,
+    kart_physics_variants: Option<RoomKartPhysicsVariants>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3761,6 +3865,16 @@ struct FrozenRaceRoster {
     concrete_track: u32,
     participants: Vec<FrozenRaceParticipant>,
     ais: Vec<FrozenAiRaceParticipant>,
+}
+
+impl FrozenRaceRoster {
+    fn active_racer_count(&self) -> usize {
+        self.participants
+            .iter()
+            .filter(|participant| !participant.observer)
+            .count()
+            + self.ais.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3887,6 +4001,23 @@ struct PendingRaceFanout {
     begin_settlement: Option<PendingBeginSettlement>,
 }
 
+#[derive(Debug)]
+struct GameSlotRelayPlan<'a> {
+    room_id: RoomId,
+    race_epoch: u64,
+    identity: &'a IdentityBinding,
+    audience: GameSlotRelayAudience,
+    recipient_mask: u32,
+    raw: Vec<u8>,
+    object_mutation: Option<RaceObjectMutation>,
+}
+
+#[derive(Debug)]
+enum RaceObjectPublicationPlan {
+    Relay(Option<RaceObjectMutation>),
+    Duplicate(RaceCommandOutcome),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RaceProgress {
     finish_times: HashMap<i32, u32>,
@@ -3894,6 +4025,7 @@ struct RaceProgress {
     pending_fanouts: VecDeque<PendingRaceFanout>,
     team_gauge_bits: [u32; 2],
     item_pickups: HashMap<i32, ItemPickupReplayState>,
+    race_objects: RaceObjectRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3912,6 +4044,7 @@ impl Default for RaceProgress {
             pending_fanouts: VecDeque::new(),
             team_gauge_bits: [0.0_f32.to_bits(); 2],
             item_pickups: HashMap::new(),
+            race_objects: RaceObjectRegistry::default(),
         }
     }
 }
@@ -3990,6 +4123,9 @@ struct ProtocolRoomState {
     closed_slots_by_id: [Option<u8>; ROOM_SLOT_COUNT],
     observers: [Option<ProtocolRoomMember>; ROOM_OBSERVER_COUNT],
     slot_positions: [Option<u8>; ROOM_SLOT_COUNT],
+    random_track_pool: Option<(u8, u32)>,
+    random_tracks_used: Vec<u32>,
+    last_random_track: Option<u32>,
 }
 
 type OutboundDelivery = (SessionId, OutboundBatch);
@@ -4129,6 +4265,9 @@ impl ProtocolRoomState {
             closed_slots_by_id: [None; ROOM_SLOT_COUNT],
             observers: array::from_fn(|_| None),
             slot_positions: [None; ROOM_SLOT_COUNT],
+            random_track_pool: None,
+            random_tracks_used: Vec::new(),
+            last_random_track: None,
         }
     }
 
@@ -4143,6 +4282,7 @@ impl ProtocolRoomState {
                 user_no,
                 player: participant.player,
                 kart_physics: participant.kart_physics,
+                kart_physics_variants: participant.kart_physics_variants,
             });
             return true;
         }
@@ -4167,6 +4307,7 @@ impl ProtocolRoomState {
             user_no,
             player: participant.player,
             kart_physics: participant.kart_physics,
+            kart_physics_variants: participant.kart_physics_variants,
         });
         self.slot_positions[slot_id] = Some(member_id);
         if self.members_by_id.iter().flatten().count() == 1 {
@@ -4416,11 +4557,13 @@ impl ProtocolRoomState {
     }
 
     fn select_concrete_track(
-        &self,
-        race_epoch: u64,
+        &mut self,
         random_track_candidates: &[u32],
     ) -> Result<u32, LobbyError> {
         if !is_random_track_selector(self.settings.track) {
+            self.random_track_pool = None;
+            self.random_tracks_used.clear();
+            self.last_random_track = None;
             return Ok(self.settings.track);
         }
         let mut candidates = random_track_candidates
@@ -4434,22 +4577,40 @@ impl ProtocolRoomState {
             return Err(LobbyError::MissingTrackCandidates);
         }
 
-        // A stable mixer gives random-looking distribution without process
-        // entropy or iteration-order dependence. Selection is evaluated once
-        // in the pre-commit start transaction and frozen with the race epoch.
-        let mut selector = u64::from(self.id.0)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(race_epoch);
-        selector ^= selector >> 30;
-        selector = selector.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        selector ^= selector >> 27;
-        selector = selector.wrapping_mul(0x94D0_49BB_1331_11EB);
-        selector ^= selector >> 31;
-        let candidate_count =
-            u64::try_from(candidates.len()).expect("the candidate count always fits in u64");
-        let index = usize::try_from(selector % candidate_count)
-            .expect("the candidate modulo result fits in usize");
-        Ok(candidates[index])
+        let catalog_game_type = u8::from(matches!(self.settings.game_type, 2 | 4));
+        let pool = (catalog_game_type, self.settings.track);
+        if self.random_track_pool != Some(pool) {
+            self.random_track_pool = Some(pool);
+            self.random_tracks_used.clear();
+            self.last_random_track = None;
+        }
+        self.random_tracks_used
+            .retain(|track| candidates.binary_search(track).is_ok());
+        if self.random_tracks_used.len() >= candidates.len() {
+            self.random_tracks_used.clear();
+        }
+        let mut available = candidates
+            .iter()
+            .copied()
+            .filter(|track| !self.random_tracks_used.contains(track))
+            .collect::<Vec<_>>();
+        if available.len() > 1
+            && let Some(last) = self.last_random_track
+        {
+            available.retain(|track| *track != last);
+        }
+        if available.is_empty() {
+            available.clone_from(&candidates);
+        }
+
+        // Match the C# server's process-entropy-backed selection. The draw is
+        // made once against the cloned pre-commit room, so serialization or
+        // outbound-reservation failures still leave room history untouched.
+        let index = rand::rng().random_range(0..available.len());
+        let selected = available[index];
+        self.random_tracks_used.push(selected);
+        self.last_random_track = Some(selected);
+        Ok(selected)
     }
 
     fn equipment_player_id(&self, user_no: UserNo) -> Option<i32> {
@@ -4660,6 +4821,31 @@ fn game_slot_player_bit(player_id: i32) -> Result<u32, RaceError> {
     Ok(1_u32 << shift)
 }
 
+fn validate_game_slot_phase(room: &ProtocolRoomState, now: Instant) -> Result<(), RaceError> {
+    match room.phase {
+        RoomPhase::Running => Ok(()),
+        RoomPhase::Settling => {
+            let settlement =
+                room.race_progress
+                    .settlement
+                    .as_ref()
+                    .ok_or(RaceError::GameSlotInvariant {
+                        detail: "Settling GameSlot room has no settlement state",
+                    })?;
+            if now >= settlement.deadline
+                || !matches!(
+                    settlement.finalization,
+                    SettlementFinalization::AwaitingDeadline
+                )
+            {
+                return Err(RaceError::SettlementClosed);
+            }
+            Ok(())
+        }
+        actual => Err(RaceError::GameSlotInactivePhase { actual }),
+    }
+}
+
 fn active_game_slot_sender<'a>(
     room: &'a ProtocolRoomState,
     identity: &IdentityBinding,
@@ -4686,6 +4872,151 @@ fn active_game_slot_sender<'a>(
         });
     }
     Ok((sender, frozen))
+}
+
+fn race_object_actor(participant: &FrozenRaceParticipant) -> Result<RaceObjectActor, RaceError> {
+    let player_id = u8::try_from(participant.player_id)
+        .ok()
+        .filter(|player_id| *player_id <= 15)
+        .ok_or(RaceError::GameSlotInvariant {
+            detail: "frozen race object actor has an invalid player ID",
+        })?;
+    Ok(RaceObjectActor {
+        user_no: participant.identity.user_no.get(),
+        generation: participant.identity.generation.get(),
+        player_id,
+    })
+}
+
+fn prepare_race_object_admission(
+    registry: &RaceObjectRegistry,
+    frozen: &FrozenRaceRoster,
+    reporter: &FrozenRaceParticipant,
+    race_epoch: u64,
+    operation: &ItemOperation,
+) -> Result<RaceObjectAdmission, RaceError> {
+    let reporter = race_object_actor(reporter)?;
+    let explicit_owner_id = match operation.barricade {
+        Some(BarricadeOperation::Placement(placement)) => Some(placement.owner_id),
+        Some(BarricadeOperation::Transition(transition)) => Some(transition.owner_id),
+        None => None,
+    };
+    let owner_claim = if let Some(owner_id) = explicit_owner_id {
+        let owner = frozen
+            .participants
+            .iter()
+            .find(|participant| {
+                !participant.observer && participant.player_id == i32::from(owner_id)
+            })
+            .ok_or(RaceError::RaceObjectOwnerNotFrozen {
+                player_id: owner_id,
+            })?;
+        Some(race_object_actor(owner)?)
+    } else if matches!(
+        operation.semantics.meaning,
+        ItemLifecycleMeaning::Initialize
+            | ItemLifecycleMeaning::Place
+            | ItemLifecycleMeaning::Launch
+            | ItemLifecycleMeaning::Activate
+    ) {
+        Some(reporter)
+    } else {
+        None
+    };
+    plan_item_operation(registry, race_epoch, operation, reporter, owner_claim)
+        .map_err(race_object_registry_error)
+}
+
+const fn race_object_registry_error(error: RaceObjectRegistryError) -> RaceError {
+    match error {
+        RaceObjectRegistryError::Capacity {
+            race_epoch,
+            object_id,
+            maximum,
+        } => RaceError::RaceObjectRegistryFull {
+            race_epoch,
+            object_id,
+            maximum,
+        },
+        RaceObjectRegistryError::ClassMismatch {
+            race_epoch,
+            object_id,
+            expected_operation_hash,
+            expected_base_hash,
+            actual_operation_hash,
+            actual_base_hash,
+        } => RaceError::RaceObjectClassMismatch {
+            race_epoch,
+            object_id,
+            expected_operation_hash,
+            expected_base_hash,
+            actual_operation_hash,
+            actual_base_hash,
+        },
+        RaceObjectRegistryError::OwnerMismatch {
+            race_epoch,
+            object_id,
+            expected_player_id,
+            expected_generation,
+            actual_player_id,
+            actual_generation,
+        } => RaceError::RaceObjectOwnerMismatch {
+            race_epoch,
+            object_id,
+            expected_player_id,
+            expected_generation,
+            actual_player_id,
+            actual_generation,
+        },
+        RaceObjectRegistryError::StalePlan { .. } => RaceError::GameSlotInvariant {
+            detail: "race object registry plan became stale inside one World actor turn",
+        },
+    }
+}
+
+fn race_object_publication_plan(
+    admission: Option<RaceObjectAdmission>,
+    room_id: RoomId,
+    race_epoch: u64,
+    player_id: u8,
+) -> RaceObjectPublicationPlan {
+    match admission {
+        Some(RaceObjectAdmission::PublishTracked(mutation)) => {
+            RaceObjectPublicationPlan::Relay(Some(mutation))
+        }
+        Some(RaceObjectAdmission::PublishUntracked) | None => {
+            RaceObjectPublicationPlan::Relay(None)
+        }
+        Some(RaceObjectAdmission::SuppressDuplicate {
+            object_id,
+            class_name,
+            phase,
+            state,
+            kind,
+        }) => {
+            tracing::debug!(
+                room_id = room_id.0,
+                race_epoch,
+                player_id,
+                object_id = format_args!("0x{object_id:08X}"),
+                class_name,
+                ?phase,
+                state,
+                ?kind,
+                "suppressed a duplicate race object transition"
+            );
+            RaceObjectPublicationPlan::Duplicate(
+                RaceCommandOutcome::GameSlotObjectDuplicateSuppressed {
+                    room_id,
+                    race_epoch,
+                    player_id,
+                    object_id,
+                    state,
+                    kind,
+                },
+            )
+        }
+    }
 }
 
 fn prepare_item_pickup_admission(
@@ -4793,6 +5124,7 @@ impl Default for World {
             room_by_identity: HashMap::new(),
             protocol_rooms: HashMap::new(),
             protocol_room_by_user: HashMap::new(),
+            observed_p2p_ports: HashMap::new(),
             free_protocol_room_ids: BTreeSet::new(),
             identity_lifecycle: VecDeque::new(),
             identity_capacity,
@@ -6664,6 +6996,22 @@ impl World {
         expected: &IdentityBinding,
         mutation: ProfilePresentationMutation,
     ) -> Result<ProfilePresentationPublication, ProfilePresentationPublicationInvariantError> {
+        let port = match mutation {
+            ProfilePresentationMutation::SetP2pPort(port) => {
+                self.observed_p2p_port(expected).unwrap_or(port)
+            }
+        };
+        self.publish_active_p2p_endpoint(expected, port)
+    }
+
+    /// Publishes an authenticated live P2P endpoint to actor-owned
+    /// projections. TCP reports reach here after durable persistence; observed
+    /// P2P UDP ingress reaches here without touching the profile on disk.
+    fn publish_active_p2p_endpoint(
+        &mut self,
+        expected: &IdentityBinding,
+        port: u16,
+    ) -> Result<ProfilePresentationPublication, ProfilePresentationPublicationInvariantError> {
         let active = self.identities.active_identity_by_user_no(expected.user_no);
         if active.as_ref() != Some(expected) {
             return Ok(if active.is_some() {
@@ -6675,57 +7023,92 @@ impl World {
             });
         }
 
-        match mutation {
-            ProfilePresentationMutation::SetP2pPort(port) => {
-                let protocol_room = self.protocol_room_by_user.get(&expected.user_no).copied();
-                if let Some(room_id) = protocol_room {
-                    let room = self.protocol_rooms.get(&room_id).ok_or(
-                        ProfilePresentationPublicationInvariantError::ProtocolMembership {
-                            room_id: room_id.0,
-                            user_no: expected.user_no,
-                        },
-                    )?;
-                    if room.member_by_user_no(expected.user_no).is_none() {
-                        return Err(
-                            ProfilePresentationPublicationInvariantError::ProtocolMembership {
-                                room_id: room_id.0,
-                                user_no: expected.user_no,
-                            },
-                        );
-                    }
-                }
+        let protocol_room = self.protocol_room_by_user.get(&expected.user_no).copied();
+        if let Some(room_id) = protocol_room {
+            let room = self.protocol_rooms.get(&room_id).ok_or(
+                ProfilePresentationPublicationInvariantError::ProtocolMembership {
+                    room_id: room_id.0,
+                    user_no: expected.user_no,
+                },
+            )?;
+            if room.member_by_user_no(expected.user_no).is_none() {
+                return Err(
+                    ProfilePresentationPublicationInvariantError::ProtocolMembership {
+                        room_id: room_id.0,
+                        user_no: expected.user_no,
+                    },
+                );
+            }
+        }
 
-                let myroom_transition = self
-                    .myroom
-                    .refresh_p2p_endpoint_if_tracked(expected, port)
-                    .map_err(
-                        |source| ProfilePresentationPublicationInvariantError::MyRoomHub { source },
-                    )?;
-                if let Some(transition) = myroom_transition {
-                    transition.commit(&mut self.myroom).map_err(|source| {
-                        ProfilePresentationPublicationInvariantError::MyRoomCommit { source }
-                    })?;
-                }
+        let myroom_transition = self
+            .myroom
+            .refresh_p2p_endpoint_if_tracked(expected, port)
+            .map_err(|source| ProfilePresentationPublicationInvariantError::MyRoomHub { source })?;
+        if let Some(transition) = myroom_transition {
+            transition.commit(&mut self.myroom).map_err(|source| {
+                ProfilePresentationPublicationInvariantError::MyRoomCommit { source }
+            })?;
+        }
 
-                if let Some(room_id) = protocol_room {
-                    let endpoint = legacy_p2p_endpoint(expected.source_ip, port);
-                    let updated = self
-                        .protocol_rooms
-                        .get_mut(&room_id)
-                        .expect("the prevalidated protocol room remains actor-owned")
-                        .set_p2p_endpoint(expected.user_no, endpoint.address(), endpoint.port());
-                    if !updated {
-                        return Err(
-                            ProfilePresentationPublicationInvariantError::ProtocolMembership {
-                                room_id: room_id.0,
-                                user_no: expected.user_no,
-                            },
-                        );
-                    }
-                }
+        if let Some(room_id) = protocol_room {
+            let endpoint = legacy_p2p_endpoint(expected.source_ip, port);
+            let updated = self
+                .protocol_rooms
+                .get_mut(&room_id)
+                .expect("the prevalidated protocol room remains actor-owned")
+                .set_p2p_endpoint(expected.user_no, endpoint.address(), endpoint.port());
+            if !updated {
+                return Err(
+                    ProfilePresentationPublicationInvariantError::ProtocolMembership {
+                        room_id: room_id.0,
+                        user_no: expected.user_no,
+                    },
+                );
             }
         }
         Ok(ProfilePresentationPublication::ActiveCachesUpdated)
+    }
+
+    fn observed_p2p_port(&self, identity: &IdentityBinding) -> Option<u16> {
+        self.observed_p2p_ports
+            .get(&identity.user_no)
+            .and_then(|(observed_identity, port)| (observed_identity == identity).then_some(*port))
+    }
+
+    /// Records only a P2P source endpoint that the UDP sidecar has already
+    /// accepted for this exact identity and generation. It is runtime state,
+    /// not a profile write.
+    fn record_observed_p2p_port(
+        &mut self,
+        identity: &IdentityBinding,
+        port: u16,
+    ) -> Result<bool, ProfilePresentationPublicationInvariantError> {
+        debug_assert_ne!(port, 0, "validated UDP endpoints never have port zero");
+        if self
+            .identities
+            .active_identity_by_user_no(identity.user_no)
+            .as_ref()
+            != Some(identity)
+        {
+            return Ok(false);
+        }
+        if self.observed_p2p_port(identity) == Some(port) {
+            return Ok(false);
+        }
+
+        self.observed_p2p_ports
+            .insert(identity.user_no, (identity.clone(), port));
+        let publication = self.publish_active_p2p_endpoint(identity, port)?;
+        tracing::debug!(
+            nickname = %identity.nickname,
+            user_no = identity.user_no.get(),
+            generation = identity.generation.get(),
+            port,
+            ?publication,
+            "installed authenticated runtime P2P endpoint"
+        );
+        Ok(publication.updates_runtime_caches())
     }
 
     fn publish_durable_main_emblems(
@@ -8401,12 +8784,12 @@ impl World {
                 })?;
         let result = Self::serialize_settlement_result(room, ranking)?;
         Ok(vec![
-            serialize_game_next_stage(room.settings.game_type),
-            result,
             serialize_game_control(
                 ServerGameControl::FinalStage,
                 settlement.end_tick.wrapping_add(FINAL_STAGE_TICK_LEAD),
             ),
+            serialize_game_next_stage(room.settings.game_type),
+            result,
         ])
     }
 
@@ -8622,6 +9005,7 @@ impl World {
         let binding =
             self.identities
                 .claim_at(session, source_ip, nickname, activated_udp_epoch)?;
+        self.observed_p2p_ports.remove(&binding.user_no);
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Announce(binding.clone()));
         Ok(binding)
@@ -8864,6 +9248,7 @@ impl World {
         debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
         self.pending_myroom_password_grants
             .remove(&completion.binding.user_no);
+        self.observed_p2p_ports.remove(&completion.binding.user_no);
         self.identity_lifecycle
             .push_back(IdentityLifecycleEvent::Advance {
                 previous: completion.previous_identity.clone(),
@@ -8921,7 +9306,7 @@ impl World {
     fn refresh_room_kart_physics(
         &mut self,
         session: SessionId,
-        kart_physics: P5136KartPhysicsBlock,
+        kart_physics: RoomKartPhysicsVariants,
     ) -> Result<bool, WorldOperationError> {
         let identity = self.authorize_session_operation(session)?;
         let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
@@ -8942,7 +9327,8 @@ impl World {
         else {
             return Ok(false);
         };
-        member.kart_physics = kart_physics;
+        member.kart_physics.clone_from(&kart_physics.default);
+        member.kart_physics_variants = Some(kart_physics);
         self.debug_assert_invariants();
         Ok(true)
     }
@@ -9472,33 +9858,30 @@ impl World {
             .ok_or(RaceError::GameSlotInvariant {
                 detail: "protocol GameSlot membership references a missing room",
             })?;
-        match room.phase {
-            RoomPhase::Running => {}
-            RoomPhase::Settling => {
-                let settlement =
-                    room.race_progress
-                        .settlement
-                        .as_ref()
-                        .ok_or(RaceError::GameSlotInvariant {
-                            detail: "Settling GameSlot room has no settlement state",
-                        })?;
-                if now >= settlement.deadline
-                    || !matches!(
-                        settlement.finalization,
-                        SettlementFinalization::AwaitingDeadline
-                    )
-                {
-                    return Err(RaceError::SettlementClosed);
-                }
-            }
-            actual => return Err(RaceError::GameSlotInactivePhase { actual }),
-        }
+        validate_game_slot_phase(room, now)?;
 
         let (sender, frozen) = active_game_slot_sender(room, identity, packet.player_id())?;
 
         let room_id = room.id;
         let race_epoch = frozen.fence.race_epoch.get();
+        let object_admission = match packet.body() {
+            GameSlotBody::ItemOperation(operation) => Some(prepare_race_object_admission(
+                &room.race_progress.race_objects,
+                frozen,
+                sender,
+                race_epoch,
+                operation,
+            )?),
+            _ => None,
+        };
         let audience = match packet.action() {
+            GameSlotAction::ConsumeNoReply => {
+                return Ok(RaceCommandOutcome::GameSlotConsumed {
+                    room_id,
+                    race_epoch,
+                    player_id: packet.player_id(),
+                });
+            }
             GameSlotAction::SynthesizeItemPickup => {
                 return self.synthesize_item_pickup(
                     room_id,
@@ -9529,31 +9912,118 @@ impl World {
                 });
             }
         }
-        let raw = packet.into_raw();
-        let mut deliveries = Vec::new();
-        for (participant, session) in self.active_frozen_recipient_sessions(room) {
-            let include = match audience {
-                GameSlotRelayAudience::AllRacePeersMaskMatch => participant.identity != *identity,
-                GameSlotRelayAudience::RecipientMaskIncludingSender => {
-                    recipient_mask & game_slot_player_bit(participant.player_id)? != 0
-                }
-                GameSlotRelayAudience::RecipientMaskExceptSender => {
-                    participant.identity != *identity
-                        && recipient_mask & game_slot_player_bit(participant.player_id)? != 0
-                }
-            };
-            if include {
-                deliveries.push((session, OutboundBatch::single(raw.clone())));
-            }
-        }
-        let recipients = deliveries.len();
-        let reserved = self.reserve_race_outbound(deliveries)?;
-        Self::publish_reserved(reserved);
+        let object_mutation = match race_object_publication_plan(
+            object_admission,
+            room_id,
+            race_epoch,
+            packet.player_id(),
+        ) {
+            RaceObjectPublicationPlan::Relay(mutation) => mutation,
+            RaceObjectPublicationPlan::Duplicate(outcome) => return Ok(outcome),
+        };
+        let recipients = self.publish_game_slot_relay(GameSlotRelayPlan {
+            room_id,
+            race_epoch,
+            identity,
+            audience,
+            recipient_mask,
+            raw: packet.into_raw(),
+            object_mutation,
+        })?;
         Ok(RaceCommandOutcome::GameSlotRelayed {
             room_id,
             race_epoch,
             recipients,
         })
+    }
+
+    fn publish_game_slot_relay(&mut self, plan: GameSlotRelayPlan<'_>) -> Result<usize, RaceError> {
+        let room = self
+            .protocol_rooms
+            .get(&plan.room_id)
+            .ok_or(RaceError::GameSlotInvariant {
+                detail: "GameSlot relay room disappeared before publication",
+            })?;
+        let mut deliveries = Vec::new();
+        for (participant, session) in self.active_frozen_recipient_sessions(room) {
+            let include = match plan.audience {
+                GameSlotRelayAudience::AllRacePeersMaskMatch => {
+                    participant.identity != *plan.identity
+                }
+                GameSlotRelayAudience::RecipientMaskExceptSender => {
+                    participant.identity != *plan.identity
+                        && plan.recipient_mask & game_slot_player_bit(participant.player_id)? != 0
+                }
+            };
+            if include {
+                deliveries.push((session, OutboundBatch::single(plan.raw.clone())));
+            }
+        }
+        let recipients = deliveries.len();
+        let reserved = self.reserve_race_outbound(deliveries)?;
+        let object_trace = plan.object_mutation.as_ref().map(|mutation| {
+            (
+                mutation.object_id(),
+                mutation.class_name(),
+                mutation.state(),
+                mutation.meaning(),
+                mutation.transition_token(),
+                mutation.source_object_id(),
+                mutation.target_object_id(),
+                mutation.phase(),
+                mutation.owner(),
+                mutation.reporter(),
+                mutation.events().collect::<Vec<_>>(),
+            )
+        });
+        if let Some(mutation) = plan.object_mutation {
+            let room =
+                self.protocol_rooms
+                    .get_mut(&plan.room_id)
+                    .ok_or(RaceError::GameSlotInvariant {
+                        detail: "race object room disappeared before commit",
+                    })?;
+            room.race_progress
+                .race_objects
+                .commit(mutation)
+                .map_err(race_object_registry_error)?;
+        }
+        Self::publish_reserved(reserved);
+        if let Some((
+            object_id,
+            class_name,
+            state,
+            meaning,
+            transition_token,
+            source_object_id,
+            target_object_id,
+            phase,
+            owner,
+            reporter,
+            events,
+        )) = object_trace
+        {
+            tracing::debug!(
+                room_id = plan.room_id.0,
+                race_epoch = plan.race_epoch,
+                object_id = format_args!("0x{object_id:08X}"),
+                class_name,
+                state,
+                ?meaning,
+                transition_token = transition_token.map(|value| format!("0x{value:08X}")),
+                source_object_id = source_object_id.map(|value| format!("0x{value:08X}")),
+                target_object_id = target_object_id.map(|value| format!("0x{value:08X}")),
+                ?phase,
+                owner_player_id = owner.player_id,
+                owner_generation = owner.generation,
+                reporter_player_id = reporter.player_id,
+                reporter_generation = reporter.generation,
+                ?events,
+                recipients,
+                "committed and published an authoritative race object transition"
+            );
+        }
+        Ok(recipients)
     }
 
     fn synthesize_item_pickup(
@@ -9605,11 +10075,7 @@ impl World {
             pickup_token.object_id,
             pickup_token.operation_tick,
         )?;
-        let racer_count = frozen
-            .participants
-            .iter()
-            .filter(|participant| !participant.observer)
-            .count();
+        let racer_count = frozen.active_racer_count();
         let race_epoch = frozen.fence.race_epoch.get();
         let award = self.item_probability.select_award(
             team_mode,
@@ -10144,8 +10610,8 @@ impl World {
         let race_epoch = allocated_race_epoch.get();
         let following_race_epoch = race_epoch.checked_add(1).and_then(GlobalRaceEpoch::new);
         let race_fence = RaceFence::new(room_id, allocated_race_epoch);
-        let concrete_track =
-            room.select_concrete_track(race_epoch, &plan.random_track_candidates)?;
+        let mut next = room.clone();
+        let concrete_track = Self::select_start_track(room, &mut next, plan)?;
         let frozen = self.freeze_race_roster(room, race_fence, concrete_track)?;
         let human_users = frozen
             .participants
@@ -10171,11 +10637,17 @@ impl World {
             let member = room
                 .member_by_user_no(participant.identity.user_no)
                 .expect("a frozen participant originated from this room");
+            let kart_physics = member
+                .kart_physics_variants
+                .as_ref()
+                .map_or(&member.kart_physics, |variants| {
+                    variants.for_room_title(&room.settings.room_name)
+                });
             let command = serialize_gr_command_start_bounded(
                 &GrCommandStart {
                     session_data: &session_data,
                     slot_data: &slot_data,
-                    kart_physics: &member.kart_physics,
+                    kart_physics,
                     ai_specs: &ai_specs,
                     concrete_track,
                 },
@@ -10190,7 +10662,6 @@ impl World {
         }
         let reserved = self.reserve_outbound(deliveries)?;
 
-        let mut next = room.clone();
         next.phase = RoomPhase::Loading;
         next.race_fence = Some(race_fence);
         next.frozen_race = Some(frozen);
@@ -10214,6 +10685,24 @@ impl World {
             racer_count,
             observer_count,
         })
+    }
+
+    fn select_start_track(
+        room: &ProtocolRoomState,
+        next: &mut ProtocolRoomState,
+        plan: &StartRoomPlan,
+    ) -> Result<u32, LobbyError> {
+        let catalog_candidates = plan.random_tracks.as_ref().map(|random_tracks| {
+            random_tracks.candidates(
+                room.settings.game_type,
+                room.settings.track,
+                room.ai_count() != 0,
+            )
+        });
+        let candidates = catalog_candidates
+            .filter(|candidates| !candidates.is_empty())
+            .unwrap_or(&plan.random_track_candidates);
+        next.select_concrete_track(candidates)
     }
 
     fn validate_start_racers(
@@ -10405,10 +10894,14 @@ impl World {
     }
 
     fn prepare_participant(
+        &self,
         identity: &IdentityBinding,
         mut participant: RoomParticipant,
     ) -> RoomParticipant {
-        let endpoint = legacy_p2p_endpoint(identity.source_ip, participant.player.p2p_port);
+        let p2p_port = self
+            .observed_p2p_port(identity)
+            .unwrap_or(participant.player.p2p_port);
+        let endpoint = legacy_p2p_endpoint(identity.source_ip, p2p_port);
         participant.player.user_no = identity.user_no.get();
         participant.player.nickname.clone_from(&identity.nickname);
         participant.player.p2p_address = endpoint.address();
@@ -10470,7 +10963,7 @@ impl World {
                 room_data: request.room_data,
             };
             let mut room = ProtocolRoomState::new(room_id, settings);
-            let participant = Self::prepare_participant(identity, participant);
+            let participant = self.prepare_participant(identity, participant);
             if room.add_participant(identity.user_no, participant) {
                 if let Err(error) = serialize_gr_slot_data(&room.slot_data()) {
                     self.free_protocol_room_ids
@@ -10529,7 +11022,7 @@ impl World {
             }
             Some(room) => {
                 let mut next = room.clone();
-                let participant = Self::prepare_participant(identity, participant);
+                let participant = self.prepare_participant(identity, participant);
                 if next.add_participant(identity.user_no, participant) {
                     serialize_gr_slot_data(&next.slot_data())?;
                     let game_type = next.settings.game_type;
@@ -11163,6 +11656,7 @@ impl World {
         unavailable_releases: &UnavailableReleaseIndex<'_>,
         publish_wire: bool,
     ) -> Result<Vec<OutboundDelivery>, MyRoomLifecycleError> {
+        self.observed_p2p_ports.remove(&identity.user_no);
         let transition = self
             .myroom
             .disconnect_released(identity)
@@ -11695,19 +12189,23 @@ async fn dispatch_udp_ingress(
     let identity = operation.binding().clone();
     let account_id = ingress.account_id;
     let source = ingress.source;
+    let observed_p2p_port = (ingress.transport == UdpTransport::P2p).then_some(source.port());
     let readiness_candidate = matches!(&ingress.body, UdpIngressBody::PqUdpTimeSync(_))
         .then(|| world.loading_readiness_candidate(&identity))
         .flatten();
     let room_targets = world.myroom_udp_targets(&identity)?;
     let request = UdpDispatchRequest {
         ingress,
-        identity,
+        identity: identity.clone(),
         racing_targets: world.racing_udp_targets(user_no),
         room_targets,
     };
 
     let result = match udp.dispatch(request).await {
         Ok(outcome) => {
+            if let Some(port) = observed_p2p_port {
+                world.record_observed_p2p_port(&identity, port)?;
+            }
             world.apply_udp_dispatch_readiness(readiness_candidate, outcome);
             Ok(())
         }
@@ -12799,7 +13297,30 @@ pub(crate) mod test_support {
             },
             observer: false,
             kart_physics: P5136KartPhysicsBlock::from([0; 235]),
+            kart_physics_variants: None,
         }
+    }
+
+    #[test]
+    fn room_title_speed_tokens_select_the_matching_prebuilt_physics() {
+        let default = P5136KartPhysicsBlock::from([99; 235]);
+        let by_speed_type = array::from_fn(|speed_type| {
+            P5136KartPhysicsBlock::from([u8::try_from(speed_type).unwrap(); 235])
+        });
+        let variants = super::RoomKartPhysicsVariants::new(default.clone(), by_speed_type);
+        assert_eq!(
+            variants.for_room_title("[S0] 초보"),
+            &P5136KartPhysicsBlock::from([3; 235])
+        );
+        assert_eq!(
+            variants.for_room_title("친선 s1"),
+            &P5136KartPhysicsBlock::from([0; 235])
+        );
+        assert_eq!(
+            variants.for_room_title("S6 무한"),
+            &P5136KartPhysicsBlock::from([6; 235])
+        );
+        assert_eq!(variants.for_room_title("TESTS1ROOM"), &default);
     }
 
     fn create_room_request(nickname: &str) -> ChCreateRoomRequest {
@@ -13058,10 +13579,11 @@ mod tests {
         channel::serialize_pr_channel_move_in,
         equipment_protocol::serialize_room_slot_items,
         game_slot_item_schema::item_operation_schema,
+        game_slot_item_semantics::{ItemLifecycleMeaning, ItemSemanticEvidence},
         game_slot_protocol::{
-            GAME_KART_ITEM_INFO_HASH, GAME_SLOT_PACKET_HASH, GO_ITEM_BARRICADE_HASH,
-            GO_ITEM_CUBE_HASH, GOP_BARRICADE_HASH, GOP_CUBE_HASH, ParsedGameSlotPacket,
-            parse_game_slot_packet,
+            GAME_KART_ITEM_INFO_HASH, GAME_KART_QUAD_PACKET_HASH, GAME_SLOT_PACKET_HASH,
+            GO_ITEM_BARRICADE_HASH, GO_ITEM_CUBE_HASH, GOP_BARRICADE_HASH, GOP_CUBE_HASH,
+            ParsedGameSlotPacket, parse_game_slot_packet,
         },
         lobby_protocol::{
             BASIC_AI_REPLY_NAME, BASIC_AI_SLOT_DATA_NAME, BasicAiRequest, CHANGE_TEAM_REPLY_NAME,
@@ -13085,7 +13607,7 @@ mod tests {
             GAME_NEXT_STAGE_PACKET_NAME, GAME_RACE_TIME_PACKET_NAME, GameControlRequest, RaceTeam,
             TEAM_BOOSTER_REPLY_NAME, TeamBoosterGaugeRequest,
         },
-        race_result_protocol::{GAME_RESULT_PACKET_NAME, ResultTeam},
+        race_result_protocol::{GAME_RESULT_PACKET_NAME, HUMAN_RESULT_RECORD_LENGTH, ResultTeam},
         race_start_protocol::{
             AiRaceSpec, GR_COMMAND_START_PACKET_NAME, P5136KartPhysicsBlock, RaceStartProtocolError,
         },
@@ -13132,6 +13654,10 @@ mod tests {
     use crate::profile_io::{MyRoomProfileLease, ProfileIoBootstrap, ProfileIoLimits};
     use crate::profile_presentation_persistence::{
         ProfilePresentationMutation, ProfilePresentationPublication,
+    };
+    use crate::race_object_registry::{
+        RaceObjectActor, RaceObjectAdmission, RaceObjectClass, RaceObjectDuplicateKind,
+        RaceObjectOperation, RaceObjectPhase,
     };
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, ItemProbabilityConfiguration,
@@ -13770,6 +14296,7 @@ mod tests {
             },
             observer: false,
             kart_physics: P5136KartPhysicsBlock::from([0; 235]),
+            kart_physics_variants: None,
         }
     }
 
@@ -13936,6 +14463,16 @@ mod tests {
         packet
     }
 
+    fn dashboard_allocation_game_slot(player_id: u8, recipient_mask: u32) -> Vec<u8> {
+        let mut packet = vec![0_u8; 20];
+        write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
+        write_test_i32(&mut packet, 4, i32::from(player_id));
+        write_test_u32(&mut packet, 8, recipient_mask);
+        packet[12] = 13;
+        packet[13] = 0xa5;
+        packet
+    }
+
     fn item_use_game_slot(player_id: u8, recipient_mask: u32) -> Vec<u8> {
         let mut packet = vec![0_u8; 26];
         write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
@@ -13950,14 +14487,35 @@ mod tests {
         packet
     }
 
+    fn spawned_item_use_game_slot(player_id: u8, recipient_mask: u32) -> Vec<u8> {
+        let mut packet = item_use_game_slot(player_id, recipient_mask);
+        packet[12] = 16;
+        packet
+    }
+
+    fn kart_snapshot_game_slot(player_id: u8, recipient_mask: u32) -> Vec<u8> {
+        let mut packet = vec![0_u8; 96];
+        write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
+        write_test_i32(&mut packet, 4, i32::from(player_id));
+        write_test_u32(&mut packet, 8, recipient_mask);
+        packet[12] = 17;
+        write_test_u32(&mut packet, 16, 76);
+        write_test_u32(&mut packet, 20, GAME_KART_QUAD_PACKET_HASH);
+        write_test_u32(&mut packet, 24, 0x1020_3040);
+        packet
+    }
+
     fn static_item_operation_game_slot(player_id: u8, recipient_mask: u32) -> Vec<u8> {
-        let schema = item_operation_schema(0x0D49_030D, 0x184D_042C).unwrap();
-        let mut packet = vec![0_u8; 45];
+        // Balloon state 0 has an exact native writer shape but no recovered
+        // lifecycle meaning. Keep this generic routing fixture semantically
+        // untracked instead of relying on a class that later gained meaning.
+        let schema = item_operation_schema(0x14A6_03ED, 0x21E8_050C).unwrap();
+        let mut packet = vec![0_u8; 36];
         write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
         write_test_i32(&mut packet, 4, i32::from(player_id));
         write_test_u32(&mut packet, 8, recipient_mask);
         packet[12] = 12;
-        write_test_u32(&mut packet, 16, 25);
+        write_test_u32(&mut packet, 16, 16);
         write_test_u32(&mut packet, 20, schema.operation_hash);
         write_test_u32(&mut packet, 24, schema.base_hash);
         write_test_u32(&mut packet, 28, 1);
@@ -13974,17 +14532,14 @@ mod tests {
         write_test_u32(&mut packet, 16, 73);
         write_test_u32(&mut packet, 20, GOP_BARRICADE_HASH);
         write_test_u32(&mut packet, 24, GO_ITEM_BARRICADE_HASH);
+        write_test_u32(&mut packet, 28, 0x1000_004C);
         packet[32] = 1;
+        write_test_u32(&mut packet, 33, 0x0001_A000);
         write_test_i32(&mut packet, 37, i32::from(player_id));
         packet
     }
 
-    fn barricade_transition_game_slot(player_id: u8, recipient_mask: u32, state: u8) -> Vec<u8> {
-        let (object_id, tick, trailing) = match state {
-            2 => (0x1000_004C, 0x0001_A79A, 0),
-            3 => (0x1000_0050, 0x0001_9E3A, 2),
-            _ => panic!("the captured barricade transition state must be 2 or 3"),
-        };
+    fn barricade_initialization_game_slot(player_id: u8, recipient_mask: u32) -> Vec<u8> {
         let mut packet = vec![0_u8; 45];
         write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
         write_test_i32(&mut packet, 4, i32::from(player_id));
@@ -13993,10 +14548,50 @@ mod tests {
         write_test_u32(&mut packet, 16, 25);
         write_test_u32(&mut packet, 20, GOP_BARRICADE_HASH);
         write_test_u32(&mut packet, 24, GO_ITEM_BARRICADE_HASH);
+        write_test_u32(&mut packet, 28, 0x1000_004C);
+        packet[32] = 0;
+        write_test_u32(&mut packet, 33, 0x0001_9F00);
+        write_test_i32(&mut packet, 37, i32::from(player_id));
+        packet
+    }
+
+    fn barricade_transition_game_slot(player_id: u8, recipient_mask: u32, state: u8) -> Vec<u8> {
+        let (object_id, tick, trailing) = match state {
+            2 => (0x1000_004C, 0x0001_A79A, 0),
+            3 => (0x1000_0050, 0x0001_9E3A, 2),
+            4 => (0x1000_0054, 0x0001_9F00, 0),
+            _ => panic!("the barricade transition state must be 2, 3, or 4"),
+        };
+        let raw_length = if state == 4 { 26 } else { 25 };
+        let mut packet = vec![0_u8; 20 + raw_length];
+        write_test_u32(&mut packet, 0, GAME_SLOT_PACKET_HASH);
+        write_test_i32(&mut packet, 4, i32::from(player_id));
+        write_test_u32(&mut packet, 8, recipient_mask);
+        packet[12] = 12;
+        write_test_u32(&mut packet, 16, u32::try_from(raw_length).unwrap());
+        write_test_u32(&mut packet, 20, GOP_BARRICADE_HASH);
+        write_test_u32(&mut packet, 24, GO_ITEM_BARRICADE_HASH);
         write_test_u32(&mut packet, 28, object_id);
         packet[32] = state;
         write_test_u32(&mut packet, 33, tick);
         write_test_u32(&mut packet, 41, trailing);
+        if state == 4 {
+            packet[45] = 1;
+        }
+        packet
+    }
+
+    fn barricade_transition_for_object(
+        reporter_id: u8,
+        owner_id: u8,
+        recipient_mask: u32,
+        object_id: u32,
+        state: u8,
+    ) -> Vec<u8> {
+        assert!(matches!(state, 2..=4));
+        let mut packet = barricade_transition_game_slot(reporter_id, recipient_mask, state);
+        write_test_u32(&mut packet, 28, object_id);
+        write_test_i32(&mut packet, 37, i32::from(owner_id));
         packet
     }
 
@@ -15455,15 +16050,15 @@ mod tests {
             assert_eq!(packets.len(), 3);
             assert_eq!(
                 logical_packet_hash(&packets[0]),
-                adler32::packet_hash(GAME_NEXT_STAGE_PACKET_NAME)
+                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
             );
             assert_eq!(
                 logical_packet_hash(&packets[1]),
-                adler32::packet_hash(GAME_RESULT_PACKET_NAME)
+                adler32::packet_hash(GAME_NEXT_STAGE_PACKET_NAME)
             );
             assert_eq!(
                 logical_packet_hash(&packets[2]),
-                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+                adler32::packet_hash(GAME_RESULT_PACKET_NAME)
             );
         }
         assert_eq!(world.protocol_rooms[&room_id].phase, RoomPhase::Lobby);
@@ -15686,7 +16281,27 @@ mod tests {
             assert_eq!(take_single_packet(&mut session.outbound), raw_vector);
         }
 
-        let item_use_mask = (1_u32 << 0) | (1_u32 << 2) | (1_u32 << 8);
+        let raw_dashboard =
+            dashboard_allocation_game_slot(0, (1_u32 << 1) | (1_u32 << 2) | (1_u32 << 8));
+        assert_eq!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&raw_dashboard),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotConsumed {
+                room_id,
+                race_epoch: 1,
+                player_id: 0,
+            }
+        );
+        for session in &mut sessions {
+            assert!(session.outbound.try_recv().is_err());
+        }
+
+        let item_use_mask = (1_u32 << 2) | (1_u32 << 8);
         let raw_item_use = item_use_game_slot(0, item_use_mask);
         assert_eq!(
             world
@@ -15699,15 +16314,57 @@ mod tests {
             RaceCommandOutcome::GameSlotRelayed {
                 room_id,
                 race_epoch: 1,
-                recipients: 3,
+                recipients: 2,
             }
         );
-        assert_eq!(take_single_packet(&mut sessions[0].outbound), raw_item_use);
+        assert!(sessions[0].outbound.try_recv().is_err());
         assert!(sessions[1].outbound.try_recv().is_err());
         assert_eq!(take_single_packet(&mut sessions[2].outbound), raw_item_use);
         assert_eq!(take_single_packet(&mut sessions[3].outbound), raw_item_use);
 
-        let reaction_mask = (1_u32 << 0) | (1_u32 << 2) | (1_u32 << 8);
+        let spawned_use_mask = (1_u32 << 1) | (1_u32 << 2) | (1_u32 << 8);
+        let raw_spawned_use = spawned_item_use_game_slot(0, spawned_use_mask);
+        assert_eq!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&raw_spawned_use),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed {
+                room_id,
+                race_epoch: 1,
+                recipients: 3,
+            }
+        );
+        assert!(sessions[0].outbound.try_recv().is_err());
+        for session in &mut sessions[1..] {
+            assert_eq!(take_single_packet(&mut session.outbound), raw_spawned_use);
+        }
+
+        let movement_mask = (1_u32 << 1) | (1_u32 << 2) | (1_u32 << 8);
+        let raw_movement = kart_snapshot_game_slot(0, movement_mask);
+        assert_eq!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&raw_movement),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed {
+                room_id,
+                race_epoch: 1,
+                recipients: 3,
+            }
+        );
+        assert!(sessions[0].outbound.try_recv().is_err());
+        for session in &mut sessions[1..] {
+            assert_eq!(take_single_packet(&mut session.outbound), raw_movement);
+        }
+
+        let reaction_mask = (1_u32 << 2) | (1_u32 << 8);
         let raw_reaction = item_reaction_game_slot(0, reaction_mask);
         assert_eq!(
             world
@@ -15890,6 +16547,278 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end FSM fixture verifies ordered fanout and every duplicate boundary"
+    )]
+    fn race_object_fsm_fans_out_once_and_allows_remote_hit_reporters() {
+        let (mut world, mut sessions, room_id) = prepare_game_slot_race(
+            "RaceObjectFsm",
+            41_811,
+            &[(false, 16), (false, 16), (true, 16)],
+        );
+        let object_id = 0x1000_004C;
+        let placement = barricade_game_slot(0, 1_u32 << 1);
+        assert_eq!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&placement),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed {
+                room_id,
+                race_epoch: 1,
+                recipients: 2,
+            }
+        );
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Active)
+        );
+        assert!(sessions[0].outbound.try_recv().is_err());
+        assert_eq!(take_single_packet(&mut sessions[1].outbound), placement);
+        assert_eq!(take_single_packet(&mut sessions[2].outbound), placement);
+
+        let hit = barricade_transition_for_object(1, 0, 1, object_id, 2);
+        assert_eq!(
+            world
+                .race_command(
+                    sessions[1].session,
+                    tcp_game_slot_request(&hit),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed {
+                room_id,
+                race_epoch: 1,
+                recipients: 2,
+            }
+        );
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Hit)
+        );
+        assert_eq!(take_single_packet(&mut sessions[0].outbound), hit);
+        assert!(sessions[1].outbound.try_recv().is_err());
+        assert_eq!(take_single_packet(&mut sessions[2].outbound), hit);
+
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[1].session,
+                    tcp_game_slot_request(&hit),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotObjectDuplicateSuppressed {
+                room_id: actual_room_id,
+                race_epoch: 1,
+                player_id: 1,
+                object_id: actual_object_id,
+                state: 2,
+                kind: RaceObjectDuplicateKind::Hit,
+            } if actual_room_id == room_id && actual_object_id == object_id
+        ));
+        for session in &mut sessions {
+            assert!(session.outbound.try_recv().is_err());
+        }
+
+        let spoofed_owner = barricade_transition_for_object(1, 1, 1, object_id, 2);
+        assert!(matches!(
+            world.race_command(
+                sessions[1].session,
+                tcp_game_slot_request(&spoofed_owner),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::RaceObjectOwnerMismatch {
+                object_id: actual_object_id,
+                expected_player_id: 0,
+                actual_player_id: 1,
+                ..
+            })) if actual_object_id == object_id
+        ));
+
+        let resolve = barricade_transition_for_object(1, 0, 1, object_id, 3);
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[1].session,
+                    tcp_game_slot_request(&resolve),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed { recipients: 2, .. }
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Hit)
+        );
+        assert_eq!(take_single_packet(&mut sessions[0].outbound), resolve);
+        assert!(sessions[1].outbound.try_recv().is_err());
+        assert_eq!(take_single_packet(&mut sessions[2].outbound), resolve);
+
+        let removal = barricade_transition_for_object(1, 0, 1, object_id, 4);
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[1].session,
+                    tcp_game_slot_request(&removal),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed { recipients: 2, .. }
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Removed)
+        );
+        assert_eq!(take_single_packet(&mut sessions[0].outbound), removal);
+        assert!(sessions[1].outbound.try_recv().is_err());
+        assert_eq!(take_single_packet(&mut sessions[2].outbound), removal);
+
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[1].session,
+                    tcp_game_slot_request(&removal),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotObjectDuplicateSuppressed {
+                kind: RaceObjectDuplicateKind::Removal,
+                ..
+            }
+        ));
+        for session in &mut sessions {
+            assert!(session.outbound.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn barricade_initialization_does_not_suppress_the_following_placement() {
+        let (mut world, mut sessions, room_id) = prepare_game_slot_race(
+            "RaceObjectInitializePlace",
+            41_813,
+            &[(false, 16), (false, 16)],
+        );
+        let object_id = 0x1000_004C;
+        let initialization = barricade_initialization_game_slot(0, 1_u32 << 1);
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&initialization),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed { recipients: 1, .. }
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Initialized)
+        );
+        assert_eq!(
+            take_single_packet(&mut sessions[1].outbound),
+            initialization
+        );
+
+        let placement = barricade_game_slot(0, 1_u32 << 1);
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&placement),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed { recipients: 1, .. }
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Active)
+        );
+        assert_eq!(take_single_packet(&mut sessions[1].outbound), placement);
+    }
+
+    #[test]
+    fn race_object_state_commits_only_after_atomic_fanout_reservation() {
+        let (mut world, mut sessions, room_id) = prepare_game_slot_race(
+            "RaceObjectAtomic",
+            41_812,
+            &[(false, 16), (false, 1), (true, 16)],
+        );
+        let object_id = 0x1000_004C;
+        let full_sender = world.sessions[&sessions[1].session]
+            .outbound
+            .clone()
+            .unwrap();
+        full_sender
+            .try_send(OutboundBatch::single(vec![0xCC]))
+            .unwrap();
+        let placement = barricade_game_slot(0, 1_u32 << 1);
+        assert!(matches!(
+            world.race_command(
+                sessions[0].session,
+                tcp_game_slot_request(&placement),
+                Instant::now(),
+            ),
+            Err(WorldError::Race(RaceError::OutboundUnavailable { session }))
+                if session == sessions[1].session
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            None
+        );
+        assert!(sessions[0].outbound.try_recv().is_err());
+        assert!(sessions[2].outbound.try_recv().is_err());
+        assert_eq!(
+            sessions[1].outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xCC]]
+        );
+
+        assert!(matches!(
+            world
+                .race_command(
+                    sessions[0].session,
+                    tcp_game_slot_request(&placement),
+                    Instant::now(),
+                )
+                .unwrap(),
+            RaceCommandOutcome::GameSlotRelayed { recipients: 2, .. }
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .phase(1, object_id),
+            Some(RaceObjectPhase::Active)
+        );
+    }
+
+    #[test]
     fn item_pickup_applies_frozen_kart_catalog_transforms_once() {
         for (case, kart_id, base_item_id, expected_item_id, rolls) in [
             ("GigantesMagnet", 1_410, 5, 103, vec![0]),
@@ -15898,6 +16827,15 @@ mod tests {
             ("UnrelatedKart", 1_409, 7, 7, vec![0]),
             ("PartialPass", 1_411, 7, 99, vec![0, 49]),
             ("PartialMiss", 1_411, 7, 7, vec![0, 50]),
+            ("SebekGoldShieldUfo", 1_395, 3, 36, vec![0, 24]),
+            ("SebekGoldShieldWaterFly", 1_395, 4, 36, vec![0, 24]),
+            ("SebekGoldShieldMagnet", 1_395, 5, 36, vec![0, 24]),
+            ("SebekGoldShieldBooster", 1_395, 6, 36, vec![0, 24]),
+            ("SebekGoldShieldRocket", 1_395, 7, 36, vec![0, 24]),
+            ("SebekGoldShieldWaterBomb", 1_395, 9, 36, vec![0, 24]),
+            ("SebekGoldShieldEmp", 1_395, 12, 36, vec![0, 24]),
+            ("SebekGoldShieldTimeBomb", 1_395, 13, 36, vec![0, 24]),
+            ("SebekGoldShieldMiss", 1_395, 5, 5, vec![0, 25]),
         ] {
             let (mut world, mut sessions, room_id) =
                 prepare_game_slot_race(case, 42_000 + kart_id, &[(false, 8)]);
@@ -15953,6 +16891,64 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn item_pickup_rank_band_counts_frozen_ai_racers() {
+        let (mut world, mut sessions, room_id) =
+            prepare_game_slot_race("ItemRankWithAi", 42_200, &[(false, 8)]);
+        let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+        room.settings.game_type = 2;
+        room.frozen_race.as_mut().unwrap().ais = (1..=3)
+            .map(|player_id| super::FrozenAiRaceParticipant {
+                player_id,
+                team: 0,
+                kart_id: 10,
+            })
+            .collect();
+        world.item_probability.configuration = Arc::new(ItemProbabilityConfiguration {
+            rank_band: ItemProbabilityRankBand::Live,
+            individual: vec![ItemProbabilityEntry {
+                item_id: 10,
+                name: "shield".to_owned(),
+                top_weight: 1,
+                high_weight: 1,
+                middle_weight: 1,
+                low_weight: 1,
+            }],
+            team: Vec::new(),
+        });
+        world.item_probability.rank_policy = ItemProbabilityRankPolicy::TrustClientReported;
+
+        let mut request = item_pickup_game_slot(0);
+        request[38..40].copy_from_slice(&3_i16.to_le_bytes());
+        let outcome = world
+            .race_command_with_clock_and_item_source(
+                sessions[0].session,
+                tcp_game_slot_request(&request),
+                Instant::now(),
+                &ServerClock::new(),
+                &mut FixedItemRolls(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RaceCommandOutcome::GameSlotItemAwarded {
+                room_id: actual_room_id,
+                race_epoch: 1,
+                item_id: 10,
+                rank_band: ItemProbabilityRankBand::Low,
+                recipients: 1,
+            } if actual_room_id == room_id
+        ));
+        assert_eq!(
+            i16::from_le_bytes(
+                take_single_packet(&mut sessions[0].outbound)[38..40]
+                    .try_into()
+                    .unwrap()
+            ),
+            10
+        );
     }
 
     #[test]
@@ -16540,19 +17536,19 @@ mod tests {
             assert_eq!(packets.len(), 3);
             assert_eq!(
                 logical_packet_hash(&packets[0]),
-                adler32::packet_hash(GAME_NEXT_STAGE_PACKET_NAME)
+                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
             );
             assert_eq!(
                 logical_packet_hash(&packets[1]),
-                adler32::packet_hash(GAME_RESULT_PACKET_NAME)
+                adler32::packet_hash(GAME_NEXT_STAGE_PACKET_NAME)
             );
             assert_eq!(
                 logical_packet_hash(&packets[2]),
-                adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+                adler32::packet_hash(GAME_RESULT_PACKET_NAME)
             );
-            assert_eq!(i32::from_le_bytes(packets[2][4..8].try_into().unwrap()), 4);
+            assert_eq!(i32::from_le_bytes(packets[0][4..8].try_into().unwrap()), 4);
             assert_eq!(
-                u32::from_le_bytes(packets[2][9..13].try_into().unwrap()),
+                u32::from_le_bytes(packets[0][9..13].try_into().unwrap()),
                 settlement.end_tick.wrapping_add(6_000)
             );
             if let Some(expected) = &expected_packets {
@@ -16563,10 +17559,10 @@ mod tests {
         }
         let packets = expected_packets.unwrap();
         assert_eq!(packets, frozen_final_packets);
-        let result = &packets[1];
+        let result = &packets[2];
         assert_eq!(result[4], ResultTeam::Blue as u8);
         assert_eq!(i32::from_le_bytes(result[5..9].try_into().unwrap()), 4);
-        let record_start = |player_id: usize| 9 + player_id * 217;
+        let record_start = |player_id: usize| 9 + player_id * HUMAN_RESULT_RECORD_LENGTH;
         let p0_record = record_start(0);
         assert_eq!(
             u32::from_le_bytes(result[p0_record + 4..p0_record + 8].try_into().unwrap()),
@@ -16602,8 +17598,9 @@ mod tests {
             u32::from_le_bytes(result[p0_record + 30..p0_record + 34].try_into().unwrap()),
             50_000 + u32::try_from(p0_reward_index).unwrap()
         );
+        assert_eq!(result[p0_record + 63], ResultTeam::Red as u8);
         assert_eq!(
-            i32::from_le_bytes(result[p0_record + 63..p0_record + 67].try_into().unwrap()),
+            i32::from_le_bytes(result[p0_record + 64..p0_record + 68].try_into().unwrap()),
             10
         );
         assert_eq!(
@@ -16623,8 +17620,9 @@ mod tests {
             i32::from_le_bytes(result[p2_record + 11..p2_record + 15].try_into().unwrap()),
             3
         );
+        assert_eq!(result[p2_record + 63], ResultTeam::Red as u8);
         assert_eq!(
-            i32::from_le_bytes(result[p2_record + 63..p2_record + 67].try_into().unwrap()),
+            i32::from_le_bytes(result[p2_record + 64..p2_record + 68].try_into().unwrap()),
             0
         );
 
@@ -19213,6 +20211,7 @@ mod tests {
         let room = &world.protocol_rooms[&room_id];
         assert_eq!(room.phase, RoomPhase::Loading);
         assert_eq!(room.frozen_race.as_ref().unwrap().ais.len(), 1);
+        assert_eq!(room.frozen_race.as_ref().unwrap().active_racer_count(), 2);
         let packets = owner.outbound.try_recv().unwrap().into_packets();
         assert_eq!(packets.len(), 2);
         assert_eq!(
@@ -19387,11 +20386,15 @@ mod tests {
         {
             let room = world.protocol_rooms.get_mut(&room_id).unwrap();
             room.settings.track = 1;
-            let from_one = room.select_concrete_track(1, &candidates).unwrap();
+            let from_one = room.select_concrete_track(&candidates).unwrap();
+            let from_one_next = room.select_concrete_track(&candidates).unwrap();
+            let from_one_recycled = room.select_concrete_track(&candidates).unwrap();
+            assert_ne!(from_one, from_one_next);
+            assert_ne!(from_one_next, from_one_recycled);
             room.settings.track = 40;
-            let from_forty = room.select_concrete_track(1, &candidates).unwrap();
-            assert_eq!(from_one, from_forty);
+            let from_forty = room.select_concrete_track(&candidates).unwrap();
             assert!(!matches!(from_one, 1 | 40));
+            assert!(!matches!(from_forty, 1 | 40));
         }
 
         let before = world.protocol_rooms[&room_id].clone();
@@ -19427,19 +20430,18 @@ mod tests {
             adler32::packet_hash(START_ROOM_REPLY_NAME)
         );
 
-        let expected_track = before.select_concrete_track(1, &candidates).unwrap();
         assert!(matches!(
             world
                 .lobby_command(
                     owner.session,
-                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(candidates, Vec::new()))
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(candidates.clone(), Vec::new()))
                 )
                 .unwrap(),
             LobbyCommandOutcome::Started {
                 race_epoch: 1,
                 concrete_track,
                 ..
-            } if concrete_track == expected_track
+            } if candidates.contains(&concrete_track)
         ));
     }
 
@@ -19556,6 +20558,88 @@ mod tests {
             } if room_id == reused_room_id
         ));
         assert_eq!(world.next_race_epoch.map(GlobalRaceEpoch::get), Some(3));
+    }
+
+    #[test]
+    fn starting_a_race_replaces_stale_object_registry_capacity() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "ObjectEpochReset", 67, 45_151, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+
+        let actor = RaceObjectActor {
+            user_no: owner.identity.user_no.get(),
+            generation: owner.identity.generation.get(),
+            player_id: 0,
+        };
+        let stale = RaceObjectOperation {
+            race_epoch: 999,
+            class: RaceObjectClass {
+                operation_hash: 0x1D86_04A3,
+                base_hash: 0x2D06_05C2,
+            },
+            class_name: "GopBarricade",
+            object_id: 0x7000_0999,
+            state: 1,
+            meaning: ItemLifecycleMeaning::Place,
+            evidence: ItemSemanticEvidence::ProducerAndConsumer,
+            transition_token: Some(1),
+            source_object_id: Some(0),
+            target_object_id: None,
+            variant: None,
+            reporter: actor,
+            owner_claim: Some(actor),
+        };
+        let RaceObjectAdmission::PublishTracked(stale) = world
+            .protocol_rooms
+            .get(&room_id)
+            .unwrap()
+            .race_progress
+            .race_objects
+            .plan(stale)
+            .unwrap()
+        else {
+            panic!("stale fixture must consume one registry slot");
+        };
+        world
+            .protocol_rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .race_progress
+            .race_objects
+            .commit(stale)
+            .unwrap();
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .len(),
+            1
+        );
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new(),
+                    )),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started {
+                room_id: actual_room_id,
+                race_epoch: 1,
+                ..
+            } if actual_room_id == room_id
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id]
+                .race_progress
+                .race_objects
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -19970,6 +21054,66 @@ mod tests {
             .unwrap();
         assert_eq!(take_single_packet(&mut destination.outbound)[4], 1);
         assert!(!world.protocol_rooms.contains_key(&room_id));
+    }
+
+    #[test]
+    fn authenticated_runtime_p2p_port_populates_room_slots_without_a_tcp_report() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "ObservedP2pOwner", 67, 47_102, 16);
+
+        assert!(
+            world
+                .record_observed_p2p_port(&owner.identity, 61_003)
+                .unwrap()
+        );
+        assert!(
+            !world
+                .record_observed_p2p_port(&owner.identity, 61_003)
+                .unwrap()
+        );
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Observed P2P", 1),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        let _ = take_single_packet(&mut owner.outbound);
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        assert_eq!(
+            world.protocol_rooms[&room_id].members_by_id[0]
+                .as_ref()
+                .unwrap()
+                .player
+                .p2p_port,
+            61_003
+        );
+
+        // A later durable client report remains stored by the profile lane,
+        // but a verified live source port stays authoritative for this
+        // generation's room presentation.
+        assert_eq!(
+            world
+                .publish_durable_profile_presentation(
+                    &owner.identity,
+                    ProfilePresentationMutation::SetP2pPort(45_136),
+                )
+                .unwrap(),
+            ProfilePresentationPublication::ActiveCachesUpdated
+        );
+        assert_eq!(
+            world.protocol_rooms[&room_id].members_by_id[0]
+                .as_ref()
+                .unwrap()
+                .player
+                .p2p_port,
+            61_003
+        );
+
+        let replacement = migrate_channel_session(&mut world, &owner, 47_103, 16);
+        assert!(world.observed_p2p_port(&replacement.identity).is_none());
     }
 
     #[test]

@@ -676,12 +676,20 @@ pub(crate) mod tests {
                     <Emblem id="8" />
                     <Emblem id="9" />
                 </Emblems>
-                <Abilities total="4" resolved="4">
+                <Abilities total="12" resolved="12">
                     <TransformByKart>
                         <Rule kartId="1410" sourceId="5" targetId="103" probability="100" gitType="no_flag" />
                         <Rule kartId="1410" sourceId="7" targetId="99" probability="100" gitType="no_flag" />
                         <Rule kartId="1410" sourceId="127" targetId="99" probability="100" gitType="no_flag" />
                         <Rule kartId="1411" sourceId="7" targetId="99" probability="50" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="3" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="4" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="5" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="6" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="7" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="9" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="12" targetId="36" probability="25" gitType="no_flag" />
+                        <Rule kartId="1395" sourceId="13" targetId="36" probability="25" gitType="no_flag" />
                     </TransformByKart>
                 </Abilities>
             </KartCatalog>"#

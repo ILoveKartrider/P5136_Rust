@@ -1,5 +1,5 @@
-//! Bounded read-only access to the legacy `Rh layer spec 1.1` archives used
-//! by the Korean P5136 `item.rho`.
+//! Bounded read-only access to the legacy `Rh layer spec 1.0` and `1.1`
+//! archives used by the Korean P5136 client.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -13,11 +13,13 @@ use thiserror::Error;
 
 use crate::legacy_vectors::get_vector;
 
+const HEADER_MAGIC_10: &str = "Rh layer spec 1.0";
 const HEADER_MAGIC_11: &str = "Rh layer spec 1.1";
 const HEADER_INFO_OFFSET: usize = 0x80;
 const HEADER_INFO_LENGTH: usize = 0x80;
 const BLOCK_TABLE_OFFSET: usize = 0x100;
 const BLOCK_INFO_LENGTH: usize = 0x20;
+const VERSION_MAGIC_10: u32 = 0x0001_0000;
 const VERSION_MAGIC_11: u32 = 0x0001_0001;
 const END_MAGIC: u32 = 0xfc1f_9778;
 const ROOT_DIRECTORY_INDEX: u32 = u32::MAX;
@@ -287,12 +289,19 @@ fn parse_archive_index(
             path: path.to_path_buf(),
         })?;
     let rho_key = unicode_adler(stem).wrapping_sub(0xa6ee_7565);
-    validate_magic(bytes)?;
+    let version = validate_magic(bytes)?;
     let header_end = HEADER_INFO_OFFSET
         .checked_add(HEADER_INFO_LENGTH)
         .ok_or(LegacyRhoError::ArithmeticOverflow)?;
     let encrypted_header = slice(bytes, HEADER_INFO_OFFSET, header_end, "header info")?;
-    let header = decrypt_header_info(encrypted_header, rho_key);
+    let header = match version {
+        LegacyRhoVersion::V10 => {
+            let mut header = encrypted_header.to_vec();
+            decrypt_data(&mut header, rho_key);
+            header
+        }
+        LegacyRhoVersion::V11 => decrypt_header_info(encrypted_header, rho_key),
+    };
     let expected_header_checksum = read_u32(&header, 0, "header checksum")?;
     let actual_header_checksum = adler32(&header[4..]);
     if actual_header_checksum != expected_header_checksum {
@@ -302,7 +311,11 @@ fn parse_archive_index(
         });
     }
     let version_magic = read_u32(&header, 4, "version magic")?;
-    if version_magic != VERSION_MAGIC_11 {
+    let expected_version_magic = match version {
+        LegacyRhoVersion::V10 => VERSION_MAGIC_10,
+        LegacyRhoVersion::V11 => VERSION_MAGIC_11,
+    };
+    if version_magic != expected_version_magic {
         return Err(LegacyRhoError::UnsupportedVersionMagic(version_magic));
     }
     let block_count_i32 = read_i32(&header, 8, "block count")?;
@@ -318,7 +331,15 @@ fn parse_archive_index(
         });
     }
     let whitening_key = read_u32(&header, 12, "block whitening key")?;
-    let end_magic = read_u32(&header, 28, "end magic")?;
+    let old_block_key = match version {
+        LegacyRhoVersion::V10 => Some(slice(&header, 16, 48, "RHO 1.0 block key")?),
+        LegacyRhoVersion::V11 => None,
+    };
+    let end_magic_offset = match version {
+        LegacyRhoVersion::V10 => 48,
+        LegacyRhoVersion::V11 => 28,
+    };
+    let end_magic = read_u32(&header, end_magic_offset, "end magic")?;
     if end_magic != END_MAGIC {
         return Err(LegacyRhoError::InvalidEndMagic(end_magic));
     }
@@ -339,8 +360,17 @@ fn parse_archive_index(
     for ordinal in 0..block_count {
         let start = BLOCK_TABLE_OFFSET + ordinal * BLOCK_INFO_LENGTH;
         let encrypted = &bytes[start..start + BLOCK_INFO_LENGTH];
-        let decoded = decrypt_header_info(encrypted, block_key);
-        block_key = block_key.wrapping_add(1);
+        let decoded = if let Some(key) = old_block_key {
+            encrypted
+                .iter()
+                .zip(key)
+                .map(|(byte, key_byte)| byte ^ key_byte)
+                .collect()
+        } else {
+            let decoded = decrypt_header_info(encrypted, block_key);
+            block_key = block_key.wrapping_add(1);
+            decoded
+        };
         let block = parse_block(&decoded, bytes.len(), minimum_data_offset, limits)?;
         if blocks.insert(block.index, block).is_some() {
             return Err(LegacyRhoError::DuplicateBlockIndex(block.index));
@@ -377,7 +407,7 @@ pub enum LegacyRhoError {
         end: usize,
         actual: usize,
     },
-    #[error("legacy RHO supports Rh layer spec 1.1 only; got {actual:?}")]
+    #[error("legacy RHO supports Rh layer spec 1.0 and 1.1 only; got {actual:?}")]
     UnsupportedMagic { actual: String },
     #[error("legacy RHO header checksum is {actual:#010x}; expected {expected:#010x}")]
     HeaderChecksum { actual: u32, expected: u32 },
@@ -527,7 +557,13 @@ fn validate_limits(limits: LegacyRhoLimits) -> Result<(), LegacyRhoError> {
     Ok(())
 }
 
-fn validate_magic(bytes: &[u8]) -> Result<(), LegacyRhoError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyRhoVersion {
+    V10,
+    V11,
+}
+
+fn validate_magic(bytes: &[u8]) -> Result<LegacyRhoVersion, LegacyRhoError> {
     let byte_length = HEADER_MAGIC_11.encode_utf16().count() * 2;
     let encoded = slice(bytes, 0, byte_length, "archive magic")?;
     let units = encoded
@@ -535,10 +571,11 @@ fn validate_magic(bytes: &[u8]) -> Result<(), LegacyRhoError> {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     let actual = String::from_utf16_lossy(&units);
-    if actual != HEADER_MAGIC_11 {
-        return Err(LegacyRhoError::UnsupportedMagic { actual });
+    match actual.as_str() {
+        HEADER_MAGIC_10 => Ok(LegacyRhoVersion::V10),
+        HEADER_MAGIC_11 => Ok(LegacyRhoVersion::V11),
+        _ => Err(LegacyRhoError::UnsupportedMagic { actual }),
     }
-    Ok(())
 }
 
 fn parse_block(
@@ -892,11 +929,12 @@ impl<'a> SliceReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, path::Path};
 
     use super::{
-        LegacyRhoError, LegacyRhoLimits, adler32, decrypt_data, parse_block, parse_directory,
-        unicode_adler, validate_block_ranges,
+        BLOCK_TABLE_OFFSET, END_MAGIC, HEADER_INFO_LENGTH, HEADER_INFO_OFFSET, HEADER_MAGIC_10,
+        LegacyRhoError, LegacyRhoLimits, VERSION_MAGIC_10, adler32, decrypt_data,
+        parse_archive_index, parse_block, parse_directory, unicode_adler, validate_block_ranges,
     };
 
     #[test]
@@ -909,6 +947,49 @@ mod tests {
         assert_ne!(bytes, original);
         decrypt_data(&mut bytes, 0x5136_5136);
         assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn version_10_header_and_xor_block_table_are_accepted() {
+        let path = Path::new("fixture.rho");
+        let rho_key = unicode_adler("fixture").wrapping_sub(0xa6ee_7565);
+        let mut archive = vec![0_u8; 0x220];
+        for (offset, unit) in HEADER_MAGIC_10.encode_utf16().enumerate() {
+            archive[offset * 2..offset * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut header = [0_u8; HEADER_INFO_LENGTH];
+        header[4..8].copy_from_slice(&VERSION_MAGIC_10.to_le_bytes());
+        header[8..12].copy_from_slice(&1_i32.to_le_bytes());
+        header[12..16].copy_from_slice(&0x5136_1024_u32.to_le_bytes());
+        let block_key = std::array::from_fn::<_, 32, _>(|index| {
+            u8::try_from(index)
+                .expect("the fixed 32-byte key index fits in u8")
+                .wrapping_mul(17)
+        });
+        header[16..48].copy_from_slice(&block_key);
+        header[48..52].copy_from_slice(&END_MAGIC.to_le_bytes());
+        let checksum = adler32(&header[4..]);
+        header[0..4].copy_from_slice(&checksum.to_le_bytes());
+        decrypt_data(&mut header, rho_key);
+        archive[HEADER_INFO_OFFSET..HEADER_INFO_OFFSET + HEADER_INFO_LENGTH]
+            .copy_from_slice(&header);
+
+        let plain_block = block_info(1, 2, 32, 32, 0);
+        for (destination, (byte, key)) in archive
+            [BLOCK_TABLE_OFFSET..BLOCK_TABLE_OFFSET + plain_block.len()]
+            .iter_mut()
+            .zip(plain_block.into_iter().zip(block_key))
+        {
+            *destination = byte ^ key;
+        }
+
+        let (decoded_key, blocks) =
+            parse_archive_index(path, &archive, LegacyRhoLimits::default()).unwrap();
+        assert_eq!(decoded_key, rho_key);
+        let block = blocks.get(&1).unwrap();
+        assert_eq!(block.offset, 0x200);
+        assert_eq!(block.data_size, 32);
     }
 
     #[test]

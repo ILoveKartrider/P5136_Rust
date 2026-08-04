@@ -1,364 +1,152 @@
-# KartRider P5136 Rust
+# P5136 Rust 서버
 
-An independent, clean Rust port of the KartRider P5136 private-server
-implementation. The original C# repository is treated as a read-only protocol
-reference and is not vendored into this repository.
+한국 카트라이더 P5136 클라이언트를 위한 독립 Rust 서버·접속기입니다. 원본 C# 프로젝트는 프로토콜 동작을 확인하는 읽기 전용 참고 자료로만 사용하며 이 저장소에 포함하지 않습니다.
 
-## Status
+이 프로젝트는 아직 모든 상용 서비스 기능을 재현한 완성 서버가 아닙니다. 현재 목표는 친구들과 같은 LAN에서 방 생성·입장, 게임 시작, 주행, 결과·시상식, 다시 방으로 돌아오는 멀티플레이 사이클을 안정적으로 지원하는 것입니다. Lucci, 보너스 아이템, 팀 플래그와 일부 이벤트·소셜·상점 기능은 범위 밖이거나 제한적으로 응답합니다.
 
-This repository is an active compatibility port, not yet a complete game
-server. The implemented foundation provides:
+## 빠른 시작
 
-- exact P5136 packet-name hashing and primitive serialization;
-- P5136 TCP and UDP checksum/encryption with bounded frame decoders;
-- the Korean P5136 first-message payload;
-- authentication, login, identity fencing, and channel migration over real TCP;
-- request-driven startup replies, legacy server time, and catalog-backed rider
-  inventory/equipment;
-- strict terminal empty protected-item list compatibility reply;
-- exact normal/preset shop-buy decoding with a fail-closed compatibility reply
-  and no economy mutation;
-- actor-owned channel rooms with create/list/join/leave, bounded fan-out, and
-  stale-generation cancellation;
-- bounded messenger TCP sessions with generation-fenced identity publication;
-- supervised game/P2P UDP sockets with exact Echo/TimeSync replies and
-  generation-fenced room relay;
-- exact client P2P-port reporting with durable, generation-bound ordinary-room
-  and MyRoom cache refresh;
-- exact ready-stage, race-control, race-start, settlement, and 235-byte kart
-  physics codecs used by the actor-integrated human race flow;
-- strict TCP `GameSlotPacket` decoding with generation-fenced, atomically
-  reserved type-9/10/11/12 relay;
-- bounded login concurrency and opt-in remote profile creation;
-- PIN/BML patching with immutable backups, a process lock, and atomic writes;
-- executable/PIN build detection and live Windows UAC, Wine, and CrossOver launch;
-- versioned JSON profile persistence compatible with legacy `Launcher.json`;
-- bounded read-only KR RHO5 emblem loading with authenticated decompression;
-- a no-argument desktop GUI with separate Server and Connector tabs, plus an
-  equivalent headless CLI.
+Rust 1.94 이상에서 다음 명령으로 릴리스 빌드를 만듭니다.
 
-Room admission, first-state, messenger, and UDP/P2P runtime flows are
-integrated. UDP authorization and room audience selection run inside the world
-actor so channel migration cannot race a stale relay decision. Human
-ready/loading, race start, finish, ranking, settlement, reward persistence, and
-the MyRoom direct/re-enter/random-public-entry, FirstState, owner-info,
-RequestItems, RequestEmblems, terminal Career-list, three-slot main-emblem
-update, character-position, RiderTalk, and Secede paths are also
-actor-integrated.
-Reenter restores an exact current membership before falling back to the
-rider's own room. Random entry selects only actor-tracked, owner-present,
-non-full public rooms. Direct entry strictly parses the required owner and
-room-password strings: protected rooms prompt on empty input, return the
-client's status-4 mismatch on an incorrect password, and admit only an exact
-match. Every visitor reply redacts stored secrets. The separate item-password
-flow parses kind plus password and returns the stock client's typed
-`0/1/2/3` statuses. A successful protected check retains no plaintext and
-mints one move-only, exact-generation grant for at most one matching follow-up;
-Garage and Item Dictionary grants authorize exactly one `RequestItems`.
-RequestItems loads a bounded owner snapshot under the canonical profile lane
-and publishes its complete ordered response as one actor-owned queue batch.
-The matching Emblem grant authorizes exactly one bounded `RequestEmblems`
-response and is consumed even if its requester queue is full. The matching
-Career grant likewise authorizes exactly one strict hash-only
-`RequestCareerList`; Rust publishes only the conservative 16-byte terminal
-empty list derived from the client's marker-equality rule and consumes the
-grant even when publication is stale or backpressured. Nonempty Career
-records, marker progression, and the separate owner-info exchange remain
-unimplemented until stronger evidence defines their ownership and policy.
-Main-emblem updates parse the stock client's exact three-`i16` body, require
-the present owner, validate every nonzero ID against an immutable positive-ID
-catalog, and publish success only after a transactional profile write is
-durable. The ordinary room cache is refreshed silently; no unsupported
-MyRoom peer fanout is invented.
-Client endpoint reports are exact ten-byte packets. Rust discards the claimed
-IPv4 bytes, derives the advertised address from the authenticated TCP peer,
-persists only the reported P2P port, and publishes it only for the same active
-identity generation. Port zero is an absolute clear and every login or
-same-channel replacement starts unadvertised even if a historical profile
-value exists. IPv4-mapped peers retain their embedded IPv4 address; native
-IPv6 peers remain `(0.0.0.0, 0)` because the legacy room wire format cannot
-represent them. The sibling game-UDP report is validated but cannot replace
-the endpoint authority learned by the UDP ingress path. No speculative
-endpoint ACK or live peer-refresh packet is emitted without capture evidence.
-Character positions use actor-derived sender slots and exact-generation peer
-audiences with all-recipient atomic queue reservation. RiderTalk uses the same
-atomic peer path, bounds and redacts the message-bearing request, enforces the
-owner's live `TalkLock` policy (`0` off, nonzero on), derives the canonical
-sender slot, and never echoes to the sender.
-Migration freezes and drains exact generation-bound operation
-leases, then crosses a pre-reserved ACK and result-free
-identity/MyRoom/protocol commit boundary. Messenger frames are rechecked across
-generation changes.
-Authenticated packet dispatch is fail-closed: explicitly catalogued
-compatibility no-reply packets remain no-reply, while an unclassified hash
-returns a typed session error instead of being mistaken for a successful
-handler. MyRoom dispatch is exhaustive so new protocol variants cannot
-silently fall through.
-`PqLockedItemGet` is a strict four-byte request and returns the bounded
-canonical protected-item projection to the authenticated requester.
-`PqLockedItemUpdate` uses the captured strict batch layout and applies
-idempotent Add/Remove operations through the canonical profile lane. An
-unresolved C# `Locked.json` is imported exactly once through the process run
-lease and a no-follow profile capability; import plus the first request share
-one immutable revision. Malformed, oversized, nonregular, or linked sidecars
-fail closed without sealing canonical state.
-`PqServerTime` likewise has an explicit authenticated path and returns the
-exact eight-byte `PrServerTime`: reply hash, days since 1900 modulo 65,536,
-and quarter-seconds since local midnight. The corroborating C# handlers do not
-consume a request body, so Rust accepts an unused suffix only under the global
-frame bound instead of claiming an unproven hash-only schema. The reply is
-direct and read-only. It uses the shared identity-operation admission and
-authorization actor commands but creates no ServerTime-specific mutation,
-disk I/O, or fanout.
-
-Stock producers prove that `PqRequestExtradata` and
-`PqWebEventCompleteCheckPacket` are both exact hash-only requests. Rust rejects
-the trailing bytes that the C# handlers silently accepted. The web-event reply
-is the exact empty four-byte named packet; the six-byte extra-data reply is an
-exact zero code plus an absent optional-value marker. Rust exposes no
-speculative extra-data success code or value. Both paths reuse global identity
-admission and authorization, return one direct requester reply, and leave
-profile, disk, World domain state, and peer queues unchanged.
-
-`PqGetRiderInfo` now has a strict stock-producer parser for its zero scalar,
-empty reserved string, bounded target nickname, and raw mode byte. Successful
-cross-profile projection is deliberately unavailable until visibility,
-offline lookup, and public-profile policy are specified. The authenticated
-path therefore returns only the exact five-byte failure reply. It never logs
-the target nickname, loads or creates the target profile, mutates state, or
-fans out a request.
-
-`PqStartRiderSchool` is likewise exact: one encoded byte after the request hash
-and no suffix. Its 240-byte reply uses the shared validated P5136 kart-physics
-builder. This deliberately keeps the normal physics formula instead of
-copying two drifted C# shortcut constants or depending on process-global
-`SpeedPatch` state. Both the request and the direct reply are profile
-read-only, generation-fenced, and covered by stale/quiesce error-priority
-tests.
-
-Both stock P5136 shop-buy aliases are also explicit. Rust strictly parses the
-producer-derived 9-byte normal body and 11-byte item-preset body, then returns
-the exact common 29-byte failure packet. It does not execute a purchase,
-change inventory or currency, persist profile data, or fan out a request.
-Malformed shop packets are bounded nonfatal drops so the authenticated session
-remains usable; stale identity ownership, an unbound profile, quiesce, and
-actor/system failures still propagate. Field widths and order are evidenced,
-but unknown business meanings and value ranges are deliberately not invented.
-
-TCP `GameSlotPacket` is handled separately from the opaque UDP packet that
-shares its name. Rust bounds the complete TCP packet at 1013 bytes and each
-nested blob at 960 bytes and validates P5136 types 1, 2, 4, 6, 9, 10, 11, 12,
-and 16. Type 12 admits a known `Gop*`/`GoItem*` operation pair only after the
-claimed actor, low-16 peer mask, and exact bounded envelope pass. The 67-class
-native-writer manifest enriches matching bodies with typed state/object
-diagnostics; its 18 C# enum-derived pairs and shape drift use an explicitly
-opaque bounded relay capability instead of a capture-by-capture allow-list.
-No type-12 packet mutates Rust world state. Barricade remains the exception:
-its placement/transition owner and finite transform are still checked before
-relay. The opt-in corpus test sends all 1,471 original retained TCP GameSlot
-records through this parser; the later barricade-hit runtime capture supplies
-the state 2/3 fixtures.
-
-The World actor accepts only an exact frozen-generation human racer during
-`Running` or the still-open `Settling` window. Type 9/10/11 honor their
-recipient masks according to their captured sender rules. Type-12 packets
-must carry the exact peer-racer mask derived by the server;
-client omissions and extra bits are rejected. All recipient queues are
-reserved before byte-exact publication. Malformed, spoofed, unsupported,
-inactive-generation, wrong-phase, and backpressured item events have no side
-effects; stale global identity ownership, actor
-termination, and invariant failures still propagate.
-
-Type 1/2 item-box requests are never relayed as-is because their rank field
-occupies the item-ID position in the response. In item individual/team rooms,
-the parser first verifies the captured pre-award state and repeated
-object/tick/state/owner fields. Per-player monotonic replay tokens and a
-capture-sized rate bucket are actor-owned and commit only after every outbound
-queue is reserved. For the current LAN/friends trust model, the default
-`Live` policy uses the client-reported rank and the C# Top/High/Middle/Low
-mapping. Uncheck the GUI trust option, or pass
-`--trust-client-item-rank false`, to use Combined weights instead. The actor
-synthesizes the exact 73-byte success packet and broadcasts it to all active
-frozen participants including the sender. Before serialization it resolves
-the frozen race kart against the bounded `KartCatalog.xml`
-`Abilities/TransformByKart` table and applies the matching `no_flag` rule
-exactly once, including the stock Gigantes V1 magnet/rocket transforms. A
-100% rule consumes no second random value; partial rules use a separate
-unbiased `[0,100)` draw. Type 10/11 remain byte-exact relay only: Rust does
-not copy speculative kart side effects, bonus-item synthesis, or the C#
-double-transformation risk.
-
-The remaining compatibility work is concentrated in type 4/6/16 routing and
-type-12 ownership semantics, actor-owned item-slot/use effects, the remaining
-MyRoom and economy requests, capture-derived movement sequencing and UDP
-first-bind capabilities, packet fixtures, green cross-platform CI evidence,
-and stock-client end-to-end validation. See
-[PORTING_STATUS.md](PORTING_STATUS.md) for the exact handoff and
-[PORTING.md](PORTING.md) for the feature ledger.
-
-## Build
-
-Local Cargo output is fixed to `target/p5136-finish-kart-abilities` by
-`.cargo/config.toml`; debug and release builds reuse that directory instead of
-creating a new full target tree for each diagnostic run.
-
-```text
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p p5136-cli
-cargo run -p p5136-cli -- server --catalog /path/to/KartRider_5136
+```powershell
+cargo build --release -p p5136-cli
 ```
 
-Tagged versions are built by GitHub Actions on Windows, Linux, and macOS. Each
-GitHub Release contains the three platform binaries plus `SHA256SUMS`.
+현재 저장소의 고정 빌드 경로는 다음과 같습니다.
 
-The configured port follows the original topology: login TCP is base `+ 1`,
-game UDP is base `+ 0`, P2P UDP is base `+ 1`, and messenger TCP is base `+ 2`.
+```text
+target/p5136-finish-kart-abilities/release/p5136.exe
+```
 
-`KartCatalog.xml` is runtime data exported from a client installation and is
-never committed. `--catalog` accepts the stock client directory, its `Profile`
-directory, or the XML file itself. For the first two forms, Rust resolves the
-C# server's existing `Profile/KartCatalog.xml` export and the sibling `Data`
-directory automatically. It does not need to write to the client installation.
-If the export is missing, run the C# server's **카트 데이터 XML 추출** once,
-then point Rust at the client or `Profile` directory—not at `KartCatalog.xml`
-manually. Without `--catalog`, login and channel startup remain available, but
-`PqGetRider` is deliberately rejected rather than serving an incomplete
-inventory. Profiles default to `./Profile`; use `--profile-root` to change that
-location.
+`p5136.exe`를 인자 없이 실행하면 한글 GUI가 열립니다. 하나의 실행 파일 안에 서버와 접속기가 들어 있으며 GUI 탭으로 구분됩니다.
 
-### Runtime packet diagnostics
+1. 서버 탭에서 `클라이언트 또는 Profile 경로`에 P5136 클라이언트 루트를 지정합니다. 예: `C:\Games\KartRider_5136`.
+2. 다른 PC가 접속한다면 `내 LAN IPv4로 자동 설정`을 누릅니다. 여러 어댑터가 있으면 목록에서 실제 LAN 주소를 선택합니다.
+3. 새 원격 닉네임으로 처음 접속한다면 `LAN의 새 닉네임 허용`을 체크합니다.
+4. `서버 시작`을 누릅니다.
+5. 접속기 탭에 게임 디렉터리, 닉네임, 서버 IPv4를 넣고 `클라이언트 준비 및 실행`을 누릅니다.
 
-Every `p5136` run creates a log file at
-`<p5136 executable directory>/logs/p5136-<timestamp>-<pid>.log`. The GUI shows
-the exact path beneath its title; set `P5136_LOG_DIR` to place it elsewhere.
-If the directory or file cannot be created, startup fails instead of silently
-running without diagnostics.
+접속기는 원본 파일의 불변 백업과 프로세스 잠금을 사용해 PIN/XML을 준비한 뒤 Windows UAC, Wine 또는 CrossOver로 클라이언트를 실행합니다.
 
-The file records every server transport-boundary packet with direction, peer,
-byte count, first-word little-endian value (the logical frame hash for
-TCP/Messenger), and hexadecimal payload: login TCP plaintext
-logical frames (including the first server frame), complete UDP wire datagrams
-before decode and after a successful send, and Messenger TCP logical frames.
-Malformed/partial TCP and Messenger wire frames are also recorded before their
-decoder returns an error. To keep a hostile maximum-size frame from exhausting
-disk, hexadecimal payload capture is limited to the first 4 KiB per record;
-the record remains present and says `truncated = true` with its full byte
-count.
+## 클라이언트 데이터 자동 탐지
 
-Each server start also records the effective endpoints, profile root,
-`KartCatalog.xml` and client-data paths, and whether each optional catalog was
-actually loaded. A failed login handler or response write records the request
-hash, byte count, authentication state, and both display and debug forms of
-its typed error; a non-cancelled login or Messenger TCP session error is also
-recorded. These session-failure diagnostics use an independent 64-records-per-
-second bounded budget and the existing lossy file target, so remote disconnects
-cannot flood the normal console. This makes a missing catalog, invalid profile
-state, or failed `PqGetRider` sequence visible in the normal per-run file
-without requiring `RUST_LOG=debug`.
+클라이언트 루트, `Profile` 폴더 또는 `KartCatalog.xml`을 지정할 수 있습니다. 서버는 다음 경로를 자동으로 찾습니다.
 
-Normal client traffic records every packet. This is deliberately not an
-unbounded remote-disk-write capability: raw packet records are process-wide
-limited to 512 per second, and the file writer has a bounded asynchronous
-queue. A rate-limited interval emits a `packet diagnostics were rate-limited`
-record with its dropped count; if the file queue itself is full, its newest
-records are dropped rather than stalling the server. Preserve these warnings
-alongside a crash log—there is no claim of complete raw capture during a
-diagnostic-overload attack.
+- `Profile/KartCatalog.xml`: 카트·장비·아이템 변환 규칙
+- `Data/item.rho`: 개인전·팀전 아이템 확률표
+- `Data/track_common.rho`: 모드·랜덤 selector별 트랙 목록
+- 그 밖의 RHO5 데이터: 엠블럼 등 지원 데이터
 
-These files can contain authentication material, nicknames, and chat text.
-They are local diagnostic data, are never committed, and should be handled as
-sensitive. There is no automatic deletion: preserve the log from a failing
-client run, then remove it manually when it is no longer needed.
+아이템 확률표의 기본 모드는 `서버 시작 시 자동 적용`입니다. 시작 버튼을 누르면 실제 `item.rho`를 먼저 읽어 개인전·팀전 항목 수와 적용 경로를 GUI에 표시하고, 그때 읽은 정확한 스냅샷을 해당 서버 실행에 넘깁니다. 로드 실패 시 서버를 시작하지 않습니다. `불러와 고정`이나 XML을 사용한 경우에만 이후 클라이언트 경로 변경과 무관한 수동 값이 됩니다.
 
-`--client-data-dir` points at the stock client's `Data` directory. At startup,
-the server uses a bounded, read-only RHO5 reader to locate exactly one
-`etc_/emblem/emblem@kr.xml`, authenticate and decompress it in memory, and load
-its source-ordered positive IDs for `RequestEmblems` and main-selection
-validation. The installed KR data fixture yields 586 unique IDs, minimum 1 and
-maximum 8803. Startup fails before binding listeners if the configured archive
-set or XML is missing, ambiguous, malformed, or exceeds its limits.
+세베크 V1 같은 카트의 아이템 변환도 `KartCatalog.xml`을 읽어 서버가 최종 획득 아이템을 결정합니다. 예를 들어 세베크 V1의 황금 실드는 클라이언트가 자동 변환하는 것이 아니라 서버의 `transformByKart` 규칙으로 처리됩니다.
 
-An optional `<Emblems>` section in the format-3 `KartCatalog.xml` remains a
-portable fallback when `--client-data-dir` is omitted. RHO5 definitions take
-precedence when both sources are configured. Without either source, the server
-fails closed with an empty emblem response and permits only `0,0,0`; `0` is
-solely the empty-selection sentinel. The existing C# exporter does not emit
-`<Emblems>`. Client archives and extracted XML must never be committed.
+## 닉네임별 카트 인벤토리
 
-The same `Data` directory supplies item probabilities. P5136 stores them in
-the legacy read-only `item.rho` paths
-`slot/itemProb_indi@zz.bml` and `slot/itemProb_team@zz.bml`, not in the RHO5
-packs. Rust validates the Rh-layer-1.1 header and block checksums, bounds every
-table/block/name, decrypts and decompresses only the exact entries, then
-parses their UTF-16 BML. The installed client yields 14 individual rows with
-combined weight 400 and 18 team rows with combined weight 410. If `item.rho`
-is absent, the loader can use equivalent RHO5 entries; without client data it
-uses a bounded 14/18-item safe table. `--item-probability-xml PATH` loads a
-portable `<itemProbabilities rankBand="...">` override containing
-`<individual>` and `<team>` sections with `item` attributes `idx`, `name`,
-`toprank`, `highrank`, `midrank`, and `lowrank`. XML is read through a bounded
-single handle and requires one complete exact root and one of each section.
+서버를 정지한 상태에서 GUI의 `닉네임별 인벤토리 편집`을 펼치면 강화 상태가 다른 동일 카트를 여러 대 소유하도록 추가할 수 있습니다.
 
-The server binds to `127.0.0.1` by default. To serve another machine, set both
-`--bind` and `--advertise`. Existing profiles may log in remotely, but creating
-new profiles from non-loopback clients additionally requires the explicit
-`--allow-remote-profile-creation` option.
+1. 서버의 `클라이언트 또는 Profile 경로`와 `프로필 저장 경로`를 먼저 지정합니다.
+2. `카트 목록 불러오기`를 눌러 실제 `KartCatalog.xml`의 한국어 이름을 읽습니다.
+3. 인벤토리를 편집할 닉네임을 입력합니다. `접속기 닉네임 사용`으로 현재 접속기 값을 복사할 수도 있습니다.
+4. `기간테스 V1`, 공백을 뺀 `기간테스v1`, 또는 숫자 ID `1410`을 입력하고 후보 드롭다운에서 카트를 선택합니다.
+5. `선택 카트 추가`를 누릅니다. 같은 카트를 다시 누르면 다음 고유 serial로 한 대가 더 추가됩니다.
 
-### Two-client LAN smoke test
+기본 카탈로그 카트는 모두 serial 1로 제공됩니다. 추가 소유분은 닉네임별 프로필의 `GrantedKarts`에 serial 2 이상으로 원자적 저장되며, 장착·플랜트·파츠 데이터가 사용하는 `(kart_id, serial)` 키와 같으므로 각 복사본을 서로 다르게 강화할 수 있습니다. 할당기는 현재 grant뿐 아니라 남아 있는 `PlantData.json`/`PartsData.json` serial도 예약하므로 과거 강화 상태를 새 복사본이 잘못 물려받지 않습니다. 프로필이 아직 없는 닉네임은 첫 추가 시 생성됩니다. 이미 접속한 클라이언트에는 재접속 후 반영됩니다.
 
-The P5136 connector prepares and launches one client installation; it does not
-turn one game directory into concurrent client instances. Use two separately
-installed, connector-recognized P5136 clients on the same LAN. On the server
-host, bind to `0.0.0.0`, advertise that host's current LAN IPv4 address, and
-enable remote profile creation only when the remote nickname does not already
-exist. Both connector instances must use that advertised IPv4 address and the
-same configured base port.
+편집 중에는 서버와 같은 프로필 루트 잠금을 잠깐 획득하고 저장소 고유 ID도 재검증합니다. 이 GUI뿐 아니라 다른 프로세스의 서버가 실행 중이어도 추가를 거부하므로 서버를 먼저 종료해야 합니다. 카트 목록을 읽은 뒤 클라이언트 경로를 바꾸면 목록과 선택은 무효화되며, 추가 직전에도 현재 `KartCatalog.xml`의 실제 경로와 제한형 내용 지문을 다시 대조합니다.
 
-Allow the server host's inbound game UDP `base`, login TCP/P2P UDP `base + 1`,
-and messenger TCP `base + 2` through its host firewall for the LAN profile in
-use. Do not substitute virtual-adapter, VPN, or loopback addresses for the
-physical LAN address unless every test client deliberately uses that overlay.
-The server's optional `--client-data-dir` must refer to the exact stock client
-`Data` directory; a mismatched client-data copy fails closed during RHO5 emblem
-catalog discovery.
+현재 편집기는 의도적으로 중복 카트 추가만 지원합니다. 일반 카탈로그 아이템은 서버가 이미 기본 인벤토리에 제공하므로, 수량형 아이템 구매·지급은 가격·재화·만료·재시도 정책을 갖춘 별도 economy 기능으로 남겨 두었습니다.
 
-## Desktop GUI and connector
+## 랜덤 트랙
 
-With no arguments, `p5136` opens the desktop GUI. The Server tab exposes the
-same server options as the CLI: bind and advertised addresses, configured port,
-profile root, an optional stock-client/`Profile` path, remote profile creation,
-and advanced session limits/timeouts. The client path automatically resolves
-the C#-exported catalog and sibling `Data` directory. On Windows, the GUI loads
-the installed `Malgun Gothic` system font so Korean operating-system errors render
-correctly. The advanced `Client Data override` field handles a non-standard
-client-data location. Starting and graceful stopping keep the supervisor on a dedicated worker; if retained reward recovery blocks graceful
-shutdown, the GUI reports that state and requires an explicit force-stop click.
-Closing a window with a live server cancels the close, requests graceful
-shutdown, waits for a bounded interval, then requests a force-stop and joins
-the worker before allowing process exit.
-The Server tab also contains an item-probability editor equivalent to the C#
-control: `Live/Top/High/Middle/Low/Combined` rank selection, separate
-individual/team tables, read-only IDs/names, editable bounded weights, client
-`item.rho`/RHO5 loading, portable XML loading, automatic client reload, and a
-safe fallback. Automatic tables must be loaded and pinned before their rank or
-weights can be edited, so the fallback preview cannot silently replace the
-stock distribution. `Trust client-reported live rank (LAN/friends)` is checked
-by default; clearing it changes only the `Live` policy to Combined fallback.
-The Server tab can copy its advertised address and configured port into the
-Connector tab. GUI edits apply to the next server start and are intentionally
-not persisted.
+서버는 클라이언트의 RHO 1.0 `track_common.rho`를 제한형·읽기 전용으로 해석합니다. 스피드/아이템 모드와 selector `0, 1, 3~8, 23, 30, 33, 40`에 맞는 실제 후보 풀에서 프로세스 난수로 선택하며, 같은 방에서는 현재 풀을 소진하기 전에 같은 트랙을 다시 고르지 않습니다. AI가 있으면 `basicAi` 트랙을 우선하고 목록이 비면 원래 풀로 되돌아갑니다.
 
-The Connector tab is a native Rust application on each host. On macOS/Linux it
-launches only `KartRider.exe` through Wine or CrossOver; on Windows, `auto` uses
-a UAC-backed native launch and refuses elevation unless the executable still
-has the known stock P5136 SHA-256. Use `p5136 connect --help` for the headless
-equivalent and `--dry-run` to inspect the complete plan without touching files,
-sockets, or processes. Closing the GUI cancels any uncommitted probe or launch;
-an atomic file preparation already in progress is allowed to finish safely.
+GUI의 `랜덤 트랙 설정`에서 클라이언트 목록을 미리 읽으면 풀별 후보가 체크박스로 표시됩니다. 개별 맵 선택과 `모두 선택`, `모두 해제`, `클라이언트 기본값` 복원을 지원합니다. 수동 설정이 없는 풀은 클라이언트 기본값을 그대로 사용하며, 빈 사용자 지정 목록은 붉은 경고를 표시하고 서버 시작 전에 거부합니다. 수동 설정은 원본 ID를 검증해야 하므로 클라이언트 `Data` 경로 없이 사용할 수 없으며, 경로가 사라지면 서버 시작 전에 오류로 중단합니다.
 
-## Provenance
+## 방 제목 S0~S7 물리
 
-Protocol constants and wire behavior were reimplemented from the local
-KartRider P5136 C# source. Keep new work free of proprietary client assets,
-runtime captures, and unrelated analysis projects.
+방 제목에 독립된 `S0`~`S7` 토큰을 넣으면 C# 서버와 같은 현대 물리 프리셋을 경기 시작 시 적용합니다.
+
+```text
+[S0] 초보방
+친선 S2
+S6 무한부스터
+```
+
+토큰은 대소문자를 구분하지 않으며 ASCII 영숫자 경계를 따릅니다. 따라서 `TESTS1ROOM`이나 `S10`은 물리 토큰으로 인식하지 않습니다. 방 목록에 보이는 기본 speed byte를 억지로 바꾸는 방식이 아니라, 각 플레이어의 카트·펫·장비와 S0~S7 기본값을 합성한 235바이트 경기 시작 물리 블록을 선택합니다.
+
+## LAN 주소와 도메인
+
+`바인드 주소`는 서버가 실제로 포트를 열 로컬 인터페이스이고, `클라이언트에 알릴 IPv4`는 로그인·채널 패킷에 넣을 주소입니다. LAN 자동 설정 버튼은 루프백·링크 로컬 주소를 제외하고 물리 어댑터를 가상 어댑터보다 먼저, 그 안에서는 사설 IPv4를 우선합니다. Wi-Fi, Ethernet, WSL, VMware, VPN, Tailscale 등이 함께 보이면 실제 클라이언트와 같은 네트워크의 주소를 직접 선택하세요. 광고 주소의 `0.0.0.0`, 멀티캐스트, 브로드캐스트는 시작 전에 거부합니다.
+
+현재 bind, advertised, 접속기 서버 주소는 IP 리터럴만 받습니다. 특히 advertised 주소는 P5136 패킷에 IPv4 4바이트로 직렬화되므로 도메인을 그대로 넣을 수 없습니다. 도메인을 쓰려면 실행 전에 A 레코드를 조회해 하나의 IPv4로 고정해야 하며, DNS 변경이 실행 중 서버 상태와 어긋날 수 있어 GUI 입력으로 지원하지 않습니다.
+
+Windows에서는 맑은 고딕, macOS에서는 Apple SD Gothic Neo/AppleGothic, Linux에서는 Noto Sans CJK KR·나눔고딕 계열을 순서대로 찾아 한글 GUI 글꼴로 사용합니다. Linux에 해당 글꼴이 없으면 설치 안내를 로그에 남깁니다.
+
+기준 포트가 `39311`이면 다음 포트를 사용합니다.
+
+| 용도 | 프로토콜 | 포트 |
+|---|---:|---:|
+| 게임 | UDP | 39311 |
+| 로그인 | TCP | 39312 |
+| P2P/relay | UDP | 39312 |
+| 메신저 | TCP | 39313 |
+
+두 PC에서 테스트할 때 서버 PC 방화벽에 위 TCP/UDP 포트를 허용해야 합니다.
+
+## 명령줄 실행
+
+GUI 없이 서버만 실행할 수 있습니다.
+
+```powershell
+p5136.exe server `
+  --bind 192.168.1.10 `
+  --advertise 192.168.1.10 `
+  --catalog C:\Games\KartRider_5136 `
+  --allow-remote-profile-creation
+```
+
+접속기만 실행하는 예:
+
+```powershell
+p5136.exe connect `
+  --game-dir C:\Games\KartRider_5136 `
+  --username player1 `
+  --server 192.168.1.10
+```
+
+`p5136.exe --help`, `p5136.exe server --help`, `p5136.exe connect --help`에서 전체 옵션을 확인할 수 있습니다.
+
+## 로그와 문제 확인
+
+모든 실행은 실행 파일 옆 `logs` 폴더에 새 로그를 만듭니다.
+
+```text
+logs/p5136-<timestamp>-<pid>.log
+```
+
+GUI 상단에도 현재 로그의 절대 경로가 표시됩니다. 서버가 받은 패킷과 보낸 패킷은 기본 파일 로그에 남습니다. 알 수 없는 패킷은 전체 제한형 원문을 기록한 뒤 응답 없이 소비하므로 선택 기능 하나가 전체 로그인 세션을 끊지 않습니다.
+
+클라이언트 크래시를 조사할 때는 서버 로그와 클라이언트의 `logs` 폴더를 함께 보관하세요.
+
+## 테스트
+
+```powershell
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+실제 클라이언트 RHO 판독 smoke test는 환경 변수를 지정해 별도로 실행합니다.
+
+```powershell
+$env:P5136_CLIENT_DATA='C:\Games\KartRider_5136\Data'
+cargo test -p p5136-server stock_client_catalog_smoke -- --ignored
+```
+
+프로토콜 근거, 완료 범위와 재개 지점은 [PORTING.md](PORTING.md), [PORTING_STATUS.md](PORTING_STATUS.md), [CLIENT_PROTOCOL_FSM.md](CLIENT_PROTOCOL_FSM.md), [ITEM_GAMEPLAY_COVERAGE.md](ITEM_GAMEPLAY_COVERAGE.md)에 정리되어 있습니다.
+
+## 안전성과 라이선스
+
+워크스페이스는 `unsafe_code = "forbid"`를 적용합니다. 외부 파일은 크기·개수·깊이 제한을 둔 읽기 전용 파서로 처리하고, 프로필 저장은 임시 파일과 원자적 교체를 사용합니다.
+
+라이선스는 `AFL-3.0`입니다.

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
         Arc,
@@ -35,6 +35,7 @@ use crate::{
         ProfileIoRuntime, ProfileIoShutdownError, RewardFailureClassification,
         RewardPersistenceFailure,
     },
+    random_track::{RandomTrackError, ResolvedRandomTracks, load_client_random_track_catalog},
     session::{ProfileCoordinator, run_login_session},
     world::{
         ItemProbabilityService, RewardCompletionDisposition, RewardDrainStatus,
@@ -51,6 +52,9 @@ const MAX_EMBLEM_COMPRESSED_BYTES: usize = 1024 * 1024;
 pub enum ServerError {
     #[error("maximum concurrent login sessions must be greater than zero")]
     InvalidLoginSessionLimit,
+
+    #[error("advertised IPv4 address {0} cannot be reached by a P5136 client")]
+    InvalidAdvertisedAddress(Ipv4Addr),
 
     #[error("failed to bind game UDP listener")]
     BindGameUdp(#[source] io::Error),
@@ -96,6 +100,19 @@ pub enum ServerError {
 
     #[error("item-probability loader task failed")]
     ItemProbabilityTask(#[source] JoinError),
+
+    #[error("failed to load random-track definitions from {path}")]
+    LoadRandomTracks {
+        path: PathBuf,
+        #[source]
+        source: RandomTrackError,
+    },
+
+    #[error("random-track loader task failed")]
+    RandomTrackTask(#[source] JoinError),
+
+    #[error("random-track overrides require a client Data directory")]
+    RandomTrackDataRequired,
 
     #[error(transparent)]
     ProfileIoConfig(#[from] ProfileIoConfigError),
@@ -283,20 +300,32 @@ pub struct BoundServer {
 impl BoundServer {
     /// Transactionally binds all four P5136 transports. If any bind fails,
     /// already-created sockets are dropped before the error is returned.
-    pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
+    pub async fn bind(mut config: ServerConfig) -> Result<Self, ServerError> {
         if config.max_login_sessions == 0 {
             return Err(ServerError::InvalidLoginSessionLimit);
+        }
+        if config.advertised_address.is_unspecified()
+            || config.advertised_address.is_multicast()
+            || config.advertised_address == Ipv4Addr::BROADCAST
+        {
+            return Err(ServerError::InvalidAdvertisedAddress(
+                config.advertised_address,
+            ));
         }
         let profile_limits = crate::profile_io::ProfileIoLimits::for_server(
             config.max_login_sessions,
             reward_persistence_worker_limit(config.max_login_sessions),
         )?;
-        let (catalog, emblems, item_probabilities) = tokio::try_join!(
+        let (catalog, emblems, item_probabilities, random_tracks) = tokio::try_join!(
             load_catalog(config.catalog_path.clone()),
             load_emblem_catalog(config.client_data_dir.clone()),
             load_item_probability_configuration(
                 config.item_probabilities.clone(),
                 config.client_data_dir.clone(),
+            ),
+            load_random_track_configuration(
+                config.client_data_dir.clone(),
+                config.random_tracks.clone(),
             ),
         )?;
         let bind_address = config.bind_address;
@@ -314,6 +343,7 @@ impl BoundServer {
                 .await
                 .map_err(ServerError::BindMessengerTcp)?;
         let profile_root = config.profile_root.clone();
+        config.resolved_random_tracks.clone_from(&random_tracks);
         let profiles = tokio::task::spawn_blocking(move || {
             ProfileIoBootstrap::acquire(profile_root, profile_limits)
         })
@@ -370,17 +400,7 @@ impl BoundServer {
         } = self;
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let force_shutdown_requested = Arc::new(AtomicBool::new(false));
-        let bind_address = config.bind_address;
-        let advertised_address = config.advertised_address;
-        let profile_root = config.profile_root.clone();
-        let catalog_path = config.catalog_path.clone();
-        let client_data_dir = config.client_data_dir.clone();
-        let item_probabilities_overridden = config.item_probabilities.is_some();
-        let item_probability_rank_policy = config.item_probability_rank_policy;
-        let remote_profile_creation = config.allow_remote_profile_creation;
-        let catalog_loaded = catalog.is_some();
         let catalog_item_transform_count = catalog_item_transform_count(catalog.as_deref());
-        let emblem_catalog_loaded = emblems.is_some();
         let item_probability_rank_band = item_probabilities.rank_band;
         let individual_item_probability_count = item_probabilities.individual.len();
         let team_item_probability_count = item_probabilities.team.len();
@@ -403,6 +423,28 @@ impl BoundServer {
         let supervisor_world = world.clone();
         let supervisor_force_shutdown = Arc::clone(&force_shutdown_requested);
         let supervisor_wire_operations = wire_operations.clone();
+        tracing::info!(
+            bind_address = %config.bind_address,
+            advertised_address = %config.advertised_address,
+            game_udp = %endpoints.game_udp,
+            login_tcp = %endpoints.login_tcp,
+            p2p_udp = %endpoints.p2p_udp,
+            messenger_tcp = %endpoints.messenger_tcp,
+            profile_root = %config.profile_root.display(),
+            catalog_path = ?config.catalog_path,
+            catalog_loaded = catalog.is_some(),
+            catalog_item_transform_count,
+            client_data_dir = ?config.client_data_dir,
+            emblem_catalog_loaded = emblems.is_some(),
+            item_probabilities_overridden = config.item_probabilities.is_some(),
+            ?item_probability_rank_band,
+            item_probability_rank_policy = ?config.item_probability_rank_policy,
+            individual_item_probability_count,
+            team_item_probability_count,
+            random_tracks_loaded = config.resolved_random_tracks.is_some(),
+            remote_profile_creation = config.allow_remote_profile_creation,
+            "P5136 server configuration validated and transports started"
+        );
         let task = tokio::spawn(async move {
             run_supervisor(
                 SupervisorTransports {
@@ -425,7 +467,6 @@ impl BoundServer {
             )
             .await
         });
-
         let server = ServerHandle {
             endpoints,
             shutdown,
@@ -434,27 +475,6 @@ impl BoundServer {
             wire_operations,
             supervisor: AsyncMutex::new(SupervisorJoin::Running(task)),
         };
-        tracing::info!(
-            %bind_address,
-            %advertised_address,
-            game_udp = %server.endpoints.game_udp,
-            login_tcp = %server.endpoints.login_tcp,
-            p2p_udp = %server.endpoints.p2p_udp,
-            messenger_tcp = %server.endpoints.messenger_tcp,
-            profile_root = %profile_root.display(),
-            catalog_path = ?catalog_path,
-            catalog_loaded,
-            catalog_item_transform_count,
-            client_data_dir = ?client_data_dir,
-            emblem_catalog_loaded,
-            item_probabilities_overridden,
-            ?item_probability_rank_band,
-            ?item_probability_rank_policy,
-            individual_item_probability_count,
-            team_item_probability_count,
-            remote_profile_creation,
-            "P5136 server configuration validated and transports started"
-        );
         Ok(server)
     }
 }
@@ -785,6 +805,31 @@ async fn load_item_probability_configuration(
             .map_err(ServerError::ItemProbabilityTask)?
             .map_err(|source| ServerError::LoadItemProbabilities { path, source })?;
     Ok(Arc::new(configuration))
+}
+
+async fn load_random_track_configuration(
+    data_directory: Option<PathBuf>,
+    configuration: crate::RandomTrackConfiguration,
+) -> Result<Option<Arc<ResolvedRandomTracks>>, ServerError> {
+    let Some(data_directory) = data_directory else {
+        return if configuration.pools.is_empty() {
+            Ok(None)
+        } else {
+            Err(ServerError::RandomTrackDataRequired)
+        };
+    };
+    let source_path = data_directory.join("track_common.rho");
+    let task_path = data_directory.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        load_client_random_track_catalog(task_path)?.resolve(&configuration)
+    })
+    .await
+    .map_err(ServerError::RandomTrackTask)?
+    .map_err(|source| ServerError::LoadRandomTracks {
+        path: source_path,
+        source,
+    })?;
+    Ok(Some(Arc::new(resolved)))
 }
 
 fn production_rho5_limits() -> Rho5Limits {
@@ -2285,8 +2330,9 @@ mod tests {
     use crate::{
         ChannelBinding, ItemProbabilityConfiguration, MessengerServiceHandle, MigrationToken,
         ProfileIoConfigError, ProfileIoError, ProfileIoRuntimeError, ProfileIoShutdownError,
-        ServerClock, ServerConfig, ServerEndpoints, UdpIngress, UdpIngressBody, UdpRuntime,
-        UdpTransport, WorldError, WorldHandle, decode_udp_ingress,
+        RandomTrackConfiguration, RandomTrackPoolOverride, ServerClock, ServerConfig,
+        ServerEndpoints, UdpIngress, UdpIngressBody, UdpRuntime, UdpTransport, WorldError,
+        WorldHandle, decode_udp_ingress,
         myroom_persistence::{MyRoomInfoPublication, MyRoomInfoWriteError},
         operation_gate::WireOperationGate,
         profile_io::{ProfileIoBootstrap, ProfileIoLimits},
@@ -2609,6 +2655,7 @@ mod tests {
                         },
                         observer: false,
                         kart_physics: P5136KartPhysicsBlock::from([0; 235]),
+                        kart_physics_variants: None,
                     },
                 },
             )
@@ -3674,7 +3721,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_client_emblem_entry_fails_before_any_listener_is_bound() {
+    async fn unusable_advertised_addresses_fail_before_preflight_or_bind() {
+        for address in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(239, 1, 2, 3),
+            Ipv4Addr::BROADCAST,
+        ] {
+            let config = ServerConfig {
+                advertised_address: address,
+                ..ServerConfig::default()
+            };
+            assert!(matches!(
+                BoundServer::bind(config).await.unwrap_err(),
+                ServerError::InvalidAdvertisedAddress(actual) if actual == address
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn random_track_overrides_require_their_client_catalog() {
+        let config = ServerConfig {
+            random_tracks: RandomTrackConfiguration {
+                pools: vec![RandomTrackPoolOverride {
+                    game_type: 0,
+                    selector: 3,
+                    track_ids: vec!["village_R01".to_owned()],
+                }],
+            },
+            ..ServerConfig::default()
+        };
+        assert!(matches!(
+            BoundServer::bind(config).await.unwrap_err(),
+            ServerError::RandomTrackDataRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_client_data_fails_preflight_before_any_listener_is_bound() {
         let profile_root = tempfile::tempdir().unwrap();
         let client_data = tempfile::tempdir().unwrap();
         let config = ServerConfig {
@@ -3691,6 +3774,10 @@ mod tests {
             matches!(
                 &error,
                 ServerError::LoadEmblemCatalog { path, .. } if path == client_data.path()
+            ) || matches!(
+                &error,
+                ServerError::LoadRandomTracks { path, .. }
+                    if path == &client_data.path().join("track_common.rho")
             ),
             "unexpected bind error: {error}"
         );

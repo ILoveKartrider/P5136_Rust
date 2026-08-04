@@ -215,6 +215,86 @@ async fn two_clients_relay_exact_game_slot_to_latest_game_endpoint() {
 }
 
 #[tokio::test]
+async fn four_clients_keep_independent_sender_ticks_relayable() {
+    let game_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let p2p_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut runtime =
+        UdpRuntime::spawn(game_server, p2p_server, UdpRuntimeConfig::default()).unwrap();
+    let mut clients = Vec::with_capacity(4);
+    for _ in 0..4 {
+        clients.push(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+    }
+
+    let sessions = session_ids(4).await;
+    let mut registry = IdentityRegistry::new();
+    let identities = sessions
+        .into_iter()
+        .enumerate()
+        .map(|(index, session)| {
+            registry
+                .claim(session, LOOPBACK, &format!("TickRider{index}"))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for (index, (client, identity)) in clients.iter().zip(&identities).enumerate() {
+        bind_with_echo(
+            &mut runtime,
+            client,
+            identity,
+            0x5100_0000 + u32::try_from(index).unwrap(),
+        )
+        .await;
+    }
+
+    // A fourth client observes three independent PCs. Their uptime-derived
+    // movement ticks intentionally descend, which is valid because ticks are
+    // only ordered within one sender timeline.
+    let independent_sender_ticks = [900_000_u32, 600_000, 300_000];
+    for (sender_index, tick) in independent_sender_ticks.into_iter().enumerate() {
+        let body = movement_game_slot_body(sender_index, tick);
+        send_request(
+            &clients[sender_index],
+            runtime.endpoints().game,
+            identities[sender_index].user_no.get(),
+            0x5200_0000 + u32::try_from(sender_index).unwrap(),
+            UdpLogicalBody::GameSlotPacket(&body),
+            100 + u32::try_from(sender_index).unwrap(),
+        )
+        .await;
+        let ingress = next_ingress(&mut runtime).await;
+        let outcome = runtime
+            .service()
+            .dispatch(request(
+                ingress,
+                &identities[sender_index],
+                identities.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, UdpDispatchAction::GameSlotRelay);
+        assert_eq!(outcome.sent_datagrams, 3);
+        assert_eq!(outcome.failed_sends, 0);
+        assert_eq!(outcome.unavailable_targets, 0);
+
+        for (target_index, client) in clients.iter().enumerate() {
+            if target_index == sender_index {
+                assert_no_datagram(client).await;
+                continue;
+            }
+            let relayed = receive_ingress(client, UdpTransport::Game).await;
+            assert_eq!(relayed.account_id, identities[target_index].user_no.get());
+            assert_eq!(
+                relayed.body,
+                UdpIngressBody::GameSlotPacket(body.clone()),
+                "receiver {target_index} lost sender {sender_index} tick {tick}"
+            );
+        }
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn p2p_ingress_replies_from_p2p_socket_but_game_slot_targets_game_route() {
     let (mut runtime, sender_socket, target_socket) = fixture().await;
     let sessions = session_ids(2).await;
@@ -740,4 +820,13 @@ async fn wait_for_malformed(runtime: &UdpRuntime) {
     })
     .await
     .expect("malformed datagram was not observed");
+}
+
+fn movement_game_slot_body(sender_index: usize, tick: u32) -> Vec<u8> {
+    const GAME_KART_PACKET: u32 = 656_737_636;
+    let mut body = vec![0_u8; 20];
+    body[0] = u8::try_from(sender_index).unwrap();
+    body.extend_from_slice(&GAME_KART_PACKET.to_le_bytes());
+    body.extend_from_slice(&tick.to_le_bytes());
+    body
 }

@@ -171,6 +171,11 @@ impl CatalogInventory {
         Self::from_reader(xml, ValidationPolicy::production())
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_structural_xml_for_tests(xml: &[u8]) -> Result<Self, CatalogInventoryError> {
+        Self::from_reader(xml, ValidationPolicy::structural_only())
+    }
+
     #[must_use]
     pub fn items(&self) -> &[CatalogInventoryItem] {
         &self.items

@@ -165,6 +165,13 @@ pub struct RiderItems {
     pub unknown1: u16,
     #[serde(rename = "Set_HeadBand")]
     pub head_band: u16,
+    /// Legacy profile/wire name for the KR P5136 category-12 equipment slot.
+    ///
+    /// `KartCatalog.xml` identifies this category as replay-recording cameras,
+    /// and the client race-state builder tests category 12 before retaining its
+    /// `KartRecorder`. Keep the serialized C# field name for profile
+    /// compatibility and use [`Self::replay_recording_camera_id`] in semantic
+    /// code.
     #[serde(rename = "Set_HeadPhone")]
     pub head_phone: u16,
     #[serde(rename = "Set_HandGearL")]
@@ -227,6 +234,20 @@ pub struct RiderItems {
     pub unknown5: u16,
     #[serde(flatten)]
     pub extra: ExtraFields,
+}
+
+impl RiderItems {
+    /// Returns the equipped KR P5136 category-12 replay-recording camera ID.
+    #[must_use]
+    pub const fn replay_recording_camera_id(&self) -> u16 {
+        self.head_phone
+    }
+
+    /// Mirrors the client's `sub_8E0970(12) != 0` equipment gate.
+    #[must_use]
+    pub const fn has_replay_recording_camera(&self) -> bool {
+        self.replay_recording_camera_id() != 0
+    }
 }
 
 impl Default for RiderItems {
@@ -497,6 +518,7 @@ mod tests {
             },
             "RiderItem": {
                 "Set_Character": 42,
+                "Set_HeadPhone": 5,
                 "Set_slotBg": 8
             },
             "futureTopLevel": [1, 2, 3]
@@ -506,6 +528,8 @@ mod tests {
         assert_eq!(profile.rider.rp, 456);
         assert_eq!(profile.rider.club_mark_logo, 77);
         assert_eq!(profile.rider_item.character, 42);
+        assert_eq!(profile.rider_item.replay_recording_camera_id(), 5);
+        assert!(profile.rider_item.has_replay_recording_camera());
         assert_eq!(profile.rider_item.slot_background, 8);
         assert_eq!(profile.race_reward_receipt, None);
 
@@ -514,6 +538,7 @@ mod tests {
         assert_eq!(encoded["futureTopLevel"], json!([1, 2, 3]));
         assert_eq!(encoded["Rider"]["RP"], 456);
         assert_eq!(encoded["RiderItem"]["Set_Character"], 42);
+        assert_eq!(encoded["RiderItem"]["Set_HeadPhone"], 5);
         assert!(encoded.get("P5136RustFavoriteItems").is_none());
         assert!(encoded.get("P5136RustRaceRewardReceipt").is_none());
     }
