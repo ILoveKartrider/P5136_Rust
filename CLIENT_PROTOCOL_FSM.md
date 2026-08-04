@@ -326,10 +326,16 @@ accepted transition returns exactly one of:
 - `ImmediateOutbound`: a same-call send, currently zero branches;
 - `UnknownSideEffect`: exact bytes but incomplete runtime effect.
 
-The reviewed 149-branch census is 71 local, 69 deferred, zero immediate, and
-9 unknown. Angel and `GopGoldShield` activation contribute deferred markers because the shared
+The reviewed 149-branch census is 74 local, 70 deferred, zero immediate, and
+5 unknown. The five unknown runtime effects are exactly `GopEventObject`
+(`0x71110001`), `GopGiantTalisman` state 3, `GopRobotBeam` state 2,
+`GopTombStone` state 2, and `GopWitchUnionMagic` state 4; a regression test
+pins this set independently of the aggregate count. Angel and `GopGoldShield`
+activation contribute deferred markers because the shared
 defense resolver has a recovered state-2 producer; that state-2 branch records
 a repeatable defense impact locally and does not remove the timed effect.
+`GopBigTimebomb` phase 0 is also deferred because its collision producer
+originates the proven phase 2/3/4 impact/resolution paths.
 `GopGoldShield` resolves kind 0 to item 36, kind 3 to item 81, and the
 state-2 trailing `u16=106` override to item 106. A
 deferred result only queues a scheduler marker; it never invents
@@ -339,11 +345,20 @@ class/object key, `Remove` clears the object, and `Unknown`/explicit no-action
 branches do not fabricate state. Decode failures are transactional across the
 object map, deferred queue, and transition counter.
 
+Recovered item selectors are also part of the executable observation. In
+particular, `GopShield` state 1 is decoded as `item_id:u16@16, token@18` and
+therefore distinguishes Shield 10, Super Shield 18, and Super Magnet 103.
+Cloud state-1 discriminator `0/3/6` resolves to `0/1/43` for `GopCloud` and
+`114/115/116` for `GopCloud2`. Fixed-class observations expose Timebomb 13,
+SnowWaterfly 118, Icefly 80, StraightRocket 73, BigTimebomb 122, and
+SpecialShield 40 without treating the class-local discriminator byte as an
+item ID.
+
 The same base fixtures are independently gated on the server side. For each
 of the 149 branches, the production `GameSlot` decoder and the registry
 mapping used by `World::relay_game_slot` admit the operation in a fresh race
 registry and preserve the complete relay packet. The fixed disposition census
-is 87 tracked, 62 relay-only/untracked, and zero suppressed. This validates
+is 88 tracked, 61 relay-only/untracked, and zero suppressed. This validates
 the protocol and server-policy composition; it does not substitute for live
 client rendering or for firing every deferred native timer/collision guard.
 

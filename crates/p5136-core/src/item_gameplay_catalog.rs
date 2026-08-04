@@ -145,7 +145,26 @@ pub enum P5136CoverageLevel {
     VerifiedOperation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReverseEngineeringScope {
+    InScope,
+    DeferredByUser,
+}
+
 impl GameplayItemHint {
+    /// Current reverse-engineering scope. Deferred entries remain in the
+    /// complete 54-heading reference and keep their existing evidence; this
+    /// flag only prevents them from being counted as active ambiguity work.
+    #[must_use]
+    pub fn reverse_engineering_scope(self) -> ReverseEngineeringScope {
+        match self.slug {
+            "rolling_waterbomb" | "jiangshi" | "first_place_devil" => {
+                ReverseEngineeringScope::DeferredByUser
+            }
+            _ => ReverseEngineeringScope::InScope,
+        }
+    }
+
     /// Mode constraints explicitly recorded from the modern gameplay page.
     /// These are reference metadata only and are deliberately not encoded as
     /// target scopes. `None` means unrecorded, not unrestricted.
@@ -198,6 +217,147 @@ const SUPPLEMENT: ItemSymbolEvidence = ItemSymbolEvidence::P5136VerifiedSuppleme
 const VERIFIED: OperationLinkEvidence = OperationLinkEvidence::VerifiedAssociation;
 const NAMED: OperationLinkEvidence = OperationLinkEvidence::NameCorrelation;
 const AMBIGUOUS: OperationLinkEvidence = OperationLinkEvidence::AmbiguousCandidate;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperationItemSelector {
+    FixedClass,
+    ItemIdU16 { raw_offset: u8 },
+    VariantByte { raw_offset: u8, value: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveredOperationItemAssociation {
+    pub class_name: &'static str,
+    pub item_id: i16,
+    pub symbol: &'static str,
+    pub selector: OperationItemSelector,
+}
+
+/// Executable- and `item.rho`-cross-checked operation/item joins relevant to
+/// the formerly ambiguous gameplay rows. This intentionally also records the
+/// distinct battle/special items that caused the original name collisions.
+pub static P5136_RECOVERED_OPERATION_ITEM_ASSOCIATIONS: &[RecoveredOperationItemAssociation] = &[
+    RecoveredOperationItemAssociation {
+        class_name: "GopRocket",
+        item_id: 7,
+        symbol: "rocket",
+        selector: OperationItemSelector::ItemIdU16 { raw_offset: 16 },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopRocket",
+        item_id: 33,
+        symbol: "guideRocket",
+        selector: OperationItemSelector::ItemIdU16 { raw_offset: 16 },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopStraightRocket",
+        item_id: 73,
+        symbol: "straightRocket",
+        selector: OperationItemSelector::FixedClass,
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopTimebomb",
+        item_id: 13,
+        symbol: "timeBomb",
+        selector: OperationItemSelector::FixedClass,
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopBigTimebomb",
+        item_id: 122,
+        symbol: "bigTimeBomb",
+        selector: OperationItemSelector::FixedClass,
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopSnowWaterfly",
+        item_id: 118,
+        symbol: "snowWaterFly",
+        selector: OperationItemSelector::FixedClass,
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopIcefly",
+        item_id: 80,
+        symbol: "iceFly",
+        selector: OperationItemSelector::FixedClass,
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopShield",
+        item_id: 10,
+        symbol: "shield",
+        selector: OperationItemSelector::ItemIdU16 { raw_offset: 16 },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopShield",
+        item_id: 18,
+        symbol: "superShield",
+        selector: OperationItemSelector::ItemIdU16 { raw_offset: 16 },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopShield",
+        item_id: 103,
+        symbol: "superMagnet",
+        selector: OperationItemSelector::ItemIdU16 { raw_offset: 16 },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopSpecialShield",
+        item_id: 40,
+        symbol: "specialShield",
+        selector: OperationItemSelector::FixedClass,
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopCloud",
+        item_id: 0,
+        symbol: "cloud",
+        selector: OperationItemSelector::VariantByte {
+            raw_offset: 24,
+            value: 0,
+        },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopCloud",
+        item_id: 1,
+        symbol: "darkCloud",
+        selector: OperationItemSelector::VariantByte {
+            raw_offset: 24,
+            value: 3,
+        },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopCloud",
+        item_id: 43,
+        symbol: "rainbowCloud",
+        selector: OperationItemSelector::VariantByte {
+            raw_offset: 24,
+            value: 6,
+        },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopCloud2",
+        item_id: 114,
+        symbol: "cloud2",
+        selector: OperationItemSelector::VariantByte {
+            raw_offset: 24,
+            value: 0,
+        },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopCloud2",
+        item_id: 115,
+        symbol: "darkCloud2",
+        selector: OperationItemSelector::VariantByte {
+            raw_offset: 24,
+            value: 3,
+        },
+    },
+    RecoveredOperationItemAssociation {
+        class_name: "GopCloud2",
+        item_id: 116,
+        symbol: "rainbowCloud2",
+        selector: OperationItemSelector::VariantByte {
+            raw_offset: 24,
+            value: 6,
+        },
+    },
+];
 
 /// Complete heading-level coverage of the supplied page. The order follows
 /// the page so missing or duplicated entries remain easy to audit.
@@ -338,8 +498,8 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
             evidence: FALLBACK,
         }],
         operation_links: &[OperationLink {
-            class_name: "GopStraightRocket",
-            evidence: AMBIGUOUS,
+            class_name: "GopRocket",
+            evidence: VERIFIED,
         }],
     },
     GameplayItemHint {
@@ -440,10 +600,7 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
         targets: &[GameplayTargetScope::RandomAheadOpponent],
         effects: &[GameplayEffectHint::LaunchAirborne],
         item_symbols: &[],
-        operation_links: &[OperationLink {
-            class_name: "GopStraightRocket",
-            evidence: AMBIGUOUS,
-        }],
+        operation_links: &[],
     },
     GameplayItemHint {
         slug: "waterbomb",
@@ -477,16 +634,10 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
             symbol: "timeBomb",
             evidence: FALLBACK,
         }],
-        operation_links: &[
-            OperationLink {
-                class_name: "GopTimebomb",
-                evidence: AMBIGUOUS,
-            },
-            OperationLink {
-                class_name: "GopBigTimebomb",
-                evidence: AMBIGUOUS,
-            },
-        ],
+        operation_links: &[OperationLink {
+            class_name: "GopTimebomb",
+            evidence: VERIFIED,
+        }],
     },
     GameplayItemHint {
         slug: "infected_waterbomb",
@@ -607,16 +758,10 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
             symbol: "snowWaterFly",
             evidence: EXECUTABLE,
         }],
-        operation_links: &[
-            OperationLink {
-                class_name: "GopIcefly",
-                evidence: AMBIGUOUS,
-            },
-            OperationLink {
-                class_name: "GopSnowWaterfly",
-                evidence: AMBIGUOUS,
-            },
-        ],
+        operation_links: &[OperationLink {
+            class_name: "GopSnowWaterfly",
+            evidence: VERIFIED,
+        }],
     },
     GameplayItemHint {
         slug: "infected_waterfly",
@@ -755,10 +900,14 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
             GameplayEffectHint::TemporaryShield,
             GameplayEffectHint::SpeedBoost,
         ],
-        item_symbols: &[],
+        item_symbols: &[ItemSymbolLink {
+            item_id: 18,
+            symbol: "superShield",
+            evidence: FALLBACK,
+        }],
         operation_links: &[OperationLink {
-            class_name: "GopSpecialShield",
-            evidence: AMBIGUOUS,
+            class_name: "GopShield",
+            evidence: VERIFIED,
         }],
     },
     GameplayItemHint {
@@ -875,7 +1024,7 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
         }],
         operation_links: &[OperationLink {
             class_name: "GopCloud2",
-            evidence: AMBIGUOUS,
+            evidence: VERIFIED,
         }],
     },
     GameplayItemHint {
@@ -895,7 +1044,7 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
         }],
         operation_links: &[OperationLink {
             class_name: "GopCloud2",
-            evidence: AMBIGUOUS,
+            evidence: VERIFIED,
         }],
     },
     GameplayItemHint {
@@ -914,8 +1063,8 @@ pub static P5136_GAMEPLAY_ITEM_HINTS: &[GameplayItemHint] = &[
             evidence: EXECUTABLE,
         }],
         operation_links: &[OperationLink {
-            class_name: "GopCloud2",
-            evidence: AMBIGUOUS,
+            class_name: "GopCloud",
+            evidence: VERIFIED,
         }],
     },
     GameplayItemHint {
@@ -1282,6 +1431,173 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(slugs.len(), 54);
         assert_eq!(names.len(), 54);
+    }
+
+    #[test]
+    fn only_explicitly_deferred_headings_retain_ambiguous_links() {
+        let deferred = P5136_GAMEPLAY_ITEM_HINTS
+            .iter()
+            .filter(|item| {
+                item.reverse_engineering_scope() == ReverseEngineeringScope::DeferredByUser
+            })
+            .map(|item| item.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deferred,
+            ["rolling_waterbomb", "jiangshi", "first_place_devil"]
+        );
+
+        for item in P5136_GAMEPLAY_ITEM_HINTS
+            .iter()
+            .filter(|item| item.reverse_engineering_scope() == ReverseEngineeringScope::InScope)
+        {
+            assert!(
+                item.operation_links
+                    .iter()
+                    .all(|link| link.evidence != OperationLinkEvidence::AmbiguousCandidate),
+                "{} still has an in-scope ambiguous operation link",
+                item.slug
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the independent literal association oracle keeps all recovered selectors visible"
+    )]
+    fn recovered_operation_item_joins_are_literal_and_unique() {
+        let actual = P5136_RECOVERED_OPERATION_ITEM_ASSOCIATIONS
+            .iter()
+            .map(|link| (link.class_name, link.item_id, link.symbol, link.selector))
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), 17);
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "GopRocket",
+                    7,
+                    "rocket",
+                    OperationItemSelector::ItemIdU16 { raw_offset: 16 }
+                ),
+                (
+                    "GopRocket",
+                    33,
+                    "guideRocket",
+                    OperationItemSelector::ItemIdU16 { raw_offset: 16 }
+                ),
+                (
+                    "GopStraightRocket",
+                    73,
+                    "straightRocket",
+                    OperationItemSelector::FixedClass
+                ),
+                (
+                    "GopTimebomb",
+                    13,
+                    "timeBomb",
+                    OperationItemSelector::FixedClass
+                ),
+                (
+                    "GopBigTimebomb",
+                    122,
+                    "bigTimeBomb",
+                    OperationItemSelector::FixedClass
+                ),
+                (
+                    "GopSnowWaterfly",
+                    118,
+                    "snowWaterFly",
+                    OperationItemSelector::FixedClass
+                ),
+                ("GopIcefly", 80, "iceFly", OperationItemSelector::FixedClass),
+                (
+                    "GopShield",
+                    10,
+                    "shield",
+                    OperationItemSelector::ItemIdU16 { raw_offset: 16 }
+                ),
+                (
+                    "GopShield",
+                    18,
+                    "superShield",
+                    OperationItemSelector::ItemIdU16 { raw_offset: 16 }
+                ),
+                (
+                    "GopShield",
+                    103,
+                    "superMagnet",
+                    OperationItemSelector::ItemIdU16 { raw_offset: 16 }
+                ),
+                (
+                    "GopSpecialShield",
+                    40,
+                    "specialShield",
+                    OperationItemSelector::FixedClass
+                ),
+                (
+                    "GopCloud",
+                    0,
+                    "cloud",
+                    OperationItemSelector::VariantByte {
+                        raw_offset: 24,
+                        value: 0
+                    }
+                ),
+                (
+                    "GopCloud",
+                    1,
+                    "darkCloud",
+                    OperationItemSelector::VariantByte {
+                        raw_offset: 24,
+                        value: 3
+                    }
+                ),
+                (
+                    "GopCloud",
+                    43,
+                    "rainbowCloud",
+                    OperationItemSelector::VariantByte {
+                        raw_offset: 24,
+                        value: 6
+                    }
+                ),
+                (
+                    "GopCloud2",
+                    114,
+                    "cloud2",
+                    OperationItemSelector::VariantByte {
+                        raw_offset: 24,
+                        value: 0
+                    }
+                ),
+                (
+                    "GopCloud2",
+                    115,
+                    "darkCloud2",
+                    OperationItemSelector::VariantByte {
+                        raw_offset: 24,
+                        value: 3
+                    }
+                ),
+                (
+                    "GopCloud2",
+                    116,
+                    "rainbowCloud2",
+                    OperationItemSelector::VariantByte {
+                        raw_offset: 24,
+                        value: 6
+                    }
+                ),
+            ]
+        );
+
+        let unique = actual
+            .iter()
+            .map(|(_, item_id, symbol, _)| (*item_id, *symbol))
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), actual.len());
     }
 
     // An exhaustive literal oracle is intentionally kept independent of the
@@ -1732,7 +2048,7 @@ mod tests {
             OperationLinkEvidence,
             ItemOperationClassEvidence,
         );
-        const EXPECTED_LINKS: [LinkGolden; 56] = [
+        const EXPECTED_LINKS: [LinkGolden; 53] = [
             ("siren", "GopSiren", VerifiedAssociation, NativeWriterSchema),
             (
                 "magnet",
@@ -1754,8 +2070,8 @@ mod tests {
             ),
             (
                 "first_place_missile",
-                "GopStraightRocket",
-                AmbiguousCandidate,
+                "GopRocket",
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
@@ -1789,12 +2105,6 @@ mod tests {
                 NativeWriterSchema,
             ),
             (
-                "random_missile",
-                "GopStraightRocket",
-                AmbiguousCandidate,
-                NativeWriterSchema,
-            ),
-            (
                 "waterbomb",
                 "GopWaterbomb",
                 VerifiedAssociation,
@@ -1803,13 +2113,7 @@ mod tests {
             (
                 "timed_waterbomb",
                 "GopTimebomb",
-                AmbiguousCandidate,
-                NativeWriterSchema,
-            ),
-            (
-                "timed_waterbomb",
-                "GopBigTimebomb",
-                AmbiguousCandidate,
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
@@ -1850,14 +2154,8 @@ mod tests {
             ),
             (
                 "ice_waterfly",
-                "GopIcefly",
-                AmbiguousCandidate,
-                NativeWriterSchema,
-            ),
-            (
-                "ice_waterfly",
                 "GopSnowWaterfly",
-                AmbiguousCandidate,
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
@@ -1894,8 +2192,8 @@ mod tests {
             ("angel", "GopAngel", VerifiedAssociation, NativeWriterSchema),
             (
                 "super_shield",
-                "GopSpecialShield",
-                AmbiguousCandidate,
+                "GopShield",
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
@@ -1927,19 +2225,19 @@ mod tests {
             (
                 "ink_cloud",
                 "GopCloud2",
-                AmbiguousCandidate,
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
                 "new_cloud",
                 "GopCloud2",
-                AmbiguousCandidate,
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
                 "fairy_cloud",
-                "GopCloud2",
-                AmbiguousCandidate,
+                "GopCloud",
+                VerifiedAssociation,
                 NativeWriterSchema,
             ),
             (
@@ -2038,22 +2336,22 @@ mod tests {
             ("magnet", VerifiedOperation),
             ("golden_magnet", VerifiedOperation),
             ("missile", VerifiedOperation),
-            ("first_place_missile", VerifiedItemSymbol),
+            ("first_place_missile", VerifiedOperation),
             ("rocket_launcher", OperationCandidate),
             ("golden_missile", VerifiedOperation),
             ("tiger_missile", VerifiedOperation),
             ("electromagnetic_missile", VerifiedOperation),
             ("snow_fairy", VerifiedOperation),
-            ("random_missile", OperationCandidate),
+            ("random_missile", GameplayReferenceOnly),
             ("waterbomb", VerifiedOperation),
-            ("timed_waterbomb", VerifiedItemSymbol),
+            ("timed_waterbomb", VerifiedOperation),
             ("infected_waterbomb", VerifiedOperation),
             ("coke_bomb", VerifiedOperation),
             ("ice_bomb", VerifiedOperation),
             ("rolling_waterbomb", VerifiedItemSymbol),
             ("net", GameplayReferenceOnly),
             ("waterfly", VerifiedOperation),
-            ("ice_waterfly", VerifiedItemSymbol),
+            ("ice_waterfly", VerifiedOperation),
             ("infected_waterfly", VerifiedOperation),
             ("bomb_waterfly", VerifiedOperation),
             ("ufo", VerifiedOperation),
@@ -2061,15 +2359,15 @@ mod tests {
             ("thunderbolt", VerifiedOperation),
             ("shield", VerifiedOperation),
             ("angel", VerifiedOperation),
-            ("super_shield", OperationCandidate),
+            ("super_shield", VerifiedOperation),
             ("golden_shield", VerifiedOperation),
             ("protect_shield", VerifiedOperation),
             ("siren_shield", VerifiedOperation),
             ("emp", VerifiedOperation),
             ("cloud", VerifiedOperation),
-            ("ink_cloud", VerifiedItemSymbol),
-            ("new_cloud", VerifiedItemSymbol),
-            ("fairy_cloud", VerifiedItemSymbol),
+            ("ink_cloud", VerifiedOperation),
+            ("new_cloud", VerifiedOperation),
+            ("fairy_cloud", VerifiedOperation),
             ("banana", VerifiedOperation),
             ("big_banana", VerifiedItemSymbol),
             ("mine", VerifiedOperation),
@@ -2100,7 +2398,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn p5136_numeric_links_are_unique_and_searchable() {
-        const EXPECTED_LINKS: [(i16, &str, ItemSymbolEvidence); 40] = [
+        const EXPECTED_LINKS: [(i16, &str, ItemSymbolEvidence); 41] = [
             (6, "booster", FALLBACK),
             (24, "siren", SUPPLEMENT),
             (5, "magnet", FALLBACK),
@@ -2125,6 +2423,7 @@ mod tests {
             (111, "thunderbolt", FALLBACK),
             (10, "shield", FALLBACK),
             (11, "angel", FALLBACK),
+            (18, "superShield", FALLBACK),
             (36, "goldShield", EXECUTABLE),
             (81, "protectShield", EXECUTABLE),
             (106, "sirenShield", EXECUTABLE),
@@ -2154,7 +2453,7 @@ mod tests {
                 .iter()
                 .filter(|(_, _, evidence)| *evidence == FALLBACK)
                 .count(),
-            18
+            19
         );
         assert_eq!(
             actual_links

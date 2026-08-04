@@ -1,11 +1,11 @@
 use std::{
     collections::HashSet,
-    fs::File,
-    hash::{DefaultHasher, Hash as _, Hasher as _},
-    io::Read as _,
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -18,59 +18,21 @@ use p5136_connector::{
 };
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
 use p5136_profile::{
-    AddKartOutcome, AdditionalKart, CatalogInventory, KartCatalogSearchResult, MAX_CATALOG_BYTES,
-    ProfileStore, add_kart, additional_karts, search_karts,
+    AddKartOutcome, AdditionalKart, CatalogInventory, KartCatalogSearchResult, ProfileStore,
+    add_kart, additional_karts, search_karts,
 };
 use p5136_server::{
     BoundServer, ItemProbabilityConfiguration, ItemProbabilityEntry, ItemProbabilityRankBand,
     ItemProbabilityRankPolicy, RandomTrackCatalog, RandomTrackConfiguration, RandomTrackDefinition,
     RandomTrackPool, RandomTrackPoolOverride, ServerConfig, ServerEndpoints,
-    load_client_item_probabilities, load_client_random_track_catalog, load_item_probability_xml,
+    load_client_item_probabilities, load_client_kart_catalog, load_client_random_track_catalog,
+    load_item_probability_xml,
 };
 
 use crate::{LoggingRuntime, client_paths};
 
 const WINDOW_TITLE: &str = "카트라이더 P5136";
 const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CatalogSourceFingerprint {
-    byte_len: u64,
-    content_hash: u64,
-}
-
-fn read_catalog_snapshot(path: &Path) -> Result<(PathBuf, Vec<u8>, CatalogSourceFingerprint)> {
-    let canonical_path = std::fs::canonicalize(path)
-        .with_context(|| format!("{}의 실제 경로를 확인하지 못했습니다", path.display()))?;
-    let file = File::open(&canonical_path)
-        .with_context(|| format!("{}을(를) 열지 못했습니다", canonical_path.display()))?;
-    let declared_len = file
-        .metadata()
-        .with_context(|| format!("{}의 크기를 읽지 못했습니다", canonical_path.display()))?
-        .len();
-    if declared_len > MAX_CATALOG_BYTES {
-        return Err(anyhow!(
-            "KartCatalog.xml이 제한 크기 {MAX_CATALOG_BYTES}바이트를 초과합니다: {declared_len}바이트"
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(declared_len).unwrap_or_default());
-    file.take(MAX_CATALOG_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("{}을(를) 읽지 못했습니다", canonical_path.display()))?;
-    let actual_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if actual_len > MAX_CATALOG_BYTES {
-        return Err(anyhow!(
-            "KartCatalog.xml이 읽는 동안 제한 크기 {MAX_CATALOG_BYTES}바이트를 초과했습니다"
-        ));
-    }
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let fingerprint = CatalogSourceFingerprint {
-        byte_len: actual_len,
-        content_hash: hasher.finish(),
-    };
-    Ok((canonical_path, bytes, fingerprint))
-}
 
 pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -166,15 +128,17 @@ enum GuiRunner {
     NativeElevated,
     Wine,
     CrossOver,
+    Sikarugir,
 }
 
 impl GuiRunner {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Auto,
         Self::Native,
         Self::NativeElevated,
         Self::Wine,
         Self::CrossOver,
+        Self::Sikarugir,
     ];
 
     const fn label(self) -> &'static str {
@@ -184,6 +148,7 @@ impl GuiRunner {
             Self::NativeElevated => "직접 실행 (Windows UAC)",
             Self::Wine => "Wine",
             Self::CrossOver => "CrossOver",
+            Self::Sikarugir => "Sikarugir wrapper",
         }
     }
 }
@@ -191,6 +156,7 @@ impl GuiRunner {
 #[derive(Debug, Clone)]
 struct GuiInputs {
     game_directory: String,
+    game_executable: String,
     nickname: String,
     server: String,
     configured_port: String,
@@ -199,12 +165,14 @@ struct GuiInputs {
     wine_prefix: String,
     crossover_binary: String,
     crossover_bottle: String,
+    sikarugir_app: String,
 }
 
 impl Default for GuiInputs {
     fn default() -> Self {
         Self {
             game_directory: default_game_directory().display().to_string(),
+            game_executable: String::new(),
             nickname: "player".to_owned(),
             server: Ipv4Addr::LOCALHOST.to_string(),
             configured_port: DEFAULT_CONFIGURED_PORT.to_string(),
@@ -213,6 +181,7 @@ impl Default for GuiInputs {
             wine_prefix: String::new(),
             crossover_binary: default_crossover_binary().display().to_string(),
             crossover_bottle: "KartRider-P5136".to_owned(),
+            sikarugir_app: String::new(),
         }
     }
 }
@@ -220,6 +189,7 @@ impl Default for GuiInputs {
 impl GuiInputs {
     fn connector_plan(&self) -> Result<ConnectorPlan> {
         let game_directory = required_path(&self.game_directory, "게임 디렉터리")?;
+        let game_executable = optional_path(&self.game_executable);
         let server_address = self
             .server
             .trim()
@@ -239,6 +209,7 @@ impl GuiInputs {
 
         ConnectorPlan::new(ConnectorRequest {
             game_directory,
+            game_executable,
             nickname: self.nickname.clone(),
             server_address,
             ports,
@@ -261,6 +232,9 @@ impl GuiInputs {
             GuiRunner::CrossOver => Ok(Runner::CrossOver {
                 wine_binary: required_path(&self.crossover_binary, "CrossOver 실행 파일")?,
                 bottle: required_text(&self.crossover_bottle, "CrossOver 보틀")?.to_owned(),
+            }),
+            GuiRunner::Sikarugir => Ok(Runner::Sikarugir {
+                app: required_path(&self.sikarugir_app, "Sikarugir wrapper 앱")?,
             }),
         }
     }
@@ -363,8 +337,8 @@ impl ServerInputs {
             ));
         }
         let client_paths = client_paths::resolve_client_runtime_paths(
-            optional_path(&self.client_path),
-            optional_path(&self.client_data_dir),
+            optional_path_ref(&self.client_path),
+            optional_path_ref(&self.client_data_dir),
         )?;
 
         Ok(ServerConfig {
@@ -372,7 +346,7 @@ impl ServerInputs {
             advertised_address,
             ports,
             profile_root: required_path(&self.profile_root, "프로필 저장 경로")?,
-            catalog_path: client_paths.catalog_path,
+            catalog_path: None,
             client_data_dir: client_paths.client_data_dir,
             item_probability_rank_policy: if self.trust_client_item_rank {
                 ItemProbabilityRankPolicy::TrustClientReported
@@ -422,8 +396,12 @@ fn required_path(value: &str, label: &str) -> Result<PathBuf> {
     required_text(value, label).map(PathBuf::from)
 }
 
+fn optional_path_ref(value: &str) -> Option<&Path> {
+    (!value.trim().is_empty()).then(|| Path::new(value))
+}
+
 fn optional_path(value: &str) -> Option<PathBuf> {
-    (!value.trim().is_empty()).then(|| PathBuf::from(value))
+    optional_path_ref(value).map(Path::to_owned)
 }
 
 fn parse_u64(value: &str, label: &str) -> Result<u64> {
@@ -664,9 +642,8 @@ struct P5136GuiApp {
     random_track_catalog: Option<RandomTrackCatalog>,
     selected_random_track_pool: usize,
     random_track_status: String,
-    inventory_catalog: Option<CatalogInventory>,
-    inventory_catalog_path: Option<PathBuf>,
-    inventory_catalog_fingerprint: Option<CatalogSourceFingerprint>,
+    inventory_catalog: Option<Arc<CatalogInventory>>,
+    inventory_catalog_data_dir: Option<PathBuf>,
     inventory_nickname: String,
     inventory_kart_query: String,
     inventory_kart_results: Vec<KartCatalogSearchResult>,
@@ -706,8 +683,7 @@ impl P5136GuiApp {
                 "자동: 서버 시작 시 클라이언트의 track_common.rho 기본 목록을 적용합니다."
                     .to_owned(),
             inventory_catalog: None,
-            inventory_catalog_path: None,
-            inventory_catalog_fingerprint: None,
+            inventory_catalog_data_dir: None,
             inventory_nickname,
             inventory_kart_query: String::new(),
             inventory_kart_results: Vec::new(),
@@ -811,6 +787,14 @@ impl P5136GuiApp {
                 );
                 ui.end_row();
 
+                ui.label("실행 파일 (선택)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.game_executable)
+                        .hint_text("비우면 KartRider.exe")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
                 ui.label("닉네임");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.nickname)
@@ -846,39 +830,7 @@ impl P5136GuiApp {
                     });
                 ui.end_row();
 
-                match self.connector_inputs.runner {
-                    GuiRunner::Wine => {
-                        ui.label("Wine 실행 파일");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.connector_inputs.wine_binary)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-
-                        ui.label("Wine prefix (선택)");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.connector_inputs.wine_prefix)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                    }
-                    GuiRunner::CrossOver => {
-                        ui.label("CrossOver Wine 실행 파일");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.connector_inputs.crossover_binary)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-
-                        ui.label("CrossOver 보틀");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.connector_inputs.crossover_bottle)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                    }
-                    _ => {}
-                }
+                self.connector_runner_inputs(ui);
             });
 
         if self.connector_inputs.runner == GuiRunner::NativeElevated && !cfg!(windows) {
@@ -892,6 +844,57 @@ impl P5136GuiApp {
             ui.weak(format!(
                 "자동 모드는 이 운영체제에서 {resolution}(으)로 실행합니다."
             ));
+        }
+        if self.connector_inputs.runner == GuiRunner::Sikarugir && !cfg!(target_os = "macos") {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Sikarugir wrapper 실행은 macOS에서만 사용할 수 있습니다.",
+            );
+        }
+    }
+
+    fn connector_runner_inputs(&mut self, ui: &mut egui::Ui) {
+        match self.connector_inputs.runner {
+            GuiRunner::Wine => {
+                ui.label("Wine 실행 파일");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.wine_binary)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label("Wine prefix (선택)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.wine_prefix)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+            }
+            GuiRunner::CrossOver => {
+                ui.label("CrossOver Wine 실행 파일");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.crossover_binary)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label("CrossOver 보틀");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.crossover_bottle)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+            }
+            GuiRunner::Sikarugir => {
+                ui.label("Sikarugir wrapper 앱");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.sikarugir_app)
+                        .hint_text("예: /Applications/KartRider.app")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+            }
+            _ => {}
         }
     }
 
@@ -943,6 +946,15 @@ impl P5136GuiApp {
                 return;
             }
         };
+        if let (Some(catalog), Some(loaded_data_dir), Some(configured_data_dir)) = (
+            self.inventory_catalog.as_ref(),
+            self.inventory_catalog_data_dir.as_ref(),
+            config.client_data_dir.as_ref(),
+        ) && std::fs::canonicalize(configured_data_dir)
+            .is_ok_and(|configured| configured == *loaded_data_dir)
+        {
+            config.resolved_catalog = Some(Arc::clone(catalog));
+        }
         if self.server_inputs.item_probability_source == GuiItemProbabilitySource::AutoClient {
             if let Some(data_dir) = &config.client_data_dir {
                 match load_client_item_probabilities(data_dir) {
@@ -1059,8 +1071,8 @@ impl P5136GuiApp {
     fn load_client_item_probability_defaults(&mut self) {
         let outcome = (|| -> Result<(ItemProbabilityConfiguration, PathBuf)> {
             let paths = client_paths::resolve_client_runtime_paths(
-                optional_path(&self.server_inputs.client_path),
-                optional_path(&self.server_inputs.client_data_dir),
+                optional_path_ref(&self.server_inputs.client_path),
+                optional_path_ref(&self.server_inputs.client_data_dir),
             )?;
             let data_dir = paths
                 .client_data_dir
@@ -1103,8 +1115,8 @@ impl P5136GuiApp {
     fn load_random_track_catalog(&mut self) {
         let outcome = (|| -> Result<RandomTrackCatalog> {
             let paths = client_paths::resolve_client_runtime_paths(
-                optional_path(&self.server_inputs.client_path),
-                optional_path(&self.server_inputs.client_data_dir),
+                optional_path_ref(&self.server_inputs.client_path),
+                optional_path_ref(&self.server_inputs.client_data_dir),
             )?;
             let data_dir = paths
                 .client_data_dir
@@ -1134,41 +1146,52 @@ impl P5136GuiApp {
     }
 
     fn load_inventory_catalog(&mut self) {
-        let outcome = (|| -> Result<(CatalogInventory, PathBuf, CatalogSourceFingerprint)> {
+        let outcome = (|| -> Result<(Arc<CatalogInventory>, PathBuf, String)> {
             let paths = client_paths::resolve_client_runtime_paths(
-                optional_path(&self.server_inputs.client_path),
-                optional_path(&self.server_inputs.client_data_dir),
+                optional_path_ref(&self.server_inputs.client_path),
+                optional_path_ref(&self.server_inputs.client_data_dir),
             )?;
-            let catalog_path = paths
-                .catalog_path
-                .ok_or_else(|| anyhow!("먼저 클라이언트 또는 Profile 경로를 설정하세요"))?;
-            let (canonical_path, bytes, fingerprint) = read_catalog_snapshot(&catalog_path)?;
-            let catalog = CatalogInventory::from_xml(&bytes)
-                .with_context(|| format!("{}을(를) 읽지 못했습니다", catalog_path.display()))?;
-            Ok((catalog, canonical_path, fingerprint))
+            let data_dir = paths.client_data_dir.ok_or_else(|| {
+                anyhow!("먼저 클라이언트 루트, Profile 또는 Data 경로를 설정하세요")
+            })?;
+            let loaded = load_client_kart_catalog(&data_dir).with_context(|| {
+                format!("{}의 RHO 카트 데이터를 읽지 못했습니다", data_dir.display())
+            })?;
+            let stats = loaded.stats();
+            let summary = format!(
+                "이름 {}, 물리 {}, 상점 {}개/{}분류, 변환 {}개",
+                stats.names,
+                stats.specs,
+                stats.inventory_items,
+                stats.inventory_categories,
+                stats.transform_rules,
+            );
+            Ok((
+                Arc::new(loaded.into_catalog()),
+                std::fs::canonicalize(&data_dir)?,
+                summary,
+            ))
         })();
         match outcome {
-            Ok((catalog, catalog_path, fingerprint)) => {
+            Ok((catalog, data_dir, summary)) => {
                 let kart_count = catalog
                     .grant_items()
                     .filter(|item| item.category == 3)
                     .count();
                 self.inventory_catalog = Some(catalog);
-                self.inventory_catalog_path = Some(catalog_path.clone());
-                self.inventory_catalog_fingerprint = Some(fingerprint);
+                self.inventory_catalog_data_dir = Some(data_dir.clone());
                 self.refresh_inventory_search_results();
                 self.inventory_status = format!(
-                    "추가 가능한 카트 {kart_count}개를 읽었습니다: {}",
-                    catalog_path.display()
+                    "RHO에서 추가 가능한 카트 {kart_count}개를 읽었습니다 ({summary}): {}",
+                    data_dir.display()
                 );
             }
             Err(error) => {
                 self.inventory_catalog = None;
-                self.inventory_catalog_path = None;
-                self.inventory_catalog_fingerprint = None;
+                self.inventory_catalog_data_dir = None;
                 self.inventory_kart_results.clear();
                 self.inventory_selected_kart = None;
-                self.inventory_status = format!("카트 목록 로드 실패: {error:#}");
+                self.inventory_status = format!("RHO 카트 목록 로드 실패: {error:#}");
             }
         }
     }
@@ -1224,7 +1247,7 @@ impl P5136GuiApp {
 
     fn add_selected_inventory_kart(&mut self) {
         let outcome = (|| -> Result<AddKartOutcome> {
-            self.validate_current_inventory_catalog_path()?;
+            self.validate_current_inventory_catalog_source()?;
             let catalog = self
                 .inventory_catalog
                 .as_ref()
@@ -1264,38 +1287,29 @@ impl P5136GuiApp {
         }
     }
 
-    fn validate_current_inventory_catalog_path(&self) -> Result<()> {
-        let loaded_path = self
-            .inventory_catalog_path
+    fn validate_current_inventory_catalog_source(&self) -> Result<()> {
+        let loaded_data_dir = self
+            .inventory_catalog_data_dir
             .as_ref()
             .ok_or_else(|| anyhow!("먼저 카트 목록을 불러오세요"))?;
         let paths = client_paths::resolve_client_runtime_paths(
-            optional_path(&self.server_inputs.client_path),
-            optional_path(&self.server_inputs.client_data_dir),
+            optional_path_ref(&self.server_inputs.client_path),
+            optional_path_ref(&self.server_inputs.client_data_dir),
         )?;
-        let current_path = paths
-            .catalog_path
-            .ok_or_else(|| anyhow!("클라이언트 또는 Profile 경로가 비어 있습니다"))?;
-        let current_path = std::fs::canonicalize(&current_path).with_context(|| {
+        let current_data_dir = paths
+            .client_data_dir
+            .ok_or_else(|| anyhow!("클라이언트 또는 Data 경로가 비어 있습니다"))?;
+        let current_data_dir = std::fs::canonicalize(&current_data_dir).with_context(|| {
             format!(
                 "{}의 실제 경로를 확인하지 못했습니다",
-                current_path.display()
+                current_data_dir.display()
             )
         })?;
-        if current_path != *loaded_path {
+        if current_data_dir != *loaded_data_dir {
             return Err(anyhow!(
-                "클라이언트 카탈로그 경로가 바뀌었습니다. 카트 목록을 다시 불러오세요: {} → {}",
-                loaded_path.display(),
-                current_path.display()
-            ));
-        }
-        let expected_fingerprint = self
-            .inventory_catalog_fingerprint
-            .ok_or_else(|| anyhow!("카트 목록 snapshot 정보가 없습니다. 다시 불러오세요"))?;
-        let (_, _, actual_fingerprint) = read_catalog_snapshot(&current_path)?;
-        if actual_fingerprint != expected_fingerprint {
-            return Err(anyhow!(
-                "KartCatalog.xml 내용이 목록을 읽은 뒤 바뀌었습니다. 카트 목록을 다시 불러오세요"
+                "클라이언트 Data 경로가 바뀌었습니다. RHO 카트 목록을 다시 불러오세요: {} → {}",
+                loaded_data_dir.display(),
+                current_data_dir.display()
             ));
         }
         Ok(())
@@ -1303,8 +1317,7 @@ impl P5136GuiApp {
 
     fn invalidate_inventory_catalog(&mut self) {
         self.inventory_catalog = None;
-        self.inventory_catalog_path = None;
-        self.inventory_catalog_fingerprint = None;
+        self.inventory_catalog_data_dir = None;
         self.inventory_kart_results.clear();
         self.inventory_selected_kart = None;
         self.inventory_additional_karts.clear();
@@ -1344,7 +1357,7 @@ impl P5136GuiApp {
             if ui.button("카트 목록 불러오기").clicked() {
                 self.load_inventory_catalog();
             }
-            ui.weak("클라이언트 경로의 Profile/KartCatalog.xml 사용");
+            ui.weak("클라이언트 Data의 kart.rho/item.rho/RHO5를 직접 읽음");
         });
     }
 
@@ -1871,7 +1884,7 @@ impl P5136GuiApp {
 
         ui.weak("포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2.");
         ui.weak(
-            "클라이언트 루트나 Profile 폴더를 지정하면 Profile/KartCatalog.xml과 Data 폴더를 자동 탐지합니다.",
+            "클라이언트 루트, Profile 또는 Data 폴더를 지정하면 RHO 카트·아이템 데이터를 자동으로 읽습니다. KartCatalog.xml은 필요하지 않습니다.",
         );
         ui.weak("주소에는 IP 리터럴만 사용할 수 있습니다. P5136 패킷은 광고 주소를 IPv4 4바이트로 기록하므로 도메인을 직접 넣을 수 없습니다.");
         ui.weak("방 제목에 S0~S7 토큰을 넣으면 다음 경기 시작 패킷의 주행 물리를 해당 등급으로 바꿉니다. 예: '[S2] 친선'.");
@@ -2243,12 +2256,13 @@ mod tests {
 
     use super::{
         ConnectorGuiEvent, GuiInputs, GuiRunState, GuiRunner, GuiSuccess, P5136GuiApp,
-        ServerInputs, lan_address_rank, read_catalog_snapshot, virtual_adapter_rank,
+        ServerInputs, lan_address_rank, virtual_adapter_rank,
     };
 
     fn fixture_inputs() -> GuiInputs {
         GuiInputs {
             game_directory: "/games/Kart Rider".to_owned(),
+            game_executable: "/games/Kart Rider/KartRider.custom.exe".to_owned(),
             nickname: "fixture-user".to_owned(),
             server: "192.0.2.10".to_owned(),
             configured_port: "39311".to_owned(),
@@ -2257,6 +2271,7 @@ mod tests {
             wine_prefix: "/bottles/p5136".to_owned(),
             crossover_binary: "/opt/cxoffice/bin/wine".to_owned(),
             crossover_bottle: "P5136".to_owned(),
+            sikarugir_app: "/Applications/KartRider.app".to_owned(),
         }
     }
 
@@ -2265,6 +2280,10 @@ mod tests {
         let plan = fixture_inputs().connector_plan().unwrap();
 
         assert_eq!(plan.game_directory, Path::new("/games/Kart Rider"));
+        assert_eq!(
+            plan.launch_request.executable(),
+            Path::new("/games/Kart Rider/KartRider.custom.exe")
+        );
         assert_eq!(plan.nickname, "fixture-user");
         assert_eq!(plan.login_endpoint.to_string(), "192.0.2.10:39312");
         assert_eq!(plan.messenger_endpoint.to_string(), "192.0.2.10:39313");
@@ -2283,6 +2302,16 @@ mod tests {
 
         let error = inputs.connector_plan().unwrap_err().to_string();
         assert!(error.contains("CrossOver 보틀"));
+    }
+
+    #[test]
+    fn sikarugir_requires_a_wrapper_app_path() {
+        let mut inputs = fixture_inputs();
+        inputs.runner = GuiRunner::Sikarugir;
+        inputs.sikarugir_app.clear();
+
+        let error = inputs.connector_plan().unwrap_err().to_string();
+        assert!(error.contains("Sikarugir wrapper 앱"));
     }
 
     #[test]
@@ -2412,33 +2441,20 @@ mod tests {
     }
 
     #[test]
-    fn inventory_add_rejects_a_catalog_snapshot_after_path_or_content_changes() {
+    fn inventory_add_rejects_a_snapshot_after_the_client_data_path_changes() {
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
         for root in [first.path(), second.path()] {
-            let profile = root.join("Profile");
-            fs::create_dir(&profile).unwrap();
-            fs::write(profile.join("KartCatalog.xml"), "fixture").unwrap();
+            fs::create_dir(root.join("Data")).unwrap();
         }
         let mut app = P5136GuiApp::new(PathBuf::new());
         app.server_inputs.client_path = first.path().display().to_string();
-        let (catalog_path, _, fingerprint) =
-            read_catalog_snapshot(&first.path().join("Profile/KartCatalog.xml")).unwrap();
-        app.inventory_catalog_path = Some(catalog_path);
-        app.inventory_catalog_fingerprint = Some(fingerprint);
-        app.validate_current_inventory_catalog_path().unwrap();
-
-        fs::write(first.path().join("Profile/KartCatalog.xml"), "changed").unwrap();
-        assert!(
-            app.validate_current_inventory_catalog_path()
-                .unwrap_err()
-                .to_string()
-                .contains("내용이 목록을 읽은 뒤 바뀌었습니다")
-        );
+        app.inventory_catalog_data_dir = Some(fs::canonicalize(first.path().join("Data")).unwrap());
+        app.validate_current_inventory_catalog_source().unwrap();
 
         app.server_inputs.client_path = second.path().display().to_string();
         assert!(
-            app.validate_current_inventory_catalog_path()
+            app.validate_current_inventory_catalog_source()
                 .unwrap_err()
                 .to_string()
                 .contains("경로가 바뀌었습니다")

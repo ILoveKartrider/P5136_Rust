@@ -201,6 +201,35 @@ impl Rho5Directory {
         let entry = self.unique_entry(path)?;
         extract_entry(entry, &self.limits)
     }
+
+    /// Extracts and authenticates one entry borrowed from this directory's
+    /// immutable index.
+    pub fn extract_entry(&self, entry: &Rho5Entry) -> Result<Vec<u8>, Rho5Error> {
+        if !self.entries.contains(entry) {
+            return Err(Rho5Error::EntryNotIndexed {
+                path: entry.normalized_path.clone(),
+            });
+        }
+        extract_entry(entry, &self.limits)
+    }
+
+    /// Extracts an authenticated P5136 entry while accepting the stock
+    /// packer's historical 1..=3-byte suffix after the zlib stream.
+    ///
+    /// The decompressed length and table-recorded MD5 remain mandatory. Use
+    /// this only for compatibility inputs known to have been produced by the
+    /// legacy client packer; [`Self::extract_entry`] remains strict.
+    pub fn extract_entry_with_legacy_padding(
+        &self,
+        entry: &Rho5Entry,
+    ) -> Result<Vec<u8>, Rho5Error> {
+        if !self.entries.contains(entry) {
+            return Err(Rho5Error::EntryNotIndexed {
+                path: entry.normalized_path.clone(),
+            });
+        }
+        extract_entry_with_trailing_limit(entry, &self.limits, 3)
+    }
 }
 
 /// Computes the encrypted header and file-table positions for a P5136 RHO5 name.
@@ -366,6 +395,8 @@ pub enum Rho5Error {
     EntryNotFound { path: String },
     #[error("{count} RHO5 entries match normalized path {path:?}")]
     DuplicateEntry { path: String, count: usize },
+    #[error("RHO5 entry {path:?} does not belong to this directory index")]
+    EntryNotIndexed { path: String },
     #[error("entry {path:?} decompressed past its declared {expected}-byte plaintext length")]
     DecompressedSizeLimitExceeded { path: String, expected: usize },
     #[error("entry {path:?} decompressed to {actual} bytes; expected {expected}")]
@@ -475,7 +506,20 @@ fn collect_archive_paths(directory: &Path, limits: &Rho5Limits) -> Result<Vec<Pa
             }
         }
     }
-    archive_paths.sort_unstable();
+    archive_paths.sort_unstable_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let right_name = right
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        left_name
+            .to_ascii_lowercase()
+            .cmp(&right_name.to_ascii_lowercase())
+            .then_with(|| left_name.cmp(right_name))
+    });
     Ok(archive_paths)
 }
 
@@ -906,6 +950,14 @@ fn finalize_entries(
 }
 
 fn extract_entry(entry: &Rho5Entry, limits: &Rho5Limits) -> Result<Vec<u8>, Rho5Error> {
+    extract_entry_with_trailing_limit(entry, limits, 0)
+}
+
+fn extract_entry_with_trailing_limit(
+    entry: &Rho5Entry,
+    limits: &Rho5Limits,
+    maximum_trailing_bytes: usize,
+) -> Result<Vec<u8>, Rho5Error> {
     if entry.compressed_size > limits.max_compressed_bytes {
         return Err(Rho5Error::CompressedSizeTooLarge {
             path: entry.archive_path.clone(),
@@ -923,7 +975,7 @@ fn extract_entry(entry: &Rho5Entry, limits: &Rho5Limits) -> Result<Vec<u8>, Rho5
         });
     }
     let compressed = read_decrypted_compressed(entry)?;
-    decompress_and_authenticate(entry, &compressed)
+    decompress_and_authenticate(entry, &compressed, maximum_trailing_bytes)
 }
 
 fn read_decrypted_compressed(entry: &Rho5Entry) -> Result<Vec<u8>, Rho5Error> {
@@ -980,7 +1032,11 @@ fn read_decrypted_compressed(entry: &Rho5Entry) -> Result<Vec<u8>, Rho5Error> {
     Ok(compressed)
 }
 
-fn decompress_and_authenticate(entry: &Rho5Entry, compressed: &[u8]) -> Result<Vec<u8>, Rho5Error> {
+fn decompress_and_authenticate(
+    entry: &Rho5Entry,
+    compressed: &[u8],
+    maximum_trailing_bytes: usize,
+) -> Result<Vec<u8>, Rho5Error> {
     let mut decoder = ZlibDecoder::new(compressed);
     let mut plaintext = Vec::with_capacity(entry.plaintext_size);
     let mut buffer = [0_u8; 8 * 1024];
@@ -1010,11 +1066,16 @@ fn decompress_and_authenticate(entry: &Rho5Entry, compressed: &[u8]) -> Result<V
         plaintext.extend_from_slice(&buffer[..read]);
     }
     let consumed = decoder.total_in();
-    if consumed
-        != u64::try_from(entry.compressed_size).map_err(|_| Rho5Error::ArithmeticOverflow {
+    let compressed_size =
+        u64::try_from(entry.compressed_size).map_err(|_| Rho5Error::ArithmeticOverflow {
             field: "RHO5 compressed stream length",
-        })?
-    {
+        })?;
+    let trailing = compressed_size
+        .checked_sub(consumed)
+        .ok_or(Rho5Error::ArithmeticOverflow {
+            field: "RHO5 trailing compressed length",
+        })?;
+    if trailing > u64::try_from(maximum_trailing_bytes).unwrap_or(u64::MAX) {
         return Err(Rho5Error::TrailingCompressedData {
             path: entry.normalized_path.clone(),
             consumed,
@@ -1229,4 +1290,4 @@ mod legacy_vectors;
 #[cfg(test)]
 mod tests;
 
-pub use legacy::{LegacyRhoArchive, LegacyRhoError, LegacyRhoLimits};
+pub use legacy::{LegacyRhoArchive, LegacyRhoEntry, LegacyRhoError, LegacyRhoLimits};

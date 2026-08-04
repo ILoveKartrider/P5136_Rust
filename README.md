@@ -26,34 +26,35 @@ target/p5136-finish-kart-abilities/release/p5136.exe
 4. `서버 시작`을 누릅니다.
 5. 접속기 탭에 게임 디렉터리, 닉네임, 서버 IPv4를 넣고 `클라이언트 준비 및 실행`을 누릅니다.
 
-접속기는 원본 파일의 불변 백업과 프로세스 잠금을 사용해 PIN/XML을 준비한 뒤 Windows UAC, Wine 또는 CrossOver로 클라이언트를 실행합니다.
+접속기는 원본 파일의 불변 백업과 프로세스 잠금을 사용해 PIN/XML을 준비한 뒤 Windows UAC, Wine, CrossOver 또는 macOS Sikarugir wrapper로 클라이언트를 실행합니다. Sikarugir의 Wine prefix와 wrapper를 수동으로 준비하는 방법은 [macOS Sikarugir walkthrough](MACOS_SIKARUGIR.md)를 참고하세요.
 
 ## 클라이언트 데이터 자동 탐지
 
-클라이언트 루트, `Profile` 폴더 또는 `KartCatalog.xml`을 지정할 수 있습니다. 서버는 다음 경로를 자동으로 찾습니다.
+클라이언트 루트, `Profile` 폴더 또는 `Data` 폴더를 지정할 수 있습니다. 서버는 `Data` 폴더를 자동으로 찾고 다음 원본을 제한형·읽기 전용으로 직접 해석합니다. C# 서버가 생성하던 `Profile/KartCatalog.xml`은 필요하지 않습니다.
 
-- `Profile/KartCatalog.xml`: 카트·장비·아이템 변환 규칙
-- `Data/item.rho`: 개인전·팀전 아이템 확률표
+- `Data/kart.rho`와 RHO5 overlay: 카트 이름과 주행 물리
+- RHO5 `zeta_/kr/shop/data/item.kml`: 인벤토리 카탈로그
+- `Data/item.rho`: 카트별 아이템 변환 규칙과 개인전·팀전 확률표
 - `Data/track_common.rho`: 모드·랜덤 selector별 트랙 목록
 - 그 밖의 RHO5 데이터: 엠블럼 등 지원 데이터
 
 아이템 확률표의 기본 모드는 `서버 시작 시 자동 적용`입니다. 시작 버튼을 누르면 실제 `item.rho`를 먼저 읽어 개인전·팀전 항목 수와 적용 경로를 GUI에 표시하고, 그때 읽은 정확한 스냅샷을 해당 서버 실행에 넘깁니다. 로드 실패 시 서버를 시작하지 않습니다. `불러와 고정`이나 XML을 사용한 경우에만 이후 클라이언트 경로 변경과 무관한 수동 값이 됩니다.
 
-세베크 V1 같은 카트의 아이템 변환도 `KartCatalog.xml`을 읽어 서버가 최종 획득 아이템을 결정합니다. 예를 들어 세베크 V1의 황금 실드는 클라이언트가 자동 변환하는 것이 아니라 서버의 `transformByKart` 규칙으로 처리됩니다.
+세베크 V1 같은 카트의 아이템 변환도 `item.rho`의 `transformByKart`를 직접 읽어 서버가 최종 획득 아이템을 결정합니다. 예를 들어 세베크 V1의 황금 실드는 클라이언트가 자동 변환하는 것이 아니라 서버 규칙으로 처리됩니다. 서버 시작 시 만든 카탈로그는 불변 메모리 스냅샷이며 RHO나 클라이언트 폴더를 수정하지 않습니다.
 
 ## 닉네임별 카트 인벤토리
 
 서버를 정지한 상태에서 GUI의 `닉네임별 인벤토리 편집`을 펼치면 강화 상태가 다른 동일 카트를 여러 대 소유하도록 추가할 수 있습니다.
 
 1. 서버의 `클라이언트 또는 Profile 경로`와 `프로필 저장 경로`를 먼저 지정합니다.
-2. `카트 목록 불러오기`를 눌러 실제 `KartCatalog.xml`의 한국어 이름을 읽습니다.
+2. `카트 목록 불러오기`를 눌러 클라이언트 RHO의 실제 이름과 ID를 읽습니다.
 3. 인벤토리를 편집할 닉네임을 입력합니다. `접속기 닉네임 사용`으로 현재 접속기 값을 복사할 수도 있습니다.
 4. `기간테스 V1`, 공백을 뺀 `기간테스v1`, 또는 숫자 ID `1410`을 입력하고 후보 드롭다운에서 카트를 선택합니다.
 5. `선택 카트 추가`를 누릅니다. 같은 카트를 다시 누르면 다음 고유 serial로 한 대가 더 추가됩니다.
 
 기본 카탈로그 카트는 모두 serial 1로 제공됩니다. 추가 소유분은 닉네임별 프로필의 `GrantedKarts`에 serial 2 이상으로 원자적 저장되며, 장착·플랜트·파츠 데이터가 사용하는 `(kart_id, serial)` 키와 같으므로 각 복사본을 서로 다르게 강화할 수 있습니다. 할당기는 현재 grant뿐 아니라 남아 있는 `PlantData.json`/`PartsData.json` serial도 예약하므로 과거 강화 상태를 새 복사본이 잘못 물려받지 않습니다. 프로필이 아직 없는 닉네임은 첫 추가 시 생성됩니다. 이미 접속한 클라이언트에는 재접속 후 반영됩니다.
 
-편집 중에는 서버와 같은 프로필 루트 잠금을 잠깐 획득하고 저장소 고유 ID도 재검증합니다. 이 GUI뿐 아니라 다른 프로세스의 서버가 실행 중이어도 추가를 거부하므로 서버를 먼저 종료해야 합니다. 카트 목록을 읽은 뒤 클라이언트 경로를 바꾸면 목록과 선택은 무효화되며, 추가 직전에도 현재 `KartCatalog.xml`의 실제 경로와 제한형 내용 지문을 다시 대조합니다.
+편집 중에는 서버와 같은 프로필 루트 잠금을 잠깐 획득하고 저장소 고유 ID도 재검증합니다. 이 GUI뿐 아니라 다른 프로세스의 서버가 실행 중이어도 추가를 거부하므로 서버를 먼저 종료해야 합니다. 카트 목록을 읽은 뒤 클라이언트 경로를 바꾸면 목록과 선택은 무효화되며, 추가 직전에도 현재 `Data` 실제 경로가 같은지 다시 대조합니다.
 
 현재 편집기는 의도적으로 중복 카트 추가만 지원합니다. 일반 카탈로그 아이템은 서버가 이미 기본 인벤토리에 제공하므로, 수량형 아이템 구매·지급은 가격·재화·만료·재시도 정책을 갖춘 별도 economy 기능으로 남겨 두었습니다.
 
@@ -102,7 +103,7 @@ GUI 없이 서버만 실행할 수 있습니다.
 p5136.exe server `
   --bind 192.168.1.10 `
   --advertise 192.168.1.10 `
-  --catalog C:\Games\KartRider_5136 `
+  --client-dir C:\Games\KartRider_5136 `
   --allow-remote-profile-creation
 ```
 
@@ -113,6 +114,17 @@ p5136.exe connect `
   --game-dir C:\Games\KartRider_5136 `
   --username player1 `
   --server 192.168.1.10
+```
+
+Sikarugir wrapper를 사용하는 macOS 예:
+
+```bash
+p5136 connect \
+  --game-dir "/Users/player/Games/KartRider_5136" \
+  --username player \
+  --server 192.168.1.10 \
+  --runner sikarugir \
+  --sikarugir-app "/Users/player/Applications/Sikarugir/kartrider.app"
 ```
 
 `p5136.exe --help`, `p5136.exe server --help`, `p5136.exe connect --help`에서 전체 옵션을 확인할 수 있습니다.
@@ -139,8 +151,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 실제 클라이언트 RHO 판독 smoke test는 환경 변수를 지정해 별도로 실행합니다.
 
 ```powershell
-$env:P5136_CLIENT_DATA='C:\Games\KartRider_5136\Data'
-cargo test -p p5136-server stock_client_catalog_smoke -- --ignored
+$env:P5136_CLIENT_DATA_DIR='C:\Games\KartRider_5136\Data'
+cargo test -p p5136-server configured_real_client_catalog_matches_the_known_p5136_shape -- --nocapture
 ```
 
 프로토콜 근거, 완료 범위와 재개 지점은 [PORTING.md](PORTING.md), [PORTING_STATUS.md](PORTING_STATUS.md), [CLIENT_PROTOCOL_FSM.md](CLIENT_PROTOCOL_FSM.md), [ITEM_GAMEPLAY_COVERAGE.md](ITEM_GAMEPLAY_COVERAGE.md)에 정리되어 있습니다.

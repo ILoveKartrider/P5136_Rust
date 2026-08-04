@@ -35,6 +35,7 @@ const ELEVATED_POWERSHELL_SCRIPT: &str = concat!(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
     pub game_directory: PathBuf,
+    executable: Option<PathBuf>,
 }
 
 impl LaunchRequest {
@@ -42,12 +43,28 @@ impl LaunchRequest {
     pub fn new(game_directory: impl Into<PathBuf>) -> Self {
         Self {
             game_directory: game_directory.into(),
+            executable: None,
         }
+    }
+
+    /// Uses a different executable while keeping the supplied game directory
+    /// as the working directory and location for connector-managed files.
+    #[must_use]
+    pub fn with_executable(mut self, executable: impl Into<PathBuf>) -> Self {
+        let executable = executable.into();
+        self.executable = Some(if executable.is_absolute() {
+            executable
+        } else {
+            self.game_directory.join(executable)
+        });
+        self
     }
 
     #[must_use]
     pub fn executable(&self) -> PathBuf {
-        self.game_directory.join(GAME_EXECUTABLE)
+        self.executable
+            .clone()
+            .unwrap_or_else(|| self.game_directory.join(GAME_EXECUTABLE))
     }
 }
 
@@ -67,6 +84,8 @@ pub enum Runner {
         wine_binary: PathBuf,
         bottle: String,
     },
+    /// Open a preconfigured Sikarugir wrapper on macOS.
+    Sikarugir { app: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +94,7 @@ pub enum RunnerBackend {
     NativeElevated,
     Wine,
     CrossOver,
+    Sikarugir,
 }
 
 impl fmt::Display for RunnerBackend {
@@ -84,6 +104,7 @@ impl fmt::Display for RunnerBackend {
             Self::NativeElevated => "native-elevated",
             Self::Wine => "wine",
             Self::CrossOver => "crossover",
+            Self::Sikarugir => "sikarugir",
         };
         formatter.write_str(name)
     }
@@ -144,8 +165,14 @@ pub enum LaunchError {
     #[error("game executable does not exist: {0}")]
     MissingExecutable(PathBuf),
 
+    #[error("Sikarugir wrapper is not an existing .app directory: {0}")]
+    MissingSikarugirApp(PathBuf),
+
     #[error("native elevated launch is supported only on Windows")]
     UnsupportedNativeElevation,
+
+    #[error("Sikarugir wrapper launch is supported only on macOS")]
+    UnsupportedSikarugir,
 
     #[error("failed to hash game executable before elevated launch: {path}")]
     ElevatedExecutableHash {
@@ -235,6 +262,14 @@ impl Runner {
                     method: LaunchMethod::Direct,
                 })
             }
+            Self::Sikarugir { app } => Ok(LaunchSpec {
+                program: PathBuf::from("/usr/bin/open"),
+                arguments: vec![app.into_os_string()],
+                current_directory,
+                environment: Vec::new(),
+                backend: RunnerBackend::Sikarugir,
+                method: LaunchMethod::Direct,
+            }),
             Self::Auto => unreachable!("the automatic runner is resolved before dispatch"),
         }
     }
@@ -245,6 +280,7 @@ impl Runner {
             Self::NativeElevated => Ok(RunnerBackend::NativeElevated),
             Self::Wine { .. } => Ok(RunnerBackend::Wine),
             Self::CrossOver { .. } => Ok(RunnerBackend::CrossOver),
+            Self::Sikarugir { .. } => Ok(RunnerBackend::Sikarugir),
             Self::Auto => unreachable!("the automatic runner is resolved before dispatch"),
         }
     }
@@ -257,6 +293,9 @@ impl Runner {
                 prefix: None,
             }),
             Self::NativeElevated if !cfg!(windows) => Err(LaunchError::UnsupportedNativeElevation),
+            Self::Sikarugir { .. } if !cfg!(target_os = "macos") => {
+                Err(LaunchError::UnsupportedSikarugir)
+            }
             other => Ok(other.clone()),
         }
     }
@@ -307,11 +346,20 @@ impl LaunchSpec {
     }
 
     pub fn validate(&self, game_executable: &Path) -> Result<(), LaunchError> {
-        if game_executable.is_file() {
-            Ok(())
-        } else {
-            Err(LaunchError::MissingExecutable(game_executable.to_owned()))
+        if !game_executable.is_file() {
+            return Err(LaunchError::MissingExecutable(game_executable.to_owned()));
         }
+        if self.backend == RunnerBackend::Sikarugir {
+            let app = self
+                .arguments
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            if !app.is_dir() || app.extension() != Some(OsStr::new("app")) {
+                return Err(LaunchError::MissingSikarugirApp(app));
+            }
+        }
+        Ok(())
     }
 
     pub async fn spawn(&self, game_executable: &Path) -> Result<LaunchedProcess, LaunchError> {
@@ -569,6 +617,73 @@ mod tests {
             ]
         );
         assert_eq!(spec.backend(), RunnerBackend::CrossOver);
+    }
+
+    #[test]
+    fn custom_executable_is_resolved_from_the_game_directory() {
+        let request = LaunchRequest::new("/Games/KartRider").with_executable("KartRider.test.exe");
+
+        assert_eq!(
+            request.executable(),
+            Path::new("/Games/KartRider/KartRider.test.exe")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sikarugir_opens_the_preconfigured_wrapper() {
+        let request = LaunchRequest::new("/games/Kart Rider");
+        let spec = Runner::Sikarugir {
+            app: PathBuf::from("/Applications/KartRider P5136.app"),
+        }
+        .build(&request)
+        .unwrap();
+
+        assert_eq!(spec.program, Path::new("/usr/bin/open"));
+        assert_eq!(
+            spec.arguments,
+            [OsString::from("/Applications/KartRider P5136.app")]
+        );
+        assert_eq!(spec.current_directory, Path::new("/games/Kart Rider"));
+        assert_eq!(spec.backend(), RunnerBackend::Sikarugir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sikarugir_preflight_requires_an_existing_app_directory() {
+        let directory = tempdir().unwrap();
+        let game_executable = directory.path().join("KartRider.exe");
+        fs::write(&game_executable, b"validation fixture only").unwrap();
+        let missing_app = directory.path().join("missing.app");
+        let spec = Runner::Sikarugir {
+            app: missing_app.clone(),
+        }
+        .build(&LaunchRequest::new(directory.path()))
+        .unwrap();
+
+        assert!(matches!(
+            spec.validate(&game_executable),
+            Err(LaunchError::MissingSikarugirApp(path)) if path == missing_app
+        ));
+
+        let app = directory.path().join("KartRider.app");
+        fs::create_dir(&app).unwrap();
+        let valid = Runner::Sikarugir { app }
+            .build(&LaunchRequest::new(directory.path()))
+            .unwrap();
+        valid.validate(&game_executable).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn sikarugir_is_rejected_outside_macos() {
+        let error = Runner::Sikarugir {
+            app: PathBuf::from("/Applications/KartRider.app"),
+        }
+        .build(&LaunchRequest::new("/games/KartRider"))
+        .unwrap_err();
+
+        assert!(matches!(error, LaunchError::UnsupportedSikarugir));
     }
 
     #[test]

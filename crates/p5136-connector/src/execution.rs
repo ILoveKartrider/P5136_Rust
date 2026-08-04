@@ -18,6 +18,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct ConnectorRequest {
     pub game_directory: PathBuf,
+    /// Optional game executable. Relative paths are resolved from `game_directory`.
+    pub game_executable: Option<PathBuf>,
     pub nickname: String,
     pub server_address: Ipv4Addr,
     pub ports: PortTopology,
@@ -126,7 +128,10 @@ impl ConnectorPlan {
         let login_endpoint = SocketAddrV4::new(request.server_address, request.ports.login_tcp());
         let messenger_endpoint =
             SocketAddrV4::new(request.server_address, request.ports.messenger_tcp());
-        let launch_request = LaunchRequest::new(&request.game_directory);
+        let launch_request = request.game_executable.map_or_else(
+            || LaunchRequest::new(&request.game_directory),
+            |executable| LaunchRequest::new(&request.game_directory).with_executable(executable),
+        );
         let launch_spec = request.runner.build(&launch_request)?;
 
         Ok(Self {
@@ -299,6 +304,7 @@ mod tests {
 
         let mut plan = ConnectorPlan::new(ConnectorRequest {
             game_directory: directory.path().to_owned(),
+            game_executable: None,
             nickname: "fixture-user".to_owned(),
             server_address: Ipv4Addr::LOCALHOST,
             ports,
@@ -355,6 +361,7 @@ mod tests {
         let configured_port = messenger_port.checked_sub(2).unwrap();
         let mut plan = ConnectorPlan::new(ConnectorRequest {
             game_directory: directory.path().to_owned(),
+            game_executable: None,
             nickname: "cancelled-user".to_owned(),
             server_address: Ipv4Addr::LOCALHOST,
             ports: PortTopology::new(configured_port).unwrap(),

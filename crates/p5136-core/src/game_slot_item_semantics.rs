@@ -134,14 +134,14 @@ fn decode_item_operation_semantics(
         "GopBalloon" => balloon(raw, state),
         "GopBanana" => banana(raw, state),
         "GopBarricade" => barricade(raw, state),
-        "GopBigTimebomb" => big_timebomb(raw, state),
+        "GopBigTimebomb" => with_effect_item_id(big_timebomb(raw, state), 122),
         "GopBlock" => block(raw, state),
         "GopBossPrison" => boss_prison(raw, state),
         "GopBoundRoad" => bound_road(raw, state),
         "GopBoundWall" => bound_wall(raw, state),
         "GopAreaUfo" => area_ufo(raw, state),
         "GopCokebomb" => bomb(raw, state, BombPhase4Source::Auxiliary),
-        "GopCloud" | "GopCloud2" => cloud(raw, state),
+        "GopCloud" | "GopCloud2" => cloud(schema.class_name, raw, state),
         "GopCourse" => course(raw),
         "GopCube" => cube(raw, state),
         "GopCubeForBoss" => cube_for_boss(raw, state),
@@ -160,7 +160,7 @@ fn decode_item_operation_semantics(
             rocket_variant(raw, state, RocketVariantFollowup::ThroughState9)
         }
         "GopInfectedBomb" => infected_bomb(raw, state),
-        "GopIcefly" => icefly(raw, state),
+        "GopIcefly" => with_effect_item_id(icefly(raw, state), 80),
         "GopGiantTalisman" | "GopWitchUnionMagic" => actor_bound_native_phase(raw, state),
         "GopHeadBand" => head_band(raw, state),
         "GopItemTimeFlybomb" | "GopTimeCokebomb" => time_coke_bomb(raw, state),
@@ -184,18 +184,21 @@ fn decode_item_operation_semantics(
         "GopSirenShield" => siren_shield(raw, state),
         "GopSlotLock" => slot_lock(raw, state),
         "GopSnowman" => rocket_variant(raw, state, RocketVariantFollowup::ThroughState7),
-        "GopSpecialShield" => special_shield(raw, state),
+        "GopSpecialShield" => with_effect_item_id(special_shield(raw, state), 40),
         "GopSpecialSiren" => special_siren(raw, state),
         "GopSpecialSmall" => special_small(raw, state),
         "GopSpaceCraft" => space_craft(raw, state),
         "GopSpeedDown" => speed_down(raw, state),
-        "GopStraightRocket" => straight_rocket(raw, state),
-        "GopInfectedWaterfly" | "GopSnowWaterfly" | "GopWaterfly" => waterfly(raw, state),
+        "GopStraightRocket" => with_effect_item_id(straight_rocket(raw, state), 73),
+        "GopInfectedWaterfly" | "GopSnowWaterfly" | "GopWaterfly" => {
+            waterfly(schema.class_name, raw, state)
+        }
         "GopSuperMag" => super_magnet(raw, state),
         "GopTargetKart" => target_kart(state),
         "GopTimeMine" => time_mine(raw, state),
         "GopTimeInfectedBomb" => time_infected_bomb(raw, state),
-        "GopTimeSnowbomb" | "GopTimebomb" => time_snow_bomb(raw, state),
+        "GopTimeSnowbomb" => time_snow_bomb(raw, state),
+        "GopTimebomb" => with_effect_item_id(time_snow_bomb(raw, state), 13),
         "GopTombStone" => spatial_target_effect(raw, state, 1),
         "GopThunderbolt" => thunderbolt(raw, state),
         "GopUfo" => ufo(raw, state),
@@ -969,10 +972,11 @@ fn space_craft(raw: &[u8], state: u32) -> ItemOperationSemantics {
     }
 }
 
-/// Only `StraightRocket` state 1 is consumed as a phase-1 launch. The writer
-/// supports compact states 2 and 3, but the recovered consumer and producer do
-/// not establish their meaning, so those exact shapes remain semantically
-/// unknown rather than being mislabeled as client no-ops.
+/// Only `StraightRocket` state 1 is consumed as a phase-1 launch. The concrete
+/// consumer accepts compact states 2 and 3 but performs no class-specific
+/// binding, phase transition, or helper call before returning success. They
+/// are therefore explicit client no-actions even though no native producer
+/// occurrence was recovered for them.
 fn straight_rocket(raw: &[u8], state: u32) -> ItemOperationSemantics {
     match state {
         1 => semantic(
@@ -984,6 +988,7 @@ fn straight_rocket(raw: &[u8], state: u32) -> ItemOperationSemantics {
             byte(raw, 56),
             ItemSemanticEvidence::ProducerAndConsumer,
         ),
+        2 | 3 => explicit_no_client_action(),
         _ => ItemOperationSemantics::unknown(),
     }
 }
@@ -992,8 +997,12 @@ fn straight_rocket(raw: &[u8], state: u32) -> ItemOperationSemantics {
 /// spatial cloud, while state 2 names one kart affected by the still-live
 /// cloud. The compact state-2 dword is therefore a target, not the install
 /// token reused by state 1.
-fn cloud(raw: &[u8], state: u32) -> ItemOperationSemantics {
-    match state {
+///
+/// The state-1 discriminator is also an exact item selector. Native producers
+/// map `GopCloud` values 0/3/6 to item IDs 0/1/43 and `GopCloud2` values 0/3/6
+/// to item IDs 114/115/116 respectively.
+fn cloud(class_name: &str, raw: &[u8], state: u32) -> ItemOperationSemantics {
+    let mut decoded = match state {
         1 => semantic(
             ItemLifecycleMeaning::Place,
             Some(0),
@@ -1013,7 +1022,19 @@ fn cloud(raw: &[u8], state: u32) -> ItemOperationSemantics {
             ItemSemanticEvidence::ProducerAndConsumer,
         ),
         _ => ItemOperationSemantics::unknown(),
+    };
+    if state == 1 {
+        decoded.effect_item_id = match (class_name, decoded.variant) {
+            ("GopCloud", Some(0)) => Some(0),
+            ("GopCloud", Some(3)) => Some(1),
+            ("GopCloud", Some(6)) => Some(43),
+            ("GopCloud2", Some(0)) => Some(114),
+            ("GopCloud2", Some(3)) => Some(115),
+            ("GopCloud2", Some(6)) => Some(116),
+            _ => None,
+        };
     }
+    decoded
 }
 
 /// Normal magnet binds the user and victim separately before advancing native
@@ -1410,11 +1431,13 @@ fn banana(raw: &[u8], state: u32) -> ItemOperationSemantics {
 }
 
 /// `GopBigTimebomb` does not carry the ordinary class lifecycle state at raw
-/// offset 12.  The receiver binds both actors and forwards the dword at 13
-/// directly to the native phase helper.  The client performs every binding
-/// and phase/token/variant operation only after both actor lookups succeed.
-/// Keep the higher-level lifecycle unknown and suppress those conditional
-/// semantics when either serialized actor ID is absent.
+/// offset 12. The receiver binds both actors and forwards the dword at 13
+/// directly to the native phase helper. Producer call sites constrain that
+/// dword to activation phase 0, ordinary/team-routed impact phases 2/3, and
+/// `SpecialShield` resolution phase 4. The client performs every binding and
+/// phase/token/variant operation only after both actor lookups succeed, so all
+/// conditional semantics remain absent when either serialized actor ID is
+/// missing.
 fn big_timebomb(raw: &[u8], native_phase: u32) -> ItemOperationSemantics {
     let source = object_id(raw, 25);
     let target = object_id(raw, 21);
@@ -1426,8 +1449,14 @@ fn big_timebomb(raw: &[u8], native_phase: u32) -> ItemOperationSemantics {
         };
     };
 
+    let meaning = match native_phase {
+        0 => ItemLifecycleMeaning::Activate,
+        2 | 3 => ItemLifecycleMeaning::Impact,
+        4 => ItemLifecycleMeaning::Resolve,
+        _ => ItemLifecycleMeaning::Unknown,
+    };
     semantic(
-        ItemLifecycleMeaning::Unknown,
+        meaning,
         u8::try_from(native_phase).ok(),
         Some(source),
         Some(target),
@@ -1550,16 +1579,19 @@ fn lockdown_rocket(raw: &[u8], state: u32) -> ItemOperationSemantics {
 }
 
 /// Ordinary Shield follows the same non-terminal defense-hit pattern. Its
-/// state-2 producer constructs a separate hit object and does not call the
-/// active Shield's cleanup path.
+/// state-1 body starts with `item_id:u16@16`, followed by an unaligned
+/// transition token at raw offset 18. The native producer selects ordinary
+/// Shield (10), Super Shield (18), or the shield half of Super Magnet (103)
+/// through this item ID. Its state-2 producer constructs a separate hit object
+/// and does not call the active Shield's cleanup path.
 fn shield(raw: &[u8], state: u32) -> ItemOperationSemantics {
-    match state {
+    let mut decoded = match state {
         1 => semantic(
             ItemLifecycleMeaning::Activate,
             Some(0),
             object_id(raw, 22),
             None,
-            object_id(raw, 16),
+            object_id(raw, 18),
             byte(raw, 30),
             ItemSemanticEvidence::ProducerAndConsumer,
         ),
@@ -1573,7 +1605,11 @@ fn shield(raw: &[u8], state: u32) -> ItemOperationSemantics {
             ItemSemanticEvidence::ProducerAndConsumer,
         ),
         _ => ItemOperationSemantics::unknown(),
+    };
+    if state == 1 {
+        decoded.effect_item_id = u16_at(raw, 16);
     }
+    decoded
 }
 
 /// `SpecialShield` has a one-byte item discriminator at raw 16 before its
@@ -2136,7 +2172,7 @@ fn time_mine(raw: &[u8], state: u32) -> ItemOperationSemantics {
 }
 
 fn rocket(raw: &[u8], state: u32) -> ItemOperationSemantics {
-    match state {
+    let mut decoded = match state {
         1 => semantic(
             ItemLifecycleMeaning::Launch,
             Some(1),
@@ -2210,7 +2246,15 @@ fn rocket(raw: &[u8], state: u32) -> ItemOperationSemantics {
             ItemSemanticEvidence::ProducerAndConsumer,
         ),
         _ => ItemOperationSemantics::unknown(),
+    };
+    if state == 1 {
+        // The common Rocket writer serializes the concrete item selector
+        // before its unaligned transition token. This distinguishes normal
+        // Rocket (7) from first-place Guide Rocket (33) without a new Gop
+        // class.
+        decoded.effect_item_id = u16_at(raw, 16);
     }
+    decoded
 }
 
 fn rocket_variant(
@@ -2430,8 +2474,8 @@ fn waterbomb_fly(raw: &[u8], state: u32) -> ItemOperationSemantics {
     }
 }
 
-fn waterfly(raw: &[u8], state: u32) -> ItemOperationSemantics {
-    match state {
+fn waterfly(class_name: &str, raw: &[u8], state: u32) -> ItemOperationSemantics {
+    let decoded = match state {
         1 => semantic(
             ItemLifecycleMeaning::Launch,
             Some(0),
@@ -2478,6 +2522,12 @@ fn waterfly(raw: &[u8], state: u32) -> ItemOperationSemantics {
             ItemSemanticEvidence::ProducerAndConsumer,
         ),
         _ => ItemOperationSemantics::unknown(),
+    };
+    match class_name {
+        "GopWaterfly" => with_effect_item_id(decoded, 4),
+        "GopSnowWaterfly" => with_effect_item_id(decoded, 118),
+        "GopInfectedWaterfly" => with_effect_item_id(decoded, 119),
+        _ => decoded,
     }
 }
 
@@ -2510,6 +2560,14 @@ fn byte(raw: &[u8], offset: usize) -> Option<u8> {
     raw.get(offset).copied()
 }
 
+const fn with_effect_item_id(
+    mut semantics: ItemOperationSemantics,
+    effect_item_id: u16,
+) -> ItemOperationSemantics {
+    semantics.effect_item_id = Some(effect_item_id);
+    semantics
+}
+
 #[cfg(test)]
 mod tests {
     use crate::game_slot_item_schema::item_operation_schema;
@@ -2522,6 +2580,55 @@ mod tests {
 
     fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
         raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn recovered_item_selectors_keep_exact_class_and_byte_meanings() {
+        let shield = schema((0x1110_037F, 0x1D33_049E));
+        let mut raw = vec![0; 31];
+        raw[16..18].copy_from_slice(&18_u16.to_le_bytes());
+        put_u32(&mut raw, 18, 0x7100_0001);
+        put_u32(&mut raw, 22, 0x7200_0002);
+        raw[30] = 9;
+        let decoded = decode_item_operation_semantics(shield, &raw, 1);
+        assert_eq!(decoded.effect_item_id, Some(18));
+        assert_eq!(decoded.transition_token, Some(0x7100_0001));
+        assert_eq!(decoded.source_object_id, Some(0x7200_0002));
+        assert_eq!(decoded.variant, Some(9));
+
+        let rocket = schema((0x1129_038E, 0x1D4C_04AD));
+        let mut raw = vec![0; 82];
+        raw[16..18].copy_from_slice(&33_u16.to_le_bytes());
+        put_u32(&mut raw, 18, 0x7300_0003);
+        let decoded = decode_item_operation_semantics(rocket, &raw, 1);
+        assert_eq!(decoded.effect_item_id, Some(33));
+        assert_eq!(decoded.transition_token, Some(0x7300_0003));
+
+        for (pair, discriminator, item_id) in [
+            ((0x0D7B_031D, 0x187F_043C), 0, 0),
+            ((0x0D7B_031D, 0x187F_043C), 3, 1),
+            ((0x0D7B_031D, 0x187F_043C), 6, 43),
+            ((0x10CA_034F, 0x1CED_046E), 0, 114),
+            ((0x10CA_034F, 0x1CED_046E), 3, 115),
+            ((0x10CA_034F, 0x1CED_046E), 6, 116),
+        ] {
+            let mut raw = vec![0; 73];
+            raw[24] = discriminator;
+            let decoded = decode_item_operation_semantics(schema(pair), &raw, 1);
+            assert_eq!(decoded.effect_item_id, Some(item_id));
+        }
+
+        for (pair, state, length, item_id) in [
+            ((0x276B_0567, 0x3929_0686), 0, 29, 122),
+            ((0x10C3_0382, 0x1CE6_04A1), 1, 78, 80),
+            ((0x3473_0640, 0x486F_075F), 0, 27, 40),
+            ((0x3C6F_06D4, 0x518A_07F3), 1, 58, 73),
+            ((0x196A_0455, 0x27CB_0574), 1, 24, 13),
+            ((0x2F69_061B, 0x4246_073A), 1, 77, 118),
+        ] {
+            let decoded = decode_item_operation_semantics(schema(pair), &vec![0; length], state);
+            assert_eq!(decoded.effect_item_id, Some(item_id));
+        }
     }
 
     #[test]
@@ -3173,12 +3280,24 @@ mod tests {
         let validated = big.validate(&raw).unwrap();
         assert_eq!(validated.state(), 4);
         let decoded = decode_item_operation_semantics(big, &raw, validated.state());
-        assert_eq!(decoded.meaning, ItemLifecycleMeaning::Unknown);
+        assert_eq!(decoded.meaning, ItemLifecycleMeaning::Resolve);
         assert_eq!(decoded.native_phase, Some(4));
         assert_eq!(decoded.transition_token, Some(TOKEN));
         assert_eq!(decoded.target_object_id, Some(TARGET));
         assert_eq!(decoded.source_object_id, Some(SOURCE));
         assert_eq!(decoded.variant, Some(0xA5));
+
+        for (phase, meaning) in [
+            (0, ItemLifecycleMeaning::Activate),
+            (2, ItemLifecycleMeaning::Impact),
+            (3, ItemLifecycleMeaning::Impact),
+            (4, ItemLifecycleMeaning::Resolve),
+        ] {
+            put_u32(&mut raw, 13, phase);
+            let decoded = decode_item_operation_semantics(big, &raw, phase);
+            assert_eq!(decoded.meaning, meaning);
+            assert_eq!(decoded.native_phase, u8::try_from(phase).ok());
+        }
 
         for pair in [
             (0x41CC_070F, 0x3996_067F),
@@ -3483,7 +3602,7 @@ mod tests {
                 source_offset: None,
                 target_offset: None,
                 variant_offset: None,
-                meaning: ItemLifecycleMeaning::Unknown,
+                meaning: ItemLifecycleMeaning::NoClientAction,
                 phase: None,
             },
             Case {
@@ -3494,7 +3613,7 @@ mod tests {
                 source_offset: None,
                 target_offset: None,
                 variant_offset: None,
-                meaning: ItemLifecycleMeaning::Unknown,
+                meaning: ItemLifecycleMeaning::NoClientAction,
                 phase: None,
             },
         ];

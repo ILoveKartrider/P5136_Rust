@@ -69,7 +69,7 @@ handled before the normal stage-adapter caller graph.
 | Loadout mutation replies | 5 | `PrEquipTuningPacket`, `PrEquipXPartsItem`, `PrUnequipXPartsItem`, `PrItemPresetUpdateSlotData`, `PrItemPresetUseSlotData` |
 
 `GameSlotPacket` is an outer aggregate rather than one layout. Its supported
-completion gate includes the 79 native-writer type-12 `Gop*` schemas and outer
+completion gate includes the 80 native-writer type-12 `Gop*` schemas and outer
 types 1/2/9/10/11/12/13/16/17. Types 4/5/6/7/8 remain strictly classified and
 bounded for diagnostics, but their Lucci-world-object, bonus-item-world-object,
 and team-flag gameplay is explicitly outside the port scope. The existing
@@ -180,13 +180,13 @@ fully semantic-unknown among the exact-writer classes.
 
 The independent `ItemClientFsm` now executes the original 149 consumer
 fixtures instead of leaving them as decode assertions. Its reviewed outcome
-census is 71 `LocalOnly`, 69 `DeferredOutbound`, zero `ImmediateOutbound`, and
-9 `UnknownSideEffect`. Angel state 0 now arms its proven later defense-hit
+census is 74 `LocalOnly`, 70 `DeferredOutbound`, zero `ImmediateOutbound`, and
+5 `UnknownSideEffect`. Angel state 0 now arms its proven later defense-hit
 producer, while state 2 is a non-terminal defense impact and keeps the timed
 team effect present. The
 extra 14 boss/controller branches and one Course
-branch use the same executor, bringing the accepted decoder/FSM surface to
-164. Deferred means only that a separately recovered native producer can emit
+branch plus the GoldShield supplement use the same executor, bringing the
+accepted decoder/FSM surface to 166. Deferred means only that a separately recovered native producer can emit
 a later state after a timer, collision, or local guard; it is a scheduler
 marker and never a synthesized acknowledgement. Unknown and explicit no-op
 branches cannot create local object state, and malformed bodies cannot partly
@@ -196,7 +196,7 @@ The fixed 149-fixture base corpus also has an exhaustive Rust-server gate.
 Every fixture passes the production outer `GameSlot` decoder, the exact
 item-to-registry mapping shared with the World actor, isolated registry plan
 and commit, and byte-preserving relay extraction. Its pinned admission census
-is 87 tracked, 62 relay-only/untracked, and zero unexpected duplicate
+is 88 tracked, 61 relay-only/untracked, and zero unexpected duplicate
 suppressions. This closes decoder-versus-registry policy drift for the audited
 branches; it is not evidence that all 149 native visual/controller effects
 have been triggered in a live client.
@@ -215,7 +215,7 @@ order:
    command-start;
 2. countdown and running-state packets: all supported `GameControl` states,
    race time, kart/item snapshots, AI master, leave, and reconnect;
-3. supported `GameSlotPacket` outer types plus all 79 emitted nested schemas,
+3. supported `GameSlotPacket` outer types plus all 80 emitted nested schemas,
    with supported-mode consumer branches and exact truncation/suffix rejection;
 4. P2P/UDP topology, TCP fallback relay, and bad-UDP recovery;
 5. rider/loadout mutations whose fields alter frozen next-race physics.

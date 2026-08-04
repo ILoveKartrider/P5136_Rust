@@ -232,6 +232,7 @@ fn has_proven_deferred_follow_up(operation: &ConsumedOperation) -> bool {
         | ("GopPress" | "GopRobotBeam" | "GopTombStone", 1)
         | ("GopCubeForBoss", 0)
         | ("GopCloud" | "GopCloud2", 1)
+        | ("GopBigTimebomb", 0)
         | ("GopSlotLock", 1)
         | ("GopSpaceCraft", 0 | 2)
         | ("GopStraightRocket", 1)

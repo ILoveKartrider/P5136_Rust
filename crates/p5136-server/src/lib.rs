@@ -1,5 +1,6 @@
 //! Cross-platform P5136 server runtime.
 
+mod client_catalog;
 mod config;
 mod equipment_persistence;
 mod favorite_persistence;
@@ -24,6 +25,10 @@ mod udp_runtime;
 mod udp_state;
 mod world;
 
+pub use client_catalog::{
+    ClientKartCatalogError, ClientKartCatalogStats, LoadedClientKartCatalog,
+    load_client_kart_catalog,
+};
 pub use config::{DEFAULT_MAX_LOGIN_SESSIONS, ServerConfig, ServerEndpoints};
 pub use favorite_persistence::FavoriteItemPersistError;
 pub use identity::{

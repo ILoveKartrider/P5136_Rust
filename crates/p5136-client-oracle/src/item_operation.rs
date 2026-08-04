@@ -194,11 +194,7 @@ pub fn consume(raw: &[u8]) -> Result<ConsumedOperation, DecodeError> {
     } else {
         Vec::new()
     };
-    let effect_item_id = if kind == Kind::GoldShield {
-        Some(gold_shield_effect_item_id(raw, state)?)
-    } else {
-        None
-    };
+    let effect_item_id = effect_item_id(class_name, kind, raw, state)?;
     Ok(ConsumedOperation {
         class_name,
         object_id,
@@ -724,9 +720,9 @@ fn bindings(
             None,
             Some(byte(raw, 56)?),
         ),
-        // Writer-only branches: no recovered producer/consumer proves that
-        // these compact bodies are lifecycle no-ops.
-        (Kind::StraightRocket, 2 | 3) => unknown(),
+        // The concrete consumer accepts these writer shapes but performs no
+        // class-specific binding, phase transition, or helper call.
+        (Kind::StraightRocket, 2 | 3) => no_action(),
         (Kind::Cloud, 1) => (
             Meaning::Place,
             Some(0),
@@ -935,7 +931,7 @@ fn bindings(
         (Kind::Shield, 1) => (
             Meaning::Activate,
             Some(0),
-            object_id(raw, 16)?,
+            object_id(raw, 18)?,
             object_id(raw, 22)?,
             None,
             Some(byte(raw, 30)?),
@@ -1195,8 +1191,14 @@ fn big_timebomb_fields(raw: &[u8], state: u32) -> Result<Fields, DecodeError> {
     let Some((source, target)) = source.zip(target) else {
         return Ok((Meaning::Unknown, None, None, None, None, None));
     };
+    let meaning = match state {
+        0 => Meaning::Activate,
+        2 | 3 => Meaning::Impact,
+        4 => Meaning::Resolve,
+        _ => Meaning::Unknown,
+    };
     Ok((
-        Meaning::Unknown,
+        meaning,
         u8::try_from(state).ok(),
         object_id(raw, 17)?,
         Some(source),
@@ -1485,10 +1487,6 @@ const fn no_action() -> Fields {
     (Meaning::NoClientAction, None, None, None, None, None)
 }
 
-const fn unknown() -> Fields {
-    (Meaning::Unknown, None, None, None, None, None)
-}
-
 fn object_id(raw: &[u8], offset: usize) -> Result<Option<u32>, DecodeError> {
     let value = u32_at(raw, offset)?;
     Ok((value != u32::MAX).then_some(value))
@@ -1507,6 +1505,34 @@ fn gold_shield_effect_item_id(raw: &[u8], state: u32) -> Result<u16, DecodeError
             value: i32::from_le_bytes(kind.to_le_bytes()),
         }),
     }
+}
+
+fn effect_item_id(
+    class_name: &str,
+    kind: Kind,
+    raw: &[u8],
+    state: u32,
+) -> Result<Option<u16>, DecodeError> {
+    let item_id = match (kind, state) {
+        (Kind::GoldShield, _) => Some(gold_shield_effect_item_id(raw, state)?),
+        (Kind::Shield, 1) => Some(u16_at(raw, 16)?),
+        (Kind::Cloud, 1) => match (class_name, byte(raw, 24)?) {
+            ("GopCloud", 0) => Some(0),
+            ("GopCloud", 3) => Some(1),
+            ("GopCloud", 6) => Some(43),
+            ("GopCloud2", 0) => Some(114),
+            ("GopCloud2", 3) => Some(115),
+            ("GopCloud2", 6) => Some(116),
+            _ => None,
+        },
+        (Kind::BigTimebomb, _) => Some(122),
+        (Kind::Icefly, _) => Some(80),
+        (Kind::SpecialShield, _) => Some(40),
+        (Kind::StraightRocket, _) => Some(73),
+        (Kind::TimeSnowBomb, _) if class_name == "GopTimebomb" => Some(13),
+        _ => None,
+    };
+    Ok(item_id)
 }
 
 fn byte(raw: &[u8], offset: usize) -> Result<u8, DecodeError> {

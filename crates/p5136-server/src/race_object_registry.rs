@@ -3290,7 +3290,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the literal integration sequence keeps registry effects adjacent to wire evidence"
     )]
-    fn fourth_pass_known_states_track_and_writer_only_states_stay_untracked() {
+    fn fourth_pass_known_states_track_and_no_action_states_stay_untracked() {
         fn parsed_item(
             pair: (u32, u32),
             object_id: u32,
@@ -3386,7 +3386,7 @@ mod tests {
                 parsed_item((0x3C6F_06D4, 0x518A_07F3), 0xC000_0009, state, 24);
             assert_eq!(
                 straight_writer_only.semantics.meaning,
-                ItemLifecycleMeaning::Unknown
+                ItemLifecycleMeaning::NoClientAction
             );
             assert_eq!(
                 registry

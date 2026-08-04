@@ -6,6 +6,7 @@ use std::{
 };
 
 use p5136_core::{frame::DEFAULT_MAX_PAYLOAD, ports::PortTopology};
+use p5136_profile::CatalogInventory;
 
 use crate::{
     ItemProbabilityConfiguration, ItemProbabilityRankPolicy, RandomTrackConfiguration,
@@ -20,10 +21,16 @@ pub struct ServerConfig {
     pub advertised_address: Ipv4Addr,
     pub ports: PortTopology,
     pub profile_root: PathBuf,
+    /// Compatibility-only path for callers that still provide an exported
+    /// catalog. Normal GUI/CLI startup leaves this unset and reads RHO data.
     pub catalog_path: Option<PathBuf>,
     /// Optional stock-client `Data` directory containing the KR `*.rho5`
     /// archives used to load authoritative emblem definitions.
     pub client_data_dir: Option<PathBuf>,
+    /// Pre-resolved direct-RHO catalog snapshot. The GUI uses this after an
+    /// inventory search load so server startup does not parse `kart.rho`
+    /// twice. Normal CLI callers leave it `None`.
+    pub resolved_catalog: Option<Arc<CatalogInventory>>,
     /// Optional validated GUI/CLI override. `None` loads the stock
     /// item.rho/RHO5 tables from `client_data_dir`, falling back to the
     /// bounded safe table when no client data directory is configured.
@@ -60,6 +67,7 @@ impl Default for ServerConfig {
             profile_root: PathBuf::from("Profile"),
             catalog_path: None,
             client_data_dir: None,
+            resolved_catalog: None,
             item_probabilities: None,
             item_probability_rank_policy: ItemProbabilityRankPolicy::default(),
             random_tracks: RandomTrackConfiguration::default(),

@@ -2,7 +2,7 @@
 //! archives used by the Korean P5136 client.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -56,6 +56,29 @@ pub struct LegacyRhoArchive {
     rho_key: u32,
     blocks: HashMap<u32, LegacyBlock>,
     limits: LegacyRhoLimits,
+}
+
+/// Immutable metadata for one file discovered in a legacy RHO archive.
+///
+/// Paths retain the archive's spelling and can be passed back to
+/// [`LegacyRhoArchive::extract_entry`].  Enumeration never materializes file
+/// contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRhoEntry {
+    normalized_path: String,
+    plaintext_size: usize,
+}
+
+impl LegacyRhoEntry {
+    #[must_use]
+    pub fn normalized_path(&self) -> &str {
+        &self.normalized_path
+    }
+
+    #[must_use]
+    pub const fn plaintext_size(&self) -> usize {
+        self.plaintext_size
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +210,60 @@ impl LegacyRhoArchive {
             });
         }
         Ok(plaintext)
+    }
+
+    /// Enumerates every file without extracting its payload.
+    ///
+    /// Directory traversal is bounded by the archive block count and the
+    /// configured path-depth limit. Reused or cyclic directory blocks are
+    /// rejected instead of being followed repeatedly.
+    pub fn entries(&self) -> Result<Vec<LegacyRhoEntry>, LegacyRhoError> {
+        let directory_key = self.rho_key.wrapping_add(0x2593_a9f1);
+        let mut pending = VecDeque::from([(ROOT_DIRECTORY_INDEX, Vec::<String>::new())]);
+        let mut visited = HashSet::new();
+        let mut entries = Vec::new();
+
+        while let Some((directory_index, components)) = pending.pop_front() {
+            if components.len() > self.limits.max_path_components {
+                return Err(LegacyRhoError::PathDepthExceeded {
+                    maximum: self.limits.max_path_components,
+                });
+            }
+            if !visited.insert(directory_index) {
+                return Err(LegacyRhoError::RepeatedDirectoryBlock {
+                    index: directory_index,
+                });
+            }
+            let bytes = self.read_block(directory_index, directory_key)?;
+            let directory = parse_directory(&bytes, self.limits)?;
+            for file in directory.files {
+                let mut path = components.join("/");
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(&file.full_name);
+                entries.push(LegacyRhoEntry {
+                    normalized_path: path,
+                    plaintext_size: file.plaintext_size,
+                });
+                if entries.len() > self.limits.max_blocks {
+                    return Err(LegacyRhoError::TooManyEnumeratedFiles {
+                        maximum: self.limits.max_blocks,
+                    });
+                }
+            }
+            for (name, child_index) in directory.directories {
+                let mut child_components = components.clone();
+                child_components.push(name);
+                pending.push_back((child_index, child_components));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Extracts an entry returned by [`LegacyRhoArchive::entries`].
+    pub fn extract_entry(&self, entry: &LegacyRhoEntry) -> Result<Vec<u8>, LegacyRhoError> {
+        self.extract_exact(&entry.normalized_path)
     }
 
     fn read_block(&self, index: u32, key: u32) -> Result<Vec<u8>, LegacyRhoError> {
@@ -517,6 +594,12 @@ pub enum LegacyRhoError {
     InvalidFileSize(i32),
     #[error("legacy RHO path is invalid: {0:?}")]
     InvalidPath(String),
+    #[error("legacy RHO directory depth exceeds configured maximum {maximum}")]
+    PathDepthExceeded { maximum: usize },
+    #[error("legacy RHO directory block {index:#010x} is reused or cyclic")]
+    RepeatedDirectoryBlock { index: u32 },
+    #[error("legacy RHO contains more than the bounded {maximum} enumerated files")]
+    TooManyEnumeratedFiles { maximum: usize },
     #[error("legacy RHO entry was not found: {path:?}")]
     EntryNotFound { path: String },
     #[error("legacy RHO path component {component:?} is duplicated")]

@@ -24,11 +24,11 @@ use tokio::{
 };
 
 use crate::{
-    ItemProbabilityConfiguration, ItemProbabilityError, MessengerConnectionError,
-    MessengerRuntimeConfig, MessengerServiceError, MessengerServiceHandle, ServerClock,
-    ServerConfig, ServerEndpoints, UdpRuntime, UdpRuntimeConfig, UdpRuntimeEvent,
-    UdpRuntimeFailure, UdpRuntimeStartError, UdpServiceError, WorldError, WorldHandle,
-    load_client_item_probabilities,
+    ClientKartCatalogError, ItemProbabilityConfiguration, ItemProbabilityError,
+    MessengerConnectionError, MessengerRuntimeConfig, MessengerServiceError,
+    MessengerServiceHandle, ServerClock, ServerConfig, ServerEndpoints, UdpRuntime,
+    UdpRuntimeConfig, UdpRuntimeEvent, UdpRuntimeFailure, UdpRuntimeStartError, UdpServiceError,
+    WorldError, WorldHandle, load_client_item_probabilities, load_client_kart_catalog,
     operation_gate::WireOperationGate,
     profile_io::{
         DurableRewardReceipt, ProfileIoBootstrap, ProfileIoConfigError, ProfileIoHandle,
@@ -80,6 +80,13 @@ pub enum ServerError {
 
     #[error("inventory catalog loader task failed")]
     CatalogTask(#[source] JoinError),
+
+    #[error("failed to build inventory catalog directly from client Data {path}")]
+    LoadClientCatalog {
+        path: PathBuf,
+        #[source]
+        source: ClientKartCatalogError,
+    },
 
     #[error("failed to load client emblem definitions from {path}")]
     LoadEmblemCatalog {
@@ -317,7 +324,11 @@ impl BoundServer {
             reward_persistence_worker_limit(config.max_login_sessions),
         )?;
         let (catalog, emblems, item_probabilities, random_tracks) = tokio::try_join!(
-            load_catalog(config.catalog_path.clone()),
+            load_catalog(
+                config.resolved_catalog.clone(),
+                config.client_data_dir.clone(),
+                config.catalog_path.clone(),
+            ),
             load_emblem_catalog(config.client_data_dir.clone()),
             load_item_probability_configuration(
                 config.item_probabilities.clone(),
@@ -432,6 +443,15 @@ impl BoundServer {
             messenger_tcp = %endpoints.messenger_tcp,
             profile_root = %config.profile_root.display(),
             catalog_path = ?config.catalog_path,
+            catalog_source = if config.resolved_catalog.is_some() {
+                "pre-resolved RHO snapshot"
+            } else if config.client_data_dir.is_some() {
+                "client Data RHO"
+            } else if config.catalog_path.is_some() {
+                "legacy XML compatibility"
+            } else {
+                "none"
+            },
             catalog_loaded = catalog.is_some(),
             catalog_item_transform_count,
             client_data_dir = ?config.client_data_dir,
@@ -736,8 +756,25 @@ impl Drop for ServerHandle {
     }
 }
 
-async fn load_catalog(path: Option<PathBuf>) -> Result<Option<Arc<CatalogInventory>>, ServerError> {
-    let Some(path) = path else {
+async fn load_catalog(
+    resolved: Option<Arc<CatalogInventory>>,
+    data_directory: Option<PathBuf>,
+    compatibility_xml: Option<PathBuf>,
+) -> Result<Option<Arc<CatalogInventory>>, ServerError> {
+    if let Some(catalog) = resolved {
+        return Ok(Some(catalog));
+    }
+    if let Some(path) = data_directory {
+        let worker_path = path.clone();
+        let catalog = tokio::task::spawn_blocking(move || {
+            load_client_kart_catalog(worker_path).map(crate::LoadedClientKartCatalog::into_catalog)
+        })
+        .await
+        .map_err(ServerError::CatalogTask)?
+        .map_err(|source| ServerError::LoadClientCatalog { path, source })?;
+        return Ok(Some(Arc::new(catalog)));
+    }
+    let Some(path) = compatibility_xml else {
         return Ok(None);
     };
     let worker_path = path.clone();
@@ -3776,6 +3813,9 @@ mod tests {
                 ServerError::LoadEmblemCatalog { path, .. } if path == client_data.path()
             ) || matches!(
                 &error,
+                ServerError::LoadClientCatalog { path, .. } if path == client_data.path()
+            ) || matches!(
+                &error,
                 ServerError::LoadRandomTracks { path, .. }
                     if path == &client_data.path().join("track_common.rho")
             ),
@@ -4462,7 +4502,13 @@ mod tests {
             ..ServerConfig::default()
         };
         let maximum = config.max_login_payload;
-        let catalog = load_catalog(config.catalog_path.clone()).await.unwrap();
+        let catalog = load_catalog(
+            config.resolved_catalog.clone(),
+            config.client_data_dir.clone(),
+            config.catalog_path.clone(),
+        )
+        .await
+        .unwrap();
         let profiles = test_profile_bootstrap(&config);
         let bound = BoundServer {
             config,

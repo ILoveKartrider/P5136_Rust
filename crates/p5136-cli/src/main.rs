@@ -48,7 +48,7 @@ enum Command {
     /// Test the connector's messenger TCP reachability check.
     Probe(ProbeArgs),
 
-    /// Prepare the client, probe the server, and launch through native/Wine/CrossOver.
+    /// Prepare the client, probe the server, and launch through a supported runner.
     Connect(ConnectArgs),
 }
 
@@ -66,9 +66,10 @@ struct ServerArgs {
     #[arg(long, default_value = "Profile", value_name = "PATH")]
     profile_root: PathBuf,
 
-    /// Stock-client directory, its Profile directory, or an exported KartCatalog.xml.
-    #[arg(long, value_name = "CLIENT_DIR_OR_CATALOG")]
-    catalog: Option<PathBuf>,
+    /// Stock-client root, Profile directory, or Data directory. The server
+    /// parses the client's RHO archives directly.
+    #[arg(long = "client-dir", alias = "catalog", value_name = "CLIENT_DIR")]
+    client_dir: Option<PathBuf>,
 
     /// Stock-client Data directory containing KR archives and item.rho.
     #[arg(long, value_name = "DATA_DIR")]
@@ -121,6 +122,10 @@ struct ConnectArgs {
     #[arg(long)]
     game_dir: PathBuf,
 
+    /// Game executable to launch. Defaults to KartRider.exe in --game-dir.
+    #[arg(long, value_name = "PATH")]
+    game_exe: Option<PathBuf>,
+
     #[arg(long)]
     username: String,
 
@@ -145,6 +150,10 @@ struct ConnectArgs {
     #[arg(long)]
     bottle: Option<String>,
 
+    /// A preconfigured Sikarugir wrapper (.app) to open on macOS.
+    #[arg(long, value_name = "APP")]
+    sikarugir_app: Option<PathBuf>,
+
     #[arg(long, default_value_t = 4_000)]
     timeout_ms: u64,
 
@@ -162,6 +171,7 @@ enum RunnerKind {
     NativeElevated,
     Wine,
     Crossover,
+    Sikarugir,
 }
 
 fn main() -> Result<()> {
@@ -284,8 +294,10 @@ fn default_log_directory() -> Result<PathBuf> {
 async fn run_server(args: ServerArgs) -> Result<()> {
     let ports = PortTopology::new(args.configured_port)
         .context("configured port cannot provide all P5136 service offsets")?;
-    let client_paths =
-        client_paths::resolve_client_runtime_paths(args.catalog, args.client_data_dir)?;
+    let client_paths = client_paths::resolve_client_runtime_paths(
+        args.client_dir.as_deref(),
+        args.client_data_dir.as_deref(),
+    )?;
     let item_probabilities = args
         .item_probability_xml
         .as_deref()
@@ -297,7 +309,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         advertised_address: args.advertise,
         ports,
         profile_root: args.profile_root,
-        catalog_path: client_paths.catalog_path,
+        catalog_path: None,
         client_data_dir: client_paths.client_data_dir,
         item_probabilities,
         item_probability_rank_policy: if args.trust_client_item_rank {
@@ -313,7 +325,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         allow_remote_profile_creation: args.allow_remote_profile_creation,
         ..ServerConfig::default()
     };
-    let catalog_configured = config.catalog_path.is_some();
+    let catalog_configured = config.client_data_dir.is_some();
     let emblem_catalog_configured = config.client_data_dir.is_some();
 
     let server = BoundServer::bind(config)
@@ -333,7 +345,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         tracing::warn!("race settlement, MyRoom, and progression handling remain in progress");
     } else {
         tracing::warn!(
-            "no inventory catalog is configured, so PqGetRider is unavailable; \
+            "no client Data directory is configured, so PqGetRider is unavailable; \
              race settlement, MyRoom, and progression handling remain in progress"
         );
     }
@@ -341,8 +353,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         tracing::info!("stock KR client emblem definitions are configured");
     } else {
         tracing::warn!(
-            "no client data directory is configured, so RequestEmblems uses only an optional \
-             KartCatalog.xml Emblems extension"
+            "no client data directory is configured, so RequestEmblems has no stock emblem catalog"
         );
     }
 
@@ -448,6 +459,7 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
     };
     let plan = ConnectorPlan::new(ConnectorRequest {
         game_directory: args.game_dir,
+        game_executable: args.game_exe,
         nickname: args.username,
         server_address: args.server,
         ports,
@@ -539,6 +551,12 @@ fn build_runner(args: &ConnectArgs) -> Result<Runner> {
                 .clone()
                 .context("--bottle is required for the CrossOver runner")?,
         }),
+        RunnerKind::Sikarugir => Ok(Runner::Sikarugir {
+            app: args
+                .sikarugir_app
+                .clone()
+                .context("--sikarugir-app is required for the Sikarugir runner")?,
+        }),
     }
 }
 
@@ -583,7 +601,7 @@ mod tests {
         };
 
         assert_eq!(args.profile_root, Path::new("Profile"));
-        assert_eq!(args.catalog, None);
+        assert_eq!(args.client_dir, None);
         assert_eq!(args.client_data_dir, None);
         assert_eq!(args.bind, std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(
@@ -608,8 +626,8 @@ mod tests {
             "server",
             "--profile-root",
             "profiles",
-            "--catalog",
-            "KartCatalog.xml",
+            "--client-dir",
+            "ClientRoot",
             "--client-data-dir",
             "client/Data",
         ])
@@ -619,7 +637,7 @@ mod tests {
         };
 
         assert_eq!(args.profile_root, Path::new("profiles"));
-        assert_eq!(args.catalog.as_deref(), Some(Path::new("KartCatalog.xml")));
+        assert_eq!(args.client_dir.as_deref(), Some(Path::new("ClientRoot")));
         assert_eq!(
             args.client_data_dir.as_deref(),
             Some(Path::new("client/Data"))
@@ -634,6 +652,7 @@ mod tests {
 
         run_connector(ConnectArgs {
             game_dir: missing_game_directory.clone(),
+            game_exe: None,
             username: "dry-run-user".to_owned(),
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
@@ -642,6 +661,7 @@ mod tests {
             wine_prefix: None,
             crossover_binary: None,
             bottle: None,
+            sikarugir_app: None,
             timeout_ms: 10,
             dry_run: true,
         })
@@ -655,6 +675,7 @@ mod tests {
     fn native_runner_is_the_explicit_non_elevated_mode() {
         let args = ConnectArgs {
             game_dir: PathBuf::from("game"),
+            game_exe: None,
             username: "user".to_owned(),
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
@@ -663,6 +684,7 @@ mod tests {
             wine_prefix: None,
             crossover_binary: None,
             bottle: None,
+            sikarugir_app: None,
             timeout_ms: 10,
             dry_run: true,
         };
@@ -670,6 +692,38 @@ mod tests {
         assert!(matches!(
             super::build_runner(&args).unwrap(),
             p5136_connector::Runner::Native
+        ));
+    }
+
+    #[test]
+    fn sikarugir_runner_and_custom_executable_parse_from_cli() {
+        let cli = Cli::try_parse_from([
+            "p5136",
+            "connect",
+            "--game-dir",
+            "/Users/player/Games/KartRider_5136",
+            "--game-exe",
+            "KartRider.test.exe",
+            "--username",
+            "player",
+            "--runner",
+            "sikarugir",
+            "--sikarugir-app",
+            "/Users/player/Applications/Sikarugir/kartrider.app",
+        ])
+        .unwrap();
+        let Some(Command::Connect(args)) = cli.command else {
+            panic!("connect subcommand should parse as Command::Connect");
+        };
+
+        assert_eq!(
+            args.game_exe.as_deref(),
+            Some(Path::new("KartRider.test.exe"))
+        );
+        assert!(matches!(
+            super::build_runner(&args).unwrap(),
+            p5136_connector::Runner::Sikarugir { app }
+                if app == Path::new("/Users/player/Applications/Sikarugir/kartrider.app")
         ));
     }
 

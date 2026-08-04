@@ -206,6 +206,12 @@ fn rejects_trailing_zlib_bytes() {
         directory.extract_exact("etc_/trailing.xml"),
         Err(Rho5Error::TrailingCompressedData { .. })
     ));
+    assert_eq!(
+        directory
+            .extract_entry_with_legacy_padding(&directory.entries()[0])
+            .expect("explicit legacy-packer compatibility"),
+        b"payload"
+    );
 }
 
 #[test]

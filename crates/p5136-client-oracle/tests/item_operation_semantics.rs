@@ -609,8 +609,34 @@ fn item_client_fsm_executes_the_original_149_consumer_branches() {
     );
     assert_eq!(
         (local, deferred, unknown),
-        (71, 69, 9),
+        (74, 70, 5),
         "the reviewed 149-branch side-effect census changed"
+    );
+}
+
+#[test]
+fn original_consumer_unknown_side_effect_set_is_explicit() {
+    let mut unknown = all_recovered_fixtures()
+        .into_iter()
+        .filter(|fixture| !is_supplemental_consumer(*fixture))
+        .filter_map(|fixture| {
+            let operation = consume(&raw(fixture)).unwrap();
+            (operation.meaning == Meaning::Unknown)
+                .then_some((operation.class_name, operation.state))
+        })
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+
+    assert_eq!(
+        unknown,
+        vec![
+            ("GopEventObject", 0x7111_0001),
+            ("GopGiantTalisman", 3),
+            ("GopRobotBeam", 2),
+            ("GopTombStone", 2),
+            ("GopWitchUnionMagic", 4),
+        ],
+        "an unknown client side effect was added or removed without review"
     );
 }
 
@@ -648,7 +674,7 @@ fn rust_server_admits_and_byte_preserves_the_original_149_consumer_branches() {
 
     assert_eq!(
         (tracked, untracked, suppressed),
-        (87, 62, 0),
+        (88, 61, 0),
         "the reviewed 149-branch server admission census changed"
     );
 }
@@ -924,21 +950,117 @@ fn gold_shield_codec_selects_all_three_defense_items_and_keeps_activation_armed(
 }
 
 #[test]
+fn recovered_item_selectors_match_the_independent_client_oracle() {
+    let mut shield = raw(Fixture {
+        pair: (0x1110_037F, 0x1D33_049E),
+        state: 1,
+        length: 31,
+        state_offset: 12,
+        flag: None,
+    });
+    shield[16..18].copy_from_slice(&18_u16.to_le_bytes());
+    put_u32(&mut shield, 18, 0x7100_0001);
+    put_u32(&mut shield, 22, 0x7200_0002);
+    let consumed = consume(&shield).unwrap();
+    assert_eq!(consumed.effect_item_id, Some(18));
+    assert_eq!(consumed.transition_token, Some(0x7100_0001));
+    assert_eq!(consumed.source_object_id, Some(0x7200_0002));
+    assert_same(&shield);
+
+    for (pair, discriminator, item_id) in [
+        ((0x0D7B_031D, 0x187F_043C), 0, 0),
+        ((0x0D7B_031D, 0x187F_043C), 3, 1),
+        ((0x0D7B_031D, 0x187F_043C), 6, 43),
+        ((0x10CA_034F, 0x1CED_046E), 0, 114),
+        ((0x10CA_034F, 0x1CED_046E), 3, 115),
+        ((0x10CA_034F, 0x1CED_046E), 6, 116),
+    ] {
+        let mut cloud = raw(Fixture {
+            pair,
+            state: 1,
+            length: 73,
+            state_offset: 12,
+            flag: None,
+        });
+        cloud[24] = discriminator;
+        assert_eq!(consume(&cloud).unwrap().effect_item_id, Some(item_id));
+        assert_same(&cloud);
+    }
+
+    for (fixture, item_id) in [
+        (
+            Fixture {
+                pair: (0x276B_0567, 0x3929_0686),
+                state: 0,
+                length: 29,
+                state_offset: 13,
+                flag: None,
+            },
+            122,
+        ),
+        (
+            Fixture {
+                pair: (0x10C3_0382, 0x1CE6_04A1),
+                state: 1,
+                length: 78,
+                state_offset: 12,
+                flag: None,
+            },
+            80,
+        ),
+        (
+            Fixture {
+                pair: (0x3473_0640, 0x486F_075F),
+                state: 0,
+                length: 27,
+                state_offset: 12,
+                flag: None,
+            },
+            40,
+        ),
+        (
+            Fixture {
+                pair: (0x3C6F_06D4, 0x518A_07F3),
+                state: 1,
+                length: 58,
+                state_offset: 12,
+                flag: None,
+            },
+            73,
+        ),
+        (
+            Fixture {
+                pair: (0x196A_0455, 0x27CB_0574),
+                state: 1,
+                length: 24,
+                state_offset: 12,
+                flag: None,
+            },
+            13,
+        ),
+    ] {
+        let operation = raw(fixture);
+        assert_eq!(consume(&operation).unwrap().effect_item_id, Some(item_id));
+        assert_same(&operation);
+    }
+}
+
+#[test]
 fn unknown_and_noop_branches_do_not_cancel_a_proven_deferred_marker() {
     let mut conservative = ItemClientFsm::new();
-    let straight_rocket = Fixture {
-        pair: (0x3C6F_06D4, 0x518A_07F3),
+    let robot_beam = Fixture {
+        pair: (0x1DC5_04A1, 0x2D45_05C0),
         state: 1,
-        length: 58,
+        length: 72,
         state_offset: 12,
         flag: None,
     };
-    conservative.accept(&raw(straight_rocket)).unwrap();
+    conservative.accept(&raw(robot_beam)).unwrap();
     let unknown_follow_up = conservative
         .accept(&raw(Fixture {
             state: 2,
             length: 24,
-            ..straight_rocket
+            ..robot_beam
         }))
         .unwrap();
     assert_eq!(
@@ -1507,6 +1629,7 @@ fn independent_oracle_preserves_distinct_actor_offsets_and_ignored_fields() {
     put_u32(&mut big, 17, TOKEN);
     put_u32(&mut big, 21, TARGET);
     put_u32(&mut big, 25, SOURCE);
+    assert_eq!(consume(&big).unwrap().meaning, Meaning::Resolve);
     assert_same(&big);
 
     for absent_offset in [21, 25] {
@@ -2027,7 +2150,7 @@ fn ordinary_effect_oracle_preserves_source_target_roles_and_runtime_only_states(
 }
 
 #[test]
-fn unresolved_straight_rocket_writer_shapes_remain_unknown() {
+fn straight_rocket_compact_writer_shapes_are_explicit_client_no_actions() {
     for fixture in [
         Fixture {
             pair: (0x3C6F_06D4, 0x518A_07F3),
@@ -2045,7 +2168,7 @@ fn unresolved_straight_rocket_writer_shapes_remain_unknown() {
         },
     ] {
         let consumed = consume(&raw(fixture)).unwrap();
-        assert_eq!(consumed.meaning, Meaning::Unknown);
+        assert_eq!(consumed.meaning, Meaning::NoClientAction);
         assert_eq!(consumed.native_phase, None);
         assert_eq!(consumed.transition_token, None);
         assert_eq!(consumed.source_object_id, None);

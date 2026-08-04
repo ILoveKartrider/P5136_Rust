@@ -19,6 +19,14 @@ short feature ledger is in [PORTING.md](PORTING.md).
   values are rejected. Hostnames remain rejected because the client endpoint
   codec carries exactly four IPv4 bytes. Korean system-font discovery now
   covers Windows, macOS, and common Linux Noto/Nanum installations.
+- Added an explicit macOS `Sikarugir` connector backend. GUI and CLI accept a
+  preconfigured wrapper `.app`, launch it through `/usr/bin/open`, preserve the
+  selected game directory for connector-managed PIN/XML files, and support an
+  optional alternate game executable. Preflight requires both the game EXE and
+  wrapper app directory to exist. `MACOS_SIKARUGIR.md` records the prefix
+  symlink, Nexon `RootPath`, working-directory batch file, optional CoreAudio
+  workaround, CLI invocation, and log verification steps without bundling
+  Sikarugir, the game, or a wrapper.
 - Automatic item probabilities are now verified on the GUI start boundary.
   The selected client Data directory is actually parsed, the individual/team
   row counts and source path are shown, and a parse failure prevents startup.
@@ -147,12 +155,13 @@ Scanning, SlotLock, SpecialSiren, SpaceCraft, and StraightRocket. The fifth
 pass adds Balloon, HeadBand, Dynamite, Hammer, Press, RobotBeam, TombStone,
 Block, BoundWall, Cube, CubeForBoss, EventObject, GiantTalisman,
 WitchUnionMagic, and TargetKart. The sixth pass adds BossPrison, BoundRoad,
-Course, Falling, and Piratebomb. Seventy-four classes yield at least one named
+Course, Falling, and Piratebomb. Seventy-five classes yield at least one named
 lifecycle meaning plus native phase, source object, target object,
 transition token, variant, and evidence grade. BigTimebomb exposes its exact
 `variant:u8@12 | native phase:u32@13 | token@17 | target@21 | source@25`
-consumer binding, conditional on both actor lookups succeeding, but deliberately
-retains `Unknown` lifecycle meaning.
+consumer binding, conditional on both actor lookups succeeding. Producer call
+sites constrain its native phase to activation 0, ordinary/team-routed impact
+2/3, and SpecialShield resolution 4.
 Angel state 0 is a proven team-effect activation. A targeted IDB follow-up
 closed state 2 as a repeatable, non-terminal defense-impact branch: its 28-byte
 body is `token@16, source@20, target@24`, and the consumer binds both actors and
@@ -164,10 +173,10 @@ shows that the shared resolver's `sub_4E83E0` is a container-insertion wrapper:
 it records the protected kart in the attack object's processed-target set and
 does not remove Angel from the kart's timed active-effect collection. The same
 evidence corrects ordinary Shield state 2 from removal to defense impact.
-StraightRocket state 1 is a proven phase-1 launch; writer-supported states 2
-and 3 have no matching producer/consumer meaning. Those two branches remain
-strictly length checked and explicitly `Unknown`, so they relay without
-mutating the authoritative registry. RobotBeam/TombStone state 2
+StraightRocket state 1 is a proven phase-1 launch. Its concrete consumer
+accepts writer-supported states 2/3 but performs no class binding, phase call,
+or helper action, so both are explicit `NoClientAction` branches rather than
+unknown side effects. RobotBeam/TombStone state 2
 and Block state 2 likewise read a source member which their writer does not
 serialize; Rust records only the token/target/native phase present on the
 wire. EventObject and Course raw 12 are object IDs rather than lifecycle
@@ -267,13 +276,17 @@ Lucci, BonusItem and TeamFlag remain scope-excluded.
 
 `p5136-client-oracle::item_client_fsm` now executes the original 149 consumer
 fixtures as state transitions rather than decode-only assertions. The pinned
-outcome census is 71 `LocalOnly`, 69 `DeferredOutbound`, zero
-`ImmediateOutbound`, and 9 `UnknownSideEffect`. Angel state 0 is deferred
+outcome census is 74 `LocalOnly`, 70 `DeferredOutbound`, zero
+`ImmediateOutbound`, and 5 `UnknownSideEffect`. Angel state 0 is deferred
 because its defense-hit continuation is proven; state 2 records a local
 defense impact while retaining the timed Angel effect. The 14 later
 BossPrison/BoundRoad/Falling/Piratebomb branches and the variable-length Course
 consumer plus the two GoldShield branches share the same executor, so all 166
 recovered branches are accepted.
+The five unknown effects are pinned by exact class/state as `GopEventObject`
+(`0x71110001`), `GopGiantTalisman` state 3, `GopRobotBeam` state 2,
+`GopTombStone` state 2, and `GopWitchUnionMagic` state 4. They are runtime
+lifecycle/effect-label gaps, not unresolved gameplay-page item/class joins.
 Deferred results enqueue only a class/object/state scheduler marker: no next
 state, timer expiration, collision, or packet byte is invented, and a newer
 known lifecycle transition for the same object cancels the stale marker.
@@ -287,7 +300,7 @@ boundary. `audit_game_slot_item_operation` uses the real outer `GameSlot`
 decoder, validates the synthetic frozen-roster reporter/mask, invokes the same
 item-to-registry operation mapping as `World::relay_game_slot`, commits any
 planned mutation in an isolated race registry, and returns the owned relay
-bytes. The pinned census is 87 `PublishTracked`, 62 `PublishUntracked`, and
+bytes. The pinned census is 88 `PublishTracked`, 61 `PublishUntracked`, and
 zero `SuppressDuplicate`; all 149 relay byte-for-byte unchanged. This composes
 with the existing actor/outbound-queue integration tests, but it deliberately
 does not claim live execution of every rare stock-client visual, timer, boss,
@@ -298,8 +311,8 @@ Scanning, SlotLock, SpecialSiren, SpaceCraft, and StraightRocket through exact
 writer-shape validation, the independent client oracle, production parsing,
 and race-object registry admission. Known activations/impacts are tracked;
 Angel state 2 now produces a tracked non-terminal hit observation, while
-StraightRocket states 2/3 publish untracked and leave the existing object
-fingerprint unchanged.
+StraightRocket states 2/3 are explicit client no-actions, publish untracked,
+and leave the existing object fingerprint unchanged.
 
 ### Complete gameplay-page item catalog (2026-08-03)
 
@@ -308,11 +321,11 @@ The user-supplied Korean item page is now represented by
 uniqueness-tested catalog across acceleration (6), attack (22), defense (7),
 placement (11), status (5), and utility (3). Each entry records a stable slug,
 Korean name, target scope, effect hints, a concise Korean summary, established
-P5136 symbol/ID pairs, and evidence-graded `Gop*` links. Forty numeric
-name/ID pairs are currently anchored as 18 retained fallback-table pairs, 20
+P5136 symbol/ID pairs, and evidence-graded `Gop*` links. Forty-one numeric
+name/ID pairs are currently anchored as 19 retained fallback-table pairs, 20
 Korean-executable initializer pairs, and two verified profile supplements
 (`siren=24`, `superMagnet=103`). Exact literal tests pin all 54 per-heading
-category/target/effect tuples and the ordered 56-pair evidence manifest.
+category/target/effect tuples and the ordered 53-pair evidence manifest.
 
 Target semantics now distinguish the immediately preceding opponent, every
 opponent ahead, nearby other karts, nearby karts including a possible source,
@@ -326,11 +339,17 @@ rolling waterbomb variant can no longer be promoted merely because both
 candidate classes have recovered native writers.
 
 The attached page was last edited in 2026, so it is never used to synthesize
-P5136 offsets, states, durations, probabilities, or defense rules. Ambiguous
-joins remain visible: Jiangshi versus first-place Devil classes, Icefly versus
-SnowWaterfly generation naming, guide/random missile projectile classes,
-cloud variants and Net. GoldShield is no longer in this unresolved set: its
-anonymous vtable was recovered as the exact Gold/Protect/Siren defense envelope. The full
+P5136 offsets, states, durations, probabilities, or defense rules. Direct RHO
+resources and executable producers now close every active ambiguous join:
+Guide Rocket 33 uses `GopRocket`; StraightRocket 73 is Giant Missile;
+Timebomb 13 is distinct from the Abyss special BigTimebomb 122; SnowWaterfly
+118 is distinct from Kefi-special Icefly 80; Super Shield 18 uses `GopShield`
+while `GopSpecialShield` is item 40; and both Cloud discriminator maps are
+exact. `GopShield` state 1 is corrected to `item_id:u16@16, token@18,
+source@22`. Rolling Waterbomb, Jiangshi, and first-place Devil are explicitly
+`DeferredByUser`. Net and modern Random Missile remain page-only because no
+P5136 join is proven, rather than because two packet classes compete.
+GoldShield remains the exact Gold/Protect/Siren defense envelope. The full
 ledger and source hash are in
 [ITEM_GAMEPLAY_COVERAGE.md](ITEM_GAMEPLAY_COVERAGE.md).
 
@@ -1799,8 +1818,8 @@ unchanged and is evidence only.
   9=`1,337`, type 10=`38`, type 11=`1`, and type 12=`30`. The external
   capture directory remains uncommitted. The separate newest-log audit adds
   174 type-17 frames. This proves parser compatibility with those corpora. The
-  78 class-specific type-12 field contracts instead come from the pinned
-  producer/writer/consumer IDB join (74 have named lifecycle meanings); the
+  79 class-specific type-12 field contracts instead come from the pinned
+  producer/writer/consumer IDB join (75 have named lifecycle meanings); the
   scope-excluded Lucci semantics, kart side effects,
   visible stock-client pickup E2E, and stock-client multiplayer E2E are still
   open.
@@ -2770,7 +2789,7 @@ These items prevent a "port complete" claim.
 
    Run the existing Windows/macOS/Linux CI matrix to green and record the
    result. Add differential C#/Rust fixtures for the supported packet surface,
-   native Windows client launch, Wine/CrossOver launch, and a two-client login
+   native Windows client launch, Wine/CrossOver/Sikarugir launch, and a two-client login
    -> migrate -> room -> race -> persistence run.
 
 7. **Explicit product-policy decisions**
@@ -2781,8 +2800,10 @@ These items prevent a "port complete" claim.
 
 ## Exact resume plan
 
-1. Start the fresh `p5136-gameslot-static` release with the stock
-   `KartRider_5136\Profile\KartCatalog.xml` and `KartRider_5136\Data`, launch
+1. Start the fresh release with the stock `KartRider_5136` client root (or its
+   `Data` directory). The Rust server now rebuilds its immutable catalog
+   directly from `kart.rho`, `item.rho`, and RHO5; `Profile\KartCatalog.xml`
+   is not required. Launch
    the local stock client, and preserve the matching server/client logs.
    Verify that initialization reaches channel switch and then exercise the
    captured menu, scenario, time-attack, room, and race entry paths.
@@ -2812,7 +2833,7 @@ These items prevent a "port complete" claim.
 7. Close remaining economy and packet-fixture gaps, then design race-wide
    reward recovery.
 8. Run the existing three-desktop CI matrix to green, record the run, and
-   exercise the connector on Wine/CrossOver.
+   exercise the connector on Wine/CrossOver/Sikarugir.
 9. Before every checkpoint run:
 
    ```text
@@ -2823,6 +2844,28 @@ These items prevent a "port complete" claim.
    git diff --check
    rg -n "\bunsafe\b" crates -g "*.rs"
    ```
+
+## 2026-08-04 direct client RHO catalog
+
+- Normal GUI/CLI startup no longer consumes the C#-generated
+  `Profile/KartCatalog.xml`. Selecting the client root, `Profile`, or `Data`
+  resolves one canonical `Data` directory and reads `kart.rho`, `item.rho`,
+  and the KR RHO5 overlays directly.
+- The bounded loader reproduces 1,456 kart names, 1,353 `BodyParam` specs,
+  6,929 shop rows across 65 categories, 73 verified item symbols, and all 493
+  `TransformByKart` rules. It requires the 1450/1453 identity, slot-capacity,
+  and chicken-gold transform sentinels before publication.
+- The opt-in stock-client test compares the complete Rust catalog value against
+  the previous C# XML export and currently reports exact semantic equality.
+  The XML remains a test oracle and compatibility-only `ServerConfig` input,
+  not a runtime prerequisite or generated artifact.
+- GUI inventory search retains the immutable direct-RHO `Arc<CatalogInventory>`
+  and passes it into the next server start when the canonical `Data` path still
+  matches, avoiding a second 112 MiB `kart.rho` parse.
+- Direct catalog reconstruction intentionally publishes only the 493 transform
+  rules consumed by current Rust gameplay. The C#-exported 78 `FiringToGain`
+  and 150 `FiredToGain` audit rows are not current `CatalogInventory` runtime
+  inputs and remain outside this loader until a server consumer is implemented.
 
 ## Definition of port complete
 

@@ -20,8 +20,8 @@ been demonstrated.
 - [x] per-run bounded file logging at every transport packet boundary, server
   configuration validation, and typed TCP-session failure boundary
 - [x] GUI platform Korean system-font fallback for Windows, macOS, and Linux
-- [x] stock-client/`Profile` path resolution for the C#-exported catalog and
-  sibling client `Data` directory
+- [x] stock-client root/`Profile`/`Data` resolution to the canonical client
+  `Data` directory without requiring a C#-exported catalog
 - [x] exact `PqGetRiderTaskContext` startup reply from the stock-client crash
   log (`PrGetRiderTaskContext | i32(0)`)
 - [x] strict post-rider startup query replies for ranker info, versus rank-one,
@@ -43,7 +43,7 @@ been demonstrated.
 - [x] endpoint replacement and NGS toggle
 - [x] immutable backup, process lock, and atomic replacement
 - [x] native Windows UAC launch specification
-- [x] Wine and CrossOver launch specifications
+- [x] Wine, CrossOver, and preconfigured macOS Sikarugir wrapper launch specifications
 - [x] no-argument Server/Connector GUI and equivalent CLI
 - [x] GUI-configurable server lifecycle with explicit graceful/forced shutdown
 - [x] GUI item-probability rank/table editor with client archive, portable XML,
@@ -60,7 +60,7 @@ been demonstrated.
 - [x] C#-exact ASCII-boundary S0-S7 room-title parser and per-equipment modern
   speed-physics variants selected transactionally at race start
 - [ ] verified launch of a stock client on Windows
-- [ ] verified launch of the same client through Wine or CrossOver
+- [ ] verified launch of the same client through Wine, CrossOver, or Sikarugir
 
 ## Login, identity, and migration
 
@@ -123,14 +123,14 @@ been demonstrated.
 - [x] producer/consumer-derived source/target/state semantics for 79 of 80
   direct-writer classes: the original 15 common contracts plus Coke/Snow/
   Infected bombs, rolling variants, WaterMine/TimeMine, timed bomb variants,
-  BigTimebomb's actor-guarded native phase pass-through, Shield/SpecialShield,
+  BigTimebomb's actor-guarded activation/impact/SpecialShield phase map, Shield/SpecialShield,
   three UFO forms, LockdownRocket, Thunderbolt's counted target set, ForceZone,
   Oil, Silence, Siren/SirenShield, SpecialSmall, Cloud/Cloud2, Magnet, and
   SpeedDown, Devil/MqDevil/NewDevil, Angel, GoldShield, EMP, Ghost, Icefly, Scanning,
   SlotLock, SpecialSiren, SpaceCraft, StraightRocket, Balloon, HeadBand,
   Dynamite, Hammer, Press, RobotBeam, TombStone, Block, BoundWall, Cube,
   CubeForBoss, EventObject, GiantTalisman, WitchUnionMagic, TargetKart,
-  BossPrison, BoundRoad, Course, Falling, and Piratebomb; 74 have a named
+  BossPrison, BoundRoad, Course, Falling, and Piratebomb; 75 have a named
   lifecycle transition. Native source omissions in Block,
   RobotBeam, and TombStone remain explicit instead of fabricating raw fields
 - [x] corrected `GopCubeForBoss` writer lengths to 77/69 (the earlier 73/65
@@ -163,11 +163,18 @@ been demonstrated.
   ForceZone/Oil success guards, Silence's explicit no-op, SpecialSmall's
   runtime-only flag update, Cloud's target-only hit, and SpeedDown teardown
 - [x] all 54 headings from the supplied Korean item page represented in a
-  typed gameplay-reference catalog with category/target/effect hints, 40
+  typed gameplay-reference catalog with category/target/effect hints, 41
   proven P5136 numeric/name links, evidence-graded `Gop*` candidates, literal
-  54-row semantic and 40-pair ID manifests, separate class/heading evidence,
+  54-row semantic and 41-pair ID manifests, separate class/heading evidence,
   and an explicit rule that modern page timers/probabilities never define the
   wire codec; see [ITEM_GAMEPLAY_COVERAGE.md](ITEM_GAMEPLAY_COVERAGE.md)
+- [x] all active ambiguous gameplay joins closed with native producer plus
+  direct-RHO evidence: Guide Rocket 33=`GopRocket`, Timebomb 13=`GopTimebomb`,
+  Ice Waterfly 118=`GopSnowWaterfly`, Super Shield 18=`GopShield`, and exact
+  Cloud/Cloud2 discriminator maps. Giant Missile 73, Abyss special 122, Kefi
+  special 80, SpecialShield 40, and RainbowCloud2 116 are retained as distinct
+  non-page associations. Rolling Waterbomb, Jiangshi, and first-place Devil
+  are explicitly deferred by user scope.
 - [x] Messenger identity validation, chat rooms, and single-writer queues
 - [x] Messenger split/coalesced frame and mid-frame generation fencing
 - [x] bounded actor-output flushing without read-loop starvation
@@ -264,8 +271,9 @@ been demonstrated.
   synthesis, strict captured request/token validation, replay/rate admission,
   sender-inclusive atomic room broadcast in game types 2/4, and the stock
   2-8-racer Top/High/Middle/Low matrix over frozen humans plus AI racers
-- [x] bounded `KartCatalog.xml` `TransformByKart` parsing and exactly-once
-  frozen-kart item acquisition remapping, including Gigantes V1
+- [x] bounded direct `kart.rho`/`item.rho`/RHO5 catalog reconstruction with no
+  generated XML sidecar, plus compatibility-only `KartCatalog.xml` parsing and
+  exactly-once frozen-kart item acquisition remapping, including Gigantes V1
   `5 -> 103`, `7/127 -> 99`, Sebek V1's eight 25% `-> goldShield(36)`
   paths, and separate partial-probability rolls
 - [ ] actor-owned live race position and track-box spawn/collision authority
@@ -327,14 +335,14 @@ been demonstrated.
   state effects and deployed-order assumptions are recorded separately in
   [CLIENT_PROTOCOL_FSM.md](CLIENT_PROTOCOL_FSM.md)
 - [x] executable independent `ItemClientFsm` for the fixed 149-branch item
-  consumer corpus (71 local, 69 deferred, zero immediate, 9 unknown), plus
+  consumer corpus (74 local, 70 deferred, zero immediate, 5 unknown), plus
   the 15 later boss/controller/Course branches; lifecycle observation,
   deferred scheduler markers, and transactional malformed-input rejection are
   tested without synthesizing unproven outbound packets
 - [x] production-server cross-wire gate for all original 149 branches: each
   fixture passes the real `GameSlot` decoder and the same item-to-registry
   admission mapping used by the World actor, then retains byte-exact relay
-  output. The pinned server census is 87 tracked, 62 relay-only/untracked, and
+  output. The pinned server census is 88 tracked, 61 relay-only/untracked, and
   zero fresh-registry suppressions. Representative World/network tests remain
   the integration proof; this exhaustive synthetic gate does not claim that
   every rare native client animation or controller condition was live-fired
@@ -367,13 +375,14 @@ been demonstrated.
 - [x] all 174 newest type-17 quad snapshots cross the native flag-derived
   length rule and sender-excluding peer-mask relay codec
 - [ ] remaining class-specific type-12 source/target/effect meanings and
-  multiplayer type-16 routing are capture-verified; 78 direct-writer classes
-  now expose recovered field semantics (74 with named lifecycle transitions), while unknown
+  multiplayer type-16 routing are capture-verified; 79 direct-writer classes
+  now expose recovered field semantics (75 with named lifecycle transitions), while unknown
   and bounded fallback bodies do not acquire invented authority;
-  scope-excluded types 4/5/6/7/8 are not a completion gate
+  scope-excluded types 4/5/6/7/8 and the three explicitly deferred gameplay
+  headings are not a completion gate
 - [ ] Windows, macOS, and Linux CI pass
 - [ ] native Windows connector launches a stock P5136 client
-- [ ] Wine or CrossOver connector launches the same client
+- [ ] Wine, CrossOver, or Sikarugir connector launches the same client
 - [ ] two clients login, migrate, join a room, race, persist, and shut down
 - [x] opt-in external corpus audit parses all 19,496 retained inbound records,
   resolves all 100 hashes, fully parses all former 28 gap families, strictly
