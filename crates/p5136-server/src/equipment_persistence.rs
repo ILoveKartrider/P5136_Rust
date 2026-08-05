@@ -548,9 +548,13 @@ pub(crate) fn validate_rider_item_selection(
         (31, current.rider_color, selection.rider_color),
         (32, current.bonus_card, selection.bonus_card),
         (36, current.boss_mode_card, selection.boss_mode_card),
+        // P5136's rider-item snapshot uses engine, wheel, handle, kit order.
+        // PlantData.json and the inventory categories use engine (43), handle
+        // (44), wheel (45), kit (46), so the two middle slots must not be
+        // validated as monotonically increasing categories.
         (43, current.kart_plant1, selection.kart_plant1),
-        (44, current.kart_plant2, selection.kart_plant2),
-        (45, current.kart_plant3, selection.kart_plant3),
+        (45, current.kart_plant2, selection.kart_plant2),
+        (44, current.kart_plant3, selection.kart_plant3),
         (46, current.kart_plant4, selection.kart_plant4),
         (59, current.fishing_pole, selection.fishing_pole),
         (61, current.tachometer, selection.tachometer),
@@ -649,6 +653,17 @@ pub(crate) mod tests {
                 item_count += 1;
             }
         }
+        // Real P5136 plant-part IDs are category-local and much smaller than
+        // the generic fixture range. Keep asymmetric grants so the rider-wire
+        // wheel/handle ordering is covered by regression tests.
+        for (category, id) in [(43, 23), (44, 2), (45, 23), (46, 1)] {
+            writeln!(
+                items,
+                r#"<Item category="{category}" id="{id}" name="plant" />"#
+            )
+            .unwrap();
+            item_count += 1;
+        }
         for (index, &category) in NON_GRANT_CATEGORIES.iter().enumerate() {
             let count = 63 + usize::from(index < 3);
             for id in 1..=count {
@@ -660,7 +675,7 @@ pub(crate) mod tests {
                 item_count += 1;
             }
         }
-        assert_eq!(item_count, 6_800);
+        assert_eq!(item_count, 6_804);
         let xml = format!(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
                 <Names>
@@ -755,6 +770,29 @@ pub(crate) mod tests {
             Err(RiderEquipmentValidationError::KartNotGranted {
                 kart_id: 1,
                 serial: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn validation_maps_p5136_plant_slots_as_engine_wheel_handle_kit() {
+        let catalog = catalog();
+        let profile = Profile::default();
+        let mut selection = selection();
+        selection.kart_plant1 = 23;
+        selection.kart_plant2 = 23;
+        selection.kart_plant3 = 2;
+        selection.kart_plant4 = 1;
+
+        validate_rider_item_selection(&catalog, &profile, selection).unwrap();
+
+        selection.kart_plant2 = 2;
+        selection.kart_plant3 = 23;
+        assert_eq!(
+            validate_rider_item_selection(&catalog, &profile, selection),
+            Err(RiderEquipmentValidationError::RiderItemNotGranted {
+                category: 45,
+                item_id: 2,
             })
         );
     }

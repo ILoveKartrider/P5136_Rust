@@ -67,9 +67,9 @@ use p5136_core::{
     },
     lobby_protocol::{
         LobbyProtocolError, LobbyRequest, classify_lobby_request, parse_basic_ai_request,
-        parse_change_master_request, parse_change_team_request, parse_change_track_request,
-        parse_close_slot_request, parse_macro_chat_request, parse_rider_talk_request,
-        parse_set_slot_state_request, parse_start_room_request,
+        parse_change_master_request, parse_change_room_info_request, parse_change_team_request,
+        parse_change_track_request, parse_close_slot_request, parse_macro_chat_request,
+        parse_rider_talk_request, parse_set_slot_state_request, parse_start_room_request,
     },
     login::{
         LegacyTime, LoginError, PrLoginFields, parse_pq_login, serialize_pr_cn_authen_login,
@@ -3840,6 +3840,9 @@ async fn handle_lobby_request_admitted(
                 resolved_message,
             }
         }
+        LobbyRequest::ChangeRoomInfo => {
+            LobbyCommandPayload::ChangeRoomInfo(parse_change_room_info_request(packet)?)
+        }
     };
     match world.lobby_command(payload).await {
         Ok(_) => {}
@@ -6265,6 +6268,10 @@ mod tests {
             Some(LobbyRequest::MacroChat) => {
                 super::parse_macro_chat_request(packet)
                     .expect("captured macro-chat request must parse");
+            }
+            Some(LobbyRequest::ChangeRoomInfo) => {
+                super::parse_change_room_info_request(packet)
+                    .expect("captured room-info change must parse");
             }
             _ => return false,
         }

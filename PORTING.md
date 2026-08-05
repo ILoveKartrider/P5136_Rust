@@ -62,6 +62,10 @@ been demonstrated.
   process-RNG selection and room-owned no-repeat history
 - [x] C#-exact ASCII-boundary S0-S8 room-title parser and per-equipment modern
   speed-physics variants selected transactionally at race start
+- [x] exact P5136 `PqChangeRoomInfoPacket` / `PrChangeRoomInfoPacket` codec,
+  room-master-only atomic title/password update and all-room reply; a changed
+  S0-S8 token selects that variant in the next `GrCommandStartPacket` while the
+  existing channel/session speed byte remains unchanged, matching the C# server
 - [x] channel-consistent no-title physics fallback: S6 for individual/team
   infinite-booster channels, S7 for speed, and S8 for item game-type rows
 - [ ] verified launch of a stock client on Windows
@@ -214,6 +218,13 @@ been demonstrated.
 - [x] exact stock 20-byte `PqEquipTuningExPacket` body, including the typed
   displaced-part descriptor, fixed-width success/failure replies, and
   lease-bound/no-follow atomic `PlantData.json` publication
+- [x] exact P5136 rider-equipment plant-slot order: engine, wheel, handle, kit
+  map to inventory categories `43, 45, 44, 46`; invalid or ungranted equipment
+  remains fail-closed and terminates the login TCP session
+- [x] `PrKartLevelUpProbText` keeps the 100%-success server policy separate from
+  its client-facing result code: accepted selection replies use the retained C#
+  golden `49 08 4C 59 00 00 00 00`, avoiding the client crash caused by writing
+  the percentage (`100`) into the result field
 - [x] all 91 recovered P5136 plant-part contributions, matched by exact
   `(kart_id, serial)` and composed into distinct speed/item plus S0-S8
   room-start physics blocks
@@ -252,8 +263,11 @@ been demonstrated.
 - [x] bounded MyRoom RequestEmblems authorization and exact catalog packet
 - [x] three-slot transactional main-emblem persistence and cache refresh
 - [x] race start/grid/readiness with deterministic fallback track
-- [x] actor-owned room track, basic-AI, closed-slot, rider-talk, and macro-chat
-  transitions with bounded atomic fanout
+- [x] actor-owned room track, basic-AI, and closed-slot transitions plus
+  sender-excluding rider-talk and C#-exact macro-chat relay with bounded atomic
+  fanout; racers and observers can send through Lobby, Loading, Running, and
+  Settling, with nonzero-team senders filtered to their team and team zero
+  broadcasting to all room peers
 - [x] requester-only `GrFirstRequestPacket` room-state rehydration, preventing
   a redundant peer `GrSlotDataPacket` from crossing a later race/ceremony
   scene boundary
@@ -263,6 +277,9 @@ been demonstrated.
   GameResult`
 - [x] durable settlement rank projection back into lobby `RoomPlayer.ranking`
   so the following `GrCommandStart` carries the previous race's start grid
+- [x] settlement-owned next-lobby master selection: highest remaining human in
+  individual races, or the highest remaining human on the server-decided
+  winning team; AI, observers, and departed racers are ineligible
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
 - [x] bounded read-only native RHO5 emblem-definition extraction

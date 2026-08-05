@@ -10,7 +10,10 @@ use thiserror::Error;
 use crate::{
     adler32,
     packet::{PacketError, PacketReader, PacketWriter},
-    room_protocol::{MAX_RIDER_NICKNAME_UTF16_UNITS, ROOM_DATA_LENGTH, ROOM_SLOT_COUNT, RoomAi},
+    room_protocol::{
+        MAX_RIDER_NICKNAME_UTF16_UNITS, MAX_ROOM_NAME_UTF16_UNITS, MAX_ROOM_PASSWORD_UTF16_UNITS,
+        ROOM_DATA_LENGTH, ROOM_SLOT_COUNT, RoomAi,
+    },
 };
 
 pub const SET_SLOT_STATE_REQUEST_NAME: &str = "GrRequestSetSlotStatePacket";
@@ -31,6 +34,8 @@ pub const RIDER_TALK_REQUEST_NAME: &str = "GrRiderTalkPacket";
 pub const RIDER_ECHO_NAME: &str = "GrRiderEchoPacket";
 pub const MACRO_CHAT_REQUEST_NAME: &str = "PqSendMacroChat";
 pub const MACRO_CHAT_RELAY_NAME: &str = "PcSendMacroChat";
+pub const CHANGE_ROOM_INFO_REQUEST_NAME: &str = "PqChangeRoomInfoPacket";
+pub const CHANGE_ROOM_INFO_REPLY_NAME: &str = "PrChangeRoomInfoPacket";
 
 pub const ROOM_OBSERVER_ID_END: i32 = 15;
 pub const MAX_ROOM_CHAT_UTF16_UNITS: usize = 256;
@@ -46,6 +51,7 @@ pub enum LobbyRequest {
     CloseSlot,
     RiderTalk,
     MacroChat,
+    ChangeRoomInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +170,14 @@ pub struct MacroChatRequest {
     pub client_message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeRoomInfoRequest {
+    pub room_name: String,
+    pub password: String,
+    pub limit_time: i32,
+    pub r_key_allowed: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartRoomStatus {
     Success = 0,
@@ -231,6 +245,7 @@ pub fn classify_lobby_request(hash: u32) -> Option<LobbyRequest> {
         (CLOSE_SLOT_REQUEST_NAME, LobbyRequest::CloseSlot),
         (RIDER_TALK_REQUEST_NAME, LobbyRequest::RiderTalk),
         (MACRO_CHAT_REQUEST_NAME, LobbyRequest::MacroChat),
+        (CHANGE_ROOM_INFO_REQUEST_NAME, LobbyRequest::ChangeRoomInfo),
     ]
     .into_iter()
     .find_map(|(name, request)| (adler32::packet_hash(name) == hash).then_some(request))
@@ -349,6 +364,21 @@ pub fn parse_macro_chat_request(packet: &[u8]) -> Result<MacroChatRequest, Lobby
     Ok(request)
 }
 
+pub fn parse_change_room_info_request(
+    packet: &[u8],
+) -> Result<ChangeRoomInfoRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, CHANGE_ROOM_INFO_REQUEST_NAME)?;
+    let request = ChangeRoomInfoRequest {
+        room_name: reader.read_utf16_bounded(MAX_ROOM_NAME_UTF16_UNITS)?,
+        password: reader.read_utf16_bounded(MAX_ROOM_PASSWORD_UTF16_UNITS)?,
+        limit_time: reader.read_i32()?,
+        r_key_allowed: reader.read_u8()?,
+    };
+    ensure_exhausted(&reader, CHANGE_ROOM_INFO_REQUEST_NAME)?;
+    Ok(request)
+}
+
 pub fn serialize_slot_state(
     states_by_id: [i32; ROOM_SLOT_COUNT],
 ) -> Result<Vec<u8>, LobbyProtocolError> {
@@ -464,7 +494,7 @@ pub fn serialize_close_slot_reply(
 }
 
 pub fn serialize_rider_echo(player_id: i32, message: &str) -> Result<Vec<u8>, LobbyProtocolError> {
-    validate_racer_player_id(player_id)?;
+    validate_player_id(player_id)?;
     validate_chat(message)?;
     let mut packet = PacketWriter::named(RIDER_ECHO_NAME);
     packet.write_i32(player_id);
@@ -484,6 +514,34 @@ pub fn serialize_macro_chat_relay(
     packet.write_i32(chat_type);
     packet.write_u8(message_id);
     packet.write_utf16(message)?;
+    Ok(packet.into_inner())
+}
+
+pub fn serialize_change_room_info_reply(
+    request: &ChangeRoomInfoRequest,
+) -> Result<Vec<u8>, LobbyProtocolError> {
+    let room_name_units = request.room_name.encode_utf16().count();
+    if room_name_units > MAX_ROOM_NAME_UTF16_UNITS {
+        return Err(PacketError::StringLimitExceeded {
+            length: room_name_units,
+            maximum: MAX_ROOM_NAME_UTF16_UNITS,
+        }
+        .into());
+    }
+    let password_units = request.password.encode_utf16().count();
+    if password_units > MAX_ROOM_PASSWORD_UTF16_UNITS {
+        return Err(PacketError::StringLimitExceeded {
+            length: password_units,
+            maximum: MAX_ROOM_PASSWORD_UTF16_UNITS,
+        }
+        .into());
+    }
+    let mut packet = PacketWriter::named(CHANGE_ROOM_INFO_REPLY_NAME);
+    packet.write_u8(1);
+    packet.write_utf16(&request.room_name)?;
+    packet.write_utf16(&request.password)?;
+    packet.write_i32(request.limit_time);
+    packet.write_u8(request.r_key_allowed);
     Ok(packet.into_inner())
 }
 
@@ -598,17 +656,19 @@ fn write_slot_positions(packet: &mut PacketWriter, positions: [i32; ROOM_SLOT_CO
 #[cfg(test)]
 mod tests {
     use super::{
-        BASIC_AI_REQUEST_NAME, CHANGE_MASTER_REQUEST_NAME, CHANGE_TEAM_REQUEST_NAME,
-        CHANGE_TRACK_REQUEST_NAME, CLOSE_SLOT_REQUEST_NAME, CloseSlotOperation, LobbyProtocolError,
-        LobbyRequest, MACRO_CHAT_REQUEST_NAME, PlayerSlotState, RIDER_TALK_REQUEST_NAME, RoomTeam,
+        BASIC_AI_REQUEST_NAME, CHANGE_MASTER_REQUEST_NAME, CHANGE_ROOM_INFO_REPLY_NAME,
+        CHANGE_ROOM_INFO_REQUEST_NAME, CHANGE_TEAM_REQUEST_NAME, CHANGE_TRACK_REQUEST_NAME,
+        CLOSE_SLOT_REQUEST_NAME, CloseSlotOperation, LobbyProtocolError, LobbyRequest,
+        MACRO_CHAT_REQUEST_NAME, PlayerSlotState, RIDER_TALK_REQUEST_NAME, RoomTeam,
         SET_SLOT_STATE_REQUEST_NAME, START_ROOM_REQUEST_NAME, StartRoomStatus,
         classify_lobby_request, parse_basic_ai_request, parse_change_master_request,
-        parse_change_team_request, parse_change_track_request, parse_close_slot_request,
-        parse_macro_chat_request, parse_rider_talk_request, parse_set_slot_state_request,
-        parse_start_room_request, serialize_basic_ai_added, serialize_basic_ai_removed,
-        serialize_basic_ai_reply, serialize_change_team_reply, serialize_close_slot_reply,
-        serialize_macro_chat_relay, serialize_rider_echo, serialize_set_slot_state_reply,
-        serialize_slot_state, serialize_start_room_reply,
+        parse_change_room_info_request, parse_change_team_request, parse_change_track_request,
+        parse_close_slot_request, parse_macro_chat_request, parse_rider_talk_request,
+        parse_set_slot_state_request, parse_start_room_request, serialize_basic_ai_added,
+        serialize_basic_ai_removed, serialize_basic_ai_reply, serialize_change_room_info_reply,
+        serialize_change_team_reply, serialize_close_slot_reply, serialize_macro_chat_relay,
+        serialize_rider_echo, serialize_set_slot_state_reply, serialize_slot_state,
+        serialize_start_room_reply,
     };
     use crate::{adler32, packet::PacketWriter, room_protocol::RoomAi};
 
@@ -656,6 +716,11 @@ mod tests {
                 0x2D36_05BD,
                 LobbyRequest::MacroChat,
             ),
+            (
+                CHANGE_ROOM_INFO_REQUEST_NAME,
+                0x6057_0888,
+                LobbyRequest::ChangeRoomInfo,
+            ),
         ];
         for (name, expected_hash, request) in fixtures {
             assert_eq!(adler32::packet_hash(name), expected_hash);
@@ -690,6 +755,32 @@ mod tests {
                 .reserved,
             0
         );
+    }
+
+    #[test]
+    fn captured_room_info_changes_match_the_p5136_codec_and_reply_order() {
+        let request_packet = decode_hex(concat!(
+            "88085760",
+            "11000000",
+            "4B002F0041002F0052002F0054002F0052002F0049002F0044002F00200053003200",
+            "00000000",
+            "65007200",
+            "00"
+        ));
+        let request = parse_change_room_info_request(&request_packet).unwrap();
+        assert_eq!(request.room_name, "K/A/R/T/R/I/D/ S2");
+        assert_eq!(request.password, "");
+        assert_eq!(request.limit_time, 0x0072_0065);
+        assert_eq!(request.r_key_allowed, 0);
+
+        let reply = serialize_change_room_info_reply(&request).unwrap();
+        assert_eq!(
+            adler32::packet_hash(CHANGE_ROOM_INFO_REPLY_NAME),
+            0x606C_0889
+        );
+        assert_eq!(reply[0..4], 0x606C_0889_u32.to_le_bytes());
+        assert_eq!(reply[4], 1);
+        assert_eq!(&reply[5..], &request_packet[4..]);
     }
 
     #[test]
@@ -818,6 +909,10 @@ mod tests {
             decode_hex("86065F3900000000010000004100")
         );
         assert_eq!(
+            serialize_rider_echo(8, "A").unwrap(),
+            decode_hex("86065F3908000000010000004100")
+        );
+        assert_eq!(
             serialize_macro_chat_relay(10, 0, 1, "").unwrap(),
             decode_hex("AF05722C0A000000000000000100000000")
         );
@@ -857,6 +952,10 @@ mod tests {
         ));
         assert!(matches!(
             serialize_set_slot_state_reply(1, true, 16, PlayerSlotState::Ready),
+            Err(LobbyProtocolError::InvalidPlayerId(16))
+        ));
+        assert!(matches!(
+            serialize_rider_echo(16, "invalid"),
             Err(LobbyProtocolError::InvalidPlayerId(16))
         ));
 

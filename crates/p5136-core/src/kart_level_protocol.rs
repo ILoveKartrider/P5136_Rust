@@ -31,7 +31,9 @@ pub const KART_LEVEL_SPECIAL_SLOT_UPDATE_REQUEST_WIRE_LENGTH: usize = 10;
 
 const STATE_REPLY_SUCCESS: i32 = 1;
 const STATE_REPLY_FAILURE: i32 = 0;
-const PROBABILITY_REPLY_SUCCESS: i32 = 100;
+// This is the client-facing result code, not the configured success chance.
+// The retained C# handler writes zero for an accepted probability-text query.
+const PROBABILITY_REPLY_SUCCESS: i32 = 0;
 
 /// Identifies one independently owned kart inventory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,14 +245,18 @@ pub fn parse_kart_level_special_slot_update_request(
     Ok(request)
 }
 
-/// The stock P5136 codec uses result `100` for a successful
-/// probability-text query. The response has no other fields.
+/// Serializes the accepted result code used by the retained P5136 C# handler.
+///
+/// This `0` must not be replaced by the server's configured success percentage:
+/// the client passes the field into its kart-level probability UI as a result
+/// value, where `100` is outside the expected domain and terminates the client.
+/// The retained C# response contains no other wire fields.
 #[must_use]
 pub fn serialize_kart_level_up_probability_success() -> Vec<u8> {
     serialize_kart_level_up_probability_result(PROBABILITY_REPLY_SUCCESS)
 }
 
-/// Serializes the same single-i32 response with a caller-selected non-100
+/// Serializes the same single-i32 response with a caller-selected non-zero
 /// compatibility error code.
 #[must_use]
 pub fn serialize_kart_level_up_probability_failure(error_code: i32) -> Vec<u8> {
@@ -653,10 +659,10 @@ mod tests {
     }
 
     #[test]
-    fn probability_success_and_failure_are_single_result_fields() {
+    fn probability_result_codes_match_the_csharp_fixed_shape() {
         assert_eq!(
             serialize_kart_level_up_probability_success(),
-            decode_hex("49084C5964000000")
+            decode_hex("49084C5900000000")
         );
         assert_eq!(
             serialize_kart_level_up_probability_failure(7),

@@ -1,9 +1,32 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
+
+## 2026-08-05 v0.1.5 room control and customization compatibility
+
+- Corrected the P5136 plant snapshot's engine/wheel/handle/kit category order
+  and the kart-level probability-query result field that previously terminated
+  the client when it was confused with a success percentage.
+- Added the exact room-title/password change codec and atomic master-only room
+  update. A changed S0-S8 title token selects the next race's physics variant
+  without rewriting the existing channel/session speed byte.
+- Rider and macro chat now retain C# room-membership scope through loading,
+  racing, and settlement. Racers and observers can send; observer player IDs
+  remain 8..15, sender exclusion is preserved, and nonzero teams retain their
+  team filter while team zero broadcasts to every peer.
+- Settlement now chooses the next lobby master from the highest-ranked
+  remaining human in individual races, or the highest-ranked remaining human
+  on the server-decided winning team. AI, observers, and departed racers are
+  not eligible.
+- The fixed-path Windows release candidate is
+  `target/p5136-finish-kart-abilities/release/p5136.exe` (18,356,736 bytes,
+  SHA-256
+  `4293B8F1245CB28277677A0E6263356FC8917626B65686A42649B2A378576376`).
+  `--version` reports `p5136 0.1.5`. Workspace all-target tests, warning-denying
+  Clippy, formatting, `git diff --check`, and the release build pass.
 
 ## 2026-08-04 lobby balance, channel fallback, GUI settings memory, and next grid
 
@@ -1159,10 +1182,10 @@ policy gap.
   analysis artifact and authoritative object ownership remain documented
   evidence/tooling gaps rather than guessed runtime policy.
 - The current CLI/GUI E2E build is
-  `target\p5136-finish-kart-abilities\release\p5136.exe` (18,347,008 bytes,
+  `target\p5136-finish-kart-abilities\release\p5136.exe` (18,356,736 bytes,
   SHA-256
-  `F1A8093D794BAD57CCD1B98C1F3FD860EE46EA338544ACEB5BE04290B20BF86F`).
-  `--version` reports `p5136 0.1.4`; the release target is the single fixed
+  `4293B8F1245CB28277677A0E6263356FC8917626B65686A42649B2A378576376`).
+  `--version` reports `p5136 0.1.5`; the release target is the single fixed
   Cargo output directory. The latest stock-data loader test used the user's
   real `KartRider_5136\Data` directly, loaded 493 catalog transforms, classified
   1,282 automatic and 14 quarantined karts, and required no generated

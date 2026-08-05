@@ -45,9 +45,14 @@ pub struct RiderItemSelection {
     pub rider_color: u16,
     pub bonus_card: u16,
     pub boss_mode_card: u16,
+    /// Plant engine item (inventory category 43).
     pub kart_plant1: u16,
+    /// Plant wheel item (inventory category 45). P5136 places this before the
+    /// handle in the rider-item wire snapshot.
     pub kart_plant2: u16,
+    /// Plant handle item (inventory category 44).
     pub kart_plant3: u16,
+    /// Plant kit item (inventory category 46).
     pub kart_plant4: u16,
     pub unknown3: u16,
     pub fishing_pole: u16,

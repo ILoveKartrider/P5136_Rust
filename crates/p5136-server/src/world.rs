@@ -20,12 +20,13 @@ use p5136_core::{
     },
     kart_physics::{P5136_MODERN_SPEED_TYPE_COUNT, csharp_room_title_speed_type},
     lobby_protocol::{
-        BasicAiRequest, ChangeTrackRequest, CloseSlotRequest, LobbyProtocolError, MacroChatRequest,
-        PlayerSlotState, RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, StartRoomStatus,
+        BasicAiRequest, ChangeRoomInfoRequest, ChangeTrackRequest, CloseSlotRequest,
+        LobbyProtocolError, MacroChatRequest, PlayerSlotState,
+        RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, StartRoomStatus,
         serialize_basic_ai_added, serialize_basic_ai_removed, serialize_basic_ai_reply,
-        serialize_change_team_reply, serialize_close_slot_reply, serialize_macro_chat_relay,
-        serialize_rider_echo as serialize_lobby_rider_echo, serialize_set_slot_state_reply,
-        serialize_slot_state, serialize_start_room_reply,
+        serialize_change_room_info_reply, serialize_change_team_reply, serialize_close_slot_reply,
+        serialize_macro_chat_relay, serialize_rider_echo as serialize_lobby_rider_echo,
+        serialize_set_slot_state_reply, serialize_slot_state, serialize_start_room_reply,
     },
     myroom_protocol::{
         CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus, EnterMyRoomStatus,
@@ -885,6 +886,7 @@ pub(crate) enum LobbyCommandPayload {
         request: MacroChatRequest,
         resolved_message: String,
     },
+    ChangeRoomInfo(ChangeRoomInfoRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -929,6 +931,9 @@ pub(crate) enum LobbyCommandOutcome {
     MessageRelayed {
         room_id: RoomId,
         recipients: usize,
+    },
+    RoomInfoChanged {
+        room_id: RoomId,
     },
 }
 
@@ -4437,6 +4442,34 @@ impl ProtocolRoomState {
                 .ranking =
                 i32::try_from(next_grid_rank).expect("the fixed room ranking always fits in i32");
         }
+    }
+
+    /// Selects the next lobby master from humans who still occupy the room.
+    /// Individual rooms use the highest previous-race finisher. Team rooms
+    /// first restrict candidates to the server-decided winning team, then use
+    /// that team's highest finisher. AI and departed racers are never eligible.
+    fn apply_next_lobby_master(&mut self, ranking: &SettlementRanking) -> Option<i32> {
+        let next_master = self
+            .members_by_id
+            .iter()
+            .enumerate()
+            .filter_map(|(member_id, member)| {
+                member.as_ref()?;
+                let player_id =
+                    i32::try_from(member_id).expect("the fixed room member ID always fits in i32");
+                let ranked = ranking.by_player_id.get(&player_id)?;
+                if ranking
+                    .winning_team
+                    .is_some_and(|winning_team| ranked.team != Some(winning_team))
+                {
+                    return None;
+                }
+                Some((ranked.rank, ranked.finish_time, player_id))
+            })
+            .min_by_key(|&(rank, finish_time, player_id)| (rank, finish_time, player_id))
+            .map(|(_, _, player_id)| player_id)?;
+        self.room_master = next_master;
+        Some(next_master)
     }
 
     fn remove_user(&mut self, user_no: UserNo) -> bool {
@@ -8895,6 +8928,7 @@ impl World {
                 return;
             };
             room.apply_next_grid_ranking(&ranking);
+            room.apply_next_lobby_master(&ranking);
             room.phase = RoomPhase::Lobby;
             room.race_fence = None;
             room.frozen_race = None;
@@ -9606,6 +9640,9 @@ impl World {
                 resolved_message,
             } => self
                 .relay_macro_chat(&identity, &request, &resolved_message)
+                .map_err(Into::into),
+            LobbyCommandPayload::ChangeRoomInfo(request) => self
+                .change_room_info(&identity, &request)
                 .map_err(Into::into),
         }
     }
@@ -10640,6 +10677,39 @@ impl World {
         })
     }
 
+    fn change_room_info(
+        &mut self,
+        identity: &IdentityBinding,
+        request: &ChangeRoomInfoRequest,
+    ) -> Result<LobbyCommandOutcome, LobbyError> {
+        let room_id = self.protocol_room_id(identity)?;
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("protocol membership always references an existing room");
+        Self::require_lobby(room)?;
+        let requester_id = room
+            .member_id(identity.user_no)
+            .ok_or(LobbyError::HumanRacerRequired)?;
+        if room.room_master != i32::try_from(requester_id).expect("room member ID fits in i32") {
+            return Err(LobbyError::NotRoomMaster);
+        }
+
+        let mut next = room.clone();
+        next.settings.room_name.clone_from(&request.room_name);
+        next.settings.password.clone_from(&request.password);
+
+        let reply = serialize_change_room_info_reply(request)?;
+        let batch = OutboundBatch::single(reply);
+        let deliveries = self.same_batch_for_room(&next, &batch)?;
+        let reserved = self.reserve_outbound(deliveries)?;
+
+        self.protocol_rooms.insert(room_id, next);
+        Self::publish_reserved(reserved);
+        self.debug_assert_invariants();
+        Ok(LobbyCommandOutcome::RoomInfoChanged { room_id })
+    }
+
     fn relay_rider_talk(
         &self,
         identity: &IdentityBinding,
@@ -10650,12 +10720,9 @@ impl World {
             .protocol_rooms
             .get(&room_id)
             .expect("protocol membership always references an existing room");
-        Self::require_lobby(room)?;
         let player_id = room
-            .member_id(identity.user_no)
+            .equipment_player_id(identity.user_no)
             .ok_or(LobbyError::HumanRacerRequired)?;
-        let player_id =
-            i32::try_from(player_id).expect("the fixed room member ID always fits in i32");
         let packet = serialize_lobby_rider_echo(player_id, &request.message)?;
         let deliveries = self
             .active_room_sessions(room)?
@@ -10683,10 +10750,8 @@ impl World {
             .protocol_rooms
             .get(&room_id)
             .expect("protocol membership always references an existing room");
-        Self::require_lobby(room)?;
         let sender = room
             .member_by_user_no(identity.user_no)
-            .filter(|_| room.member_id(identity.user_no).is_some())
             .ok_or(LobbyError::HumanRacerRequired)?;
         let packet = serialize_macro_chat_relay(
             identity.user_no.get(),
@@ -10701,6 +10766,7 @@ impl World {
             .filter(|(user_no, _)| *user_no != identity.user_no)
             .filter(|(user_no, _)| {
                 request.chat_type == 0
+                    || sender_team == 0
                     || room
                         .member_by_user_no(*user_no)
                         .is_some_and(|member| member.player.team == sender_team)
@@ -13793,8 +13859,9 @@ mod tests {
             ParsedGameSlotPacket, parse_game_slot_packet,
         },
         lobby_protocol::{
-            BASIC_AI_REPLY_NAME, BASIC_AI_SLOT_DATA_NAME, BasicAiRequest, CHANGE_TEAM_REPLY_NAME,
-            CLOSE_SLOT_REPLY_NAME, ChangeTrackRequest, CloseSlotOperation, CloseSlotRequest,
+            BASIC_AI_REPLY_NAME, BASIC_AI_SLOT_DATA_NAME, BasicAiRequest,
+            CHANGE_ROOM_INFO_REPLY_NAME, CHANGE_TEAM_REPLY_NAME, CLOSE_SLOT_REPLY_NAME,
+            ChangeRoomInfoRequest, ChangeTrackRequest, CloseSlotOperation, CloseSlotRequest,
             MACRO_CHAT_RELAY_NAME, MacroChatRequest, PlayerSlotState, RIDER_ECHO_NAME,
             RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
             SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
@@ -13839,9 +13906,10 @@ mod tests {
         MyRoomLifecycleError, MyRoomOwnerChoiceSource, MyRoomPeerCommandPayload,
         MyRoomPreparedCommand, MyRoomProtectedResource, MyRoomWireProjection, OutboundBatch,
         ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload, RaceError,
-        RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId, RoomParticipant,
-        RoomPhase, SessionId, StartRoomPlan, World, WorldCommand, WorldError, WorldHandle,
-        WorldOperationError, WorldSidecarError, WorldSidecars, WorldSpawnError, dispatch_command,
+        RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId,
+        RoomKartPhysicsVariants, RoomParticipant, RoomPhase, SessionId, StartRoomPlan, World,
+        WorldCommand, WorldError, WorldHandle, WorldOperationError, WorldSidecarError,
+        WorldSidecars, WorldSpawnError, dispatch_command,
     };
     use crate::equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentWriteError,
@@ -14551,6 +14619,15 @@ mod tests {
         }
     }
 
+    fn change_room_info_request(room_name: &str, password: &str) -> ChangeRoomInfoRequest {
+        ChangeRoomInfoRequest {
+            room_name: room_name.to_owned(),
+            password: password.to_owned(),
+            limit_time: 0x0072_0065,
+            r_key_allowed: 0,
+        }
+    }
+
     fn join_request(room_id: RoomId) -> ChJoinRoomRequest {
         ChJoinRoomRequest {
             room_id: u16::try_from(room_id.0).unwrap(),
@@ -14575,6 +14652,185 @@ mod tests {
             )
             .unwrap();
         world.protocol_room_by_user[&owner.identity.user_no]
+    }
+
+    #[test]
+    fn changed_room_title_selects_the_new_physics_variant_at_the_next_start() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "TitleOwner", 67, 40_901, 64);
+        let default = P5136KartPhysicsBlock::from([99; 235]);
+        let variants = RoomKartPhysicsVariants::new(
+            default.clone(),
+            array::from_fn(|speed_type| {
+                P5136KartPhysicsBlock::from([u8::try_from(speed_type).unwrap(); 235])
+            }),
+        );
+        let mut participant = room_participant();
+        participant.kart_physics = default;
+        participant.kart_physics_variants = Some(variants);
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("initial title", 1),
+                    participant,
+                },
+            )
+            .unwrap();
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        drain_batches(&mut owner.outbound);
+
+        let request = change_room_info_request("next race S2", "pw");
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::ChangeRoomInfo(request.clone()),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::RoomInfoChanged {
+                room_id: changed_room_id,
+            } if changed_room_id == room_id
+        ));
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.settings.room_name, request.room_name);
+        assert_eq!(room.settings.password, request.password);
+        assert_eq!(
+            room.settings.speed_type, 7,
+            "C# keeps the channel/session speed byte separate from the title override"
+        );
+        assert_eq!(
+            logical_packet_hash(&take_single_packet(&mut owner.outbound)),
+            adler32::packet_hash(CHANGE_ROOM_INFO_REPLY_NAME)
+        );
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new(),
+                    )),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started { room_id: started_room_id, .. }
+                if started_room_id == room_id
+        ));
+        let packets = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(
+            logical_packet_hash(&packets[0]),
+            adler32::packet_hash(START_ROOM_REPLY_NAME)
+        );
+        assert!(
+            packets[1].windows(235).any(|window| window == [1_u8; 235]),
+            "S2 must map to protocol speed type 1 in the next GrCommandStartPacket"
+        );
+    }
+
+    #[test]
+    fn room_info_change_is_master_owned_broadcast_and_atomic() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "TitleAtomicOwner", 67, 40_910, 64);
+        let mut guest = register_channel_session(&mut world, "TitleAtomicGuest", 67, 40_920, 1);
+        let default = P5136KartPhysicsBlock::from([99; 235]);
+        let variants = RoomKartPhysicsVariants::new(
+            default.clone(),
+            array::from_fn(|speed_type| {
+                P5136KartPhysicsBlock::from([u8::try_from(speed_type).unwrap(); 235])
+            }),
+        );
+        let mut participant = room_participant();
+        participant.kart_physics = default;
+        participant.kart_physics_variants = Some(variants);
+        world
+            .room_protocol(
+                owner.session,
+                RoomCommandPayload::Create {
+                    request: create_request("initial title", 1),
+                    participant,
+                },
+            )
+            .unwrap();
+        let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+        drain_batches(&mut owner.outbound);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+
+        let unauthorized = change_room_info_request("guest title S4", "guest");
+        assert!(matches!(
+            world.lobby_command(
+                guest.session,
+                LobbyCommandPayload::ChangeRoomInfo(unauthorized),
+            ),
+            Err(WorldError::Lobby(LobbyError::NotRoomMaster))
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id].settings.room_name,
+            "initial title"
+        );
+        assert!(owner.outbound.try_recv().is_err());
+        assert!(guest.outbound.try_recv().is_err());
+
+        let mut s2 = change_room_info_request("atomic title S2", "pw");
+        s2.limit_time = 123;
+        s2.r_key_allowed = 1;
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::ChangeRoomInfo(s2.clone()),
+            )
+            .unwrap();
+        let owner_reply = take_single_packet(&mut owner.outbound);
+        assert_eq!(
+            logical_packet_hash(&owner_reply),
+            adler32::packet_hash(CHANGE_ROOM_INFO_REPLY_NAME)
+        );
+        // Leave the guest's capacity-one queue occupied. The next update must
+        // reserve every recipient before mutating the room or publishing.
+
+        let mut blocked = change_room_info_request("must roll back S4", "blocked");
+        blocked.limit_time = 456;
+        assert!(matches!(
+            world.lobby_command(
+                owner.session,
+                LobbyCommandPayload::ChangeRoomInfo(blocked),
+            ),
+            Err(WorldError::Lobby(LobbyError::OutboundUnavailable { session }))
+                if session == guest.session
+        ));
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.settings.room_name, s2.room_name);
+        assert_eq!(room.settings.password, s2.password);
+        assert_eq!(room.settings.speed_type, 7);
+        assert!(owner.outbound.try_recv().is_err());
+        assert_eq!(take_single_packet(&mut guest.outbound), owner_reply);
+
+        let mut fallback = change_room_info_request("plain title", "");
+        fallback.limit_time = 789;
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::ChangeRoomInfo(fallback.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            take_single_packet(&mut owner.outbound),
+            take_single_packet(&mut guest.outbound)
+        );
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.settings.room_name, fallback.room_name);
+        assert_eq!(room.settings.speed_type, 7);
+        assert_eq!(
+            room.member_by_user_no(owner.identity.user_no)
+                .unwrap()
+                .kart_physics_for_room(&room.settings)
+                .as_bytes(),
+            &[99; 235],
+            "removing the title token must restore the precomputed channel fallback"
+        );
     }
 
     fn join_protocol_room(
@@ -15038,6 +15294,136 @@ mod tests {
         }
         force_running(&mut world, room_id);
         (world, sessions, room_id)
+    }
+
+    #[test]
+    fn running_room_relays_typed_and_macro_chat_like_the_csharp_room_handler() {
+        let (mut world, mut sessions, room_id) =
+            prepare_game_slot_race("RunningChat", 41_751, &[(false, 64), (false, 64)]);
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    sessions[0].session,
+                    LobbyCommandPayload::RiderTalk(LobbyRiderTalkRequest {
+                        message: "race chat".to_owned(),
+                        reserved: 0,
+                    }),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::MessageRelayed {
+                room_id: relayed_room_id,
+                recipients: 1,
+            } if relayed_room_id == room_id
+        ));
+        assert!(sessions[0].outbound.try_recv().is_err());
+        assert_eq!(
+            logical_packet_hash(&take_single_packet(&mut sessions[1].outbound)),
+            adler32::packet_hash(RIDER_ECHO_NAME)
+        );
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    sessions[1].session,
+                    LobbyCommandPayload::MacroChat {
+                        request: MacroChatRequest {
+                            chat_type: 0,
+                            message_id: 1,
+                            client_message: String::new(),
+                        },
+                        // The native consumer resolves an empty body from the
+                        // sender user number and message ID.
+                        resolved_message: String::new(),
+                    },
+                )
+                .unwrap(),
+            LobbyCommandOutcome::MessageRelayed {
+                room_id: relayed_room_id,
+                recipients: 1,
+            } if relayed_room_id == room_id
+        ));
+        let macro_packet = take_single_packet(&mut sessions[0].outbound);
+        assert_eq!(
+            logical_packet_hash(&macro_packet),
+            adler32::packet_hash(MACRO_CHAT_RELAY_NAME)
+        );
+        assert_eq!(macro_packet.len(), 17);
+        assert_eq!(
+            u32::from_le_bytes(macro_packet[4..8].try_into().unwrap()),
+            sessions[1].identity.user_no.get()
+        );
+        assert_eq!(
+            i32::from_le_bytes(macro_packet[8..12].try_into().unwrap()),
+            0
+        );
+        assert_eq!(macro_packet[12], 1);
+        assert_eq!(
+            i32::from_le_bytes(macro_packet[13..17].try_into().unwrap()),
+            0
+        );
+        assert!(sessions[1].outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn running_observer_chat_uses_observer_id_and_csharp_team_zero_broadcast() {
+        let (mut world, mut sessions, room_id) = prepare_game_slot_race(
+            "RunningObserverChat",
+            41_781,
+            &[(false, 64), (false, 64), (true, 64)],
+        );
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    sessions[2].session,
+                    LobbyCommandPayload::RiderTalk(LobbyRiderTalkRequest {
+                        message: "observer chat".to_owned(),
+                        reserved: 0,
+                    }),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::MessageRelayed {
+                room_id: relayed_room_id,
+                recipients: 2,
+            } if relayed_room_id == room_id
+        ));
+        let owner_echo = take_single_packet(&mut sessions[0].outbound);
+        assert_eq!(owner_echo, take_single_packet(&mut sessions[1].outbound));
+        assert_eq!(
+            logical_packet_hash(&owner_echo),
+            adler32::packet_hash(RIDER_ECHO_NAME)
+        );
+        assert_eq!(i32::from_le_bytes(owner_echo[4..8].try_into().unwrap()), 8);
+        assert!(sessions[2].outbound.try_recv().is_err());
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    sessions[2].session,
+                    LobbyCommandPayload::MacroChat {
+                        request: MacroChatRequest {
+                            chat_type: 1,
+                            message_id: 2,
+                            client_message: String::new(),
+                        },
+                        resolved_message: "observer macro".to_owned(),
+                    },
+                )
+                .unwrap(),
+            LobbyCommandOutcome::MessageRelayed { recipients: 2, .. }
+        ));
+        let owner_macro = take_single_packet(&mut sessions[0].outbound);
+        assert_eq!(owner_macro, take_single_packet(&mut sessions[1].outbound));
+        assert_eq!(
+            logical_packet_hash(&owner_macro),
+            adler32::packet_hash(MACRO_CHAT_RELAY_NAME)
+        );
+        assert_eq!(
+            i32::from_le_bytes(owner_macro[8..12].try_into().unwrap()),
+            1
+        );
+        assert!(sessions[2].outbound.try_recv().is_err());
     }
 
     fn prepare_single_reward_persistence(
@@ -17827,6 +18213,10 @@ mod tests {
         assert_eq!(packets, frozen_final_packets);
         let returned_room = &world.protocol_rooms[&room_id];
         assert_eq!(returned_room.phase, RoomPhase::Lobby);
+        assert_eq!(
+            returned_room.room_master, 1,
+            "the highest-ranked remaining human on the blue winning team becomes master"
+        );
         assert_eq!(
             returned_room.members_by_id[1]
                 .as_ref()
@@ -20684,8 +21074,11 @@ mod tests {
         };
         let room = world.protocol_rooms.get_mut(&room_id).unwrap();
         room.apply_next_grid_ranking(&ranking);
+        assert_eq!(room.apply_next_lobby_master(&ranking), Some(1));
 
         let slot_data = room.slot_data();
+        assert_eq!(room.room_master, 1);
+        assert_eq!(slot_data.room_master, 1);
         assert_eq!(room.members_by_id[0].as_ref().unwrap().player.ranking, 1);
         assert_eq!(room.members_by_id[1].as_ref().unwrap().player.ranking, 0);
         assert!(matches!(
@@ -20696,6 +21089,48 @@ mod tests {
             &slot_data.members_by_id[1],
             super::WireRoomMember::Player(player) if player.ranking == 0
         ));
+    }
+
+    #[test]
+    fn team_settlement_selects_the_winning_teams_highest_remaining_human_as_master() {
+        let mut world = World::default();
+        let sessions = (0..4)
+            .map(|index| {
+                register_channel_session(
+                    &mut world,
+                    &format!("WinnerMaster{index}"),
+                    68,
+                    42_301 + index * 10,
+                    64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let room_id = create_protocol_room(&mut world, &sessions[0], 3);
+        for session in &sessions[1..] {
+            join_protocol_room(&mut world, session, room_id, false);
+        }
+        let ranked_result = |rank, team| super::RankedRaceResult {
+            finish_time: 1_000 + u32::try_from(rank).unwrap(),
+            rank,
+            team,
+            team_points: 0,
+        };
+        let ranking = super::SettlementRanking {
+            winning_team: Some(ResultTeam::Red),
+            by_player_id: HashMap::from([
+                (0, ranked_result(0, Some(ResultTeam::Blue))),
+                (1, ranked_result(2, Some(ResultTeam::Red))),
+                (2, ranked_result(3, Some(ResultTeam::Blue))),
+                (3, ranked_result(1, Some(ResultTeam::Red))),
+            ]),
+        };
+        let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+        assert_eq!(room.apply_next_lobby_master(&ranking), Some(3));
+        assert_eq!(room.slot_data().room_master, 3);
+
+        assert!(room.remove_user(sessions[3].identity.user_no));
+        assert_eq!(room.apply_next_lobby_master(&ranking), Some(1));
+        assert_eq!(room.slot_data().room_master, 1);
     }
 
     #[test]

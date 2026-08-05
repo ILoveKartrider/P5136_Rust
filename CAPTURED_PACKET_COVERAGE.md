@@ -1,6 +1,6 @@
 # Retained P5136 packet-trace coverage
 
-Last updated: 2026-07-31
+Last updated: 2026-08-05
 
 This ledger records the read-only audit of
 `C:\Users\drash\Documents\kartrider\KartRider_5136\logs`. The capture files
@@ -52,7 +52,8 @@ remain external evidence and are not copied into this repository.
 | `PqNewCareerItemStatePacket` | 26, 36 | covered | Bounded counted item-state vector; authenticated diagnostic no-reply |
 | `PqNewCareerListPacket` | 4 | covered | Exact 24-byte empty career projection |
 | `PqReportUdpReconnect` | 4 | covered | Exact-generation UDP rebind authorization clears stale Game/P2P routes behind an arrival-epoch fence |
-| `PqSendMacroChat` | 13 | covered | Resolves the bound profile quick-message table and actor-fans out with team filtering |
+| `PqChangeRoomInfoPacket` | 43, 51 | covered | Exact bounded title/password/limit/R-key codec; room-master-only atomic all-room update, with the changed title selecting next-start S0-S8 physics |
+| `PqSendMacroChat` | 13 | covered | Resolves the bound profile quick-message table and atomically relays racer/observer messages in every room phase; global or team-zero messages reach all peers, while nonzero teams keep the C# team filter |
 | `PqStartScenario` | 8 | covered | Exact reply plus canonical-lane durable `scenario_type` update |
 | `PqStartTimeAttack` | 39 | covered | Checked entry fee plus atomic mode/track state, requested physics build, active-run fence, then exact reply |
 | `PcRideSwithInfoPacket` (`0x5815082A`) | 56, 64, 68, 72, 76, 80, 88 observed | covered | Bounded typed elapsed/map/vector/eight-aggregate container; all producer bytes are consumed and the observed sizes are regression fixtures, not a generic unknown-packet escape hatch |
