@@ -6,7 +6,7 @@
 //! one immutable in-memory snapshot, so no generated sidecar is required.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -85,6 +85,9 @@ pub struct ClientKartCatalogStats {
     pub specs: usize,
     pub inventory_items: usize,
     pub inventory_categories: usize,
+    pub inventory_karts: usize,
+    pub auto_grant_karts: usize,
+    pub quarantined_karts: usize,
     pub transform_rules: usize,
     pub item_symbols: usize,
 }
@@ -226,7 +229,18 @@ struct RawTransform {
 
 type KartNames = BTreeMap<u16, Prioritized<String>>;
 type KartSpecs = BTreeMap<String, Prioritized<SourceElement>>;
-type InventoryItem = (u16, u16, String);
+#[derive(Debug, Default)]
+struct KartResources {
+    model_folders: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct InventoryItem {
+    category: u16,
+    id: u16,
+    name: String,
+    auto_grant: bool,
+}
 type TransformSources = BTreeMap<String, Prioritized<SourceElement>>;
 
 /// Reads the authoritative catalog inputs directly from `kart.rho`,
@@ -237,9 +251,10 @@ pub fn load_client_kart_catalog(
     data_directory: impl AsRef<Path>,
 ) -> Result<LoadedClientKartCatalog, ClientKartCatalogError> {
     let (source_directory, kart_path, item_path) = client_catalog_paths(data_directory.as_ref())?;
-    let (names, specs, rho5) = load_kart_metadata(&source_directory, &kart_path)?;
+    let (names, specs, resources, rho5) = load_kart_metadata(&source_directory, &kart_path)?;
     validate_kart_metadata(&names, &specs)?;
-    let inventory = load_inventory(&rho5, &names)?;
+    let mut inventory = load_inventory(&rho5, &names)?;
+    classify_kart_auto_grants(&mut inventory, &names, &specs, &resources);
     let (symbols, transforms) = load_item_transforms(&item_path)?;
 
     let xml = build_catalog_xml(&names, &specs, &inventory, &transforms)?;
@@ -251,9 +266,18 @@ pub fn load_client_kart_catalog(
         inventory_items: inventory.len(),
         inventory_categories: inventory
             .iter()
-            .map(|item| item.0)
+            .map(|item| item.category)
             .collect::<BTreeSet<_>>()
             .len(),
+        inventory_karts: inventory.iter().filter(|item| item.category == 3).count(),
+        auto_grant_karts: inventory
+            .iter()
+            .filter(|item| item.category == 3 && item.auto_grant)
+            .count(),
+        quarantined_karts: inventory
+            .iter()
+            .filter(|item| item.category == 3 && !item.auto_grant)
+            .count(),
         transform_rules: transforms.len(),
         item_symbols: symbols.len(),
     };
@@ -295,12 +319,16 @@ fn client_catalog_paths(
 fn load_kart_metadata(
     source_directory: &Path,
     kart_path: &Path,
-) -> Result<(KartNames, KartSpecs, Rho5Directory), ClientKartCatalogError> {
+) -> Result<(KartNames, KartSpecs, KartResources, Rho5Directory), ClientKartCatalogError> {
     let kart_archive = LegacyRhoArchive::open(kart_path, kart_rho_limits())?;
     let mut names = KartNames::new();
     let mut specs = KartSpecs::new();
+    let mut resources = KartResources::default();
     for entry in kart_archive.entries()? {
         let path = entry.normalized_path();
+        if let Some(folder) = kart_model_folder(path) {
+            resources.model_folders.insert(folder);
+        }
         let file_name = path.rsplit('/').next().unwrap_or(path);
         let name_priority = catalog_file_priority(file_name, "itemTable", "kr");
         if name_priority > 0 {
@@ -316,6 +344,9 @@ fn load_kart_metadata(
     let rho5 = Rho5Directory::scan_kr(source_directory, catalog_rho5_limits())?;
     for entry in rho5.entries() {
         let path = entry.normalized_path();
+        if let Some(folder) = kart_model_folder(path) {
+            resources.model_folders.insert(folder);
+        }
         let file_name = path.rsplit('/').next().unwrap_or(path);
         let name_priority = catalog_file_priority(file_name, "itemTable", "kr");
         let spec = kart_param_candidate(path, "kr");
@@ -333,7 +364,7 @@ fn load_kart_metadata(
     // `kart.rho` is 112 MiB in the stock build. Release it before opening
     // `item.rho` so startup does not retain both legacy archives at once.
     drop(kart_archive);
-    Ok((names, specs, rho5))
+    Ok((names, specs, resources, rho5))
 }
 
 fn validate_kart_metadata(
@@ -364,6 +395,63 @@ fn load_inventory(
         .ok_or(ClientKartCatalogError::MissingInventory)?;
     let inventory_bytes = checked_rho5_extract(rho5, inventory_entry)?;
     parse_inventory(inventory_entry.normalized_path(), &inventory_bytes, names)
+}
+
+fn classify_kart_auto_grants(
+    inventory: &mut [InventoryItem],
+    names: &KartNames,
+    specs: &KartSpecs,
+    resources: &KartResources,
+) {
+    for item in inventory.iter_mut().filter(|item| item.category == 3) {
+        item.auto_grant = kart_is_safe_for_automatic_grant(item, names, specs, resources);
+    }
+}
+
+fn kart_is_safe_for_automatic_grant(
+    item: &InventoryItem,
+    names: &KartNames,
+    specs: &KartSpecs,
+    resources: &KartResources,
+) -> bool {
+    let Some(internal_name) = names.get(&item.id).map(|name| name.value.trim()) else {
+        return false;
+    };
+    if internal_name.is_empty() || looks_like_non_player_kart(internal_name, &item.name) {
+        return false;
+    }
+    let Some(spec) = specs.get(&internal_name.to_ascii_lowercase()) else {
+        return false;
+    };
+    let model_folder = spec
+        .value
+        .attribute("addModelFolder")
+        .map(str::trim)
+        .filter(|folder| !folder.is_empty())
+        .unwrap_or(internal_name)
+        .to_ascii_lowercase();
+    resources.model_folders.contains(&model_folder)
+}
+
+fn looks_like_non_player_kart(internal_name: &str, display_name: &str) -> bool {
+    let internal = internal_name.to_ascii_lowercase();
+    let display = display_name.to_ascii_lowercase();
+    internal.contains("dummy")
+        || internal.starts_with("npc_")
+        || internal.starts_with("ai_")
+        || internal.contains("test")
+        || display.contains("dummy")
+        || display.contains("test")
+        || display.contains("더미")
+}
+
+fn kart_model_folder(path: &str) -> Option<String> {
+    let mut components = path.rsplit('/');
+    if !components.next()?.eq_ignore_ascii_case("model.1s") {
+        return None;
+    }
+    let folder = components.next()?.trim();
+    (!folder.is_empty()).then(|| folder.to_ascii_lowercase())
 }
 
 fn load_item_transforms(
@@ -561,7 +649,7 @@ fn parse_inventory(
     path: &str,
     bytes: &[u8],
     names: &BTreeMap<u16, Prioritized<String>>,
-) -> Result<Vec<(u16, u16, String)>, ClientKartCatalogError> {
+) -> Result<Vec<InventoryItem>, ClientKartCatalogError> {
     let mut inventory = BTreeMap::new();
     for element in source_elements(path, bytes, "item")? {
         let category = parse_required::<u16>(&element, "itemCatId", path)?;
@@ -582,7 +670,12 @@ fn parse_inventory(
     }
     Ok(inventory
         .into_iter()
-        .map(|((category, id), name)| (category, id, name))
+        .map(|((category, id), name)| InventoryItem {
+            category,
+            id,
+            name,
+            auto_grant: true,
+        })
         .collect())
 }
 
@@ -774,7 +867,7 @@ fn write_catalog_inventory(
     let total = inventory.len().to_string();
     let categories = inventory
         .iter()
-        .map(|item| item.0)
+        .map(|item| item.category)
         .collect::<BTreeSet<_>>()
         .len()
         .to_string();
@@ -784,14 +877,17 @@ fn write_catalog_inventory(
     writer
         .write_event(Event::Start(inventory_root))
         .map_err(xml_build_error)?;
-    for (category, id, name) in inventory {
-        let category = category.to_string();
-        let id = id.to_string();
+    for item in inventory {
+        let category = item.category.to_string();
+        let id = item.id.to_string();
         let mut element = BytesStart::new("Item");
         element.push_attribute(("category", category.as_str()));
         element.push_attribute(("id", id.as_str()));
-        if !name.trim().is_empty() {
-            element.push_attribute(("name", name.as_str()));
+        if !item.name.trim().is_empty() {
+            element.push_attribute(("name", item.name.as_str()));
+        }
+        if !item.auto_grant {
+            element.push_attribute(("autoGrant", "false"));
         }
         writer
             .write_event(Event::Empty(element))
@@ -1164,8 +1260,12 @@ fn catalog_file_format_priority(file_name: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
-        catalog_file_priority, decode_xml_text, kart_param_candidate, load_client_kart_catalog,
+        InventoryItem, KartNames, KartResources, KartSpecs, Prioritized, SourceElement,
+        catalog_file_priority, classify_kart_auto_grants, decode_xml_text, kart_model_folder,
+        kart_param_candidate, load_client_kart_catalog,
     };
 
     #[test]
@@ -1190,6 +1290,99 @@ mod tests {
     }
 
     #[test]
+    fn automatic_grants_require_a_spec_and_resolvable_model_resources() {
+        let names = KartNames::from([
+            (
+                1,
+                Prioritized {
+                    priority: 1,
+                    value: "normalKart".to_owned(),
+                },
+            ),
+            (
+                2,
+                Prioritized {
+                    priority: 1,
+                    value: "sharedKart".to_owned(),
+                },
+            ),
+            (
+                3,
+                Prioritized {
+                    priority: 1,
+                    value: "missingModel".to_owned(),
+                },
+            ),
+            (
+                4,
+                Prioritized {
+                    priority: 1,
+                    value: "missingSpec".to_owned(),
+                },
+            ),
+            (
+                5,
+                Prioritized {
+                    priority: 1,
+                    value: "development_test_kart".to_owned(),
+                },
+            ),
+        ]);
+        let body = |attributes: &[(&str, &str)]| Prioritized {
+            priority: 1,
+            value: SourceElement {
+                attributes: attributes
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+        };
+        let specs = KartSpecs::from([
+            ("normalkart".to_owned(), body(&[])),
+            (
+                "sharedkart".to_owned(),
+                body(&[("addModelFolder", "commonModel")]),
+            ),
+            ("missingmodel".to_owned(), body(&[])),
+            ("development_test_kart".to_owned(), body(&[])),
+        ]);
+        let resources = KartResources {
+            model_folders: HashSet::from([
+                "normalkart".to_owned(),
+                "commonmodel".to_owned(),
+                "development_test_kart".to_owned(),
+            ]),
+        };
+        let mut inventory = (1..=5)
+            .map(|id| InventoryItem {
+                category: 3,
+                id,
+                name: format!("Kart {id}"),
+                auto_grant: true,
+            })
+            .collect::<Vec<_>>();
+
+        classify_kart_auto_grants(&mut inventory, &names, &specs, &resources);
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|item| item.auto_grant)
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn model_folder_detection_is_case_insensitive_and_requires_model_file() {
+        assert_eq!(
+            kart_model_folder("kart_/GigantesV1/MODEL.1S"),
+            Some("gigantesv1".to_owned())
+        );
+        assert_eq!(kart_model_folder("kart_/GigantesV1/param.xml"), None);
+        assert_eq!(kart_model_folder("model.1s"), None);
+    }
+
+    #[test]
     fn configured_real_client_catalog_matches_the_known_p5136_shape() {
         let Ok(data) = std::env::var("P5136_CLIENT_DATA_DIR") else {
             return;
@@ -1200,16 +1393,25 @@ mod tests {
         assert_eq!(stats.specs, 1_353);
         assert_eq!(stats.inventory_items, 6_929);
         assert_eq!(stats.inventory_categories, 65);
+        assert_eq!(stats.inventory_karts, 1_296);
+        assert_eq!(stats.auto_grant_karts, 1_282);
+        assert_eq!(stats.quarantined_karts, 14);
         assert_eq!(stats.transform_rules, 493);
         assert_eq!(stats.item_symbols, 73);
         assert_eq!(loaded.catalog().kart_name(1_410), Some("gigantesV1"));
-        let reference_path = std::path::Path::new(&std::env::var("P5136_CLIENT_DATA_DIR").unwrap())
-            .parent()
-            .unwrap()
-            .join("Profile/KartCatalog.xml");
-        if reference_path.is_file() {
-            let reference = p5136_profile::CatalogInventory::load(reference_path).unwrap();
-            assert_eq!(loaded.catalog(), &reference);
-        }
+        assert!(loaded.catalog().grants_item(3, 1_410));
+        assert!(loaded.catalog().contains_kart(814));
+        assert!(!loaded.catalog().grants_item(3, 814));
+        assert_eq!(
+            loaded
+                .catalog()
+                .category(3)
+                .filter(|item| !item.auto_grant)
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![
+                199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 795, 814, 886, 1167,
+            ]
+        );
     }
 }

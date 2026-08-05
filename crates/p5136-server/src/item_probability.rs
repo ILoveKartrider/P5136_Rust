@@ -24,7 +24,7 @@ const MAX_WEIGHT: u32 = 1_000_000;
 const MAX_TABLE_BYTES: usize = 1024 * 1024;
 const MAX_TABLE_READ_BYTES: u64 = 1024 * 1024 + 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ItemProbabilityRankBand {
     Live,
     Top,
@@ -127,7 +127,7 @@ impl ItemProbabilityRankBand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ItemProbabilityEntry {
     pub item_id: i16,
     pub name: String,
@@ -155,7 +155,7 @@ impl ItemProbabilityEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ItemProbabilityConfiguration {
     pub rank_band: ItemProbabilityRankBand,
     pub individual: Vec<ItemProbabilityEntry>,

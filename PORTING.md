@@ -54,11 +54,16 @@ been demonstrated.
 - [x] Korean GUI labels, LAN IPv4 discovery/apply control, explicit IP-only
   bind/advertise guidance, invalid advertised-address rejection, and exact
   server-start item.rho snapshot confirmation
+- [x] bounded GUI persistence for server/connector inputs, including paths,
+  runner settings, limits, probability tables, and random-track overrides;
+  client root/Profile selection is required at the GUI server boundary
 - [x] bounded legacy RHO 1.0/1.1 reader and client `track_common.rho` random
   catalog with per-mode/selector pools, GUI overrides, AI filtering, and
   process-RNG selection and room-owned no-repeat history
-- [x] C#-exact ASCII-boundary S0-S7 room-title parser and per-equipment modern
+- [x] C#-exact ASCII-boundary S0-S8 room-title parser and per-equipment modern
   speed-physics variants selected transactionally at race start
+- [x] channel-consistent no-title physics fallback: S6 for individual/team
+  infinite-booster channels, S7 for speed, and S8 for item game-type rows
 - [ ] verified launch of a stock client on Windows
 - [ ] verified launch of the same client through Wine, CrossOver, or Sikarugir
 
@@ -97,6 +102,8 @@ been demonstrated.
 - [x] table-driven public race-channel mapping for speed/item individual/team
   and matching newbie channels
 - [x] ready, team, master, and observer actor state
+- [x] team-room admission balances active human/AI counts and assigns matching
+  blue/red physical slot ranges, choosing blue only when counts are tied
 - [x] bounded AI slot/wire primitives
 - [x] C#-compatible frozen-roster loading handshake: `GameControl(state=0)`
   arms, successful UDP time-sync marks ready, then timeout and ordered start
@@ -104,6 +111,14 @@ been demonstrated.
   P2P-source fallback, and relay
 - [x] synchronized UDP receive/activation order across generation boundaries
 - [x] exact-generation actor-owned UDP audience selection
+- [x] eight-client real-socket UDP relay mock: all eight senders fan out exact
+  movement packets to the other seven (56 datagrams), paired with an eight-human
+  frozen-roster target-resolution test
+- [x] configurable eight-client UDP stress test (120 seconds by default):
+  deterministic timing jitter and per-client latency force ping/movement ingress
+  reordering; deliberately old sender ticks and unordered exact-output matching
+  prove 7-way relay without loss, duplication, route corruption, or global-tick
+  assumptions
 - [x] exact-generation UDP reconnect reset for both Game/P2P routes with an
   arrival-epoch fence against stale datagrams
 - [x] bounded TCP GameSlot type 1/2/4/5/6/7/8/9/10/11/12/13/16/17 parsing and
@@ -196,6 +211,32 @@ been demonstrated.
 - [x] durable rider equipment/plant selection with actor cache publication
   and lobby-only next-race kart-physics refresh; Loading/Running physics remain
   frozen against mid-race equipment changes
+- [x] exact stock 20-byte `PqEquipTuningExPacket` body, including the typed
+  displaced-part descriptor, fixed-width success/failure replies, and
+  lease-bound/no-follow atomic `PlantData.json` publication
+- [x] all 91 recovered P5136 plant-part contributions, matched by exact
+  `(kart_id, serial)` and composed into distinct speed/item plus S0-S8
+  room-start physics blocks
+- [x] exact legacy kart-level request/reply codecs and `LevelData.json` preload,
+  including bounded 0..10 slots and 35-point validation, reconnect durability,
+  and kart-level physics composition
+- [x] sidecar-isolated lenient login/inventory preload with strict target-only
+  mutation, canonical last-wins `(kart_id, serial)` deduplication, and explicit
+  post-rename committed-but-durability-uncertain outcomes
+- [x] intentional free-server enhancement policy: owned target and donor are
+  authenticated, success probability/result are always 100%/success, request
+  cost and balances are not deducted, and the zero consumed-material descriptor
+  preserves the donor kart on both client and server; signed point deltas allow
+  bounded redistribution without exceeding any slot or the total budget
+- [x] native-consumer-correct Floater socket/tune/protect/reset codecs, including
+  full-width failure replies, category-3 target validation, and fixes for the C#
+  socket record-state and reset pre/post-state divergence
+- [x] lease-bound/no-follow atomic `TuneData.json`, reconnect preload ahead of
+  plant/level/parts, serial-normalized per-kart state, non-consuming activation
+  kits, bounded protection/reset transitions, and duplicate-protection rejection
+- [x] exact C# speed-Floater physics for codes 103..903; Black-H's fixed
+  603/703/903 set reaches the frozen room kart-physics block while item-mode
+  codes remain valid persistent client semantics without fabricated speed values
 - [x] MyRoom core topology and generation-aware cleanup/migration
 - [x] fresh MyRoom FirstState projection
 - [x] durable owner-info update and exact owner echo
@@ -220,6 +261,8 @@ been demonstrated.
 - [x] finish, ranking, settlement, team booster, and DNF deadline, including
   the deployed C# ceremony order `GameControl(state=4) -> GameNextStage ->
   GameResult`
+- [x] durable settlement rank projection back into lobby `RoomPlayer.ranking`
+  so the following `GrCommandStart` carries the previous race's start grid
 - [x] idempotent per-player reward persistence and retry/dead-letter state
 - [x] graceful/forced shutdown durability and visibility barriers
 - [x] bounded read-only native RHO5 emblem-definition extraction
@@ -276,6 +319,10 @@ been demonstrated.
   exactly-once frozen-kart item acquisition remapping, including Gigantes V1
   `5 -> 103`, `7/127 -> 99`, Sebek V1's eight 25% `-> goldShield(36)`
   paths, and separate partial-probability rolls
+- [x] conservative category-3 auto-grant admission requiring a resolved name,
+  `BodyParam`, and effective `model.1s` folder while excluding development-like
+  rows; quarantined catalog IDs remain available only through exact numeric GUI
+  lookup and a nickname-scoped serial-2+ manual grant
 - [ ] actor-owned live race position and track-box spawn/collision authority
 - [ ] evidence-backed held-slot/type-10 use and type-11 reaction side effects;
   common type-12 object lifecycle admission is actor-owned, while

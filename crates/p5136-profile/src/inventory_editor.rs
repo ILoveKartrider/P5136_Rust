@@ -2,7 +2,7 @@
 //!
 //! The stock P5136 inventory already grants one serial-1 instance of every
 //! usable catalog kart. Additional copies therefore only need durable
-//! `(kart_id, serial)` grants. Plant/parts sidecars and rider equipment both
+//! `(kart_id, serial)` grants. Floater/plant/level/parts sidecars and rider equipment
 //! use the same pair, which lets each copy retain different enhancement data.
 
 use std::collections::{BTreeMap, HashSet};
@@ -23,6 +23,7 @@ const MAX_CLIENT_SAFE_KART_SERIAL: u16 = 32_767;
 pub struct KartCatalogSearchResult {
     pub kart_id: u16,
     pub name: String,
+    pub auto_granted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +89,7 @@ pub enum KartInventoryEditError {
     #[error(transparent)]
     Equipment(#[from] EquipmentProfileError),
 
-    #[error("kart ID {kart_id} is not a usable category-3 grant in this catalog")]
+    #[error("kart ID {kart_id} is not a known category-3 kart in this catalog")]
     KartNotGrantable { kart_id: u16 },
 
     #[error("profile already contains the maximum {maximum} additional kart records")]
@@ -120,12 +121,19 @@ pub fn search_karts(
         return Vec::new();
     }
     let numeric_query = trimmed.parse::<u16>().ok();
-    let mut matches = grantable_kart_names(catalog)
+    let names = if numeric_query.is_some() {
+        known_kart_names(catalog)
+    } else {
+        grantable_kart_names(catalog)
+    };
+    let mut matches = names
         .into_iter()
         .filter_map(|(kart_id, name)| {
             let normalized_name = normalize_search_text(&name);
             let rank = if numeric_query == Some(kart_id) {
                 0
+            } else if numeric_query.is_some() {
+                return None;
             } else if normalized_name == normalized_query {
                 1
             } else if normalized_name.starts_with(&normalized_query) {
@@ -144,7 +152,11 @@ pub fn search_karts(
     matches
         .into_iter()
         .take(limit.min(MAX_KART_SEARCH_RESULTS))
-        .map(|(_, _, name, kart_id)| KartCatalogSearchResult { kart_id, name })
+        .map(|(_, _, name, kart_id)| KartCatalogSearchResult {
+            kart_id,
+            name,
+            auto_granted: catalog.grants_item(3, kart_id),
+        })
         .collect()
 }
 
@@ -153,7 +165,7 @@ pub fn search_karts(
 /// but are omitted from this operator view, matching runtime behavior.
 #[must_use]
 pub fn additional_karts(catalog: &CatalogInventory, profile: &Profile) -> Vec<AdditionalKart> {
-    let names = grantable_kart_names(catalog);
+    let names = known_kart_names(catalog);
     let mut seen = HashSet::new();
     let mut karts = profile
         .granted_karts
@@ -238,7 +250,7 @@ fn add_kart_to_profile(
     profile: &mut Profile,
     kart_id: u16,
 ) -> Result<GrantedKart, KartInventoryEditError> {
-    if !catalog.grants_item(3, kart_id) {
+    if !catalog.contains_kart(kart_id) {
         return Err(KartInventoryEditError::KartNotGrantable { kart_id });
     }
     if profile.granted_karts.len() >= MAX_ADDITIONAL_KARTS_PER_PROFILE {
@@ -259,7 +271,21 @@ fn add_kart_to_profile(
     if let Ok(signed_kart_id) = i16::try_from(kart_id) {
         used.extend(
             equipment
+                .tune
+                .iter()
+                .filter(|record| record.id == signed_kart_id)
+                .filter_map(|record| u16::try_from(record.serial).ok()),
+        );
+        used.extend(
+            equipment
                 .plant
+                .iter()
+                .filter(|record| record.id == signed_kart_id)
+                .filter_map(|record| u16::try_from(record.serial).ok()),
+        );
+        used.extend(
+            equipment
+                .kart_level
                 .iter()
                 .filter(|record| record.id == signed_kart_id)
                 .filter_map(|record| u16::try_from(record.serial).ok()),
@@ -314,6 +340,22 @@ fn grantable_kart_names(catalog: &CatalogInventory) -> BTreeMap<u16, String> {
         .collect()
 }
 
+fn known_kart_names(catalog: &CatalogInventory) -> BTreeMap<u16, String> {
+    catalog
+        .category(3)
+        .filter(|item| catalog.contains_kart(item.id))
+        .map(|item| {
+            let name = item.name.trim();
+            let name = if name.is_empty() {
+                catalog.kart_name(item.id).unwrap_or("이름 없는 카트")
+            } else {
+                name
+            };
+            (item.id, name.to_owned())
+        })
+        .collect()
+}
+
 fn normalize_search_text(value: &str) -> String {
     value
         .chars()
@@ -338,10 +380,11 @@ mod tests {
     fn catalog() -> CatalogInventory {
         CatalogInventory::from_structural_xml_for_tests(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
-                <Inventory total="3" categories="1">
+                <Inventory total="4" categories="1">
                     <Item category="3" id="1395" name="세베크 V1" />
                     <Item category="3" id="1410" name="기간테스 V1" />
                     <Item category="3" id="1430" name="흑기사 V1" />
+                    <Item category="3" id="1500" name="수동 확인 카트" autoGrant="false" />
                 </Inventory>
             </KartCatalog>"#
                 .as_bytes(),
@@ -362,6 +405,30 @@ mod tests {
         assert_eq!(by_fragment.len(), 2);
         let by_id = search_karts(&catalog, "1410", 10);
         assert_eq!(by_id[0].name, "기간테스 V1");
+    }
+
+    #[test]
+    fn quarantined_kart_is_hidden_by_name_but_can_be_added_by_exact_id() {
+        let catalog = catalog();
+        assert!(search_karts(&catalog, "수동 확인", 10).is_empty());
+
+        let by_id = search_karts(&catalog, "1500", 10);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].kart_id, 1_500);
+        assert_eq!(by_id[0].name, "수동 확인 카트");
+        assert!(!by_id[0].auto_granted);
+
+        let mut profile = Profile::default();
+        let grant = add_kart_to_profile(
+            &catalog,
+            &EquipmentExceptions::default(),
+            &mut profile,
+            1_500,
+        )
+        .unwrap();
+        assert_eq!(grant.serial, 2);
+        assert_eq!(additional_karts(&catalog, &profile)[0].kart_id, 1_500);
+        assert!(!catalog.grants_item(3, 1_500));
     }
 
     #[test]
@@ -432,12 +499,17 @@ mod tests {
     }
 
     #[test]
-    fn reserves_orphaned_plant_and_parts_sidecar_serials() {
+    fn reserves_orphaned_tune_plant_level_and_parts_sidecar_serials() {
         let root = tempdir().unwrap();
         let store = ProfileStore::new(root.path());
         let catalog = catalog();
         let loaded = store.load_or_create("Rider").unwrap();
         let rider_directory = loaded.source_path.parent().unwrap();
+        fs::write(
+            rider_directory.join("TuneData.json"),
+            r#"[{"ID":1410,"SN":6}]"#,
+        )
+        .unwrap();
         fs::write(
             rider_directory.join("PlantData.json"),
             r#"[{"ID":1410,"SN":2}]"#,
@@ -445,14 +517,21 @@ mod tests {
         .unwrap();
         fs::write(
             rider_directory.join("PartsData.json"),
-            r#"[{"ID":1410,"SN":4}]"#,
+            r#"[{"ID":1410,"SN":5}]"#,
+        )
+        .unwrap();
+        fs::write(
+            rider_directory.join("LevelData.json"),
+            r#"[{"ID":1410,"SN":4,"Grade":5,"Points":35}]"#,
         )
         .unwrap();
 
         let first = add_kart(&store, &catalog, "Rider", 1_410).unwrap();
         let second = add_kart(&store, &catalog, "Rider", 1_410).unwrap();
+        let third = add_kart(&store, &catalog, "Rider", 1_410).unwrap();
         assert_eq!(first.kart().serial, 3);
-        assert_eq!(second.kart().serial, 5);
+        assert_eq!(second.kart().serial, 7);
+        assert_eq!(third.kart().serial, 8);
     }
 
     #[test]

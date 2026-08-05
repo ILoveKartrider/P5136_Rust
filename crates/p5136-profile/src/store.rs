@@ -18,8 +18,8 @@ use cap_std::{
 };
 use fs2::FileExt;
 use p5136_core::{
-    equipment_protocol::XPartEquipRequest,
-    inventory::PartsExcRecord,
+    equipment_protocol::{PlantPartEquipRequest, XPartEquipRequest},
+    inventory::{KartLevelExcRecord, PartsExcRecord, PlantExcRecord, TuneExcRecord},
     nickname::{NicknameError, canonical_nickname_key, normalize_nickname},
 };
 use rand::random;
@@ -28,7 +28,10 @@ use thiserror::Error;
 
 use crate::{
     FavoriteItems, Profile,
-    equipment::{EquipmentExceptions, EquipmentProfileError},
+    equipment::{
+        EquipmentExceptions, EquipmentMutationOutcome, EquipmentProfileError, FloaterResetOutcome,
+        LenientEquipmentLoad,
+    },
 };
 
 const LEGACY_FILENAME: &str = "Launcher.json";
@@ -562,6 +565,49 @@ impl ProfileStore {
         lease: &RaceRunLease,
         nickname: &str,
     ) -> Result<EquipmentExceptions, EquipmentProfileError> {
+        self.with_equipment_profile_directory(
+            lease,
+            nickname,
+            |root, rider, root_path, rider_path| {
+                EquipmentExceptions::load_from_capabilities(root, rider, root_path, rider_path)
+            },
+        )
+    }
+
+    /// Loads optional equipment streams independently. A malformed or unsafe
+    /// sidecar contributes an empty stream plus a warning, so inventory preload
+    /// can keep the authenticated session alive. Mutations continue to use the
+    /// strict target-specific loaders below.
+    pub fn load_equipment_exceptions_lenient(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+    ) -> Result<LenientEquipmentLoad, EquipmentProfileError> {
+        self.with_equipment_profile_directory(
+            lease,
+            nickname,
+            |root, rider, root_path, rider_path| {
+                Ok(EquipmentExceptions::load_lenient_from_capabilities(
+                    root, rider, root_path, rider_path,
+                ))
+            },
+        )
+    }
+
+    fn with_equipment_profile_directory<T, F>(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        operation: F,
+    ) -> Result<T, EquipmentProfileError>
+    where
+        F: FnOnce(
+            &CapabilityDir,
+            &CapabilityDir,
+            &Path,
+            &Path,
+        ) -> Result<T, crate::equipment::EquipmentStateError>,
+    {
         self.validate_race_run_lease(lease)?;
         let nickname = Self::normalize_storage_nickname(nickname)?;
         let profile_lock = self.profile_lock(&nickname)?;
@@ -582,12 +628,99 @@ impl ProfileStore {
                 path: snapshot.directory.clone(),
                 source,
             })?;
-        Ok(EquipmentExceptions::load_from_capabilities(
+        Ok(operation(
             &lease.root_capability,
             &profile_directory,
             lease.root(),
             &snapshot.directory,
         )?)
+    }
+
+    /// Applies one plant-part selection through the run-bound, no-follow
+    /// profile capability and publishes `PlantData.json` atomically.
+    pub fn equip_plant_part(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        request: PlantPartEquipRequest,
+    ) -> Result<EquipmentMutationOutcome<PlantExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::equip_plant_part_capability(rider, rider_path, request)
+        })
+    }
+
+    pub fn activate_floater_socket(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+    ) -> Result<EquipmentMutationOutcome<TuneExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::activate_floater_socket_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+            )
+        })
+    }
+
+    pub fn apply_floater_tune(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+        selector: i16,
+    ) -> Result<EquipmentMutationOutcome<TuneExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::apply_floater_tune_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+                selector,
+            )
+        })
+    }
+
+    pub fn protect_floater_slot(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+        protect_kind: i16,
+        slot: i16,
+    ) -> Result<EquipmentMutationOutcome<TuneExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::protect_floater_slot_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+                protect_kind,
+                slot,
+            )
+        })
+    }
+
+    pub fn reset_floater_socket(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+    ) -> Result<EquipmentMutationOutcome<FloaterResetOutcome>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::reset_floater_socket_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+            )
+        })
     }
 
     /// Applies one X-part selection through the same lease-bound, no-follow
@@ -598,32 +731,82 @@ impl ProfileStore {
         lease: &RaceRunLease,
         nickname: &str,
         request: XPartEquipRequest,
-    ) -> Result<PartsExcRecord, EquipmentProfileError> {
-        self.validate_race_run_lease(lease)?;
-        let nickname = Self::normalize_storage_nickname(nickname)?;
-        let profile_lock = self.profile_lock(&nickname)?;
-        let _guard = lock(&profile_lock)?;
-        let snapshot = self.load_or_default_from_disk(&nickname)?;
-        let directory_name =
-            snapshot
-                .directory
-                .file_name()
-                .ok_or(ProfileStoreError::InternalInvariant {
-                    message: "equipment profile directory must have one terminal component",
-                })?;
-        let profile_directory = lease
-            .root_capability
-            .open_dir_nofollow(directory_name)
-            .map_err(|source| ProfileStoreError::Io {
-                operation: "open X-parts profile directory without following links",
-                path: snapshot.directory.clone(),
-                source,
-            })?;
-        Ok(EquipmentExceptions::equip_x_part_capability(
-            &profile_directory,
-            &snapshot.directory,
-            request,
-        )?)
+    ) -> Result<EquipmentMutationOutcome<PartsExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::equip_x_part_capability(rider, rider_path, request)
+        })
+    }
+
+    pub fn upgrade_kart_level(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+    ) -> Result<EquipmentMutationOutcome<KartLevelExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::upgrade_kart_level_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+            )
+        })
+    }
+
+    pub fn update_kart_level_points(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+        additions: [i16; 4],
+    ) -> Result<EquipmentMutationOutcome<KartLevelExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::update_kart_level_points_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+                additions,
+            )
+        })
+    }
+
+    pub fn clear_kart_level_points(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+    ) -> Result<EquipmentMutationOutcome<KartLevelExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::clear_kart_level_points_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+            )
+        })
+    }
+
+    pub fn update_kart_level_effect(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+        effect: i16,
+    ) -> Result<EquipmentMutationOutcome<KartLevelExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::update_kart_level_effect_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+                effect,
+            )
+        })
     }
 
     pub(crate) fn normalize_storage_nickname(nickname: &str) -> Result<String, ProfileStoreError> {

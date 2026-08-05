@@ -18,7 +18,7 @@ use p5136_core::{
         GameSlotRelayAudience, GameSlotSynthesisError, ItemOperation, ItemPickupKind,
         ParsedGameSlotPacket,
     },
-    kart_physics::csharp_room_title_speed_type,
+    kart_physics::{P5136_MODERN_SPEED_TYPE_COUNT, csharp_room_title_speed_type},
     lobby_protocol::{
         BasicAiRequest, ChangeTrackRequest, CloseSlotRequest, LobbyProtocolError, MacroChatRequest,
         PlayerSlotState, RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, StartRoomStatus,
@@ -742,25 +742,72 @@ pub(crate) struct RoomParticipant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoomKartPhysicsVariants {
     default: P5136KartPhysicsBlock,
-    by_speed_type: Arc<[P5136KartPhysicsBlock; 8]>,
+    by_speed_type: Arc<[P5136KartPhysicsBlock; P5136_MODERN_SPEED_TYPE_COUNT]>,
+    by_game_type_and_speed:
+        Option<Arc<[[P5136KartPhysicsBlock; P5136_MODERN_SPEED_TYPE_COUNT]; 4]>>,
 }
 
 impl RoomKartPhysicsVariants {
     #[must_use]
     pub(crate) fn new(
         default: P5136KartPhysicsBlock,
-        by_speed_type: [P5136KartPhysicsBlock; 8],
+        by_speed_type: [P5136KartPhysicsBlock; P5136_MODERN_SPEED_TYPE_COUNT],
     ) -> Self {
         Self {
             default,
             by_speed_type: Arc::new(by_speed_type),
+            by_game_type_and_speed: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_game_types(
+        default: P5136KartPhysicsBlock,
+        by_game_type_and_speed: [[P5136KartPhysicsBlock; P5136_MODERN_SPEED_TYPE_COUNT]; 4],
+    ) -> Self {
+        let by_speed_type = Arc::new(by_game_type_and_speed[0].clone());
+        Self {
+            default,
+            by_speed_type,
+            by_game_type_and_speed: Some(Arc::new(by_game_type_and_speed)),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn speed_blocks(&self) -> [P5136KartPhysicsBlock; P5136_MODERN_SPEED_TYPE_COUNT] {
+        self.by_speed_type.as_ref().clone()
     }
 
     fn for_room_title(&self, room_name: &str) -> &P5136KartPhysicsBlock {
         csharp_room_title_speed_type(room_name).map_or(&self.default, |speed_type| {
             &self.by_speed_type[usize::from(speed_type)]
         })
+    }
+
+    pub(crate) fn for_room(
+        &self,
+        room_name: &str,
+        game_type: u8,
+        fallback_speed_type: u8,
+    ) -> &P5136KartPhysicsBlock {
+        let Some(matrix) = &self.by_game_type_and_speed else {
+            return csharp_room_title_speed_type(room_name)
+                .or((fallback_speed_type != 7).then_some(fallback_speed_type))
+                .and_then(|speed_type| self.by_speed_type.get(usize::from(speed_type)))
+                .unwrap_or(&self.default);
+        };
+        let Some(game_index) = game_type
+            .checked_sub(1)
+            .map(usize::from)
+            .filter(|index| *index < 4)
+        else {
+            return self.for_room_title(room_name);
+        };
+        let speed_type = csharp_room_title_speed_type(room_name).unwrap_or(fallback_speed_type);
+        let Some(block) = matrix[game_index].get(usize::from(speed_type)) else {
+            return self.for_room_title(room_name);
+        };
+        block
     }
 }
 
@@ -3819,6 +3866,16 @@ struct ProtocolRoomMember {
     kart_physics_variants: Option<RoomKartPhysicsVariants>,
 }
 
+impl ProtocolRoomMember {
+    fn kart_physics_for_room(&self, settings: &RoomSettings) -> &P5136KartPhysicsBlock {
+        self.kart_physics_variants
+            .as_ref()
+            .map_or(&self.kart_physics, |variants| {
+                variants.for_room(&settings.room_name, settings.game_type, settings.speed_type)
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FrozenRaceParticipant {
     identity: IdentityBinding,
@@ -4290,16 +4347,12 @@ impl ProtocolRoomState {
         let Some(member_id) = self.vacant_member_id() else {
             return false;
         };
-        let Some(slot_id) = self.slot_positions.iter().position(Option::is_none) else {
+        let Some((slot_id, team)) = self.admission_slot_and_team() else {
             return false;
         };
 
         participant.player.player_type = 2;
-        participant.player.team = if matches!(self.settings.game_type, 3 | 4) {
-            if slot_id < ROOM_SLOT_COUNT / 2 { 2 } else { 1 }
-        } else {
-            0
-        };
+        participant.player.team = team;
         participant.player.ranking = i32::try_from(self.members_by_id.iter().flatten().count())
             .expect("a room ranking count always fits in i32");
         let member_id = u8::try_from(member_id).expect("an eight-member room ID always fits in u8");
@@ -4314,6 +4367,76 @@ impl ProtocolRoomState {
             self.room_master = i32::from(member_id);
         }
         true
+    }
+
+    /// Picks a physical slot for a joining racer. Team rooms alternate into the
+    /// currently smaller team, including actor-owned AI racers in the counts.
+    /// Blue wins a tie so the owner starts blue and the second racer starts red.
+    fn admission_slot_and_team(&self) -> Option<(usize, u8)> {
+        if !matches!(self.settings.game_type, 3 | 4) {
+            return self
+                .slot_positions
+                .iter()
+                .position(Option::is_none)
+                .map(|slot_id| (slot_id, 0));
+        }
+
+        let team_count = |team| {
+            self.members_by_id
+                .iter()
+                .flatten()
+                .filter(|member| member.player.team == team)
+                .count()
+                + self
+                    .ais_by_id
+                    .iter()
+                    .flatten()
+                    .filter(|ai| ai.team == team)
+                    .count()
+        };
+        let blue_count = team_count(2);
+        let red_count = team_count(1);
+        let preferred_team = if blue_count <= red_count { 2 } else { 1 };
+
+        [preferred_team, if preferred_team == 2 { 1 } else { 2 }]
+            .into_iter()
+            .find_map(|team| {
+                let range = if team == 2 {
+                    0..ROOM_SLOT_COUNT / 2
+                } else {
+                    ROOM_SLOT_COUNT / 2..ROOM_SLOT_COUNT
+                };
+                range
+                    .into_iter()
+                    .find(|&slot_id| self.slot_positions[slot_id].is_none())
+                    .map(|slot_id| (slot_id, team))
+            })
+    }
+
+    fn apply_next_grid_ranking(&mut self, ranking: &SettlementRanking) {
+        let mut active = self
+            .members_by_id
+            .iter()
+            .enumerate()
+            .filter_map(|(player_id, member)| {
+                member.as_ref()?;
+                let wire_player_id =
+                    i32::try_from(player_id).expect("the fixed room member ID always fits in i32");
+                ranking
+                    .by_player_id
+                    .get(&wire_player_id)
+                    .map(|result| (result.rank, player_id))
+            })
+            .collect::<Vec<_>>();
+        active.sort_unstable();
+        for (next_grid_rank, (_, player_id)) in active.into_iter().enumerate() {
+            self.members_by_id[player_id]
+                .as_mut()
+                .expect("the next-grid list contains only active human members")
+                .player
+                .ranking =
+                i32::try_from(next_grid_rank).expect("the fixed room ranking always fits in i32");
+        }
     }
 
     fn remove_user(&mut self, user_no: UserNo) -> bool {
@@ -4782,6 +4905,16 @@ const fn expected_room_game_type(channel_game_type: u8) -> Option<u8> {
         68 | 24 | 13 => Some(3),
         66 | 7 => Some(4),
         _ => None,
+    }
+}
+
+/// P5136 infinite-booster channels use wire speed type S6, item channels use
+/// the integrated-item S8 preset, and the remaining stock channels use S7.
+const fn channel_default_speed_type(channel_game_type: u8) -> u8 {
+    match channel_game_type {
+        23 | 24 => 6,
+        65 | 66 | 8 | 7 => 8,
+        _ => 7,
     }
 }
 
@@ -8678,7 +8811,7 @@ impl World {
         if !self.try_flush_pending_race_fanouts(room_id) {
             return;
         }
-        let packets = {
+        let (packets, ranking) = {
             let Some(room) = self.protocol_rooms.get(&room_id) else {
                 tracing::error!(
                     room_id = room_id.0,
@@ -8694,7 +8827,9 @@ impl World {
                 return;
             };
             match &settlement.finalization {
-                SettlementFinalization::Ready { packets, .. } => packets.clone(),
+                SettlementFinalization::Ready {
+                    packets, ranking, ..
+                } => (packets.clone(), ranking.clone()),
                 SettlementFinalization::AwaitingDeadline
                 | SettlementFinalization::Persisting { .. }
                 | SettlementFinalization::Failed(_) => {
@@ -8759,6 +8894,7 @@ impl World {
             let Some(room) = self.protocol_rooms.get_mut(&room_id) else {
                 return;
             };
+            room.apply_next_grid_ranking(&ranking);
             room.phase = RoomPhase::Lobby;
             room.race_fence = None;
             room.frozen_race = None;
@@ -10637,12 +10773,7 @@ impl World {
             let member = room
                 .member_by_user_no(participant.identity.user_no)
                 .expect("a frozen participant originated from this room");
-            let kart_physics = member
-                .kart_physics_variants
-                .as_ref()
-                .map_or(&member.kart_physics, |variants| {
-                    variants.for_room_title(&room.settings.room_name)
-                });
+            let kart_physics = member.kart_physics_for_room(&room.settings);
             let command = serialize_gr_command_start_bounded(
                 &GrCommandStart {
                     session_data: &session_data,
@@ -10952,12 +11083,15 @@ impl World {
 
         let mut outcome = CreateRoomOutcome::Rejected;
         if accepted && let Some(room_id) = self.allocate_protocol_room_id() {
+            let channel = channel.expect("accepted room creation has a selected channel");
+            let speed_type = csharp_room_title_speed_type(&request.room_name)
+                .unwrap_or_else(|| channel_default_speed_type(channel.game_type));
             let settings = RoomSettings {
-                channel: channel.expect("accepted room creation has a selected channel"),
+                channel,
                 room_name: request.room_name,
                 password: request.password,
                 game_type,
-                speed_type: 7,
+                speed_type,
                 track: 0,
                 room_data_header: request.room_data_header,
                 room_data: request.room_data,
@@ -13320,7 +13454,80 @@ pub(crate) mod test_support {
             variants.for_room_title("S6 무한"),
             &P5136KartPhysicsBlock::from([6; 235])
         );
+        assert_eq!(
+            variants.for_room_title("S8 아이템"),
+            &P5136KartPhysicsBlock::from([8; 235])
+        );
         assert_eq!(variants.for_room_title("TESTS1ROOM"), &default);
+    }
+
+    #[test]
+    fn room_game_type_selects_the_matching_plant_mode_physics_matrix() {
+        let default = P5136KartPhysicsBlock::from([99; 235]);
+        let by_game_type_and_speed = array::from_fn(|game_type| {
+            array::from_fn(|speed_type| {
+                let marker = u8::try_from(game_type * 16 + speed_type).unwrap();
+                P5136KartPhysicsBlock::from([marker; 235])
+            })
+        });
+        let variants = super::RoomKartPhysicsVariants::new_with_game_types(
+            default.clone(),
+            by_game_type_and_speed,
+        );
+
+        // C# title S0 maps to wire speed type 3. Game type 2 is item mode.
+        assert_eq!(
+            variants.for_room("[S0] 아이템", 2, 7),
+            &P5136KartPhysicsBlock::from([19; 235])
+        );
+        // Game type 4 is team item mode; this synthetic matrix still proves
+        // that World selects its fourth row and S6 maps directly to type 6.
+        assert_eq!(
+            variants.for_room("S6 배틀", 4, 7),
+            &P5136KartPhysicsBlock::from([54; 235])
+        );
+        // A normal room without a title token uses S7 within that game mode.
+        assert_eq!(
+            variants.for_room("친선전", 3, 7),
+            &P5136KartPhysicsBlock::from([39; 235])
+        );
+        // Infinite-booster channels instead supply S6 as their fallback.
+        assert_eq!(
+            variants.for_room("무한부스터", 3, 6),
+            &P5136KartPhysicsBlock::from([38; 235])
+        );
+        // Item channels use S8 while selecting their own game-type rows.
+        assert_eq!(
+            variants.for_room("개인 아이템", 2, 8),
+            &P5136KartPhysicsBlock::from([24; 235])
+        );
+        assert_eq!(
+            variants.for_room("팀 아이템", 4, 8),
+            &P5136KartPhysicsBlock::from([56; 235])
+        );
+        // An explicit title token always overrides the channel fallback.
+        assert_eq!(
+            variants.for_room("[S2] 무한부스터", 1, 6),
+            &P5136KartPhysicsBlock::from([1; 235])
+        );
+        // Unknown game types retain the legacy title/default behavior.
+        assert_eq!(
+            variants.for_room("친선 S1", 0, 7),
+            &P5136KartPhysicsBlock::from([0; 235])
+        );
+        assert_eq!(variants.for_room("친선전", 0, 7), &default);
+    }
+
+    #[test]
+    fn channel_fallback_speed_matches_infinite_and_item_channel_semantics() {
+        assert_eq!(super::channel_default_speed_type(23), 6);
+        assert_eq!(super::channel_default_speed_type(24), 6);
+        for channel_game_type in [65, 66, 8, 7] {
+            assert_eq!(super::channel_default_speed_type(channel_game_type), 8);
+        }
+        for channel_game_type in [67, 68, 14, 13] {
+            assert_eq!(super::channel_default_speed_type(channel_game_type), 7);
+        }
     }
 
     fn create_room_request(nickname: &str) -> ChCreateRoomRequest {
@@ -13724,7 +13931,7 @@ mod tests {
     }
 
     #[test]
-    fn p5136_item_channels_accept_matching_room_creation_requests() {
+    fn p5136_item_channels_accept_matching_room_creation_requests_and_advertise_s8() {
         let mut world = World::default();
         for (nickname, channel_game_type, room_game_type, port) in [
             ("ItemIndividual", 65, 2, 40_065),
@@ -13748,6 +13955,31 @@ mod tests {
                 world.protocol_rooms[&room_id].settings.game_type,
                 room_game_type
             );
+            assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 8);
+        }
+    }
+
+    #[test]
+    fn infinite_booster_channels_advertise_s6_without_a_room_title_token() {
+        let mut world = World::default();
+        for (nickname, channel_game_type, room_game_type, port) in [
+            ("InfiniteIndividual", 23, 1, 40_123),
+            ("InfiniteTeam", 24, 3, 40_124),
+        ] {
+            let mut owner =
+                register_channel_session(&mut world, nickname, channel_game_type, port, 8);
+            world
+                .room_protocol(
+                    owner.session,
+                    RoomCommandPayload::Create {
+                        request: create_request(nickname, room_game_type),
+                        participant: room_participant(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(take_single_packet(&mut owner.outbound)[4], 1);
+            let room_id = world.protocol_room_by_user[&owner.identity.user_no];
+            assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 6);
         }
     }
 
@@ -15176,6 +15408,40 @@ mod tests {
         join_protocol_room(&mut world, &player, destination_room, false);
         let targets = world.racing_udp_targets(source.identity.user_no);
         assert_eq!(targets, vec![observer.identity]);
+    }
+
+    #[test]
+    fn eight_player_frozen_roster_resolves_seven_udp_targets_for_every_sender() {
+        const PLAYER_COUNT: usize = 8;
+
+        let (world, sessions, room_id) =
+            prepare_game_slot_race("EightUdpRoster", 40_101, &[(false, 64); PLAYER_COUNT]);
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.phase, RoomPhase::Running);
+        let frozen = room.frozen_race.as_ref().unwrap();
+        assert_eq!(frozen.participants.len(), PLAYER_COUNT);
+        assert_eq!(
+            frozen
+                .participants
+                .iter()
+                .map(|participant| participant.player_id)
+                .collect::<Vec<_>>(),
+            (0..i32::try_from(PLAYER_COUNT).unwrap()).collect::<Vec<_>>()
+        );
+
+        for (sender_index, sender) in sessions.iter().enumerate() {
+            let targets = world.racing_udp_targets(sender.identity.user_no);
+            let expected = sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != sender_index)
+                .map(|(_, session)| session.identity.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                targets, expected,
+                "wrong UDP roster for sender {sender_index}"
+            );
+        }
     }
 
     #[test]
@@ -17559,6 +17825,32 @@ mod tests {
         }
         let packets = expected_packets.unwrap();
         assert_eq!(packets, frozen_final_packets);
+        let returned_room = &world.protocol_rooms[&room_id];
+        assert_eq!(returned_room.phase, RoomPhase::Lobby);
+        assert_eq!(
+            returned_room.members_by_id[1]
+                .as_ref()
+                .unwrap()
+                .player
+                .ranking,
+            0
+        );
+        assert_eq!(
+            returned_room.members_by_id[2]
+                .as_ref()
+                .unwrap()
+                .player
+                .ranking,
+            2
+        );
+        assert_eq!(
+            returned_room.members_by_id[3]
+                .as_ref()
+                .unwrap()
+                .player
+                .ranking,
+            1
+        );
         let result = &packets[2];
         assert_eq!(result[4], ResultTeam::Blue as u8);
         assert_eq!(i32::from_le_bytes(result[5..9].try_into().unwrap()), 4);
@@ -20243,7 +20535,20 @@ mod tests {
             drain_batches(&mut session.outbound);
         }
 
-        let red_racer = &sessions[4];
+        // Balanced admission leaves Blue with three racers and Red with two.
+        // Move one red racer to Blue so the capacity rejection below still
+        // exercises a genuinely full target team.
+        world
+            .lobby_command(
+                sessions[1].session,
+                LobbyCommandPayload::ChangeTeam(RoomTeam::Blue),
+            )
+            .unwrap();
+        for session in &mut sessions {
+            drain_batches(&mut session.outbound);
+        }
+
+        let red_racer = &sessions[3];
         let before = world.protocol_rooms[&room_id].clone();
         assert!(matches!(
             world.lobby_command(
@@ -20297,7 +20602,7 @@ mod tests {
             changed,
             LobbyCommandOutcome::TeamChanged {
                 team: RoomTeam::Red,
-                slot_id: 5,
+                slot_id: 4,
                 ..
             }
         ));
@@ -20311,6 +20616,86 @@ mod tests {
             logical_packet_hash(&owner_packets[1]),
             adler32::packet_hash("GrSlotDataPacket")
         );
+    }
+
+    #[test]
+    fn team_room_admission_balances_blue_and_red_slots() {
+        let mut world = World::default();
+        let sessions = (0..4)
+            .map(|index| {
+                register_channel_session(
+                    &mut world,
+                    &format!("Balanced{index}"),
+                    68,
+                    42_101 + index * 10,
+                    64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let room_id = create_protocol_room(&mut world, &sessions[0], 3);
+        for session in &sessions[1..] {
+            join_protocol_room(&mut world, session, room_id, false);
+        }
+
+        let room = &world.protocol_rooms[&room_id];
+        let teams = room
+            .members_by_id
+            .iter()
+            .flatten()
+            .map(|member| member.player.team)
+            .collect::<Vec<_>>();
+        assert_eq!(teams, vec![2, 1, 2, 1]);
+        assert_eq!(
+            room.slot_positions,
+            [Some(0), Some(2), None, None, Some(1), Some(3), None, None]
+        );
+    }
+
+    #[test]
+    fn settlement_rank_becomes_the_next_race_grid_rank() {
+        let mut world = World::default();
+        let owner = register_channel_session(&mut world, "GridOwner", 67, 42_201, 64);
+        let guest = register_channel_session(&mut world, "GridGuest", 67, 42_211, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+
+        let ranking = super::SettlementRanking {
+            winning_team: None,
+            by_player_id: HashMap::from([
+                (
+                    0,
+                    super::RankedRaceResult {
+                        finish_time: 5_000,
+                        rank: 1,
+                        team: None,
+                        team_points: 0,
+                    },
+                ),
+                (
+                    1,
+                    super::RankedRaceResult {
+                        finish_time: 4_000,
+                        rank: 0,
+                        team: None,
+                        team_points: 0,
+                    },
+                ),
+            ]),
+        };
+        let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+        room.apply_next_grid_ranking(&ranking);
+
+        let slot_data = room.slot_data();
+        assert_eq!(room.members_by_id[0].as_ref().unwrap().player.ranking, 1);
+        assert_eq!(room.members_by_id[1].as_ref().unwrap().player.ranking, 0);
+        assert!(matches!(
+            &slot_data.members_by_id[0],
+            super::WireRoomMember::Player(player) if player.ranking == 1
+        ));
+        assert!(matches!(
+            &slot_data.members_by_id[1],
+            super::WireRoomMember::Player(player) if player.ranking == 0
+        ));
     }
 
     #[test]

@@ -66,6 +66,30 @@ pub struct PlantPartEquipRequest {
     pub kart_category: i16,
     pub kart_id: i16,
     pub kart_serial: i16,
+    /// Stock P5136 also identifies the part that was displaced by this
+    /// operation. An all-zero descriptor means that the destination slot was
+    /// empty. The server does not need to consume the old part, but retaining
+    /// the descriptor keeps the native request semantics explicit.
+    pub replaced_part: Option<PlantPartDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlantPartDescriptor {
+    pub item_category: i16,
+    pub item_id: i16,
+    pub kart_category: i16,
+    pub kart_id: i16,
+    pub kart_serial: i16,
+}
+
+impl PlantPartDescriptor {
+    pub const EMPTY: Self = Self {
+        item_category: 0,
+        item_id: 0,
+        kart_category: 0,
+        kart_id: 0,
+        kart_serial: 0,
+    };
 }
 
 /// The exact 18-byte body emitted by P5136 for one X-parts selection.
@@ -194,8 +218,35 @@ pub fn parse_equip_plant_part(
         kart_category: reader.read_i16()?,
         kart_id: reader.read_i16()?,
         kart_serial: reader.read_i16()?,
+        replaced_part: None,
     };
-    ensure_exhausted(&reader, EQUIP_PLANT_PART_REQUEST_NAME)?;
+    // Retained C# fixtures contain only the first descriptor. The stock 5136
+    // writer appends a second five-i16 descriptor for the displaced part.
+    // Accept the retained legacy shape as well as the exact stock shape, but
+    // reject every other size.
+    match reader.remaining().len() {
+        0 => {}
+        10 => {
+            let mut replaced = PlantPartDescriptor {
+                item_category: reader.read_i16()?,
+                item_id: reader.read_i16()?,
+                kart_category: reader.read_i16()?,
+                kart_id: reader.read_i16()?,
+                kart_serial: reader.read_i16()?,
+            };
+            if replaced != PlantPartDescriptor::EMPTY {
+                replaced.kart_serial =
+                    normalize_signed_kart_serial(replaced.kart_id, replaced.kart_serial);
+                request.replaced_part = Some(replaced);
+            }
+        }
+        count => {
+            return Err(EquipmentProtocolError::TrailingBytes {
+                name: EQUIP_PLANT_PART_REQUEST_NAME,
+                count,
+            });
+        }
+    }
     if !(43..=46).contains(&request.item_category) {
         return Err(EquipmentProtocolError::InvalidPlantPartCategory(
             request.item_category,
@@ -246,7 +297,12 @@ pub fn parse_equip_x_part(packet: &[u8]) -> Result<XPartEquipRequest, EquipmentP
 #[must_use]
 pub fn serialize_equip_tuning_failure() -> Vec<u8> {
     let mut packet = PacketWriter::named(EQUIP_TUNING_REPLY_NAME);
-    packet.write_i32(0);
+    // The native decoder always consumes `u8 result + 5*i16`, including on
+    // failure. The retained C# implementation emitted a truncated i32 body.
+    packet.write_u8(0);
+    for _ in 0..5 {
+        packet.write_i16(0);
+    }
     packet.into_inner()
 }
 
@@ -361,9 +417,10 @@ const _: () = assert!(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH == 65);
 mod tests {
     use super::{
         EQUIP_PLANT_PART_REQUEST_NAME, EQUIP_X_PART_REQUEST_NAME, EquipmentProtocolError,
-        EquipmentRequest, PlantPartEquipRequest, RiderItemSelection, SET_RIDER_ITEMS_REQUEST_NAME,
-        XPartEquipRequest, classify_equipment_request, parse_equip_plant_part, parse_equip_x_part,
-        parse_set_rider_items, serialize_equip_tuning_failure, serialize_equip_tuning_success,
+        EquipmentRequest, PlantPartDescriptor, PlantPartEquipRequest, RiderItemSelection,
+        SET_RIDER_ITEMS_REQUEST_NAME, XPartEquipRequest, classify_equipment_request,
+        parse_equip_plant_part, parse_equip_x_part, parse_set_rider_items,
+        serialize_equip_tuning_failure, serialize_equip_tuning_success,
         serialize_equip_x_part_failure, serialize_equip_x_part_success, serialize_room_slot_items,
     };
     use crate::{adler32, packet::PacketWriter};
@@ -444,6 +501,7 @@ mod tests {
                 kart_category: 3,
                 kart_id: 1_401,
                 kart_serial: 1,
+                replaced_part: None,
             }
         );
         assert_eq!(
@@ -452,8 +510,46 @@ mod tests {
         );
         assert_eq!(
             serialize_equip_tuning_failure(),
-            decode_hex("9307E74A00000000")
+            decode_hex("9307E74A0000000000000000000000")
         );
+    }
+
+    #[test]
+    fn stock_plant_part_writer_displaced_descriptor_is_typed_and_bounded() {
+        let request = decode_hex("4F08B95A2B0017000300BB03010000000000000000000000");
+        assert_eq!(
+            parse_equip_plant_part(&request).unwrap(),
+            PlantPartEquipRequest {
+                item_category: 43,
+                item_id: 23,
+                kart_category: 3,
+                kart_id: 955,
+                kart_serial: 1,
+                replaced_part: None,
+            }
+        );
+
+        let replacement = decode_hex("4F08B95A2B0017000300BB0301002B0005000300BB030100");
+        assert_eq!(
+            parse_equip_plant_part(&replacement).unwrap().replaced_part,
+            Some(PlantPartDescriptor {
+                item_category: 43,
+                item_id: 5,
+                kart_category: 3,
+                kart_id: 955,
+                kart_serial: 1,
+            })
+        );
+
+        let mut unsupported = request;
+        unsupported.push(0);
+        assert!(matches!(
+            parse_equip_plant_part(&unsupported),
+            Err(EquipmentProtocolError::TrailingBytes {
+                name: EQUIP_PLANT_PART_REQUEST_NAME,
+                count: 11,
+            })
+        ));
     }
 
     #[test]

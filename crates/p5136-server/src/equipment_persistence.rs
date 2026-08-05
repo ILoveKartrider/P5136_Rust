@@ -500,12 +500,14 @@ pub(crate) fn kart_is_owned(
     kart_id: u16,
     serial: u16,
 ) -> bool {
-    catalog_grants(catalog, 3, kart_id)
-        && (serial == 1
-            || profile
-                .granted_karts
-                .iter()
-                .any(|kart| kart.kart_id == kart_id && kart.serial == serial))
+    if serial == 1 {
+        return catalog_grants(catalog, 3, kart_id);
+    }
+    catalog.contains_kart(kart_id)
+        && profile
+            .granted_karts
+            .iter()
+            .any(|kart| kart.kart_id == kart_id && kart.serial == serial)
 }
 
 const fn normalized_kart_serial(kart_id: u16, serial: u16) -> u16 {
@@ -730,6 +732,15 @@ pub(crate) mod tests {
         );
         profile.rider_item.kart = 0;
         profile.rider_item.kart_serial = 0;
+
+        profile.granted_karts.push(GrantedKart {
+            kart_id: 1_453,
+            serial: 2,
+        });
+        let mut manual_quarantine_override = selection;
+        manual_quarantine_override.kart = 1_453;
+        manual_quarantine_override.kart_serial = 2;
+        validate_rider_item_selection(&catalog, &profile, manual_quarantine_override).unwrap();
 
         profile.granted_karts.push(GrantedKart {
             kart_id: 1,

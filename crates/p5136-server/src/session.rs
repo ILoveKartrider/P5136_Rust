@@ -33,6 +33,14 @@ use p5136_core::{
         parse_set_rider_items, serialize_equip_tuning_failure, serialize_equip_tuning_success,
         serialize_equip_x_part_failure, serialize_equip_x_part_success,
     },
+    floater_physics::p5136_floater_spec,
+    floater_protocol::{
+        FLOATER_PROTECT_RESULT_ALREADY_PROTECTED, FLOATER_PROTECT_RESULT_KART_UNAVAILABLE,
+        FLOATER_PROTECT_RESULT_SOCKET_MISSING, FLOATER_RESULT_FAILURE, FLOATER_RESULT_SUCCESS,
+        FloaterProtocolError, FloaterRequest, classify_floater_request, parse_floater_request,
+        serialize_use_protect_spanner_reply, serialize_use_reset_socket_reply,
+        serialize_use_socket_reply, serialize_use_tune_reply,
+    },
     frame::{self, FrameError},
     game_slot_protocol::parse_game_slot_packet,
     handshake,
@@ -42,8 +50,20 @@ use p5136_core::{
         classify_item_state_request, favorite_item_list_capacity, parse_item_state_request,
         serialize_favorite_item_list, serialize_locked_item_list,
     },
+    kart_level_physics::p5136_kart_level_spec,
+    kart_level_protocol::{
+        KartInstance, KartLevelProtocolError, KartLevelRequest, KartLevelState,
+        classify_kart_level_request, parse_kart_level_request,
+        serialize_kart_level_point_clear_failure, serialize_kart_level_point_clear_success,
+        serialize_kart_level_point_update_failure, serialize_kart_level_point_update_success,
+        serialize_kart_level_special_slot_update_failure,
+        serialize_kart_level_special_slot_update_success, serialize_kart_level_up_failure,
+        serialize_kart_level_up_probability_failure, serialize_kart_level_up_probability_success,
+        serialize_kart_level_up_success,
+    },
     kart_physics::{
-        KartPhysicsBuildError, P5136KartPhysicsSnapshot, build_p5136_kart_physics_block,
+        KartPhysicsBuildError, P5136_MODERN_SPEED_TYPE_COUNT, P5136KartPhysicsSnapshot,
+        build_p5136_kart_physics_block,
     },
     lobby_protocol::{
         LobbyProtocolError, LobbyRequest, classify_lobby_request, parse_basic_ai_request,
@@ -71,6 +91,7 @@ use p5136_core::{
     },
     nickname::canonical_nickname_key,
     packet::PacketError,
+    plant_physics::{P5136PlantGameMode, apply_p5136_plant_part},
     race_protocol::{
         RaceProtocolError, RaceRequest, classify_race_request, parse_ai_goal_in_request,
         parse_game_control_finish_snapshot, parse_game_control_request,
@@ -121,10 +142,11 @@ use p5136_core::{
 };
 use p5136_profile::{
     AppliedTimeReward, CatalogInventory, DEFAULT_RP, EmblemCatalog, EquipmentExceptions,
-    EquipmentProfileError, EquipmentStateError, InventoryBuildError, MAX_MYROOM_ITEM_RECORDS,
-    MyRoomItemStateError, MyRoomOwnerInventory, Profile, ProfileMutation, ProfileStoreError,
-    ProfileTransaction, build_inventory_snapshot_with_equipment, finish_reward,
-    generated_x_part_is_granted, rider_item_snapshot,
+    EquipmentLoadWarning, EquipmentMutationOutcome, EquipmentProfileError, EquipmentStateError,
+    InventoryBuildError, MAX_MYROOM_ITEM_RECORDS, MyRoomItemStateError, MyRoomOwnerInventory,
+    Profile, ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction, RaceRunLease,
+    build_inventory_snapshot_with_equipment, finish_reward, generated_x_part_is_granted,
+    rider_item_snapshot,
 };
 use rand::Rng;
 use thiserror::Error;
@@ -310,6 +332,12 @@ pub enum LoginSessionError {
 
     #[error(transparent)]
     EquipmentProtocol(#[from] EquipmentProtocolError),
+
+    #[error(transparent)]
+    KartLevelProtocol(#[from] KartLevelProtocolError),
+
+    #[error(transparent)]
+    FloaterProtocol(#[from] FloaterProtocolError),
 
     #[error(transparent)]
     MyRoomProtocol(#[from] MyRoomProtocolError),
@@ -729,6 +757,42 @@ impl ProfileCoordinator {
         ))
     }
 
+    async fn load_with_equipment(
+        &self,
+        nickname: String,
+        allow_creation: bool,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, EquipmentExceptions, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run(
+                "load profile and equipment",
+                move |store, lease, subject| {
+                    if !allow_creation && !store.profile_exists(subject.nickname())? {
+                        return Err(LoginSessionError::ProfileCreationDenied { nickname });
+                    }
+                    let loaded = store.load_or_create(subject.nickname())?;
+                    let equipment_load =
+                        store.load_equipment_exceptions_lenient(lease, subject.nickname())?;
+                    log_equipment_load_warnings(subject.nickname(), &equipment_load.warnings);
+                    let equipment = equipment_load.equipment;
+                    Ok::<_, LoginSessionError>((loaded, equipment))
+                },
+            )
+            .await?;
+        let (loaded, lane) = completed.into_parts();
+        let (loaded, equipment) = loaded?;
+        Ok((
+            ProfileSnapshot {
+                profile: loaded.profile,
+                revision: loaded.revision,
+                source_path: loaded.source_path,
+            },
+            equipment,
+            lane,
+        ))
+    }
+
     /// Reloads each occupied `MyRoom` slot through its own canonical profile
     /// lane. Lanes are released one at a time: holding several rider lanes
     /// together would permit an A-visits-B/B-visits-A deadlock.
@@ -1108,12 +1172,18 @@ impl ProfileCoordinator {
         &self,
         request: PlantPartEquipRequest,
         admission: ProfileJobAdmission,
-    ) -> Result<(bool, ProfileLanePermit), LoginSessionError> {
+    ) -> Result<
+        (
+            Option<p5136_core::inventory::PlantExcRecord>,
+            ProfileLanePermit,
+        ),
+        LoginSessionError,
+    > {
         let catalog = self.catalog.clone();
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
         let completed = admission
-            .run("equip plant part", move |store, _, subject| {
+            .run("equip plant part", move |store, lease, subject| {
                 #[cfg(test)]
                 if let Some(hook) = blocking_update_hook {
                     hook.entered.wait();
@@ -1121,15 +1191,15 @@ impl ProfileCoordinator {
                 }
                 let loaded = store.load_or_create(subject.nickname())?;
                 if !plant_part_is_owned(catalog.as_deref(), &loaded.profile, request) {
-                    return Ok::<_, LoginSessionError>(false);
+                    return Ok::<_, LoginSessionError>(None);
                 }
-                let rider_directory = loaded
-                    .source_path
-                    .parent()
-                    .map(std::path::Path::to_owned)
-                    .ok_or(LoginSessionError::ProfileDirectoryUnavailable)?;
-                EquipmentExceptions::equip_plant_part(rider_directory, request)?;
-                Ok(true)
+                let outcome = store.equip_plant_part(lease, subject.nickname(), request)?;
+                log_equipment_durability_warning(
+                    subject.nickname(),
+                    "PlantData.json",
+                    outcome.durability_warning.as_ref(),
+                );
+                Ok(Some(outcome.value))
             })
             .await?;
         let (result, lane) = completed.into_parts();
@@ -1155,8 +1225,182 @@ impl ProfileCoordinator {
                 if !x_part_is_owned(catalog.as_deref(), &loaded.profile, request) {
                     return Ok::<_, LoginSessionError>(false);
                 }
-                store.equip_x_part(lease, subject.nickname(), request)?;
+                let outcome = store.equip_x_part(lease, subject.nickname(), request)?;
+                log_equipment_durability_warning(
+                    subject.nickname(),
+                    "PartsData.json",
+                    outcome.durability_warning.as_ref(),
+                );
                 Ok(true)
+            })
+            .await?;
+        let (result, lane) = completed.into_parts();
+        Ok((result?, lane))
+    }
+
+    async fn apply_floater_request(
+        &self,
+        request: FloaterRequest,
+        admission: ProfileJobAdmission,
+    ) -> Result<(FloaterProfileResult, ProfileLanePermit), LoginSessionError> {
+        let catalog = self.catalog.clone();
+        let completed = admission
+            .run("apply Floater request", move |store, lease, subject| {
+                let loaded = store.load_or_create(subject.nickname())?;
+                let equipment_load =
+                    store.load_equipment_exceptions_lenient(lease, subject.nickname())?;
+                log_equipment_load_warnings(subject.nickname(), &equipment_load.warnings);
+                let mut equipment = equipment_load.equipment;
+                let target = floater_request_target(request);
+                let current = floater_state_for(&equipment, target);
+                let owned = floater_request_has_valid_kart_category(request)
+                    && catalog.as_deref().is_some_and(|catalog| {
+                        kart_instance_is_owned(catalog, &loaded.profile, target)
+                    });
+                if !owned {
+                    return Ok::<_, LoginSessionError>(FloaterProfileResult {
+                        result_code: if matches!(request, FloaterRequest::ProtectSlot(_)) {
+                            FLOATER_PROTECT_RESULT_KART_UNAVAILABLE
+                        } else {
+                            FLOATER_RESULT_FAILURE
+                        },
+                        response_state: current,
+                        equipment,
+                    });
+                }
+
+                let mutation = apply_floater_mutation(store, lease, subject.nickname(), request);
+                let applied = match mutation {
+                    Ok(result) => result,
+                    Err(EquipmentProfileError::State(error)) => {
+                        let result_code = floater_state_rejection_code(request, &error);
+                        tracing::warn!(
+                            nickname = subject.nickname(),
+                            %error,
+                            "rejected P5136 Floater mutation without closing the session"
+                        );
+                        return Ok(FloaterProfileResult {
+                            result_code,
+                            response_state: current,
+                            equipment,
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                log_equipment_durability_warning(
+                    subject.nickname(),
+                    "TuneData.json",
+                    applied.durability_warning.as_ref(),
+                );
+                upsert_tune_record(&mut equipment, applied.persisted_state);
+                Ok(FloaterProfileResult {
+                    result_code: FLOATER_RESULT_SUCCESS,
+                    response_state: applied.response_state,
+                    equipment,
+                })
+            })
+            .await?;
+        let (result, lane) = completed.into_parts();
+        Ok((result?, lane))
+    }
+
+    async fn apply_kart_level_request(
+        &self,
+        request: KartLevelRequest,
+        admission: ProfileJobAdmission,
+    ) -> Result<(KartLevelProfileResult, ProfileLanePermit), LoginSessionError> {
+        let catalog = self.catalog.clone();
+        let completed = admission
+            .run("apply kart-level request", move |store, lease, subject| {
+                let loaded = store.load_or_create(subject.nickname())?;
+                let equipment_load =
+                    store.load_equipment_exceptions_lenient(lease, subject.nickname())?;
+                log_equipment_load_warnings(subject.nickname(), &equipment_load.warnings);
+                let mut equipment = equipment_load.equipment;
+                let target = kart_level_request_target(request);
+                let donor = kart_level_request_donor(request);
+                let owned = catalog.as_deref().is_some_and(|catalog| {
+                    kart_instance_is_owned(catalog, &loaded.profile, target)
+                        && donor.is_none_or(|donor| {
+                            kart_instance_is_owned(catalog, &loaded.profile, donor)
+                        })
+                });
+                let current_state = kart_level_state_for(&equipment, target);
+                if !owned {
+                    return Ok::<_, LoginSessionError>(KartLevelProfileResult {
+                        accepted: false,
+                        state: current_state,
+                        equipment,
+                        koin: loaded.profile.rider.koin,
+                        lucci: loaded.profile.rider.lucci,
+                    });
+                }
+
+                let mutation = match request {
+                    KartLevelRequest::LevelUpProbability(_) => None,
+                    KartLevelRequest::LevelUp(_) => Some(store.upgrade_kart_level(
+                        lease,
+                        subject.nickname(),
+                        target.kart_id,
+                        target.serial,
+                    )),
+                    KartLevelRequest::PointUpdate(request) => Some(store.update_kart_level_points(
+                        lease,
+                        subject.nickname(),
+                        target.kart_id,
+                        target.serial,
+                        request.level_deltas,
+                    )),
+                    KartLevelRequest::PointClear(_) => Some(store.clear_kart_level_points(
+                        lease,
+                        subject.nickname(),
+                        target.kart_id,
+                        target.serial,
+                    )),
+                    KartLevelRequest::SpecialSlotUpdate(request) => {
+                        Some(store.update_kart_level_effect(
+                            lease,
+                            subject.nickname(),
+                            target.kart_id,
+                            target.serial,
+                            request.effect,
+                        ))
+                    }
+                };
+                let state = match mutation {
+                    None => current_state,
+                    Some(Ok(outcome)) => {
+                        log_equipment_durability_warning(
+                            subject.nickname(),
+                            "LevelData.json",
+                            outcome.durability_warning.as_ref(),
+                        );
+                        upsert_kart_level_record(&mut equipment, outcome.value);
+                        kart_level_state_from_record(outcome.value)
+                    }
+                    Some(Err(EquipmentProfileError::State(error))) => {
+                        tracing::warn!(
+                            nickname = subject.nickname(),
+                            %error,
+                            "rejected P5136 kart-level mutation without closing the session"
+                        );
+                        return Ok(KartLevelProfileResult {
+                            accepted: false,
+                            state: current_state,
+                            equipment,
+                            koin: loaded.profile.rider.koin,
+                            lucci: loaded.profile.rider.lucci,
+                        });
+                    }
+                    Some(Err(error)) => return Err(error.into()),
+                };
+                Ok(KartLevelProfileResult {
+                    accepted: true,
+                    state,
+                    equipment,
+                    koin: loaded.profile.rider.koin,
+                    lucci: loaded.profile.rider.lucci,
+                })
             })
             .await?;
         let (result, lane) = completed.into_parts();
@@ -1167,7 +1411,15 @@ impl ProfileCoordinator {
         &self,
         nickname: String,
         admission: ProfileJobAdmission,
-    ) -> Result<(Vec<Vec<u8>>, ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+    ) -> Result<
+        (
+            Vec<Vec<u8>>,
+            ProfileSnapshot,
+            EquipmentExceptions,
+            ProfileLanePermit,
+        ),
+        LoginSessionError,
+    > {
         Self::ensure_admitted_subject(&admission, &nickname)?;
         let catalog = self
             .catalog
@@ -1179,32 +1431,41 @@ impl ProfileCoordinator {
                 move |store, lease, subject| {
                     let mut loaded = store.load_or_create(subject.nickname())?;
                     let equipped_kart = loaded.profile.rider_item.kart;
-                    let equipped_kart_is_ungranted =
-                        equipped_kart != 0 && !catalog.grants_item(3, equipped_kart);
-                    if equipped_kart_is_ungranted
-                        || (equipped_kart != 0 && loaded.profile.rider_item.kart_serial == 0)
-                    {
+                    let equipped_serial = loaded.profile.rider_item.kart_serial;
+                    let equipped_kart_is_ungranted = equipped_kart != 0
+                        && equipped_serial != 0
+                        && !kart_is_owned(
+                            &catalog,
+                            &loaded.profile,
+                            equipped_kart,
+                            equipped_serial,
+                        );
+                    if equipped_kart_is_ungranted || (equipped_kart != 0 && equipped_serial == 0) {
                         let (saved, profile) = store.update(subject.nickname(), |profile| {
-                            if profile.rider_item.kart != 0
-                                && !catalog.grants_item(3, profile.rider_item.kart)
+                            let kart_id = profile.rider_item.kart;
+                            let serial = profile.rider_item.kart_serial;
+                            if kart_id != 0 && serial == 0 && catalog.grants_item(3, kart_id) {
+                                profile.rider_item.kart_serial = 1;
+                            } else if kart_id != 0
+                                && (serial == 0
+                                    || !kart_is_owned(&catalog, profile, kart_id, serial))
                             {
                                 profile.rider_item.kart = 0;
                                 profile.rider_item.kart_serial = 0;
-                            } else if profile.rider_item.kart != 0
-                                && profile.rider_item.kart_serial == 0
-                            {
-                                profile.rider_item.kart_serial = 1;
                             }
                         })?;
                         loaded.profile = profile;
                         loaded.revision = Some(saved.revision);
                         loaded.source_path = saved.path;
                     }
-                    let equipment = store.load_equipment_exceptions(lease, subject.nickname())?;
+                    let equipment_load =
+                        store.load_equipment_exceptions_lenient(lease, subject.nickname())?;
+                    log_equipment_load_warnings(subject.nickname(), &equipment_load.warnings);
+                    let equipment = equipment_load.equipment;
                     let inventory = build_inventory_snapshot_with_equipment(
                         &catalog,
                         &loaded.profile,
-                        equipment,
+                        equipment.clone(),
                     )?;
                     let rider = profile_rider_fields(nickname, &loaded.profile);
                     let responses = serialize_get_rider_sequence(&inventory, &rider)?
@@ -1218,13 +1479,300 @@ impl ProfileCoordinator {
                             revision: loaded.revision,
                             source_path: loaded.source_path,
                         },
+                        equipment,
                     ))
                 },
             )
             .await?;
         let (result, lane) = completed.into_parts();
-        let (responses, profile) = result?;
-        Ok((responses, profile, lane))
+        let (responses, profile, equipment) = result?;
+        Ok((responses, profile, equipment, lane))
+    }
+}
+
+#[derive(Debug)]
+struct KartLevelProfileResult {
+    accepted: bool,
+    state: KartLevelState,
+    equipment: EquipmentExceptions,
+    koin: u32,
+    lucci: u32,
+}
+
+#[derive(Debug)]
+struct FloaterProfileResult {
+    result_code: i32,
+    response_state: p5136_core::inventory::TuneExcRecord,
+    equipment: EquipmentExceptions,
+}
+
+struct AppliedFloaterMutation {
+    response_state: p5136_core::inventory::TuneExcRecord,
+    persisted_state: p5136_core::inventory::TuneExcRecord,
+    durability_warning: Option<EquipmentStateError>,
+}
+
+fn direct_floater_mutation(
+    outcome: EquipmentMutationOutcome<p5136_core::inventory::TuneExcRecord>,
+) -> AppliedFloaterMutation {
+    AppliedFloaterMutation {
+        response_state: outcome.value,
+        persisted_state: outcome.value,
+        durability_warning: outcome.durability_warning,
+    }
+}
+
+fn apply_floater_mutation(
+    store: &ProfileStore,
+    lease: &RaceRunLease,
+    nickname: &str,
+    request: FloaterRequest,
+) -> Result<AppliedFloaterMutation, EquipmentProfileError> {
+    match request {
+        FloaterRequest::ActivateSocket(request) => store
+            .activate_floater_socket(lease, nickname, request.kart_id, request.kart_serial)
+            .map(direct_floater_mutation),
+        FloaterRequest::ApplyTune(request) => store
+            .apply_floater_tune(
+                lease,
+                nickname,
+                request.kart_id,
+                request.kart_serial,
+                request.consumable_id,
+            )
+            .map(direct_floater_mutation),
+        FloaterRequest::ProtectSlot(request) => store
+            .protect_floater_slot(
+                lease,
+                nickname,
+                request.kart_id,
+                request.kart_serial,
+                request.protect_kind,
+                request.slot,
+            )
+            .map(direct_floater_mutation),
+        FloaterRequest::ResetSocket(request) => store
+            .reset_floater_socket(lease, nickname, request.kart_id, request.kart_serial)
+            .map(|outcome| AppliedFloaterMutation {
+                // Native consumers replace their cached Tune record with the
+                // reply. C#'s pre-reset reply diverged from durable state.
+                response_state: outcome.value.after,
+                persisted_state: outcome.value.after,
+                durability_warning: outcome.durability_warning,
+            }),
+    }
+}
+
+fn log_equipment_load_warnings(nickname: &str, warnings: &[EquipmentLoadWarning]) {
+    for warning in warnings {
+        tracing::warn!(
+            nickname,
+            sidecar = ?warning.sidecar,
+            error = %warning.error,
+            "ignored one invalid optional equipment stream; strict mutation remains disabled for that sidecar"
+        );
+    }
+}
+
+fn log_equipment_durability_warning(
+    nickname: &str,
+    sidecar: &str,
+    warning: Option<&EquipmentStateError>,
+) {
+    if let Some(warning) = warning {
+        tracing::warn!(
+            nickname,
+            sidecar,
+            error = %warning,
+            "equipment mutation was atomically published but final directory durability is uncertain; treating it as committed to prevent replay"
+        );
+    }
+}
+
+fn upsert_plant_record(
+    equipment: &mut EquipmentExceptions,
+    record: p5136_core::inventory::PlantExcRecord,
+) {
+    if let Some(existing) = equipment
+        .plant
+        .iter_mut()
+        .find(|existing| existing.id == record.id && existing.serial == record.serial)
+    {
+        *existing = record;
+    } else {
+        equipment.plant.push(record);
+    }
+}
+
+fn upsert_tune_record(
+    equipment: &mut EquipmentExceptions,
+    record: p5136_core::inventory::TuneExcRecord,
+) {
+    if let Some(existing) = equipment
+        .tune
+        .iter_mut()
+        .find(|existing| existing.id == record.id && existing.serial == record.serial)
+    {
+        *existing = record;
+    } else {
+        equipment.tune.push(record);
+    }
+}
+
+fn floater_request_target(request: FloaterRequest) -> KartInstance {
+    match request {
+        FloaterRequest::ActivateSocket(request)
+        | FloaterRequest::ApplyTune(request)
+        | FloaterRequest::ResetSocket(request) => KartInstance {
+            kart_id: request.kart_id,
+            serial: request.kart_serial,
+        },
+        FloaterRequest::ProtectSlot(request) => KartInstance {
+            kart_id: request.kart_id,
+            serial: request.kart_serial,
+        },
+    }
+}
+
+fn floater_request_has_valid_kart_category(request: FloaterRequest) -> bool {
+    match request {
+        FloaterRequest::ActivateSocket(request)
+        | FloaterRequest::ApplyTune(request)
+        | FloaterRequest::ResetSocket(request) => request.kart_category == 3,
+        FloaterRequest::ProtectSlot(request) => request.kart_category == 3,
+    }
+}
+
+fn floater_state_rejection_code(request: FloaterRequest, error: &EquipmentStateError) -> i32 {
+    match (request, error) {
+        (FloaterRequest::ProtectSlot(_), EquipmentStateError::MissingFloaterState { .. }) => {
+            FLOATER_PROTECT_RESULT_SOCKET_MISSING
+        }
+        (
+            FloaterRequest::ProtectSlot(_),
+            EquipmentStateError::DuplicateFloaterProtectionSlot(_),
+        ) => FLOATER_PROTECT_RESULT_ALREADY_PROTECTED,
+        _ => FLOATER_RESULT_FAILURE,
+    }
+}
+
+fn floater_state_for(
+    equipment: &EquipmentExceptions,
+    target: KartInstance,
+) -> p5136_core::inventory::TuneExcRecord {
+    let serial = if target.kart_id != 0 && target.serial == 0 {
+        1
+    } else {
+        target.serial
+    };
+    equipment
+        .tune
+        .iter()
+        .find(|record| record.id == target.kart_id && record.serial == serial)
+        .copied()
+        .unwrap_or(p5136_core::inventory::TuneExcRecord {
+            id: target.kart_id,
+            serial,
+            tune1: 0,
+            tune2: 0,
+            tune3: 0,
+            slot1: -1,
+            count1: 0,
+            slot2: -1,
+            count2: 0,
+        })
+}
+
+fn upsert_kart_level_record(
+    equipment: &mut EquipmentExceptions,
+    record: p5136_core::inventory::KartLevelExcRecord,
+) {
+    if let Some(existing) = equipment
+        .kart_level
+        .iter_mut()
+        .find(|existing| existing.id == record.id && existing.serial == record.serial)
+    {
+        *existing = record;
+    } else {
+        equipment.kart_level.push(record);
+    }
+}
+
+fn kart_level_request_target(request: KartLevelRequest) -> KartInstance {
+    match request {
+        KartLevelRequest::LevelUpProbability(request) => request.kart,
+        KartLevelRequest::LevelUp(request) => request.kart,
+        KartLevelRequest::PointUpdate(request) => request.kart,
+        KartLevelRequest::PointClear(request) => request.kart,
+        KartLevelRequest::SpecialSlotUpdate(request) => request.kart,
+    }
+}
+
+fn kart_level_request_donor(request: KartLevelRequest) -> Option<KartInstance> {
+    match request {
+        KartLevelRequest::LevelUpProbability(request) => Some(request.donor),
+        KartLevelRequest::LevelUp(request) => Some(request.donor),
+        KartLevelRequest::PointUpdate(_)
+        | KartLevelRequest::PointClear(_)
+        | KartLevelRequest::SpecialSlotUpdate(_) => None,
+    }
+}
+
+fn kart_instance_is_owned(
+    catalog: &CatalogInventory,
+    profile: &Profile,
+    kart: KartInstance,
+) -> bool {
+    let (Ok(kart_id), Ok(mut serial)) = (u16::try_from(kart.kart_id), u16::try_from(kart.serial))
+    else {
+        return false;
+    };
+    if kart_id != 0 && serial == 0 {
+        serial = 1;
+    }
+    kart_is_owned(catalog, profile, kart_id, serial)
+}
+
+fn kart_level_state_for(equipment: &EquipmentExceptions, kart: KartInstance) -> KartLevelState {
+    let serial = if kart.kart_id != 0 && kart.serial == 0 {
+        1
+    } else {
+        kart.serial
+    };
+    equipment
+        .kart_level
+        .iter()
+        .find(|record| record.id == kart.kart_id && record.serial == serial)
+        .copied()
+        .map_or(
+            KartLevelState {
+                kart_id: kart.kart_id,
+                serial,
+                grade: 0,
+                points: 0,
+                level1: 0,
+                level2: 0,
+                level3: 0,
+                level4: 0,
+                effect: 0,
+            },
+            kart_level_state_from_record,
+        )
+}
+
+fn kart_level_state_from_record(
+    record: p5136_core::inventory::KartLevelExcRecord,
+) -> KartLevelState {
+    KartLevelState {
+        kart_id: record.id,
+        serial: record.serial,
+        grade: record.grade,
+        points: record.points,
+        level1: record.level1,
+        level2: record.level2,
+        level3: record.level3,
+        level4: record.level4,
+        effect: record.effect,
     }
 }
 
@@ -1360,6 +1908,13 @@ impl SessionContext {
             .as_ref()
             .filter(|bound| bound.identity == identity)
             .map_or(0, |bound| bound.reported_p2p_port);
+        let equipment = self
+            .profile
+            .as_ref()
+            .filter(|bound| bound.identity == identity)
+            .map_or_else(EquipmentExceptions::default, |bound| {
+                bound.equipment.clone()
+            });
         if !binding_unchanged {
             self.active_time_attack = None;
         }
@@ -1373,8 +1928,22 @@ impl SessionContext {
         self.profile = Some(BoundProfile {
             identity,
             profile,
+            equipment,
             reported_p2p_port,
         });
+    }
+
+    fn bind_profile_with_equipment(
+        &mut self,
+        identity: IdentityBinding,
+        profile: ProfileSnapshot,
+        equipment: EquipmentExceptions,
+    ) {
+        self.bind_profile(identity, profile);
+        self.profile
+            .as_mut()
+            .expect("bind_profile always installs a bound profile")
+            .equipment = equipment;
     }
 
     fn begin_time_attack(&mut self, request: StartTimeAttackRequest, track: u32) {
@@ -1407,6 +1976,26 @@ impl SessionContext {
 
     fn profile_for(&self, identity: &IdentityBinding) -> Result<&Profile, LoginSessionError> {
         Ok(&self.bound_profile_for(identity)?.profile.profile)
+    }
+
+    fn equipment_for(
+        &self,
+        identity: &IdentityBinding,
+    ) -> Result<&EquipmentExceptions, LoginSessionError> {
+        Ok(&self.bound_profile_for(identity)?.equipment)
+    }
+
+    fn replace_equipment(
+        &mut self,
+        identity: &IdentityBinding,
+        equipment: EquipmentExceptions,
+    ) -> Result<(), LoginSessionError> {
+        self.profile
+            .as_mut()
+            .filter(|bound| &bound.identity == identity)
+            .ok_or(LoginSessionError::ProfileNotBound)?
+            .equipment = equipment;
+        Ok(())
     }
 
     fn bound_profile_for(
@@ -1443,6 +2032,7 @@ impl SessionContext {
         room_participant_from_profile_with_p2p_port(
             identity,
             &bound.profile.profile,
+            &bound.equipment,
             bound.reported_p2p_port,
             catalog,
         )
@@ -1579,6 +2169,7 @@ fn rider_equipment_write_error(source: RiderEquipmentWriteError) -> LoginSession
 struct BoundProfile {
     identity: IdentityBinding,
     profile: ProfileSnapshot,
+    equipment: EquipmentExceptions,
     reported_p2p_port: u16,
 }
 
@@ -2317,11 +2908,15 @@ async fn handle_single_player_request(
             let profile = context.profile_for(&identity)?;
             let physics = selected_physics_metadata(
                 profile,
+                None,
                 profiles.catalog(),
-                request.kart_id,
-                request.flying_pet_id,
-                request.speed_type,
-                false,
+                PhysicsSelection {
+                    kart_id: request.kart_id,
+                    flying_pet_id: request.flying_pet_id,
+                    requested_speed_type: request.speed_type,
+                    plant_game_mode: P5136PlantGameMode::Unknown,
+                    apply_profile_equipment: false,
+                },
             )?;
             trace_single_player_physics_fallback(&identity, &physics, "PqKartSpec");
             Ok(vec![serialize_kart_spec_reply(&physics.block)])
@@ -2342,7 +2937,7 @@ async fn handle_start_time_attack(
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let before = world.authorize_identity().await?;
-    let _ = context.bound_profile_for(&before)?;
+    let equipment = context.equipment_for(&before)?.clone();
     context.ensure_time_attack_idle()?;
     let track = if request.requested_track == 0 {
         P5136_FALLBACK_TRACK_ID
@@ -2359,11 +2954,15 @@ async fn handle_start_time_attack(
     ensure_identity_fence(&before, &after)?;
     let physics = selected_physics_metadata(
         &profile.profile,
+        Some(&equipment),
         profiles.catalog(),
-        request.kart_id,
-        request.flying_pet_id,
-        request.speed_type,
-        request.start_type == 0,
+        PhysicsSelection {
+            kart_id: request.kart_id,
+            flying_pet_id: request.flying_pet_id,
+            requested_speed_type: request.speed_type,
+            plant_game_mode: P5136PlantGameMode::TimeAttack,
+            apply_profile_equipment: request.start_type == 0,
+        },
     )?;
     trace_single_player_physics_fallback(&after, &physics, "PqStartTimeAttack");
     let response = serialize_start_time_attack_reply(
@@ -2621,6 +3220,12 @@ async fn dispatch_profile_bound_request(
         return Some(
             dispatch_equipment_request(world, services.profiles, request, packet, context).await,
         );
+    }
+    if classify_floater_request(hash).is_some() {
+        return Some(handle_floater_request(world, services.profiles, packet, context).await);
+    }
+    if classify_kart_level_request(hash).is_some() {
+        return Some(handle_kart_level_request(world, services.profiles, packet, context).await);
     }
     if classify_item_state_request(hash).is_some() {
         return Some(
@@ -3059,8 +3664,8 @@ async fn handle_login(
     let login = parse_pq_login(packet)?;
     let admission = profiles.admit(&login.nickname, "login profile").await?;
     let claimed = world.claim_identity(session_id, login.nickname).await?;
-    let (profile, lane) = profiles
-        .load(
+    let (profile, equipment, lane) = profiles
+        .load_with_equipment(
             claimed.nickname.clone(),
             config.allow_remote_profile_creation || claimed.source_ip.is_loopback(),
             admission,
@@ -3068,7 +3673,7 @@ async fn handle_login(
         .await?;
     let identity = world.authorize_identity(session_id).await?;
     ensure_identity_fence(&claimed, &identity)?;
-    context.bind_profile(identity.clone(), profile);
+    context.bind_profile_with_equipment(identity.clone(), profile, equipment);
     let profile = context.profile_for(&identity)?;
 
     let response = serialize_pr_login(&PrLoginFields {
@@ -3111,8 +3716,8 @@ async fn handle_channel_move_in(
     let admission = profiles
         .admit(preflight.nickname(), "load migrated profile")
         .await?;
-    let (profile, lane) = profiles
-        .load(
+    let (profile, equipment, lane) = profiles
+        .load_with_equipment(
             preflight.nickname().to_owned(),
             config.allow_remote_profile_creation || preflight.destination_ip().is_loopback(),
             admission,
@@ -3131,7 +3736,7 @@ async fn handle_channel_move_in(
         .await?;
     let identity = world.authorize_identity(session_id).await?;
     ensure_identity_fence(&completion.binding, &identity)?;
-    context.bind_profile(identity, profile);
+    context.bind_profile_with_equipment(identity, profile, equipment);
 
     Ok(Vec::new())
 }
@@ -4053,6 +4658,7 @@ async fn update_rider_equipment(
 ) -> Result<(), LoginSessionError> {
     let before = world.authorize_identity().await?;
     let _ = context.profile_for(&before)?;
+    let equipment = context.equipment_for(&before)?.clone();
     tracing::info!(
         nickname = %before.nickname,
         kart_id = selection.kart,
@@ -4111,7 +4717,7 @@ async fn update_rider_equipment(
     }
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
-    let physics = room_physics_metadata(&profile.profile, profiles.catalog.as_deref())?;
+    let physics = room_physics_metadata(&profile.profile, &equipment, profiles.catalog.as_deref())?;
     let refreshed_room_physics = world
         .refresh_room_kart_physics(physics.variants.clone())
         .await?;
@@ -4133,7 +4739,7 @@ async fn equip_plant_part(
     profiles: &ProfileCoordinator,
     _session_id: SessionId,
     request: PlantPartEquipRequest,
-    context: &SessionContext,
+    context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let nickname = context.bound_identity()?.nickname.clone();
     let admission = profiles
@@ -4141,7 +4747,7 @@ async fn equip_plant_part(
         .await?;
     let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
-    let (equipped, lane) = match profiles.equip_plant_part(request, admission).await {
+    let (record, lane) = match profiles.equip_plant_part(request, admission).await {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(%error, "failed to persist P5136 plant-part selection");
@@ -4150,7 +4756,28 @@ async fn equip_plant_part(
     };
     let after_write = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after_write)?;
-    let _ = context.profile_for(&after_write)?;
+    let profile = context.profile_for(&after_write)?.clone();
+    let mut equipment = context.equipment_for(&after_write)?.clone();
+    let equipped = record.is_some();
+    if let Some(record) = record {
+        upsert_plant_record(&mut equipment, record);
+    }
+    context.replace_equipment(&after_write, equipment.clone())?;
+    if equipped {
+        let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
+        let refreshed_room_physics = world
+            .refresh_room_kart_physics(physics.variants.clone())
+            .await?;
+        tracing::info!(
+            nickname = %after_write.nickname,
+            kart_id = request.kart_id,
+            kart_serial = request.kart_serial,
+            item_category = request.item_category,
+            item_id = request.item_id,
+            refreshed_room_physics,
+            "installed durable P5136 plant part in the bound physics cache"
+        );
+    }
     drop(lane);
     Ok(vec![if equipped {
         serialize_equip_tuning_success(request)
@@ -4194,6 +4821,158 @@ async fn equip_x_part(
     Ok(vec![serialize_equip_x_part_success(request)])
 }
 
+async fn handle_floater_request(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let request = parse_floater_request(packet)?;
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let admission = profiles
+        .admit_for_operation(world.operation(), &before.nickname, "apply Floater request")
+        .await?;
+    let (result, lane) = profiles.apply_floater_request(request, admission).await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let profile = context.profile_for(&after)?.clone();
+    context.replace_equipment(&after, result.equipment.clone())?;
+
+    let changes_physics = matches!(
+        request,
+        FloaterRequest::ApplyTune(_) | FloaterRequest::ResetSocket(_)
+    );
+    let accepted = result.result_code == FLOATER_RESULT_SUCCESS;
+    let refreshed_room_physics = if accepted && changes_physics {
+        let physics = room_physics_metadata(&profile, &result.equipment, profiles.catalog())?;
+        world
+            .refresh_room_kart_physics(physics.variants.clone())
+            .await?
+    } else {
+        false
+    };
+    tracing::info!(
+        nickname = %after.nickname,
+        request = ?request,
+        accepted,
+        result_code = result.result_code,
+        consumable_consumed = false,
+        refreshed_room_physics,
+        "processed durable P5136 Floater request"
+    );
+    drop(lane);
+
+    let response_code = result.result_code;
+    let response = match request {
+        FloaterRequest::ActivateSocket(request) => {
+            serialize_use_socket_reply(request, response_code, result.response_state)
+        }
+        FloaterRequest::ApplyTune(request) => {
+            serialize_use_tune_reply(request, response_code, result.response_state)
+        }
+        FloaterRequest::ProtectSlot(request) => {
+            serialize_use_protect_spanner_reply(request, response_code, result.response_state)
+        }
+        FloaterRequest::ResetSocket(request) => {
+            serialize_use_reset_socket_reply(request, response_code, result.response_state)
+        }
+    };
+    Ok(vec![response])
+}
+
+async fn handle_kart_level_request(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let request = parse_kart_level_request(packet)?;
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let admission = profiles
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            "apply kart-level request",
+        )
+        .await?;
+    let (result, lane) = profiles
+        .apply_kart_level_request(request, admission)
+        .await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let profile = context.profile_for(&after)?.clone();
+    context.replace_equipment(&after, result.equipment.clone())?;
+
+    let mut refreshed_room_physics = false;
+    if result.accepted && !matches!(request, KartLevelRequest::LevelUpProbability(_)) {
+        let physics = room_physics_metadata(&profile, &result.equipment, profiles.catalog())?;
+        refreshed_room_physics = world
+            .refresh_room_kart_physics(physics.variants.clone())
+            .await?;
+    }
+    tracing::info!(
+        nickname = %after.nickname,
+        request = ?request,
+        accepted = result.accepted,
+        donor_consumed = false,
+        success_probability_percent = 100,
+        refreshed_room_physics,
+        "processed durable P5136 legacy kart-level request"
+    );
+    drop(lane);
+
+    let response = match request {
+        KartLevelRequest::LevelUpProbability(_) => {
+            if result.accepted {
+                serialize_kart_level_up_probability_success()
+            } else {
+                serialize_kart_level_up_probability_failure(1)
+            }
+        }
+        KartLevelRequest::LevelUp(_) => {
+            if result.accepted {
+                serialize_kart_level_up_success(
+                    current_legacy_time(),
+                    result.state,
+                    result.koin,
+                    result.lucci,
+                )
+            } else {
+                serialize_kart_level_up_failure(
+                    current_legacy_time(),
+                    result.state,
+                    result.koin,
+                    result.lucci,
+                )
+            }
+        }
+        KartLevelRequest::PointUpdate(_) => {
+            if result.accepted {
+                serialize_kart_level_point_update_success(result.state)
+            } else {
+                serialize_kart_level_point_update_failure(result.state)
+            }
+        }
+        KartLevelRequest::PointClear(_) => {
+            if result.accepted {
+                serialize_kart_level_point_clear_success(result.state, result.koin)
+            } else {
+                serialize_kart_level_point_clear_failure(result.state, result.koin)
+            }
+        }
+        KartLevelRequest::SpecialSlotUpdate(_) => {
+            if result.accepted {
+                serialize_kart_level_special_slot_update_success(result.state)
+            } else {
+                serialize_kart_level_special_slot_update_failure(result.state)
+            }
+        }
+    };
+    Ok(vec![response])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RoomKartBaseResolution {
     KartZeroBaseline,
@@ -4207,7 +4986,9 @@ enum RoomPhysicsFallbackReason {
     CatalogUnavailable,
     CatalogSpecUnavailable,
     FlyingPetSpecUnavailable { item_id: u16 },
-    KartPlantNotApplied { slot: u8, item_id: u16 },
+    KartPlantSpecUnavailable { category: i16, item_id: i16 },
+    FloaterSpecInvalid { codes: [i16; 3] },
+    KartLevelSpecInvalid { levels: [i16; 4] },
     SpeedPatchNotApplied { value: u8 },
 }
 
@@ -4220,6 +5001,30 @@ struct RoomPhysicsMetadata {
     variants: RoomKartPhysicsVariants,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhysicsSelection {
+    kart_id: u16,
+    flying_pet_id: u16,
+    requested_speed_type: u8,
+    plant_game_mode: P5136PlantGameMode,
+    apply_profile_equipment: bool,
+}
+
+impl PhysicsSelection {
+    fn for_room(profile: &Profile, plant_game_mode: P5136PlantGameMode) -> Self {
+        Self {
+            kart_id: profile.rider_item.kart,
+            flying_pet_id: profile.rider_item.flying_pet,
+            // Multiplayer rooms keep the historical S7/C# default unless the
+            // room title selects an S0-S8 variant at race start. Rider.speed_type
+            // is a persisted rider field and is not the room-title override.
+            requested_speed_type: 7,
+            plant_game_mode,
+            apply_profile_equipment: true,
+        }
+    }
+}
+
 impl RoomPhysicsMetadata {
     fn physics_fallback(&self) -> bool {
         !self.fallback_reasons.is_empty()
@@ -4228,29 +5033,46 @@ impl RoomPhysicsMetadata {
 
 fn room_physics_metadata(
     profile: &Profile,
+    equipment: &EquipmentExceptions,
     catalog: Option<&CatalogInventory>,
 ) -> Result<RoomPhysicsMetadata, KartPhysicsBuildError> {
-    selected_physics_metadata(
+    let mut speed = selected_physics_metadata(
         profile,
+        Some(equipment),
         catalog,
-        profile.rider_item.kart,
-        profile.rider_item.flying_pet,
-        // Multiplayer rooms keep the historical S7/C# default unless the
-        // room title selects an S0-S7 variant at race start. Rider.speed_type
-        // is a persisted rider field and is not the room-title override.
-        7,
-        true,
-    )
+        PhysicsSelection::for_room(profile, P5136PlantGameMode::Speed),
+    )?;
+    let item = selected_physics_metadata(
+        profile,
+        Some(equipment),
+        catalog,
+        PhysicsSelection::for_room(profile, P5136PlantGameMode::Item),
+    )?;
+    speed.variants = RoomKartPhysicsVariants::new_with_game_types(
+        speed.block.clone(),
+        [
+            speed.variants.speed_blocks(),
+            item.variants.speed_blocks(),
+            speed.variants.speed_blocks(),
+            item.variants.speed_blocks(),
+        ],
+    );
+    Ok(speed)
 }
 
 fn selected_physics_metadata(
     profile: &Profile,
+    equipment: Option<&EquipmentExceptions>,
     catalog: Option<&CatalogInventory>,
-    kart_id: u16,
-    flying_pet_id: u16,
-    requested_speed_type: u8,
-    apply_profile_equipment: bool,
+    selection: PhysicsSelection,
 ) -> Result<RoomPhysicsMetadata, KartPhysicsBuildError> {
+    let PhysicsSelection {
+        kart_id,
+        flying_pet_id,
+        requested_speed_type,
+        plant_game_mode,
+        apply_profile_equipment,
+    } = selection;
     let items = &profile.rider_item;
     let mut snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
     if let Some(speed) =
@@ -4291,21 +5113,14 @@ fn selected_physics_metadata(
         }
     }
     if apply_profile_equipment && kart_id == items.kart {
-        for (slot, item_id) in [
-            items.kart_plant1,
-            items.kart_plant2,
-            items.kart_plant3,
-            items.kart_plant4,
-        ]
-        .into_iter()
-        .enumerate()
-        .filter(|(_, item_id)| *item_id != 0)
-        {
-            fallback_reasons.push(RoomPhysicsFallbackReason::KartPlantNotApplied {
-                slot: u8::try_from(slot + 1).expect("the four kart-plant slots fit in u8"),
-                item_id,
-            });
-        }
+        apply_profile_exception_physics(
+            &mut snapshot,
+            equipment,
+            kart_id,
+            items.kart_serial,
+            plant_game_mode,
+            &mut fallback_reasons,
+        );
     }
     if profile.server_setting.speed_patch_use != 0 {
         fallback_reasons.push(RoomPhysicsFallbackReason::SpeedPatchNotApplied {
@@ -4313,18 +5128,19 @@ fn selected_physics_metadata(
         });
     }
     let block = build_p5136_kart_physics_block(&snapshot)?;
-    let variants = (0_u8..8)
+    let variants = (0_u8..u8::try_from(P5136_MODERN_SPEED_TYPE_COUNT)
+        .expect("modern speed-type count fits in a protocol byte"))
         .map(|speed_type| {
             let mut variant = snapshot;
             variant.speed_type = speed_type;
             variant.speed =
                 p5136_core::kart_physics::P5136SpeedSpecSnapshot::csharp_modern(speed_type)
-                    .expect("every protocol speed byte from 0 through 7 has a modern preset");
+                    .expect("every protocol speed byte from 0 through 8 has a modern preset");
             build_p5136_kart_physics_block(&variant)
         })
         .collect::<Result<Vec<_>, _>>()?
         .try_into()
-        .expect("the fixed 0 through 7 speed range produces eight blocks");
+        .expect("the fixed 0 through 8 speed range produces nine blocks");
     Ok(RoomPhysicsMetadata {
         kart_id,
         base_resolution,
@@ -4334,13 +5150,83 @@ fn selected_physics_metadata(
     })
 }
 
+fn apply_profile_exception_physics(
+    snapshot: &mut P5136KartPhysicsSnapshot,
+    equipment: Option<&EquipmentExceptions>,
+    kart_id: u16,
+    kart_serial: u16,
+    plant_game_mode: P5136PlantGameMode,
+    fallback_reasons: &mut Vec<RoomPhysicsFallbackReason>,
+) {
+    let Some(equipment) = equipment else {
+        return;
+    };
+    let (Ok(kart_id), Ok(mut kart_serial)) = (i16::try_from(kart_id), i16::try_from(kart_serial))
+    else {
+        return;
+    };
+    if kart_id != 0 && kart_serial == 0 {
+        kart_serial = 1;
+    }
+
+    if let Some(tune) = equipment
+        .tune
+        .iter()
+        .find(|record| record.id == kart_id && record.serial == kart_serial)
+    {
+        let codes = [tune.tune1, tune.tune2, tune.tune3];
+        if let Some(spec) = p5136_floater_spec(codes) {
+            snapshot.exc.tune = spec;
+        } else {
+            fallback_reasons.push(RoomPhysicsFallbackReason::FloaterSpecInvalid { codes });
+        }
+    }
+
+    if let Some(plant) = equipment
+        .plant
+        .iter()
+        .find(|record| record.id == kart_id && record.serial == kart_serial)
+    {
+        for (category, item_id) in [
+            (plant.engine_category, plant.engine_id),
+            (plant.handle_category, plant.handle_id),
+            (plant.wheel_category, plant.wheel_id),
+            (plant.kit_category, plant.kit_id),
+        ]
+        .into_iter()
+        .filter(|(_, item_id)| *item_id != 0)
+        {
+            if !apply_p5136_plant_part(&mut snapshot.exc, category, item_id, plant_game_mode) {
+                fallback_reasons.push(RoomPhysicsFallbackReason::KartPlantSpecUnavailable {
+                    category,
+                    item_id,
+                });
+            }
+        }
+    }
+
+    if let Some(level) = equipment
+        .kart_level
+        .iter()
+        .find(|record| record.id == kart_id && record.serial == kart_serial)
+    {
+        let levels = [level.level1, level.level2, level.level3, level.level4];
+        if let Some(spec) = p5136_kart_level_spec(levels) {
+            snapshot.exc.kart_level = spec;
+        } else {
+            fallback_reasons.push(RoomPhysicsFallbackReason::KartLevelSpecInvalid { levels });
+        }
+    }
+}
+
 fn room_participant_from_profile_with_p2p_port(
     identity: &IdentityBinding,
     profile: &Profile,
+    equipment: &EquipmentExceptions,
     reported_p2p_port: u16,
     catalog: Option<&CatalogInventory>,
 ) -> Result<RoomParticipant, LoginSessionError> {
-    let physics = room_physics_metadata(profile, catalog)?;
+    let physics = room_physics_metadata(profile, equipment, catalog)?;
     if physics.physics_fallback() {
         tracing::warn!(
             nickname = %identity.nickname,
@@ -4392,6 +5278,7 @@ fn room_participant_from_profile(
     room_participant_from_profile_with_p2p_port(
         identity,
         profile,
+        &EquipmentExceptions::default(),
         u16::try_from(profile.rider.p2p_port).unwrap_or_default(),
         catalog,
     )
@@ -4465,7 +5352,7 @@ async fn handle_get_rider_admitted(
         .await?;
     let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
-    let (responses, profile, lane) = profiles
+    let (responses, profile, equipment, lane) = profiles
         .get_rider_sequence(before.nickname.clone(), admission)
         .await?;
     let after = world.authorize_identity().await?;
@@ -4476,7 +5363,7 @@ async fn handle_get_rider_admitted(
     world
         .refresh_myroom_presentation(after.clone(), MyRoomProfileLease::new(presentation, lane))
         .await?;
-    context.bind_profile(after, profile);
+    context.bind_profile_with_equipment(after, profile, equipment);
     Ok(responses)
 }
 
@@ -4782,6 +5669,30 @@ async fn handle_get_rider(
 }
 
 #[cfg(test)]
+async fn handle_kart_level(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_kart_level_request(&world.admitted(&operation), profiles, packet, context).await
+}
+
+#[cfg(test)]
+async fn handle_floater(
+    world: &WorldHandle,
+    profiles: &ProfileCoordinator,
+    session_id: SessionId,
+    packet: &[u8],
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let operation = world.admit_identity_operation(session_id).await?;
+    handle_floater_request(&world.admitted(&operation), profiles, packet, context).await
+}
+
+#[cfg(test)]
 async fn update_game_options(
     world: &WorldHandle,
     profiles: &ProfileCoordinator,
@@ -4830,6 +5741,11 @@ mod tests {
             EquipmentRequest, PlantPartEquipRequest, RiderItemSelection, XPartEquipRequest,
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
             serialize_equip_x_part_failure, serialize_equip_x_part_success,
+        },
+        floater_physics::p5136_floater_spec,
+        floater_protocol::{
+            USE_PROTECT_SPANNER_REQUEST_NAME, USE_RESET_SOCKET_REQUEST_NAME,
+            USE_SOCKET_REQUEST_NAME, USE_TUNE_REQUEST_NAME,
         },
         frame::{DEFAULT_MAX_PAYLOAD, encode_encrypted},
         game_slot_protocol::{
@@ -4899,14 +5815,15 @@ mod tests {
     use super::{
         BlockingUpdateHook, FAVORITE_ITEM_UPDATE_OPERATION, LoginSessionError,
         MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_OWNER_ITEM_BYTES, MAX_MYROOM_OWNER_ITEM_PACKETS,
-        MAX_OUTBOUND_BATCH_BURST, MyRoomOwnerItemPacketBatch, ProfileCoordinator,
+        MAX_OUTBOUND_BATCH_BURST, MyRoomOwnerItemPacketBatch, PhysicsSelection, ProfileCoordinator,
         RiderEquipmentValidationError, RoomKartBaseResolution, RoomPhysicsFallbackReason,
         SessionContext, SessionReadEvent, SessionServices, dispatch_packet, handle_channel_move_in,
-        handle_equipment_request, handle_get_rider, handle_lobby_request, handle_race_request,
-        handle_room_request, myroom_player_slot_from_profile, myroom_profile_presentation,
+        handle_equipment_request, handle_floater, handle_get_rider, handle_kart_level,
+        handle_lobby_request, handle_race_request, handle_room_request,
+        myroom_player_slot_from_profile, myroom_profile_presentation, p5136_kart_level_spec,
         read_encrypted_frame, read_encrypted_frame_with_diagnostics, read_session_frame,
         room_participant_from_profile, room_physics_metadata, select_session_read_event,
-        update_game_options, write_outbound_batch, write_session_bytes,
+        selected_physics_metadata, update_game_options, write_outbound_batch, write_session_bytes,
     };
     use crate::equipment_persistence::validate_rider_item_selection;
     use crate::operation_gate::WireOperationGate;
@@ -5005,6 +5922,9 @@ mod tests {
                     <Kart id="1453" name="sessionMissingKartSpec" />
                 </Names>
                 <Specs>
+                    <Spec name="sessionBaseKart">
+                        <BodyParam ForwardAccelForce="147" DragFactor="-0.05" />
+                    </Spec>
                     <Spec name="sessionKnownKart">
                         <BodyParam ForwardAccelForce="147" DragFactor="-0.05" />
                     </Spec>
@@ -8566,7 +9486,8 @@ mod tests {
                 .unwrap();
         let mut profile = Profile::default();
 
-        let unequipped = room_physics_metadata(&profile, None).unwrap();
+        let unequipped =
+            room_physics_metadata(&profile, &EquipmentExceptions::default(), None).unwrap();
         assert_eq!(unequipped.kart_id, 0);
         assert_eq!(
             unequipped.base_resolution,
@@ -8577,7 +9498,12 @@ mod tests {
         assert_eq!(unequipped.block, baseline);
 
         profile.rider_item.kart = 1_450;
-        let resolved = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        let resolved = room_physics_metadata(
+            &profile,
+            &EquipmentExceptions::default(),
+            Some(catalog.as_ref()),
+        )
+        .unwrap();
         let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
         expected_snapshot.kart = *catalog.kart_spec(1_450).unwrap();
         let expected = build_p5136_kart_physics_block(&expected_snapshot).unwrap();
@@ -8603,7 +9529,8 @@ mod tests {
         let mut profile = Profile::default();
         profile.rider_item.kart = 1_450;
 
-        let missing_catalog = room_physics_metadata(&profile, None).unwrap();
+        let missing_catalog =
+            room_physics_metadata(&profile, &EquipmentExceptions::default(), None).unwrap();
         assert_eq!(
             missing_catalog.base_resolution,
             RoomKartBaseResolution::MissingCatalogFallback
@@ -8615,7 +9542,12 @@ mod tests {
         assert_eq!(missing_catalog.block, baseline);
 
         profile.rider_item.kart = 1_453;
-        let missing_spec = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        let missing_spec = room_physics_metadata(
+            &profile,
+            &EquipmentExceptions::default(),
+            Some(catalog.as_ref()),
+        )
+        .unwrap();
         assert_eq!(
             missing_spec.base_resolution,
             RoomKartBaseResolution::MissingCatalogSpecFallback
@@ -8637,24 +9569,19 @@ mod tests {
         profile.rider_item.kart_plant4 = 46;
         profile.server_setting.speed_patch_use = 1;
 
-        let resolved = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        let resolved = room_physics_metadata(
+            &profile,
+            &EquipmentExceptions::default(),
+            Some(catalog.as_ref()),
+        )
+        .unwrap();
         assert_eq!(
             resolved.base_resolution,
             RoomKartBaseResolution::CatalogBaseSpec
         );
         assert_eq!(
             resolved.fallback_reasons,
-            vec![
-                RoomPhysicsFallbackReason::KartPlantNotApplied {
-                    slot: 2,
-                    item_id: 44,
-                },
-                RoomPhysicsFallbackReason::KartPlantNotApplied {
-                    slot: 4,
-                    item_id: 46,
-                },
-                RoomPhysicsFallbackReason::SpeedPatchNotApplied { value: 1 },
-            ]
+            vec![RoomPhysicsFallbackReason::SpeedPatchNotApplied { value: 1 }]
         );
 
         let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
@@ -8668,13 +9595,116 @@ mod tests {
     }
 
     #[test]
+    fn plant_sidecar_uses_exact_kart_serial_and_room_game_mode() {
+        let catalog = test_catalog();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+        profile.rider_item.kart_serial = 2;
+        let equipment = EquipmentExceptions {
+            plant: vec![p5136_core::inventory::PlantExcRecord {
+                id: 1_450,
+                serial: 2,
+                engine_category: 43,
+                engine_id: 23,
+                handle_category: 44,
+                handle_id: 2,
+                wheel_category: 45,
+                wheel_id: 23,
+                kit_category: 46,
+                kit_id: 1,
+            }],
+            ..EquipmentExceptions::default()
+        };
+        let speed = selected_physics_metadata(
+            &profile,
+            Some(&equipment),
+            Some(catalog.as_ref()),
+            PhysicsSelection {
+                kart_id: 1_450,
+                flying_pet_id: 0,
+                requested_speed_type: 7,
+                plant_game_mode: p5136_core::plant_physics::P5136PlantGameMode::Speed,
+                apply_profile_equipment: true,
+            },
+        )
+        .unwrap();
+        let item = selected_physics_metadata(
+            &profile,
+            Some(&equipment),
+            Some(catalog.as_ref()),
+            PhysicsSelection {
+                kart_id: 1_450,
+                flying_pet_id: 0,
+                requested_speed_type: 7,
+                plant_game_mode: p5136_core::plant_physics::P5136PlantGameMode::Item,
+                apply_profile_equipment: true,
+            },
+        )
+        .unwrap();
+        assert_ne!(speed.block, item.block);
+        let room = room_physics_metadata(&profile, &equipment, Some(catalog.as_ref())).unwrap();
+        assert_eq!(
+            room.variants.for_room("S7 개인 아이템", 2, 7),
+            room.variants.for_room("S7 팀 아이템", 4, 7)
+        );
+        assert_eq!(
+            room.variants.for_room("S7 개인 스피드", 1, 7),
+            room.variants.for_room("S7 팀 스피드", 3, 7)
+        );
+        assert_ne!(
+            room.variants.for_room("S7 스피드", 1, 7),
+            room.variants.for_room("S7 아이템", 2, 7)
+        );
+
+        let mismatched = EquipmentExceptions {
+            plant: vec![p5136_core::inventory::PlantExcRecord {
+                serial: 3,
+                ..equipment.plant[0]
+            }],
+            ..EquipmentExceptions::default()
+        };
+        let without_matching_serial = selected_physics_metadata(
+            &profile,
+            Some(&mismatched),
+            Some(catalog.as_ref()),
+            PhysicsSelection {
+                kart_id: 1_450,
+                flying_pet_id: 0,
+                requested_speed_type: 7,
+                plant_game_mode: p5136_core::plant_physics::P5136PlantGameMode::Speed,
+                apply_profile_equipment: true,
+            },
+        )
+        .unwrap();
+        let baseline = selected_physics_metadata(
+            &profile,
+            Some(&EquipmentExceptions::default()),
+            Some(catalog.as_ref()),
+            PhysicsSelection {
+                kart_id: 1_450,
+                flying_pet_id: 0,
+                requested_speed_type: 7,
+                plant_game_mode: p5136_core::plant_physics::P5136PlantGameMode::Speed,
+                apply_profile_equipment: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(without_matching_serial.block, baseline.block);
+    }
+
+    #[test]
     fn unknown_flying_pet_id_keeps_csharp_zero_spec_and_reports_fallback() {
         let catalog = test_catalog();
         let mut profile = Profile::default();
         profile.rider_item.kart = 1_450;
         profile.rider_item.flying_pet = u16::MAX;
 
-        let resolved = room_physics_metadata(&profile, Some(catalog.as_ref())).unwrap();
+        let resolved = room_physics_metadata(
+            &profile,
+            &EquipmentExceptions::default(),
+            Some(catalog.as_ref()),
+        )
+        .unwrap();
         assert_eq!(
             resolved.fallback_reasons,
             vec![RoomPhysicsFallbackReason::FlyingPetSpecUnavailable { item_id: u16::MAX }]
@@ -12106,12 +13136,14 @@ mod tests {
         let mut context = SessionContext::default();
         context.bind_profile(identity, profile);
         drop(lane);
+        fs::write(rider_directory.join("LevelData.json"), b"[malformed").unwrap();
         let request = PlantPartEquipRequest {
             item_category: 43,
             item_id: 1_000,
             kart_category: 3,
             kart_id: 1,
             kart_serial: 1,
+            replaced_part: None,
         };
         let mut packet = PacketWriter::named("PqEquipTuningExPacket");
         packet.write_i16(request.item_category);
@@ -12131,11 +13163,432 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(responses, vec![serialize_equip_tuning_success(request)]);
+        fs::remove_file(rider_directory.join("LevelData.json")).unwrap();
         let equipment = EquipmentExceptions::load(profile_root.path(), rider_directory).unwrap();
         assert_eq!(equipment.plant.len(), 1);
         assert_eq!(equipment.plant[0].id, 1);
         assert_eq!(equipment.plant[0].engine_category, 43);
         assert_eq!(equipment.plant[0].engine_id, 1_000);
+
+        world.session_closed(session).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    fn kart_level_pair_request(name: &str, donor_serial: i16, cost: Option<i32>) -> Vec<u8> {
+        let mut packet = PacketWriter::named(name);
+        for value in [1_i16, 1, 2, donor_serial] {
+            packet.write_i16(value);
+        }
+        if let Some(cost) = cost {
+            packet.write_i32(cost);
+        }
+        packet.into_inner()
+    }
+
+    fn kart_level_point_update_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqKartLevelPointUpdate");
+        for value in [1_i16, 1, 10, 10, 10, 5] {
+            packet.write_i16(value);
+        }
+        packet.into_inner()
+    }
+
+    fn assert_non_consuming_kart_upgrade_reply(reply: &[u8], koin: u32, lucci: u32) {
+        let mut reader = PacketReader::new(reply);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrKartLevelUp")
+        );
+        reader.read_u16().unwrap();
+        reader.read_u16().unwrap();
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 5);
+        assert_eq!(reader.read_i16().unwrap(), 35);
+        for _ in 0..4 {
+            assert_eq!(reader.read_i16().unwrap(), 0);
+        }
+        assert_eq!(reader.read_i16().unwrap(), 0); // special effect
+        assert_eq!(reader.read_i16().unwrap(), 0); // consumed category
+        assert_eq!(reader.read_i16().unwrap(), 0); // consumed kart ID
+        assert_eq!(reader.read_i16().unwrap(), 0); // consumed kart serial
+        assert_eq!(reader.read_u32().unwrap(), koin);
+        assert_eq!(reader.read_u32().unwrap(), lucci);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert!(reader.remaining().is_empty());
+    }
+
+    fn assert_kart_level_allocation_reply(reply: &[u8]) {
+        let mut reader = PacketReader::new(reply);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrKartLevelPointUpdate")
+        );
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 5);
+        assert_eq!(reader.read_i16().unwrap(), 0);
+        let levels = array::from_fn(|_| reader.read_i16().unwrap());
+        assert_eq!(levels, [10, 10, 10, 5]);
+        assert_eq!(reader.read_i16().unwrap(), 0);
+        assert!(reader.remaining().is_empty());
+    }
+
+    fn assert_kart_level_preload(preload: &[Vec<u8>]) {
+        let level_packet = preload
+            .iter()
+            .find(|packet| packet.get(4..10) == Some([0, 0, 1, 0, 0, 0].as_slice()))
+            .expect("reconnect preload must include the kart-level exception stream");
+        let mut reader = PacketReader::new(level_packet);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("LoRpGetRiderExcDataPacket")
+        );
+        assert_eq!(reader.read_bytes(6).unwrap(), [0, 0, 1, 0, 0, 0]);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 5);
+        assert_eq!(reader.read_i16().unwrap(), 0);
+        let levels = array::from_fn(|_| reader.read_i16().unwrap());
+        assert_eq!(levels, [10, 10, 10, 5]);
+        assert_eq!(reader.read_i16().unwrap(), 0);
+        for _ in 0..3 {
+            assert_eq!(reader.read_i32().unwrap(), 0);
+        }
+        assert!(reader.remaining().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_kart_upgrade_is_certain_non_consuming_durable_and_preloaded() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let catalog = test_catalog();
+        let mut initial_profile = Profile::default();
+        initial_profile.rider_item.kart = 1;
+        initial_profile.rider_item.kart_serial = 1;
+        initial_profile.granted_karts.push(GrantedKart {
+            kart_id: 2,
+            serial: 2,
+        });
+        ProfileStore::new(profile_root.path())
+            .save("LevelOwner", &initial_profile)
+            .unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(catalog.clone()));
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_802))
+            .await
+            .unwrap();
+        let identity = world.claim_identity(session, "LevelOwner").await.unwrap();
+        let admission = profiles
+            .admit(
+                &identity.nickname,
+                "test initial profile and equipment load",
+            )
+            .await
+            .unwrap();
+        let (profile, equipment, lane) = profiles
+            .load_with_equipment(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        let mut context = SessionContext::default();
+        context.bind_profile_with_equipment(identity.clone(), profile, equipment);
+        drop(lane);
+
+        let probability = kart_level_pair_request("PqKartLevelUpProbText", 2, None);
+        assert_eq!(
+            handle_kart_level(&world, &profiles, session, &probability, &mut context,)
+                .await
+                .unwrap(),
+            vec![p5136_core::kart_level_protocol::serialize_kart_level_up_probability_success()]
+        );
+
+        // The stock writer includes the displayed enhancement cost. This
+        // free-server policy parses it but neither validates nor deducts it.
+        let upgrade = kart_level_pair_request("PqKartLevelUp", 2, Some(123_456));
+        let upgrade_reply = handle_kart_level(&world, &profiles, session, &upgrade, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_non_consuming_kart_upgrade_reply(
+            &upgrade_reply,
+            initial_profile.rider.koin,
+            initial_profile.rider.lucci,
+        );
+
+        let persisted_profile = ProfileStore::new(profile_root.path())
+            .load_or_create("LevelOwner")
+            .unwrap();
+        assert_eq!(
+            persisted_profile.profile.granted_karts,
+            vec![GrantedKart {
+                kart_id: 2,
+                serial: 2,
+            }]
+        );
+        let rider_directory = persisted_profile.source_path.parent().unwrap();
+        let upgraded = EquipmentExceptions::load(profile_root.path(), rider_directory).unwrap();
+        assert_eq!(upgraded.kart_level.len(), 1);
+        assert_eq!(upgraded.kart_level[0].id, 1);
+        assert_eq!(upgraded.kart_level[0].grade, 5);
+        assert_eq!(upgraded.kart_level[0].points, 35);
+
+        let allocate = kart_level_point_update_request();
+        let allocation_reply =
+            handle_kart_level(&world, &profiles, session, &allocate, &mut context)
+                .await
+                .unwrap()
+                .remove(0);
+        assert_kart_level_allocation_reply(&allocation_reply);
+
+        let preload = handle_get_rider(&world, &profiles, session, &mut context)
+            .await
+            .unwrap();
+        assert_kart_level_preload(&preload);
+
+        let bound_profile = context.profile_for(&identity).unwrap().clone();
+        let bound_equipment = context.equipment_for(&identity).unwrap().clone();
+        let physics =
+            room_physics_metadata(&bound_profile, &bound_equipment, Some(catalog.as_ref()))
+                .unwrap();
+        let mut expected = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected.exc.kart_level = p5136_kart_level_spec([10, 10, 10, 5]).unwrap();
+        assert_eq!(
+            physics.block,
+            build_p5136_kart_physics_block(&expected).unwrap()
+        );
+
+        world.session_closed(session).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    fn floater_item_request(
+        name: &'static str,
+        consumable_id: i16,
+        kart_category: i16,
+        kart_id: i16,
+        kart_serial: i16,
+    ) -> Vec<u8> {
+        let mut packet = PacketWriter::named(name);
+        for value in [consumable_id, kart_category, kart_id, 0, kart_serial] {
+            packet.write_i16(value);
+        }
+        packet.into_inner()
+    }
+
+    fn floater_protect_request(
+        protect_kind: i16,
+        consumable_id: i16,
+        kart_id: i16,
+        kart_serial: i16,
+        slot: i16,
+    ) -> Vec<u8> {
+        let mut packet = PacketWriter::named(USE_PROTECT_SPANNER_REQUEST_NAME);
+        for value in [
+            protect_kind,
+            consumable_id,
+            3,
+            kart_id,
+            kart_serial,
+            0,
+            slot,
+        ] {
+            packet.write_i16(value);
+        }
+        packet.into_inner()
+    }
+
+    fn read_floater_state(reader: &mut PacketReader<'_>) -> [i16; 7] {
+        array::from_fn(|_| reader.read_i16().unwrap())
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end test proves all four Floater mutations, reconnect preload, and physics share one durable identity"
+    )]
+    async fn black_floater_is_non_consuming_durable_preloaded_and_applied_to_room_physics() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let catalog = test_catalog();
+        let mut initial_profile = Profile::default();
+        initial_profile.rider_item.kart = 633;
+        initial_profile.rider_item.kart_serial = 1;
+        ProfileStore::new(profile_root.path())
+            .save("FloaterOwner", &initial_profile)
+            .unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(catalog.clone()));
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_803))
+            .await
+            .unwrap();
+        let identity = world.claim_identity(session, "FloaterOwner").await.unwrap();
+        let admission = profiles
+            .admit(&identity.nickname, "test initial Floater profile load")
+            .await
+            .unwrap();
+        let (profile, equipment, lane) = profiles
+            .load_with_equipment(identity.nickname.clone(), true, admission)
+            .await
+            .unwrap();
+        let rider_directory = profile.source_path.parent().unwrap().to_owned();
+        let mut context = SessionContext::default();
+        context.bind_profile_with_equipment(identity.clone(), profile, equipment);
+        drop(lane);
+
+        // A structurally valid request for a non-kart category gets a complete
+        // failure reply and leaves the authenticated session usable.
+        let wrong_category = floater_item_request(USE_SOCKET_REQUEST_NAME, 1, 1, 633, 1);
+        let rejected = handle_floater(&world, &profiles, session, &wrong_category, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(rejected.len(), 34);
+        assert_eq!(i32::from_le_bytes(rejected[4..8].try_into().unwrap()), 1);
+        assert_eq!(world.authorize_identity(session).await.unwrap(), identity);
+
+        let missing_socket = floater_protect_request(49, 1, 633, 1, 0);
+        let missing_reply =
+            handle_floater(&world, &profiles, session, &missing_socket, &mut context)
+                .await
+                .unwrap()
+                .remove(0);
+        assert_eq!(missing_reply.len(), 38);
+        assert_eq!(
+            i32::from_le_bytes(missing_reply[4..8].try_into().unwrap()),
+            3
+        );
+
+        let socket = floater_item_request(USE_SOCKET_REQUEST_NAME, 1, 3, 633, 1);
+        let socket_reply = handle_floater(&world, &profiles, session, &socket, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        let mut reader = PacketReader::new(&socket_reply);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrUseSocketItem")
+        );
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 3);
+        assert_eq!(reader.read_i16().unwrap(), 633);
+        assert_eq!(reader.read_i16().unwrap(), 0);
+        assert_eq!(reader.read_i16().unwrap(), 1);
+        assert_eq!(reader.read_i16().unwrap(), 2);
+        assert_eq!(read_floater_state(&mut reader), [0, 0, 0, -1, 0, -1, 0]);
+        assert!(reader.remaining().is_empty());
+
+        let tune = floater_item_request(USE_TUNE_REQUEST_NAME, 5, 3, 633, 1);
+        let tune_reply = handle_floater(&world, &profiles, session, &tune, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        let mut reader = PacketReader::new(&tune_reply);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrUseTuneItem")
+        );
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(
+            reader.read_bytes(10).unwrap(),
+            [5, 0, 3, 0, 121, 2, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            read_floater_state(&mut reader),
+            [603, 703, 903, -1, 0, -1, 0]
+        );
+        assert!(reader.remaining().is_empty());
+
+        for (index, (kind, slot)) in [(49, 0), (53, 2)].into_iter().enumerate() {
+            let request = floater_protect_request(kind, 1, 633, 1, slot);
+            let response = handle_floater(&world, &profiles, session, &request, &mut context)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(response.len(), 38);
+            assert_eq!(i32::from_le_bytes(response[4..8].try_into().unwrap()), 0);
+            if index == 0 {
+                let duplicate = floater_protect_request(53, 1, 633, 1, 0);
+                let duplicate_reply =
+                    handle_floater(&world, &profiles, session, &duplicate, &mut context)
+                        .await
+                        .unwrap()
+                        .remove(0);
+                assert_eq!(duplicate_reply.len(), 38);
+                assert_eq!(
+                    i32::from_le_bytes(duplicate_reply[4..8].try_into().unwrap()),
+                    4
+                );
+            }
+        }
+
+        let reset = floater_item_request(USE_RESET_SOCKET_REQUEST_NAME, 1, 3, 633, 1);
+        let reset_reply = handle_floater(&world, &profiles, session, &reset, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        let mut reader = PacketReader::new(&reset_reply);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrUseResetSocketItem")
+        );
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(
+            reader.read_bytes(16).unwrap(),
+            [1, 0, 3, 0, 121, 2, 1, 0, 34, 0, 76, 0, 1, 0, 1, 0]
+        );
+        assert_eq!(read_floater_state(&mut reader), [603, 0, 903, 0, 3, 2, 2]);
+        assert!(reader.remaining().is_empty());
+
+        let persisted = EquipmentExceptions::load(profile_root.path(), &rider_directory).unwrap();
+        assert_eq!(persisted.tune.len(), 1);
+        assert_eq!(
+            [
+                persisted.tune[0].tune1,
+                persisted.tune[0].tune2,
+                persisted.tune[0].tune3
+            ],
+            [603, 0, 903]
+        );
+        let unchanged_profile = ProfileStore::new(profile_root.path())
+            .load_or_create("FloaterOwner")
+            .unwrap();
+        assert_eq!(unchanged_profile.profile, initial_profile);
+        assert_eq!(unchanged_profile.revision, Some(1));
+
+        let preload = handle_get_rider(&world, &profiles, session, &mut context)
+            .await
+            .unwrap();
+        let tune_preload = preload
+            .iter()
+            .find(|packet| packet.get(4..10) == Some([1, 0, 0, 0, 0, 0].as_slice()))
+            .expect("reconnect preload must include TuneData");
+        assert!(
+            tune_preload
+                .windows(14)
+                .any(|window| { window == [91, 2, 0, 0, 135, 3, 0, 0, 3, 0, 2, 0, 2, 0] })
+        );
+
+        let bound_profile = context.profile_for(&identity).unwrap().clone();
+        let bound_equipment = context.equipment_for(&identity).unwrap().clone();
+        let physics =
+            room_physics_metadata(&bound_profile, &bound_equipment, Some(catalog.as_ref()))
+                .unwrap();
+        let mut expected = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected.exc.tune = p5136_floater_spec([603, 0, 903]).unwrap();
+        assert_eq!(
+            physics.block,
+            build_p5136_kart_physics_block(&expected).unwrap()
+        );
 
         world.session_closed(session).await.unwrap();
         world.shutdown().await.unwrap();
@@ -12427,7 +13880,7 @@ mod tests {
             .admit("UnsafeKartOwner", "test unresolved kart sanitization")
             .await
             .unwrap();
-        let (responses, snapshot, lane) = profiles
+        let (responses, snapshot, _equipment, lane) = profiles
             .get_rider_sequence("UnsafeKartOwner".to_owned(), admission)
             .await
             .unwrap();
@@ -13326,6 +14779,7 @@ mod tests {
             kart_category: 3,
             kart_id: 1,
             kart_serial: 1,
+            replaced_part: None,
         };
         let write = tokio::spawn(async move {
             let admission = write_profiles

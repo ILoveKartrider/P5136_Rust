@@ -17,7 +17,10 @@ pub use catalog::{
     MAX_CATALOG_ITEM_TRANSFORMS, P5136KartSpecSnapshot, is_grant_category, is_grant_item,
 };
 pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
-pub use equipment::{EquipmentExceptions, EquipmentProfileError, EquipmentStateError};
+pub use equipment::{
+    EquipmentExceptions, EquipmentLoadWarning, EquipmentMutationOutcome, EquipmentProfileError,
+    EquipmentSidecar, EquipmentStateError, FloaterResetOutcome, LenientEquipmentLoad,
+};
 pub use favorite_items::{
     DEFAULT_MAX_FAVORITE_ITEM_LIST_RECORDS, FavoriteItemStateError, FavoriteItems, LockedItems,
     apply_favorite_item_changes, apply_item_collection_changes, favorite_item_snapshot,

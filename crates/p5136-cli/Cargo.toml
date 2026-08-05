@@ -16,6 +16,7 @@ clap.workspace = true
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "glow",
+    "persistence",
     "wayland",
     "x11",
 ] }
@@ -24,6 +25,8 @@ p5136-connector = { path = "../p5136-connector" }
 p5136-core = { path = "../p5136-core" }
 p5136-profile = { path = "../p5136-profile" }
 p5136-server = { path = "../p5136-server" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

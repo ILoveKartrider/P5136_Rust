@@ -4083,6 +4083,21 @@ mod tests {
             read_login_packet(&mut client, maximum).await,
             serialize_equip_x_part_failure(request)
         );
+        let get_rider = PacketWriter::named("PqGetRider").into_inner();
+        send_packet(&mut client.stream, &get_rider, &mut client.send_iv, maximum).await;
+        let mut saw_final_rider = false;
+        for _ in 0..256 {
+            let packet = read_login_packet(&mut client, maximum).await;
+            if packet.get(..4) == Some(adler32::packet_hash("PrGetRider").to_le_bytes().as_slice())
+            {
+                saw_final_rider = true;
+                break;
+            }
+        }
+        assert!(
+            saw_final_rider,
+            "malformed optional X-part state must not terminate PqGetRider preload"
+        );
         assert_eq!(
             request_named(&mut client, "PqLoginVipInfo", maximum).await,
             serialize_pr_login_vip_info(5)
@@ -4450,6 +4465,7 @@ mod tests {
             kart_category: 3,
             kart_id: 1,
             kart_serial: 1,
+            replaced_part: None,
         };
         let plant_packet = build_plant_part_request(plant_request, false);
         send_packet(

@@ -21,6 +21,7 @@ pub const P5136_KART_PHYSICS_FIELD_COUNT: usize = 70;
 pub const P5136_ENCODED_F32_COUNT: usize = 49;
 pub const P5136_ENCODED_I32_COUNT: usize = 6;
 pub const P5136_ENCODED_U8_COUNT: usize = 15;
+pub const P5136_MODERN_SPEED_TYPE_COUNT: usize = 9;
 pub const P5136_S4_DRIFT_MAX_GAUGE: f32 = 1.0;
 pub const P5136_S6_BOOSTER_TIME: f32 = 2_000_000.0;
 
@@ -249,10 +250,10 @@ impl P5136SpeedSpecSnapshot {
     }
 
     /// Exact modern Korean room-speed preset selected by the C# server's
-    /// S0-S7 title tokens. The input is the protocol speed byte, not the
+    /// S0-S8 title tokens. The input is the protocol speed byte, not the
     /// visible grade number (`S0` maps to byte 3, `S1` to 0, and so on).
     #[must_use]
-    // Keeping the eight reverse-engineered C# records adjacent makes byte-
+    // Keeping the nine reverse-engineered C# records adjacent makes byte-
     // level review safer than hiding individual fields behind a builder.
     #[allow(clippy::too_many_lines)]
     pub const fn csharp_modern(speed_type: u8) -> Option<Self> {
@@ -410,6 +411,11 @@ impl P5136SpeedSpecSnapshot {
                 ..Self::csharp_zero()
             },
             7 => Self::csharp_default(),
+            8 => {
+                let mut value = Self::csharp_default();
+                value.drag_factor = 0.74;
+                value
+            }
             _ => return None,
         };
         Some(preset)
@@ -446,14 +452,14 @@ impl P5136SpeedSpecSnapshot {
     }
 }
 
-/// Parses the C# server's case-insensitive, ASCII-alphanumeric-bounded S0-S7
+/// Parses the C# server's case-insensitive, ASCII-alphanumeric-bounded S0-S8
 /// room-title token and returns its protocol speed byte.
 #[must_use]
 pub fn csharp_room_title_speed_type(room_name: &str) -> Option<u8> {
-    const SPEED_TYPES: [u8; 8] = [3, 0, 1, 2, 4, 5, 6, 7];
+    const SPEED_TYPES: [u8; P5136_MODERN_SPEED_TYPE_COUNT] = [3, 0, 1, 2, 4, 5, 6, 7, 8];
     let bytes = room_name.as_bytes();
     for index in 0..bytes.len().saturating_sub(1) {
-        if !matches!(bytes[index], b'S' | b's') || !matches!(bytes[index + 1], b'0'..=b'7') {
+        if !matches!(bytes[index], b'S' | b's') || !matches!(bytes[index + 1], b'0'..=b'8') {
             continue;
         }
         let left_is_alphanumeric = index != 0 && bytes[index - 1].is_ascii_alphanumeric();
@@ -1767,13 +1773,14 @@ mod tests {
         assert_eq!(csharp_room_title_speed_type("[S4] 무한"), Some(4));
         assert_eq!(csharp_room_title_speed_type("S6-연습"), Some(6));
         assert_eq!(csharp_room_title_speed_type("S7"), Some(7));
+        assert_eq!(csharp_room_title_speed_type("S8 아이템"), Some(8));
         assert_eq!(csharp_room_title_speed_type("TESTS1ROOM"), None);
         assert_eq!(csharp_room_title_speed_type("S10"), None);
-        assert_eq!(csharp_room_title_speed_type("S8"), None);
+        assert_eq!(csharp_room_title_speed_type("S9"), None);
     }
 
     #[test]
-    fn modern_s0_through_s7_presets_keep_the_reference_distinguishers() {
+    fn modern_s0_through_s8_presets_keep_the_reference_distinguishers() {
         let s0 = P5136SpeedSpecSnapshot::csharp_modern(3).unwrap();
         let s1 = P5136SpeedSpecSnapshot::csharp_modern(0).unwrap();
         let s3 = P5136SpeedSpecSnapshot::csharp_modern(2).unwrap();
@@ -1797,7 +1804,10 @@ mod tests {
             P5136SpeedSpecSnapshot::csharp_modern(7),
             Some(P5136SpeedSpecSnapshot::csharp_default())
         );
-        assert_eq!(P5136SpeedSpecSnapshot::csharp_modern(8), None);
+        let s8 = P5136SpeedSpecSnapshot::csharp_modern(8).unwrap();
+        assert_eq!(s8.drag_factor.to_bits(), 0.74_f32.to_bits());
+        assert_eq!(s8.forward_accel_force.to_bits(), 2_150.0_f32.to_bits());
+        assert_eq!(P5136SpeedSpecSnapshot::csharp_modern(9), None);
     }
 
     #[test]

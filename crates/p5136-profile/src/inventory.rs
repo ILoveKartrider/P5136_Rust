@@ -118,7 +118,7 @@ pub fn apply_rider_item_selection(items: &mut RiderItems, selection: RiderItemSe
 
 /// Builds the complete catalog-backed rider-item portion of `PqGetRider`.
 ///
-/// Plant and equipped-parts exception records are profile sidecars in the C#
+/// Floater, plant, kart-level, and equipped-parts exception records are profile sidecars in the C#
 /// implementation. Loaded records are restricted to client-safe catalog karts;
 /// the item stream preserves its physical category/X-parts boundaries.
 pub fn build_inventory_snapshot(
@@ -134,11 +134,17 @@ pub fn build_inventory_snapshot_with_equipment(
     mut equipment: EquipmentExceptions,
 ) -> Result<InventorySnapshot, InventoryBuildError> {
     equipment
+        .tune
+        .retain(|record| exception_kart_is_owned(catalog, profile, record.id, record.serial));
+    equipment
         .plant
-        .retain(|record| exception_kart_is_granted(catalog, record.id));
+        .retain(|record| exception_kart_is_owned(catalog, profile, record.id, record.serial));
+    equipment
+        .kart_level
+        .retain(|record| exception_kart_is_owned(catalog, profile, record.id, record.serial));
     equipment
         .parts
-        .retain(|record| exception_kart_is_granted(catalog, record.id));
+        .retain(|record| exception_kart_is_owned(catalog, profile, record.id, record.serial));
 
     let prevent_item = profile.server_setting.prevent_item_use != 0;
     let slot_changer = profile.rider.slot_changer;
@@ -182,14 +188,32 @@ pub fn build_inventory_snapshot_with_equipment(
     )?;
 
     Ok(InventorySnapshot {
+        tune_exceptions: equipment.tune,
         plant_exceptions: equipment.plant,
+        kart_level_exceptions: equipment.kart_level,
         parts_exceptions: equipment.parts,
         item_groups,
     })
 }
 
-fn exception_kart_is_granted(catalog: &CatalogInventory, kart_id: i16) -> bool {
-    u16::try_from(kart_id).is_ok_and(|kart_id| catalog.grants_item(3, kart_id))
+fn exception_kart_is_owned(
+    catalog: &CatalogInventory,
+    profile: &Profile,
+    kart_id: i16,
+    serial: i16,
+) -> bool {
+    let (Ok(kart_id), Ok(serial)) = (u16::try_from(kart_id), u16::try_from(serial)) else {
+        return false;
+    };
+    let serial = normalize_kart_serial(kart_id, serial);
+    if serial == 1 {
+        return catalog.grants_item(3, kart_id);
+    }
+    catalog.contains_kart(kart_id)
+        && profile
+            .granted_karts
+            .iter()
+            .any(|grant| grant.kart_id == kart_id && grant.serial == serial)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,8 +360,8 @@ fn add_granted_karts(
     prevent_item: bool,
 ) {
     let known_karts = catalog
-        .grant_items()
-        .filter(|item| item.category == 3)
+        .category(3)
+        .filter(|item| catalog.contains_kart(item.id))
         .map(|item| item.id)
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
@@ -492,6 +516,7 @@ mod tests {
             tail_lamp: 6,
         };
         EquipmentExceptions {
+            tune: Vec::new(),
             plant: vec![
                 granted_plant,
                 PlantExcRecord {
@@ -499,6 +524,7 @@ mod tests {
                     ..granted_plant
                 },
             ],
+            kart_level: Vec::new(),
             parts: vec![
                 granted_parts,
                 PartsExcRecord {
@@ -577,6 +603,25 @@ mod tests {
                 .unwrap()
                 .amount,
             321
+        );
+
+        profile.granted_karts.push(GrantedKart {
+            kart_id: 1_453,
+            serial: 2,
+        });
+        let manual_snapshot = build_inventory_snapshot_with_equipment(
+            &catalog,
+            &profile,
+            equipment_with_unresolved_sidecars(),
+        )
+        .unwrap();
+        assert_eq!(manual_snapshot.plant_exceptions.len(), 2);
+        assert_eq!(manual_snapshot.parts_exceptions.len(), 2);
+        assert!(
+            manual_snapshot.item_groups[48]
+                .records
+                .iter()
+                .any(|record| record.id == 1_453 && record.serial == 2)
         );
     }
 

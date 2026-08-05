@@ -1,10 +1,10 @@
 //! P5136 inventory preload packet codecs.
 //!
 //! The stock client expects `PqGetRider` to enqueue every inventory packet
-//! before the final `PrGetRider` snapshot. The observed order is plant
-//! exception data, parts exception data, rider-item groups, then the rider
-//! snapshot. The later `LoRqGetRiderItemPacket` is deliberately consumed
-//! without another reply.
+//! before the final `PrGetRider` snapshot. The observed exception order is
+//! Floater/tune, plant, kart level, and parts, followed by rider-item groups
+//! and the rider snapshot. The later `LoRqGetRiderItemPacket` is deliberately
+//! consumed without another reply.
 //!
 //! Inventory wire records contain no strings. All record, group, and output
 //! packet counts are bounded before any output packet is allocated.
@@ -124,6 +124,32 @@ pub struct PlantExcRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuneExcRecord {
+    pub id: i16,
+    pub serial: i16,
+    pub tune1: i16,
+    pub tune2: i16,
+    pub tune3: i16,
+    pub slot1: i16,
+    pub count1: i16,
+    pub slot2: i16,
+    pub count2: i16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KartLevelExcRecord {
+    pub id: i16,
+    pub serial: i16,
+    pub grade: i16,
+    pub points: i16,
+    pub level1: i16,
+    pub level2: i16,
+    pub level3: i16,
+    pub level4: i16,
+    pub effect: i16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartsExcRecord {
     pub id: i16,
     pub serial: i16,
@@ -159,14 +185,18 @@ impl RiderItemGroup {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InventorySnapshot {
+    pub tune_exceptions: Vec<TuneExcRecord>,
     pub plant_exceptions: Vec<PlantExcRecord>,
+    pub kart_level_exceptions: Vec<KartLevelExcRecord>,
     pub parts_exceptions: Vec<PartsExcRecord>,
     pub item_groups: Vec<RiderItemGroup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GetRiderPacketKind {
+    TuneExceptions { first_chunk: bool },
     PlantExceptions { first_chunk: bool },
+    KartLevelExceptions { first_chunk: bool },
     PartsExceptions { first_chunk: bool },
     RiderItems,
     RiderSnapshot,
@@ -216,9 +246,8 @@ pub fn classify_inventory_request(hash: u32) -> Option<InventoryRequest> {
 
 /// Serializes only the inventory packets that must precede `PrGetRider`.
 ///
-/// Plant and parts exception arrays are chunked globally. Rider items are
-/// chunked independently inside each group so category/X-parts boundaries are
-/// not merged.
+/// Exception arrays are chunked globally. Rider items are chunked independently
+/// inside each group so category/X-parts boundaries are not merged.
 pub fn serialize_inventory_preload(
     snapshot: &InventorySnapshot,
 ) -> Result<Vec<GetRiderPacket>, InventoryError> {
@@ -226,6 +255,18 @@ pub fn serialize_inventory_preload(
 
     let packet_count = preload_packet_count(snapshot)?;
     let mut packets = Vec::with_capacity(packet_count);
+
+    for (index, records) in snapshot
+        .tune_exceptions
+        .chunks(RECORDS_PER_INVENTORY_PACKET)
+        .enumerate()
+    {
+        let first_chunk = index == 0;
+        packets.push(GetRiderPacket {
+            kind: GetRiderPacketKind::TuneExceptions { first_chunk },
+            logical_packet: serialize_tune_exc_packet(records, first_chunk)?,
+        });
+    }
 
     for (index, records) in snapshot
         .plant_exceptions
@@ -236,6 +277,18 @@ pub fn serialize_inventory_preload(
         packets.push(GetRiderPacket {
             kind: GetRiderPacketKind::PlantExceptions { first_chunk },
             logical_packet: serialize_plant_exc_packet(records, first_chunk)?,
+        });
+    }
+
+    for (index, records) in snapshot
+        .kart_level_exceptions
+        .chunks(RECORDS_PER_INVENTORY_PACKET)
+        .enumerate()
+    {
+        let first_chunk = index == 0;
+        packets.push(GetRiderPacket {
+            kind: GetRiderPacketKind::KartLevelExceptions { first_chunk },
+            logical_packet: serialize_kart_level_exc_packet(records, first_chunk)?,
         });
     }
 
@@ -296,6 +349,36 @@ pub fn serialize_rider_item_packet(records: &[RiderItemRecord]) -> Result<Vec<u8
         packet.write_u8(record.part_flag);
         packet.write_u8(record.grade);
         write_i16(&mut packet, record.value);
+    }
+    Ok(packet.into_inner())
+}
+
+pub fn serialize_tune_exc_packet(
+    records: &[TuneExcRecord],
+    first_chunk: bool,
+) -> Result<Vec<u8>, InventoryError> {
+    let count = validate_packet_chunk("Floater exception stream", records.len())?;
+    let mut packet = PacketWriter::named("LoRpGetRiderExcDataPacket");
+    packet.write_bytes(&[u8::from(first_chunk), 0, 0, 0, 0, 0]);
+    packet.write_i32(count);
+
+    for record in records {
+        write_i16(&mut packet, 3);
+        write_i16(&mut packet, record.id);
+        write_i16(&mut packet, record.serial);
+        write_i16(&mut packet, 0);
+        write_i16(&mut packet, 0);
+        write_i16(&mut packet, record.tune1);
+        write_i16(&mut packet, record.tune2);
+        write_i16(&mut packet, record.tune3);
+        write_i16(&mut packet, record.slot1);
+        write_i16(&mut packet, record.count1);
+        write_i16(&mut packet, record.slot2);
+        write_i16(&mut packet, record.count2);
+    }
+
+    for _ in 0..5 {
+        packet.write_i32(0);
     }
     Ok(packet.into_inner())
 }
@@ -382,6 +465,35 @@ pub fn serialize_plant_exc_packet(
     Ok(packet.into_inner())
 }
 
+pub fn serialize_kart_level_exc_packet(
+    records: &[KartLevelExcRecord],
+    first_chunk: bool,
+) -> Result<Vec<u8>, InventoryError> {
+    let count = validate_packet_chunk("kart-level exception stream", records.len())?;
+    let mut packet = PacketWriter::named("LoRpGetRiderExcDataPacket");
+    packet.write_bytes(&[0, 0, u8::from(first_chunk), 0, 0, 0]);
+    packet.write_i32(0);
+    packet.write_i32(0);
+    packet.write_i32(count);
+
+    for record in records {
+        write_i16(&mut packet, record.id);
+        write_i16(&mut packet, record.serial);
+        write_i16(&mut packet, record.grade);
+        write_i16(&mut packet, record.points);
+        write_i16(&mut packet, record.level1);
+        write_i16(&mut packet, record.level2);
+        write_i16(&mut packet, record.level3);
+        write_i16(&mut packet, record.level4);
+        write_i16(&mut packet, record.effect);
+    }
+
+    packet.write_i32(0);
+    packet.write_i32(0);
+    packet.write_i32(0);
+    Ok(packet.into_inner())
+}
+
 fn validate_snapshot(snapshot: &InventorySnapshot) -> Result<(), InventoryError> {
     enforce_limit(
         "rider-item group",
@@ -390,8 +502,16 @@ fn validate_snapshot(snapshot: &InventorySnapshot) -> Result<(), InventoryError>
     )?;
 
     let mut record_count = snapshot
-        .plant_exceptions
+        .tune_exceptions
         .len()
+        .checked_add(snapshot.plant_exceptions.len())
+        .ok_or(InventoryError::CountOverflow {
+            resource: "inventory record",
+        })?
+        .checked_add(snapshot.kart_level_exceptions.len())
+        .ok_or(InventoryError::CountOverflow {
+            resource: "inventory record",
+        })?
         .checked_add(snapshot.parts_exceptions.len())
         .ok_or(InventoryError::CountOverflow {
             resource: "inventory record",
@@ -415,7 +535,15 @@ fn validate_snapshot(snapshot: &InventorySnapshot) -> Result<(), InventoryError>
 }
 
 fn preload_packet_count(snapshot: &InventorySnapshot) -> Result<usize, InventoryError> {
-    let mut packet_count = chunk_count(snapshot.plant_exceptions.len())
+    let mut packet_count = chunk_count(snapshot.tune_exceptions.len())
+        .checked_add(chunk_count(snapshot.plant_exceptions.len()))
+        .ok_or(InventoryError::CountOverflow {
+            resource: "inventory preload packet",
+        })?
+        .checked_add(chunk_count(snapshot.kart_level_exceptions.len()))
+        .ok_or(InventoryError::CountOverflow {
+            resource: "inventory preload packet",
+        })?
         .checked_add(chunk_count(snapshot.parts_exceptions.len()))
         .ok_or(InventoryError::CountOverflow {
             resource: "inventory preload packet",
@@ -474,10 +602,11 @@ mod tests {
 
     use super::{
         GetRiderPacketKind, InventoryError, InventoryRequest, InventoryRequestDisposition,
-        InventorySnapshot, MAX_INVENTORY_ITEM_GROUPS, MAX_INVENTORY_RECORDS, PartsExcRecord,
-        PlantExcRecord, RECORDS_PER_INVENTORY_PACKET, RiderItemGroup, RiderItemRecord,
-        classify_inventory_request, serialize_get_rider_sequence, serialize_inventory_preload,
-        serialize_parts_exc_packet, serialize_plant_exc_packet, serialize_rider_item_packet,
+        InventorySnapshot, KartLevelExcRecord, MAX_INVENTORY_ITEM_GROUPS, MAX_INVENTORY_RECORDS,
+        PartsExcRecord, PlantExcRecord, RECORDS_PER_INVENTORY_PACKET, RiderItemGroup,
+        RiderItemRecord, TuneExcRecord, classify_inventory_request, serialize_get_rider_sequence,
+        serialize_inventory_preload, serialize_kart_level_exc_packet, serialize_parts_exc_packet,
+        serialize_plant_exc_packet, serialize_rider_item_packet, serialize_tune_exc_packet,
     };
     use crate::{adler32, startup::PrGetRiderFields};
 
@@ -531,7 +660,9 @@ mod tests {
     #[test]
     fn nonempty_preload_matches_csharp_goldens_and_wire_order() {
         let snapshot = InventorySnapshot {
+            tune_exceptions: Vec::new(),
             plant_exceptions: vec![fixture_plant()],
+            kart_level_exceptions: Vec::new(),
             parts_exceptions: vec![fixture_parts()],
             item_groups: vec![RiderItemGroup::new(vec![
                 RiderItemRecord::normal(3, 1001, 1, 1, false),
@@ -569,7 +700,9 @@ mod tests {
     #[test]
     fn complete_sequence_never_publishes_rider_before_inventory() {
         let snapshot = InventorySnapshot {
+            tune_exceptions: Vec::new(),
             plant_exceptions: vec![fixture_plant()],
+            kart_level_exceptions: Vec::new(),
             parts_exceptions: vec![fixture_parts()],
             item_groups: vec![RiderItemGroup::new(vec![RiderItemRecord::normal(
                 3, 1001, 1, 1, false,
@@ -605,7 +738,9 @@ mod tests {
         let repeated_parts = vec![fixture_parts(); RECORDS_PER_INVENTORY_PACKET + 1];
         let item = RiderItemRecord::normal(3, 1001, 1, 1, false);
         let snapshot = InventorySnapshot {
+            tune_exceptions: Vec::new(),
             plant_exceptions: repeated_plant,
+            kart_level_exceptions: Vec::new(),
             parts_exceptions: repeated_parts,
             item_groups: vec![
                 RiderItemGroup::new(vec![item; 60]),
@@ -650,6 +785,56 @@ mod tests {
             &parts,
             74,
             "DEE094439F8C925B46C1FE5F3227F4CA51373282E15B3E3B5196CDC5B15F2ADD",
+        );
+    }
+
+    #[test]
+    fn kart_level_exception_matches_the_p5136_reconnect_shape() {
+        let record = KartLevelExcRecord {
+            id: 1_031,
+            serial: 1,
+            grade: 5,
+            points: 5,
+            level1: 10,
+            level2: 10,
+            level3: 5,
+            level4: 5,
+            effect: 2,
+        };
+        let packet = serialize_kart_level_exc_packet(&[record], true).unwrap();
+        assert_eq!(
+            packet,
+            decode_hex(
+                "8509D37900000100000000000000000000000100000007040100050005000A000A00050005000200\
+                 000000000000000000000000"
+            )
+        );
+    }
+
+    #[test]
+    fn floater_exception_matches_csharp_and_precedes_other_exception_streams() {
+        let record = fixture_tune();
+        let packet = serialize_tune_exc_packet(&[record], true).unwrap();
+        assert_eq!(
+            packet,
+            decode_hex(
+                "8509D37901000000000001000000030079020200000000005B02BF0287030000040002000300\
+                 0000000000000000000000000000000000000000"
+            )
+        );
+
+        let snapshot = InventorySnapshot {
+            tune_exceptions: vec![record],
+            plant_exceptions: vec![fixture_plant()],
+            ..InventorySnapshot::default()
+        };
+        let packets = serialize_inventory_preload(&snapshot).unwrap();
+        assert_eq!(
+            packets.iter().map(|packet| packet.kind).collect::<Vec<_>>(),
+            [
+                GetRiderPacketKind::TuneExceptions { first_chunk: true },
+                GetRiderPacketKind::PlantExceptions { first_chunk: true },
+            ]
         );
     }
 
@@ -714,6 +899,20 @@ mod tests {
             wheel_id: 33,
             kit_category: 46,
             kit_id: 44,
+        }
+    }
+
+    fn fixture_tune() -> TuneExcRecord {
+        TuneExcRecord {
+            id: 633,
+            serial: 2,
+            tune1: 603,
+            tune2: 703,
+            tune3: 903,
+            slot1: 0,
+            count1: 4,
+            slot2: 2,
+            count2: 3,
         }
     }
 

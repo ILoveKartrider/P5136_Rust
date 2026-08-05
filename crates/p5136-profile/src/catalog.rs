@@ -61,6 +61,10 @@ pub struct CatalogInventoryItem {
     pub id: u16,
     pub serial: u16,
     pub name: String,
+    /// Whether the server may publish the item as an implicit serial-1 grant.
+    /// `false` keeps the catalog entry available for an explicit operator ID
+    /// override without exposing it to every client by default.
+    pub auto_grant: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +279,23 @@ impl CatalogInventory {
             .filter(move |item| item.category == category)
     }
 
+    /// Returns the complete shop-catalog entry, including conservatively
+    /// quarantined entries that are not implicit grants.
+    #[must_use]
+    pub fn item(&self, category: u16, item_id: u16) -> Option<&CatalogInventoryItem> {
+        self.items
+            .iter()
+            .find(|item| item.category == category && item.id == item_id)
+    }
+
+    /// Returns whether the client catalog knows this category-3 kart ID.
+    /// This is deliberately broader than [`Self::grants_item`]: an operator
+    /// may explicitly add a conservative false negative by numeric ID.
+    #[must_use]
+    pub fn contains_kart(&self, kart_id: u16) -> bool {
+        self.item(3, kart_id).is_some()
+    }
+
     /// Returns whether one catalog item is safe to expose as owned inventory.
     ///
     /// Older inventory-only catalogs have no kart-name/spec metadata, so their
@@ -337,7 +358,8 @@ pub fn is_grant_category(category: u16) -> bool {
 
 #[must_use]
 pub fn is_grant_item(item: &CatalogInventoryItem) -> bool {
-    is_grant_category(item.category)
+    item.auto_grant
+        && is_grant_category(item.category)
         && (item.category != 1 || UNSAFE_CHARACTER_ITEM_IDS.binary_search(&item.id).is_err())
 }
 
@@ -1054,6 +1076,16 @@ impl CatalogParser {
                 None => 0,
             };
         let name = attribute(reader, element, b"name")?.unwrap_or_default();
+        let auto_grant = match attribute(reader, element, b"autoGrant")? {
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(_) => {
+                return Err(CatalogInventoryError::InvalidItemAttribute {
+                    attribute: "autoGrant",
+                });
+            }
+            None => true,
+        };
         if name.len() > MAX_ITEM_NAME_BYTES {
             return Err(CatalogInventoryError::ItemNameTooLong {
                 maximum: MAX_ITEM_NAME_BYTES,
@@ -1067,6 +1099,7 @@ impl CatalogParser {
             id,
             serial,
             name,
+            auto_grant,
         });
         Ok(())
     }
@@ -1966,7 +1999,7 @@ mod tests {
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
                 <Names />
                 <Inventory total="3" categories="2">
-                    <Item category="3" id="1453" name="chicken_goldV1" />
+                    <Item category="3" id="1453" name="chicken_goldV1" autoGrant="false" />
                     <Item category="1" id="45" name="dummy" />
                     <Item category="3" id="1450" serial="7" name="shurikenV1" />
                 </Inventory>
@@ -1993,12 +2026,32 @@ mod tests {
             id: 45,
             serial: 0,
             name: String::new(),
+            auto_grant: true,
         }));
-        assert_eq!(catalog.grant_items().count(), 2);
+        assert!(!catalog.items()[2].auto_grant);
+        assert!(catalog.contains_kart(1453));
+        assert!(!catalog.grants_item(3, 1453));
+        assert_eq!(catalog.grant_items().count(), 1);
         assert_eq!(catalog.kart_spec_stats().names, 0);
         assert!(catalog.kart_spec(1450).is_none());
         assert_eq!(catalog.emblem_catalog(), None);
         assert!(catalog.emblems().is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_auto_grant_attribute() {
+        assert!(matches!(
+            parse_structural(
+                r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                    <Inventory total="1" categories="1">
+                        <Item category="3" id="1450" name="kart" autoGrant="maybe" />
+                    </Inventory>
+                </KartCatalog>"#,
+            ),
+            Err(CatalogInventoryError::InvalidItemAttribute {
+                attribute: "autoGrant"
+            })
+        ));
     }
 
     #[test]

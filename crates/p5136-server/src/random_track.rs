@@ -42,14 +42,14 @@ pub struct RandomTrackPool {
     pub default_track_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RandomTrackPoolOverride {
     pub game_type: u8,
     pub selector: u32,
     pub track_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RandomTrackConfiguration {
     pub pools: Vec<RandomTrackPoolOverride>,
 }

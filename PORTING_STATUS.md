@@ -5,11 +5,201 @@ Last updated: 2026-08-04
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
 
+## 2026-08-04 lobby balance, channel fallback, GUI settings memory, and next grid
+
+- Team-room admission now counts active human and actor-owned AI racers by team
+  and places the next human in the smaller team. A tie selects Blue, producing
+  Blue/Red/Blue/Red from an empty room while retaining physical slots 0..3 for
+  Blue and 4..7 for Red. If the preferred half is physically unavailable, the
+  other half is used without violating the slot/team mapping.
+- Room creation derives its advertised `speed_type` from the channel whenever
+  the title has no standalone S0-S8 token. Individual/team infinite-booster
+  channels 23/24 use S6, item channels use S8, and speed/newbie channels use S7.
+  The race-start physics lookup receives that same fallback, while game types
+  2/4 still select their individual/team item matrix rows. Thus channel/session
+  metadata and the emitted 235-byte physics block no longer disagree.
+- The native GUI now enables eframe desktop persistence and stores a bounded
+  (2 MiB maximum) versioned snapshot of all server/connector input fields:
+  addresses, ports, paths, nickname, runner/Wine/CrossOver/Sikarugir settings,
+  advanced limits, checkboxes, edited item-probability tables, and random-track
+  overrides. Runtime state, logs, loaded catalogs, and search results remain
+  transient. GUI server startup now requires a client root, `Profile`, or
+  `Data` selection and resolves it to an existing `Data` folder. A persistent
+  footer displays the compiled Cargo package version.
+- Settlement finalization sorts every still-present human by the server's final
+  rank and writes a compact 0-based lobby `RoomPlayer.ranking` before clearing
+  race state. The next `RoomSlotData` embedded in `GrCommandStart` therefore
+  carries the prior race order (including DNF ordering) instead of the original
+  join order, without leaving an empty grid position when a racer disconnected.
+- Regression coverage includes alternating team admission and physical slots,
+  true team-full rejection, S6 infinite/S8 item channel creation, matrix
+  fallback selection, GUI persistence and required-path rejection, and exact
+  next-start `RoomPlayer.ranking` serialization.
+- The refreshed fixed-path release is
+  `target/p5136-finish-kart-abilities/release/p5136.exe` (18,347,008 bytes,
+  SHA-256
+  `F1A8093D794BAD57CCD1B98C1F3FD860EE46EA338544ACEB5BE04290B20BF86F`).
+  Workspace tests with all features, warning-denying workspace Clippy, release
+  build, `--help` smoke, formatting, and diff checks pass at this checkpoint.
+
+## 2026-08-04 conservative kart inventory admission
+
+- Replaced blanket category-3 inventory publication with a conservative
+  resource check. Automatic serial-1 ownership now requires a nonempty resolved
+  internal name, a parsed KR/default `BodyParam`, and an actual `model.1s` in
+  the effective folder (`addModelFolder` when present, otherwise the kart's own
+  folder). Internal/display names that look like dummy, test, NPC, or AI rows
+  are also excluded.
+- The stock P5136 client resolves 1,296 shop karts: 1,282 remain automatic and
+  14 are quarantined (`199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 795,
+  814, 886, 1167`). Quarantine removes only implicit serial-1 ownership and
+  ordinary name search; it does not discard catalog identity.
+- An operator who has verified a conservative false negative can enter its
+  exact decimal ID in the GUI. The result is marked `[수동 확인]`, requires an
+  explicit selection, and creates only a nickname-scoped serial-2+ grant.
+  Equipment validation and inventory serialization accept that exact persisted
+  pair but do not silently restore serial 1 for the same quarantined kart.
+- Structural parser tests cover the bounded `autoGrant` attribute, name search
+  hiding versus exact-ID discovery, durable manual grant allocation, and manual
+  equipment ownership. Loader tests cover direct and shared model folders,
+  missing spec/model rejection, development-name rejection, and the exact
+  stock-data 1,282/14 split.
+
+## 2026-08-04 Floater/TuneData and Black-H physics
+
+- Reconstructed all four fixed-width P5136 Floater request/reply pairs from the
+  client consumers: socket creation, activation kit, protection spanner, and
+  socket reset. Requests now distinguish `consumable_id` from the required
+  category-3 kart type. Every failure returns the complete decoder shape, so a
+  missing state or rejected request cannot leave the client UI busy forever.
+- Corrected two retained C# incompatibilities instead of cloning them. The
+  socket reply writes native `record_state=0` rather than duplicating the kart
+  serial and sends the same `[Tune1,Tune2,Tune3,Slot1,Count1,Slot2,Count2]`
+  state that is persisted. Reset atomically computes and stores the post-reset
+  state, then returns that exact state so the client cache cannot diverge from
+  the server. Protection result codes 2/3/4 retain native kart-unavailable,
+  socket-missing, and already-protected meanings.
+- Added bounded, BOM-tolerant, last-wins `(kart_id, normalized_serial)` loading
+  for `TuneData.json`. Mutations use the existing profile-root lease, no-follow
+  rider capability, temporary-file atomic replace, and explicit
+  committed-but-directory-sync-uncertain outcome. Unknown JSON fields survive
+  rewrites; malformed or duplicate tune codes isolate only the Tune stream at
+  login but strictly reject a Tune mutation without replacing the file.
+- The friend-server policy does not deduct Floater consumables. It still checks
+  target kart ownership, category, selector, slot range, nonempty target slot,
+  and duplicate protection. Activation selector 4 uses the recovered item pool,
+  selector 6 the speed pool, and selector 5 installs the fixed Black set
+  `[603,703,903]`. Protection counts and reset survival match native behavior.
+- Tune preload is emitted before plant, kart-level, parts, and ordinary rider
+  items using the exact 12-`i16` record and six-vector `LoRpGetRiderExcDataPacket`
+  layout. Duplicate-kart serial allocation also reserves orphaned Tune records,
+  preventing a newly granted copy from inheriting another copy's Floater state.
+- Ported the exact C# server-physics contributions for codes 103 through 903.
+  Black-H therefore contributes start-booster time `+800`, transform
+  acceleration `+0.018`, and drift escape force `+210` to the matching
+  `(kart_id,serial)` room physics snapshot. Item codes 10103 through 12003 remain
+  valid persisted client semantics but deliberately add no invented server
+  speed physics, matching the original C# path.
+- Added codec golden/bounds tests, strict/lenient persistence tests, protection
+  and reset transition tests, inventory-preload ordering tests, and a session
+  workflow covering rejected category, missing/duplicate protection, socket →
+  Black activation → protection → reset, main-profile non-consumption, reconnect
+  preload, and final room-physics bytes.
+
+## 2026-08-04 plant parts and legacy kart enhancement
+
+- Reconstructed the stock `PqEquipTuningExPacket` as two five-`i16`
+  descriptors: the newly equipped plant part and the displaced part. The
+  retained shorter C# fixture remains accepted, but arbitrary trailing sizes
+  fail closed. `PrEquipTuningPacket` failure now uses the native decoder's
+  fixed `u8 + 5*i16` body instead of the truncated C# `i32` response.
+- Plant changes are written through the profile-root lease and no-follow rider
+  directory capability, then atomically published to `PlantData.json` before a
+  success reply. The refreshed exception cache is bound to the authenticated
+  session and room participant; an exact kart ID and normalized serial match is
+  required before any contribution is applied.
+- Ported all 91 recovered plant performance entries and their C# mode filters.
+  Race participants now carry a game-type-by-S0..S7 physics matrix: game types
+  1 and 3 use speed rules, while 2 and 4 use individual/team item rules. Loading
+  and Running still retain their frozen race-start block.
+- Added exact native codecs for probability, upgrade, point allocation, point
+  clear, and special-slot requests/replies. The stock upgrade request's final
+  `i32 cost`, all nine state shorts including `Effect`, and the three-short
+  consumed-material descriptor are explicitly modeled. Startup inventory sends
+  the C#-order plant -> level -> parts exception streams.
+- Enhancement is intentionally friend-server behavior: both target and donor
+  ownership are checked, probability is reported as 100, result is success,
+  the request cost is parsed but not deducted, balances are echoed unchanged,
+  and the donor descriptor is all zero. The donor `GrantedKarts` entry is never
+  removed. First upgrade creates grade 5 with 35 free points; repeated upgrades
+  preserve allocation. Point mutations are bounded per slot to 0..10 and to a
+  total of 35 before `LevelData.json` is atomically replaced.
+- Login, channel migration, `PqGetRider`, equipment changes, and time-attack/
+  room physics all use the same cached plant/level sidecars. Invalid persisted
+  levels are rejected before array lookup. Optional plant/level/global-parts/
+  rider-parts streams now fail independently during login and `PqGetRider`: the
+  damaged stream is empty and logged while the authenticated session and other
+  valid streams survive. Mutations remain strict for the one sidecar they
+  change, so a malformed unrelated Level/Parts file no longer turns a committed
+  plant write into a false failure.
+- Plant and level records are normalized and deduplicated last-wins by
+  `(kart_id, serial)`, matching the retained C# compatibility loader and keeping
+  preload identical to the record used for physics. Duplicate-kart serial
+  allocation reserves orphaned `LevelData.json` records as well as plant and
+  parts records. A stale grade-zero level placeholder is reset to a real grade-5
+  35-point state; a repeated grade-5 upgrade preserves allocation and normalizes
+  remaining points. Signed deltas support bounded point redistribution.
+- Capability mutations distinguish pre-publish failure from a rename that was
+  committed but whose final directory durability check failed. The latter is
+  logged and treated as committed, including in additive point updates, so a
+  client retry cannot double-apply a mutation that is already visible on disk.
+- Added golden codec tests, sidecar validation tests, exact serial/mode physics
+  tests, and a session-handler workflow proving 100% upgrade, donor
+  non-consumption, point persistence, reconnect preload, and final physics
+  composition. Fault tests cover isolated malformed-sidecar preload and
+  post-rename durability uncertainty. Core/profile/server library suites pass;
+  a stock-client GUI enhancement smoke test remains the final hardware E2E gate.
+
+## 2026-08-04 eight-client UDP relay mock
+
+- Added an ignored, duration-configurable eight-client UDP stress test. Its
+  default duration is 120 seconds. Every burst concurrently schedules movement
+  and `PqUdpEcho` requests with deterministic per-client latency plus jitter;
+  the first request is delayed behind the second so the server must observe
+  genuine ingress-order reversals. Movement payloads also include deliberately
+  older sender-local ticks. Replies are checked as an unordered exact multiset,
+  so arrival order is unconstrained while any missing, duplicate, wrong-account,
+  stale-route, or byte-changed datagram fails the test.
+- The full 120-second run passed on 2026-08-04: 8,870 movement requests, 4,246
+  ping echoes, 2,257 deliberately stale ticks, 4,910 observed ingress-order
+  reversals, and 62,090 exact seven-recipient movement relays. Per-sender
+  movement counts were `[1084, 1056, 1110, 1149, 1120, 1131, 1075, 1145]`.
+  Re-run it with:
+
+  ```powershell
+  $env:P5136_UDP_STRESS_SECONDS='120'
+  cargo test -p p5136-server --test udp_runtime_standalone eight_clients_sustain_jittered_exact_relay_for_configured_duration --locked -- --ignored --exact --nocapture
+  ```
+
+- Added a real-socket standalone UDP test with eight independently bound
+  localhost clients. Every client sends one movement `GameSlotPacket`; the
+  runtime excludes the sender and publishes the exact body to the other seven,
+  covering 56 relayed datagrams in total. The test also proves independent
+  sender ticks, per-recipient account routing, no sender echo, and use of each
+  recipient's latest observed route hash.
+- Added an eight-human World race fixture. After all seven guests become ready
+  and the room freezes its race roster, every possible sender resolves exactly
+  the other seven identities in stable slot order. Player IDs 0 through 7 and
+  the running-room boundary are asserted explicitly.
+- This is executable server/mock coverage, not a claim that eight stock clients
+  have completed the live LAN race and podium cycle. That remains a separate
+  hardware E2E gate.
+
 ## 2026-08-04 deployment UI, random tracks, and room-title physics
 
 - Rewrote README as the Korean deployment guide. It now leads with GUI startup,
   client-path discovery, LAN ports, logs, IP/domain constraints, item-table
-  provenance, random tracks, and S0-S7 title physics instead of the historical
+  provenance, random tracks, and S0-S8 title physics instead of the historical
   implementation narrative.
 - Localized the native GUI and added a LAN IPv4 discovery/apply control.
   Loopback, link-local, unspecified, and multicast addresses are excluded;
@@ -48,12 +238,13 @@ short feature ledger is in [PORTING.md](PORTING.md).
   create a manual override lazily, and select-all, clear-all, and restore-client-
   defaults actions are available. An empty manual selection remains visible for
   correction but is rejected before server startup.
-- Ported the exact C# ASCII-boundary S0-S7 parser, protocol-byte mapping
-  `[3,0,1,2,4,5,6,7]`, and all modern speed-base fields. Each participant now
-  carries eight prebuilt equipment-specific 235-byte physics blocks; World
-  selects the title variant at race start and refreshes all eight variants
-  after durable equipment changes. `TESTS1ROOM`, `S10`, and out-of-scope S8 do
-  not trigger an override.
+- Ported the exact C# ASCII-boundary S0-S8 parser, protocol-byte mapping
+  `[3,0,1,2,4,5,6,7,8]`, and all modern speed-base fields. S8 preserves the
+  C# integrated-item `DragFactor=0.74` distinction from S7. Each participant
+  carries nine prebuilt equipment-specific 235-byte physics blocks; World
+  selects the title variant at race start and refreshes all nine variants
+  after durable equipment changes. `TESTS1ROOM`, `S10`, and S9 do not trigger
+  an override.
 
 ## Scope and source policy
 
@@ -968,14 +1159,15 @@ policy gap.
   analysis artifact and authoritative object ownership remain documented
   evidence/tooling gaps rather than guessed runtime policy.
 - The current CLI/GUI E2E build is
-  `target\p5136-finish-kart-abilities\release\p5136.exe` (16,631,296 bytes,
+  `target\p5136-finish-kart-abilities\release\p5136.exe` (18,347,008 bytes,
   SHA-256
-  `EF202819DC2CD7262844154428C1C73D62AD9BA802D9A0402C114BDDB8DE5D34`).
-  `--version` reports `p5136 0.1.0`; the release target is the single fixed
-  Cargo output directory. The 2026-08-04 bounded smoke with the user's real
-  `KartRider_5136` root started all four transports, resolved
-  `Profile/KartCatalog.xml` and sibling `Data`, loaded 493 catalog transforms
-  and the emblem catalog, and passed messenger reachability. The installed
+  `F1A8093D794BAD57CCD1B98C1F3FD860EE46EA338544ACEB5BE04290B20BF86F`).
+  `--version` reports `p5136 0.1.4`; the release target is the single fixed
+  Cargo output directory. The latest stock-data loader test used the user's
+  real `KartRider_5136\Data` directly, loaded 493 catalog transforms, classified
+  1,282 automatic and 14 quarantined karts, and required no generated
+  `Profile/KartCatalog.xml`. The earlier bounded smoke started all four
+  transports and passed messenger reachability. The installed
   legacy `item.rho` opt-in test separately confirmed 14/18 probability rows
   and combined weights 400/410. The server smoke log is
   `target\p5136-finish-kart-abilities\release\logs\p5136-1785851010010-9888.log`.
@@ -1057,10 +1249,13 @@ unchanged and is evidence only.
   arguments opens the desktop Server/Connector GUI.
 - The Server tab maps directly to the public CLI server configuration: bind
   address, advertised IPv4 address, configured base port, profile root,
-  optional `KartCatalog.xml`, optional client `Data` directory, remote profile
-  creation, and the advanced first-message/session timeout and login-limit
-  values. Inputs are validated before a bind and apply only to the next start;
-  the GUI deliberately persists no machine-specific paths or endpoints.
+  required client root/`Profile`/`Data` location, remote profile creation, and
+  the advanced first-message/session timeout and login-limit values. Inputs are
+  validated before a bind and apply only to the next start. The GUI persists a
+  bounded versioned snapshot of server and connector input fields, including
+  paths, nickname, runner configuration, probability edits, and random-track
+  overrides. Runtime state, log/catalog/search results, and profile contents
+  are not part of that snapshot.
 - Server ownership never crosses into the GUI thread. A named worker owns the
   `ServerHandle`; it reports the four bound endpoints, receives explicit
   graceful/force commands, and is joined after it reports a terminal result.
@@ -2549,7 +2744,7 @@ P5136_CLIENT_DATA=<stock Data> cargo test -p p5136-server random_track::tests::s
 git diff --check
 ```
 
-The current deployment-tweak release build is
+The earlier deployment-tweak checkpoint build was
 `target/p5136-finish-kart-abilities/release/p5136.exe` (16,822,272 bytes),
 SHA-256
 `EB918B7D345993545942F90A1FD8F97B56A459FF4B2573088CC92A3DF2CBB0C7`.
@@ -2855,10 +3050,11 @@ These items prevent a "port complete" claim.
   6,929 shop rows across 65 categories, 73 verified item symbols, and all 493
   `TransformByKart` rules. It requires the 1450/1453 identity, slot-capacity,
   and chicken-gold transform sentinels before publication.
-- The opt-in stock-client test compares the complete Rust catalog value against
-  the previous C# XML export and currently reports exact semantic equality.
-  The XML remains a test oracle and compatibility-only `ServerConfig` input,
-  not a runtime prerequisite or generated artifact.
+- The opt-in stock-client test now verifies the direct-RHO cardinalities,
+  sentinels, exact 1,282 automatic kart grants, and exact 14-ID quarantine set.
+  The old XML remains a compatibility-only `ServerConfig` input, not a runtime
+  prerequisite or generated artifact; blanket C# inventory publication is no
+  longer treated as the desired semantic oracle.
 - GUI inventory search retains the immutable direct-RHO `Arc<CatalogInventory>`
   and passes it into the next server start when the canonical `Data` path still
   matches, avoiding a second 112 MiB `kart.rho` parse.

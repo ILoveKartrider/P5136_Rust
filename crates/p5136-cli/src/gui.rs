@@ -28,11 +28,15 @@ use p5136_server::{
     load_client_item_probabilities, load_client_kart_catalog, load_client_random_track_catalog,
     load_item_probability_xml,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{LoggingRuntime, client_paths};
 
 const WINDOW_TITLE: &str = "카트라이더 P5136";
+const BUILD_VERSION_LABEL: &str = concat!("빌드 버전: ", env!("CARGO_PKG_VERSION"));
 const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const GUI_SETTINGS_KEY: &str = "p5136-gui-settings-v2";
+const MAX_GUI_SETTINGS_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -48,7 +52,10 @@ pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
         options,
         Box::new(move |creation_context| {
             configure_platform_fonts(&creation_context.egui_ctx);
-            Ok(Box::new(P5136GuiApp::new(log_path)))
+            Ok(Box::new(P5136GuiApp::new(
+                log_path,
+                creation_context.storage,
+            )))
         }),
     )
     .map_err(|error| anyhow!("데스크톱 GUI를 실행하지 못했습니다: {error}"))
@@ -121,7 +128,7 @@ fn platform_korean_font_candidates() -> Vec<PathBuf> {
     Vec::new()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum GuiRunner {
     Auto,
     Native,
@@ -153,7 +160,8 @@ impl GuiRunner {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct GuiInputs {
     game_directory: String,
     game_executable: String,
@@ -240,7 +248,8 @@ impl GuiInputs {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct ServerInputs {
     bind_address: String,
     advertised_address: String,
@@ -262,7 +271,54 @@ struct ServerInputs {
     random_tracks: RandomTrackConfiguration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GuiPersistedSettings {
+    connector: GuiInputs,
+    server: ServerInputs,
+}
+
+impl GuiPersistedSettings {
+    fn load(storage: Option<&dyn eframe::Storage>) -> Option<Self> {
+        let encoded = storage?.get_string(GUI_SETTINGS_KEY)?;
+        if encoded.len() > MAX_GUI_SETTINGS_BYTES {
+            tracing::warn!(
+                bytes = encoded.len(),
+                "ignored oversized persisted GUI settings"
+            );
+            return None;
+        }
+        serde_json::from_str(&encoded)
+            .inspect_err(|error| tracing::warn!(%error, "ignored malformed persisted GUI settings"))
+            .ok()
+    }
+
+    fn save(&self, storage: &mut dyn eframe::Storage) {
+        let encoded = match serde_json::to_string(self) {
+            Ok(encoded) if encoded.len() <= MAX_GUI_SETTINGS_BYTES => encoded,
+            Ok(encoded) => {
+                tracing::error!(
+                    bytes = encoded.len(),
+                    "GUI settings exceed the persistence size limit"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to serialize GUI settings");
+                return;
+            }
+        };
+        storage.set_string(GUI_SETTINGS_KEY, encoded);
+    }
+
+    fn from_app(app: &P5136GuiApp) -> Self {
+        Self {
+            connector: app.connector_inputs.clone(),
+            server: app.server_inputs.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum GuiItemProbabilitySource {
     AutoClient,
     Edited,
@@ -336,8 +392,9 @@ impl ServerInputs {
                 pool.selector
             ));
         }
+        let client_path = required_path(&self.client_path, "클라이언트 또는 Profile 경로")?;
         let client_paths = client_paths::resolve_client_runtime_paths(
-            optional_path_ref(&self.client_path),
+            Some(&client_path),
             optional_path_ref(&self.client_data_dir),
         )?;
 
@@ -653,16 +710,21 @@ struct P5136GuiApp {
 }
 
 impl P5136GuiApp {
-    fn new(log_path: PathBuf) -> Self {
+    fn new(log_path: PathBuf, storage: Option<&dyn eframe::Storage>) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
-        let connector_inputs = GuiInputs::default();
+        let persisted = GuiPersistedSettings::load(storage);
+        let connector_inputs = persisted
+            .as_ref()
+            .map_or_else(GuiInputs::default, |settings| settings.connector.clone());
+        let server_inputs =
+            persisted.map_or_else(ServerInputs::default, |settings| settings.server);
         let inventory_nickname = connector_inputs.nickname.clone();
         Self {
             log_path,
             selected_tab: GuiTab::Server,
             connector_inputs,
             connector_run_state: GuiRunState::Idle,
-            server_inputs: ServerInputs::default(),
+            server_inputs,
             server_run_state: ServerRunState::Stopped,
             event_sender,
             event_receiver,
@@ -1159,11 +1221,13 @@ impl P5136GuiApp {
             })?;
             let stats = loaded.stats();
             let summary = format!(
-                "이름 {}, 물리 {}, 상점 {}개/{}분류, 변환 {}개",
+                "이름 {}, 물리 {}, 상점 {}개/{}분류, 자동 카트 {}개, 수동 확인 카트 {}개, 변환 {}개",
                 stats.names,
                 stats.specs,
                 stats.inventory_items,
                 stats.inventory_categories,
+                stats.auto_grant_karts,
+                stats.quarantined_karts,
                 stats.transform_rules,
             );
             Ok((
@@ -1182,7 +1246,7 @@ impl P5136GuiApp {
                 self.inventory_catalog_data_dir = Some(data_dir.clone());
                 self.refresh_inventory_search_results();
                 self.inventory_status = format!(
-                    "RHO에서 추가 가능한 카트 {kart_count}개를 읽었습니다 ({summary}): {}",
+                    "RHO에서 자동 지급 가능한 카트 {kart_count}개를 읽었습니다. 보수적 검사에서 빠진 카트는 정확한 ID로 수동 추가할 수 있습니다 ({summary}): {}",
                     data_dir.display()
                 );
             }
@@ -1400,7 +1464,18 @@ impl P5136GuiApp {
 
         let selected_text = self.inventory_selected_kart.as_ref().map_or_else(
             || "검색 후보 선택".to_owned(),
-            |kart| format!("{} (ID {})", kart.name, kart.kart_id),
+            |kart| {
+                format!(
+                    "{} (ID {}){}",
+                    kart.name,
+                    kart.kart_id,
+                    if kart.auto_granted {
+                        ""
+                    } else {
+                        " [수동 확인]"
+                    }
+                )
+            },
         );
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("inventory-kart-search-results")
@@ -1414,7 +1489,16 @@ impl P5136GuiApp {
                         ui.selectable_value(
                             &mut self.inventory_selected_kart,
                             Some(candidate.clone()),
-                            format!("{} (ID {})", candidate.name, candidate.kart_id),
+                            format!(
+                                "{} (ID {}){}",
+                                candidate.name,
+                                candidate.kart_id,
+                                if candidate.auto_granted {
+                                    ""
+                                } else {
+                                    " [수동 확인]"
+                                }
+                            ),
                         );
                     }
                 });
@@ -1433,6 +1517,12 @@ impl P5136GuiApp {
                 "이름 → kart_id 변환: {} → {}",
                 selected.name, selected.kart_id
             ));
+            if !selected.auto_granted {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "이 카트는 리소스/개발 데이터 보수 검사에서 자동 지급이 제외됐습니다. 실제 클라이언트 지원을 확인한 경우에만 정확한 ID로 수동 추가하세요.",
+                );
+            }
         }
     }
 
@@ -1857,7 +1947,7 @@ impl P5136GuiApp {
                 }
                 ui.end_row();
 
-                ui.label("클라이언트 또는 Profile 경로 (선택)");
+                ui.label("클라이언트 또는 Profile 경로 (필수)");
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.server_inputs.client_path)
@@ -1887,8 +1977,8 @@ impl P5136GuiApp {
             "클라이언트 루트, Profile 또는 Data 폴더를 지정하면 RHO 카트·아이템 데이터를 자동으로 읽습니다. KartCatalog.xml은 필요하지 않습니다.",
         );
         ui.weak("주소에는 IP 리터럴만 사용할 수 있습니다. P5136 패킷은 광고 주소를 IPv4 4바이트로 기록하므로 도메인을 직접 넣을 수 없습니다.");
-        ui.weak("방 제목에 S0~S7 토큰을 넣으면 다음 경기 시작 패킷의 주행 물리를 해당 등급으로 바꿉니다. 예: '[S2] 친선'.");
-        ui.weak("설정은 서버를 시작할 때 적용되며 GUI가 별도로 저장하지 않습니다.");
+        ui.weak("방 제목에 S0~S8 토큰을 넣으면 다음 경기 시작 패킷의 주행 물리를 해당 등급으로 바꿉니다. 예: '[S2] 친선'.");
+        ui.weak("서버·접속기 입력 설정은 GUI 종료 시 저장되어 다음 실행에 복원됩니다. 실행 상태, 로그, 임시 검색 결과는 저장하지 않습니다.");
     }
 
     fn server_advanced_input_panel(&mut self, ui: &mut egui::Ui) {
@@ -2077,6 +2167,10 @@ impl Drop for P5136GuiApp {
 }
 
 impl eframe::App for P5136GuiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        GuiPersistedSettings::from_app(self).save(storage);
+    }
+
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.handle_close_request(context);
@@ -2086,6 +2180,11 @@ impl eframe::App for P5136GuiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::bottom("build-version-footer").show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.weak(BUILD_VERSION_LABEL);
+            });
+        });
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(WINDOW_TITLE);
             ui.small(format!("실행 로그: {}", self.log_path.display()));
@@ -2242,6 +2341,7 @@ const fn stage_label(stage: ConnectorStage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         net::{IpAddr, Ipv4Addr},
         path::{Path, PathBuf},
@@ -2255,9 +2355,29 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ConnectorGuiEvent, GuiInputs, GuiRunState, GuiRunner, GuiSuccess, P5136GuiApp,
-        ServerInputs, lan_address_rank, virtual_adapter_rank,
+        BUILD_VERSION_LABEL, ConnectorGuiEvent, GUI_SETTINGS_KEY, GuiInputs,
+        GuiItemProbabilitySource, GuiRunState, GuiRunner, GuiSuccess, MAX_GUI_SETTINGS_BYTES,
+        P5136GuiApp, ServerInputs, lan_address_rank, virtual_adapter_rank,
     };
+
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     fn fixture_inputs() -> GuiInputs {
         GuiInputs {
@@ -2273,6 +2393,14 @@ mod tests {
             crossover_bottle: "P5136".to_owned(),
             sikarugir_app: "/Applications/KartRider.app".to_owned(),
         }
+    }
+
+    #[test]
+    fn build_version_footer_uses_the_compiled_package_version() {
+        assert_eq!(
+            BUILD_VERSION_LABEL,
+            concat!("빌드 버전: ", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -2316,12 +2444,14 @@ mod tests {
 
     #[test]
     fn server_inputs_build_the_same_runtime_configuration_as_cli() {
+        let client = tempdir().unwrap();
+        fs::create_dir(client.path().join("Data")).unwrap();
         let inputs = ServerInputs {
             bind_address: "::1".to_owned(),
             advertised_address: "192.0.2.20".to_owned(),
             configured_port: "49311".to_owned(),
             profile_root: "runtime/Profiles".to_owned(),
-            client_path: String::new(),
+            client_path: client.path().display().to_string(),
             client_data_dir: String::new(),
             allow_remote_profile_creation: true,
             first_message_delay_ms: "500".to_owned(),
@@ -2340,7 +2470,10 @@ mod tests {
         assert_eq!(config.ports.login_tcp(), 49_312);
         assert_eq!(config.profile_root, Path::new("runtime/Profiles"));
         assert_eq!(config.catalog_path, None);
-        assert_eq!(config.client_data_dir, None);
+        assert_eq!(
+            config.client_data_dir,
+            Some(fs::canonicalize(client.path().join("Data")).unwrap())
+        );
         assert_eq!(
             config.item_probability_rank_policy,
             ItemProbabilityRankPolicy::TrustClientReported
@@ -2382,6 +2515,8 @@ mod tests {
 
     #[test]
     fn server_inputs_preserve_nonempty_random_track_checkbox_overrides() {
+        let client = tempdir().unwrap();
+        fs::create_dir(client.path().join("Data")).unwrap();
         let random_tracks = RandomTrackConfiguration {
             pools: vec![RandomTrackPoolOverride {
                 game_type: 0,
@@ -2390,11 +2525,71 @@ mod tests {
             }],
         };
         let inputs = ServerInputs {
+            client_path: client.path().display().to_string(),
             random_tracks: random_tracks.clone(),
             ..ServerInputs::default()
         };
 
         assert_eq!(inputs.server_config().unwrap().random_tracks, random_tracks);
+    }
+
+    #[test]
+    fn server_inputs_require_a_client_location() {
+        let error = ServerInputs::default().server_config().unwrap_err();
+        assert!(error.to_string().contains("클라이언트 또는 Profile 경로"));
+    }
+
+    #[test]
+    fn gui_persists_server_and_connector_inputs_between_runs() {
+        let mut app = P5136GuiApp::new(PathBuf::new(), None);
+        app.connector_inputs = fixture_inputs();
+        app.server_inputs = ServerInputs {
+            bind_address: "0.0.0.0".to_owned(),
+            advertised_address: "192.168.1.10".to_owned(),
+            configured_port: "49311".to_owned(),
+            profile_root: "D:/P5136/Profile".to_owned(),
+            client_path: "D:/Games/KartRider_5136".to_owned(),
+            client_data_dir: "D:/Games/KartRider_5136/Data".to_owned(),
+            allow_remote_profile_creation: true,
+            first_message_delay_ms: "400".to_owned(),
+            login_timeout_seconds: "20".to_owned(),
+            session_idle_timeout_seconds: "600".to_owned(),
+            session_write_timeout_seconds: "30".to_owned(),
+            max_login_sessions: "64".to_owned(),
+            trust_client_item_rank: false,
+            item_probability_source: GuiItemProbabilitySource::Edited,
+            item_probability_xml: "D:/P5136/item-probability.xml".to_owned(),
+            show_team_item_probabilities: true,
+            random_tracks: RandomTrackConfiguration {
+                pools: vec![RandomTrackPoolOverride {
+                    game_type: 3,
+                    selector: 5,
+                    track_ids: vec!["village_R01".to_owned(), "desert_R01".to_owned()],
+                }],
+            },
+            ..ServerInputs::default()
+        };
+        app.server_inputs.item_probabilities.individual[0].top_weight += 17;
+        let expected_connector = app.connector_inputs.clone();
+        let expected_server = app.server_inputs.clone();
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert!(storage.0.contains_key(GUI_SETTINGS_KEY));
+
+        let restored = P5136GuiApp::new(PathBuf::new(), Some(&storage));
+        assert_eq!(restored.connector_inputs, expected_connector);
+        assert_eq!(restored.server_inputs, expected_server);
+    }
+
+    #[test]
+    fn gui_ignores_malformed_or_oversized_persisted_settings() {
+        for encoded in ["{".to_owned(), "x".repeat(MAX_GUI_SETTINGS_BYTES + 1)] {
+            let mut storage = MemoryStorage::default();
+            storage.0.insert(GUI_SETTINGS_KEY.to_owned(), encoded);
+            let restored = P5136GuiApp::new(PathBuf::new(), Some(&storage));
+            assert_eq!(restored.connector_inputs, GuiInputs::default());
+            assert_eq!(restored.server_inputs, ServerInputs::default());
+        }
     }
 
     #[test]
@@ -2447,7 +2642,7 @@ mod tests {
         for root in [first.path(), second.path()] {
             fs::create_dir(root.join("Data")).unwrap();
         }
-        let mut app = P5136GuiApp::new(PathBuf::new());
+        let mut app = P5136GuiApp::new(PathBuf::new(), None);
         app.server_inputs.client_path = first.path().display().to_string();
         app.inventory_catalog_data_dir = Some(fs::canonicalize(first.path().join("Data")).unwrap());
         app.validate_current_inventory_catalog_source().unwrap();
@@ -2502,7 +2697,7 @@ mod tests {
     #[test]
     fn dropping_the_gui_cancels_its_active_worker_before_launch() {
         let cancellation = ConnectorCancellation::new();
-        let mut app = P5136GuiApp::new(PathBuf::from("p5136-test.log"));
+        let mut app = P5136GuiApp::new(PathBuf::from("p5136-test.log"), None);
         app.cancellation = Some(cancellation.clone());
 
         drop(app);

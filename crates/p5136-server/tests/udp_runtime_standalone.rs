@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -291,6 +292,398 @@ async fn four_clients_keep_independent_sender_ticks_relayable() {
         }
     }
 
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn eight_clients_each_relay_exact_movement_to_the_other_seven() {
+    const CLIENT_COUNT: usize = 8;
+
+    let game_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let p2p_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut runtime =
+        UdpRuntime::spawn(game_server, p2p_server, UdpRuntimeConfig::default()).unwrap();
+    let mut clients = Vec::with_capacity(CLIENT_COUNT);
+    for _ in 0..CLIENT_COUNT {
+        clients.push(Arc::new(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+        ));
+    }
+
+    let sessions = session_ids(CLIENT_COUNT).await;
+    let mut registry = IdentityRegistry::new();
+    let identities = sessions
+        .into_iter()
+        .enumerate()
+        .map(|(index, session)| {
+            registry
+                .claim(session, LOOPBACK, &format!("EightRider{index}"))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut current_route_hashes = (0..CLIENT_COUNT)
+        .map(|index| 0x7100_0000 + u32::try_from(index).unwrap())
+        .collect::<Vec<_>>();
+    for ((client, identity), route_hash) in clients
+        .iter()
+        .zip(&identities)
+        .zip(current_route_hashes.iter().copied())
+    {
+        bind_with_echo(&mut runtime, client, identity, route_hash).await;
+    }
+
+    // These ticks deliberately have no global ordering. Each stock client has
+    // its own uptime-derived movement timeline, so only one sender's sequence
+    // may be compared with itself.
+    let sender_ticks = [
+        900_000_u32,
+        7,
+        u32::MAX - 1,
+        300_000,
+        42,
+        800_000,
+        1,
+        600_000,
+    ];
+    for (sender_index, tick) in sender_ticks.into_iter().enumerate() {
+        let body = movement_game_slot_body(sender_index, tick);
+        let relay_route_hash = 0x7200_0000 + u32::try_from(sender_index).unwrap();
+        send_request(
+            &clients[sender_index],
+            runtime.endpoints().game,
+            identities[sender_index].user_no.get(),
+            relay_route_hash,
+            UdpLogicalBody::GameSlotPacket(&body),
+            0x5136_0100 + u32::try_from(sender_index).unwrap(),
+        )
+        .await;
+        let ingress = next_ingress(&mut runtime).await;
+        current_route_hashes[sender_index] = relay_route_hash;
+        let outcome = runtime
+            .service()
+            .dispatch(request(
+                ingress,
+                &identities[sender_index],
+                identities.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.action, UdpDispatchAction::GameSlotRelay);
+        assert_eq!(outcome.sent_datagrams, CLIENT_COUNT - 1);
+        assert_eq!(outcome.failed_sends, 0);
+        assert_eq!(outcome.unavailable_targets, 0);
+
+        for (target_index, client) in clients.iter().enumerate() {
+            if target_index == sender_index {
+                assert_no_datagram(client).await;
+                continue;
+            }
+            let relayed = receive_ingress(client, UdpTransport::Game).await;
+            assert_eq!(relayed.source, runtime.endpoints().game);
+            assert_eq!(relayed.account_id, identities[target_index].user_no.get());
+            assert_eq!(
+                relayed.route_hash, current_route_hashes[target_index],
+                "receiver {target_index} did not use its latest route after sender {sender_index}"
+            );
+            assert_eq!(
+                relayed.body,
+                UdpIngressBody::GameSlotPacket(body.clone()),
+                "receiver {target_index} lost sender {sender_index} tick {tick}"
+            );
+        }
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "runs an eight-client UDP relay stress loop for two minutes"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the stress scenario keeps setup, timed traffic, and exact relay assertions together"
+)]
+async fn eight_clients_sustain_jittered_exact_relay_for_configured_duration() {
+    const CLIENT_COUNT: usize = 8;
+
+    let game_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let p2p_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut runtime =
+        UdpRuntime::spawn(game_server, p2p_server, UdpRuntimeConfig::default()).unwrap();
+    let mut clients = Vec::with_capacity(CLIENT_COUNT);
+    for _ in 0..CLIENT_COUNT {
+        clients.push(Arc::new(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+        ));
+    }
+
+    let sessions = session_ids(CLIENT_COUNT).await;
+    let mut registry = IdentityRegistry::new();
+    let identities = sessions
+        .into_iter()
+        .enumerate()
+        .map(|(index, session)| {
+            registry
+                .claim(session, LOOPBACK, &format!("StressRider{index}"))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut current_route_hashes = (0..CLIENT_COUNT)
+        .map(|index| 0x7300_0000 + u32::try_from(index).unwrap())
+        .collect::<Vec<_>>();
+    for ((client, identity), route_hash) in clients
+        .iter()
+        .zip(&identities)
+        .zip(current_route_hashes.iter().copied())
+    {
+        bind_with_echo(&mut runtime, client, identity, route_hash).await;
+    }
+
+    // Sender-local clocks intentionally begin far apart, including near wrap.
+    // The relay must preserve each opaque movement payload without imposing a
+    // single server-global tick ordering on eight independent clients.
+    let mut sender_ticks = [
+        900_000_u32,
+        7,
+        u32::MAX - 4_096,
+        300_000,
+        42,
+        800_000,
+        1,
+        600_000,
+    ];
+    let mut last_sent_movement_ticks: [Option<u32>; CLIENT_COUNT] = [None; CLIENT_COUNT];
+    let mut per_sender_dispatches = [0_u64; CLIENT_COUNT];
+    let mut per_sender_requests = [0_u64; CLIENT_COUNT];
+    let mut forced_sender_cursor = 0_usize;
+    let mut movement_dispatch_count = 0_u64;
+    let mut echo_dispatch_count = 0_u64;
+    let mut out_of_order_movement_count = 0_u64;
+    let mut arrival_reorder_count = 0_u64;
+    let mut request_count = 0_u64;
+    let mut relay_datagram_count = 0_u64;
+    let mut random_state = 0x5136_8a11_5eed_cafe_u64;
+    let duration = udp_stress_duration();
+    let started = Instant::now();
+    let deadline = started + duration;
+
+    while Instant::now() < deadline {
+        let jitter = next_udp_stress_jitter(&mut random_state);
+        if !jitter.is_zero() {
+            tokio::time::sleep(jitter.min(deadline.saturating_duration_since(Instant::now())))
+                .await;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        // Queue a small burst before draining ingress. Requests from different
+        // sockets, ping echoes, and deliberately stale movement ticks can then
+        // interleave. Validation below is multiset-based and never assumes
+        // receive order, while still requiring every exact datagram once.
+        let batch_size = usize::try_from((next_stress_random(&mut random_state) % 11) + 2).unwrap();
+        let mut send_tasks = Vec::with_capacity(batch_size);
+        let mut batch_request_orders = Vec::with_capacity(batch_size);
+        for operation_index in 0..batch_size {
+            let force_movement = operation_index == 0;
+            let is_echo = operation_index == 1
+                || (!force_movement && next_stress_random(&mut random_state).is_multiple_of(4));
+            let sender_index = if force_movement {
+                let sender_index = forced_sender_cursor;
+                forced_sender_cursor = (forced_sender_cursor + 1) % CLIENT_COUNT;
+                sender_index
+            } else {
+                usize::try_from(next_stress_random(&mut random_state) % CLIENT_COUNT as u64)
+                    .unwrap()
+            };
+            let sender_sequence = u32::try_from(per_sender_requests[sender_index]).unwrap();
+            let route_hash = 0x7400_0000
+                | (u32::try_from(sender_index).unwrap() << 20)
+                | (sender_sequence & 0x000f_ffff);
+            let iv = 0x5136_1000_u32.wrapping_add(u32::try_from(request_count).unwrap());
+            let creation_order = request_count;
+            let simulated_latency = if operation_index == 0 {
+                Duration::from_millis(30)
+            } else if operation_index == 1 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(
+                    u64::try_from(sender_index).unwrap() * 3
+                        + (next_stress_random(&mut random_state) % 26),
+                )
+            };
+            let socket = Arc::clone(&clients[sender_index]);
+            let endpoint = runtime.endpoints().game;
+            let account_id = identities[sender_index].user_no.get();
+
+            if is_echo {
+                let echo = PqUdpEchoBody {
+                    value_1: i32::try_from(sender_index).unwrap(),
+                    value_2: i32::try_from(request_count).unwrap(),
+                };
+                send_tasks.push(tokio::spawn(async move {
+                    tokio::time::sleep(simulated_latency).await;
+                    send_request(
+                        &socket,
+                        endpoint,
+                        account_id,
+                        route_hash,
+                        UdpLogicalBody::PqUdpEcho(echo),
+                        iv,
+                    )
+                    .await;
+                }));
+            } else {
+                let tick_delta =
+                    u32::try_from((next_stress_random(&mut random_state) % 2_048) + 1).unwrap();
+                sender_ticks[sender_index] = sender_ticks[sender_index].wrapping_add(tick_delta);
+                let stale = last_sent_movement_ticks[sender_index].is_some()
+                    && (next_stress_random(&mut random_state).is_multiple_of(5)
+                        || request_count.is_multiple_of(17));
+                let tick = if let (true, Some(last_tick)) =
+                    (stale, last_sent_movement_ticks[sender_index])
+                {
+                    out_of_order_movement_count += 1;
+                    last_tick.wrapping_sub(
+                        u32::try_from((next_stress_random(&mut random_state) % 4_096) + 1).unwrap(),
+                    )
+                } else {
+                    sender_ticks[sender_index]
+                };
+                last_sent_movement_ticks[sender_index] = Some(tick);
+                let body = movement_game_slot_body(sender_index, tick);
+                send_tasks.push(tokio::spawn(async move {
+                    tokio::time::sleep(simulated_latency).await;
+                    send_request(
+                        &socket,
+                        endpoint,
+                        account_id,
+                        route_hash,
+                        UdpLogicalBody::GameSlotPacket(&body),
+                        iv,
+                    )
+                    .await;
+                }));
+            }
+
+            batch_request_orders.push((iv, creation_order));
+            per_sender_requests[sender_index] += 1;
+            request_count += 1;
+        }
+        for send_task in send_tasks {
+            send_task.await.unwrap();
+        }
+
+        let mut expected_by_client = vec![Vec::<(u32, UdpIngressBody)>::new(); CLIENT_COUNT];
+        let mut batch_arrival_orders = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let ingress = next_ingress(&mut runtime).await;
+            let creation_order = batch_request_orders
+                .iter()
+                .find_map(|(iv, order)| (*iv == ingress.iv).then_some(*order))
+                .expect("stress ingress IV must identify one planned request");
+            batch_arrival_orders.push(creation_order);
+            let sender_index = identities
+                .iter()
+                .position(|identity| identity.user_no.get() == ingress.account_id)
+                .expect("stress ingress must belong to one of the eight clients");
+            current_route_hashes[sender_index] = ingress.route_hash;
+            let ingress_route_hash = ingress.route_hash;
+            let ingress_body = ingress.body.clone();
+            let outcome = runtime
+                .service()
+                .dispatch(request(
+                    ingress,
+                    &identities[sender_index],
+                    identities.clone(),
+                ))
+                .await
+                .unwrap();
+
+            match ingress_body {
+                UdpIngressBody::PqUdpEcho(echo) => {
+                    assert_eq!(outcome.action, UdpDispatchAction::EchoReply);
+                    assert_eq!(outcome.sent_datagrams, 1);
+                    expected_by_client[sender_index]
+                        .push((ingress_route_hash, UdpIngressBody::PrUdpEcho(echo.reply())));
+                    echo_dispatch_count += 1;
+                }
+                UdpIngressBody::GameSlotPacket(body) => {
+                    assert_eq!(outcome.action, UdpDispatchAction::GameSlotRelay);
+                    assert_eq!(outcome.sent_datagrams, CLIENT_COUNT - 1);
+                    for target_index in 0..CLIENT_COUNT {
+                        if target_index != sender_index {
+                            expected_by_client[target_index].push((
+                                current_route_hashes[target_index],
+                                UdpIngressBody::GameSlotPacket(body.clone()),
+                            ));
+                        }
+                    }
+                    per_sender_dispatches[sender_index] += 1;
+                    movement_dispatch_count += 1;
+                    relay_datagram_count += u64::try_from(outcome.sent_datagrams).unwrap();
+                }
+                body => panic!("unexpected stress ingress body: {body:?}"),
+            }
+            assert_eq!(outcome.failed_sends, 0);
+            assert_eq!(outcome.unavailable_targets, 0);
+        }
+        arrival_reorder_count += u64::try_from(
+            batch_arrival_orders
+                .windows(2)
+                .filter(|pair| pair[1] < pair[0])
+                .count(),
+        )
+        .unwrap();
+
+        for (target_index, client) in clients.iter().enumerate() {
+            let expected = &mut expected_by_client[target_index];
+            for _ in 0..expected.len() {
+                let received = receive_ingress(client, UdpTransport::Game).await;
+                assert_eq!(received.source, runtime.endpoints().game);
+                assert_eq!(received.account_id, identities[target_index].user_no.get());
+                let Some(position) = expected.iter().position(|(route_hash, body)| {
+                    *route_hash == received.route_hash && body == &received.body
+                }) else {
+                    panic!(
+                        "client {target_index} received unexpected or duplicate datagram: route={:#010x}, body={:?}, remaining={expected:?}",
+                        received.route_hash, received.body
+                    );
+                };
+                expected.swap_remove(position);
+            }
+            assert!(expected.is_empty());
+        }
+    }
+
+    assert!(
+        movement_dispatch_count >= CLIENT_COUNT as u64,
+        "stress duration was too short to exercise every sender"
+    );
+    assert_eq!(
+        relay_datagram_count,
+        movement_dispatch_count * (CLIENT_COUNT as u64 - 1)
+    );
+    assert!(per_sender_dispatches.iter().all(|count| *count != 0));
+    assert!(
+        echo_dispatch_count != 0,
+        "stress run did not interleave ping echoes"
+    );
+    assert!(
+        out_of_order_movement_count != 0,
+        "stress run did not inject a stale movement tick"
+    );
+    assert!(
+        arrival_reorder_count != 0,
+        "different simulated client latencies did not reverse any ingress order"
+    );
+    for client in &clients {
+        assert_no_datagram(client).await;
+    }
+
+    eprintln!(
+        "8-client UDP stress: elapsed={:?}, movements={movement_dispatch_count}, echoes={echo_dispatch_count}, stale_ticks={out_of_order_movement_count}, arrival_reorders={arrival_reorder_count}, relayed_datagrams={relay_datagram_count}, per_sender={per_sender_dispatches:?}",
+        started.elapsed()
+    );
     runtime.shutdown().await;
 }
 
@@ -829,4 +1222,35 @@ fn movement_game_slot_body(sender_index: usize, tick: u32) -> Vec<u8> {
     body.extend_from_slice(&GAME_KART_PACKET.to_le_bytes());
     body.extend_from_slice(&tick.to_le_bytes());
     body
+}
+
+fn udp_stress_duration() -> Duration {
+    std::env::var("P5136_UDP_STRESS_SECONDS").map_or(Duration::from_secs(120), |value| {
+        let seconds = value
+            .parse::<u64>()
+            .expect("P5136_UDP_STRESS_SECONDS must be a positive integer");
+        assert!(seconds != 0, "P5136_UDP_STRESS_SECONDS must be positive");
+        Duration::from_secs(seconds)
+    })
+}
+
+fn next_stress_random(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    value
+}
+
+fn next_udp_stress_jitter(state: &mut u64) -> Duration {
+    let value = next_stress_random(state);
+    let bucket = value % 100;
+    let milliseconds = match bucket {
+        0..=24 => 0,
+        25..=74 => 1 + ((value >> 8) % 12),
+        75..=94 => 13 + ((value >> 8) % 28),
+        _ => 50 + ((value >> 8) % 71),
+    };
+    Duration::from_millis(milliseconds)
 }

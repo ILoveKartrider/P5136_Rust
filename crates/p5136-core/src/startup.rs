@@ -578,7 +578,10 @@ pub fn serialize_lo_rp_add_racing_time() -> Vec<u8> {
 #[must_use]
 pub fn serialize_pr_equip_tuning_failure() -> Vec<u8> {
     let mut packet = PacketWriter::named("PrEquipTuningPacket");
-    packet.write_i32(0);
+    packet.write_u8(0);
+    for _ in 0..5 {
+        packet.write_i16(0);
+    }
     packet.into_inner()
 }
 
@@ -1554,7 +1557,11 @@ mod tests {
             1_718_487_233,
             &[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         );
-        assert_packet(&serialize_pr_equip_tuning_failure(), 1_256_654_739, &[0; 4]);
+        assert_packet(
+            &serialize_pr_equip_tuning_failure(),
+            1_256_654_739,
+            &[0; 11],
+        );
         assert_packet(&serialize_pr_set_playtime_event_tick(), 1_671_366_848, &[0]);
         assert_packet(&serialize_pr_chapter_info(), 1_224_542_061, &[0; 4]);
         assert_packet(
