@@ -472,9 +472,6 @@ pub enum LoginSessionError {
     #[error("PqFinishTimeAttack arrived without an active, unfinished time-attack start")]
     TimeAttackFinishWithoutStart,
 
-    #[error("PqStartTimeAttack arrived while the session already has an unfinished time attack")]
-    TimeAttackStartWhileActive,
-
     #[error("time-attack Lucci reward overflowed the profile balance")]
     TimeAttackLucciOverflow,
 
@@ -1946,16 +1943,13 @@ impl SessionContext {
             .equipment = equipment;
     }
 
-    fn begin_time_attack(&mut self, request: StartTimeAttackRequest, track: u32) {
-        self.active_time_attack = Some(ActiveTimeAttack { request, track });
-    }
-
-    fn ensure_time_attack_idle(&self) -> Result<(), LoginSessionError> {
-        if self.active_time_attack.is_none() {
-            Ok(())
-        } else {
-            Err(LoginSessionError::TimeAttackStartWhileActive)
-        }
+    fn begin_time_attack(
+        &mut self,
+        request: StartTimeAttackRequest,
+        track: u32,
+    ) -> Option<ActiveTimeAttack> {
+        self.active_time_attack
+            .replace(ActiveTimeAttack { request, track })
     }
 
     fn active_time_attack(&self) -> Result<ActiveTimeAttack, LoginSessionError> {
@@ -2938,7 +2932,6 @@ async fn handle_start_time_attack(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let before = world.authorize_identity().await?;
     let equipment = context.equipment_for(&before)?.clone();
-    context.ensure_time_attack_idle()?;
     let track = if request.requested_track == 0 {
         P5136_FALLBACK_TRACK_ID
     } else {
@@ -2973,7 +2966,16 @@ async fn handle_start_time_attack(
         track,
     );
     context.bind_profile(after, profile);
-    context.begin_time_attack(request, track);
+    if let Some(previous) = context.begin_time_attack(request, track) {
+        tracing::debug!(
+            nickname = %before.nickname,
+            previous_track = format_args!("0x{:08X}", previous.track),
+            replacement_track = format_args!("0x{track:08X}"),
+            previous_start_token = previous.request.start_token,
+            replacement_start_token = request.start_token,
+            "replaced an unfinished time-attack attempt with the newly accepted start"
+        );
+    }
     drop(lane);
     Ok(vec![response])
 }
@@ -7686,7 +7688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn captured_single_player_time_attack_flow_is_durable_and_not_replayable() {
+    async fn captured_single_player_time_attack_flow_replaces_an_unfinished_attempt() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
@@ -7736,18 +7738,29 @@ mod tests {
             charged.profile.rider.lucci,
             initial.profile.rider.lucci - 1_000
         );
-        let active_before_replay = context.active_time_attack().unwrap();
-        assert!(matches!(
-            dispatch_packet(&services, &start, &mut context).await,
-            Err(LoginSessionError::TimeAttackStartWhileActive)
-        ));
-        let after_replay = store.load_or_create(&identity.nickname).unwrap();
-        assert_eq!(after_replay.revision, charged.revision);
+        // P5136 can return to the time-attack menu without sending
+        // PqFinishTimeAttack. A subsequent start is a new attempt, not a
+        // replay of the old request, and must replace the session-local state.
+        let replacement_track = 0x34B8_040A;
+        let replacement = time_attack_start_request(replacement_track, 0);
+        let replacement_reply = dispatch_packet(&services, &replacement, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(replacement_reply.len(), 1);
         assert_eq!(
-            after_replay.profile.rider.lucci,
+            replacement_reply[0].len(),
+            p5136_core::single_player_protocol::START_TIME_ATTACK_REPLY_LENGTH
+        );
+        let after_replacement = store.load_or_create(&identity.nickname).unwrap();
+        assert!(after_replacement.revision > charged.revision);
+        assert_eq!(
+            after_replacement.profile.rider.lucci,
             charged.profile.rider.lucci
         );
-        assert_eq!(context.active_time_attack().unwrap(), active_before_replay);
+        assert_eq!(after_replacement.profile.rider.track, replacement_track);
+        let active_after_replacement = context.active_time_attack().unwrap();
+        assert_eq!(active_after_replacement.track, replacement_track);
+        assert_eq!(active_after_replacement.request.mode_type, 0);
 
         let single_start = captured_single_start_request();
         assert!(
@@ -7777,7 +7790,7 @@ mod tests {
         );
 
         let loaded = store.load_or_create(&identity.nickname).unwrap();
-        assert_eq!(loaded.profile.rider.track, track);
+        assert_eq!(loaded.profile.rider.track, replacement_track);
         assert_eq!(loaded.profile.rider.speed_type, 7);
         assert_eq!(loaded.profile.rider.game_type, 0);
         assert_eq!(loaded.profile.rider.attack_type, 0);
