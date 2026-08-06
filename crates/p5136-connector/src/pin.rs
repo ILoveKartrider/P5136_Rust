@@ -10,6 +10,9 @@ use crate::{
 
 pub const P5136_PIN_MAGIC: u32 = 0x10EF_037E;
 pub const P5136_MINOR_VERSION: u16 = 5136;
+pub const P5136_STORAGE_ROOT: &str = "카트라이더_5136";
+pub const P5136_SCREENSHOT_DIRECTORY: &str = "스크린샷";
+pub const P5136_RIDER_DATA_DIRECTORY: &str = "라이더데이터";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShallowPinHeader {
@@ -61,12 +64,14 @@ pub struct PinDocument {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PinPatchOptions {
     pub remove_ngs_on: bool,
+    pub override_storage: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinPatchReport {
     pub authentication_methods: usize,
     pub removed_ngs_on_entries: usize,
+    pub storage_overridden: bool,
 }
 
 impl PinDocument {
@@ -216,6 +221,10 @@ impl PinDocument {
             auth_method.login_servers.push(endpoint);
         }
 
+        if options.override_storage {
+            self.storage_config = Some(p5136_storage_config());
+        }
+
         let removed_ngs_on_entries = if options.remove_ngs_on {
             [&mut self.storage_config, &mut self.extra_config]
                 .into_iter()
@@ -230,6 +239,7 @@ impl PinDocument {
         Ok(PinPatchReport {
             authentication_methods: self.auth_methods.len(),
             removed_ngs_on_entries,
+            storage_overridden: options.override_storage,
         })
     }
 
@@ -359,8 +369,35 @@ pub fn patch_p5136_pin_with_limits(
     {
         return Err(PinCodecError::EndpointVerificationFailed);
     }
+    if report.storage_overridden
+        && verified.storage_config.as_ref() != Some(&p5136_storage_config())
+    {
+        return Err(PinCodecError::StorageVerificationFailed);
+    }
 
     Ok((output, report))
+}
+
+fn p5136_storage_config() -> BmlObject {
+    BmlObject {
+        name: "storage".to_owned(),
+        children: vec![BmlObject {
+            name: "document".to_owned(),
+            attributes: vec![
+                ("root".to_owned(), P5136_STORAGE_ROOT.to_owned()),
+                (
+                    "screenShot".to_owned(),
+                    P5136_SCREENSHOT_DIRECTORY.to_owned(),
+                ),
+                (
+                    "riderData".to_owned(),
+                    P5136_RIDER_DATA_DIRECTORY.to_owned(),
+                ),
+            ],
+            ..BmlObject::default()
+        }],
+        ..BmlObject::default()
+    }
 }
 
 pub fn decode_shallow_pin_header(input: &[u8]) -> Result<ShallowPinHeader, PinCodecError> {
@@ -436,7 +473,10 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use super::{P5136_MINOR_VERSION, PinDocument, PinPatchOptions, patch_p5136_pin};
+    use super::{
+        P5136_MINOR_VERSION, P5136_RIDER_DATA_DIRECTORY, P5136_SCREENSHOT_DIRECTORY,
+        P5136_STORAGE_ROOT, PinDocument, PinPatchOptions, p5136_storage_config, patch_p5136_pin,
+    };
     use crate::{
         bml::BmlObject,
         encoded_block::{DEFAULT_KART_CRYPTO_KEY, FLAG_KART_CRYPTO, FLAG_ZLIB},
@@ -499,12 +539,14 @@ mod tests {
             endpoint,
             PinPatchOptions {
                 remove_ngs_on: true,
+                override_storage: true,
             },
         )
         .unwrap();
 
         assert_eq!(report.authentication_methods, 2);
         assert_eq!(report.removed_ngs_on_entries, 1);
+        assert!(report.storage_overridden);
         let patched = PinDocument::decode(&patched_bytes).unwrap();
         assert_eq!(patched.encoding.flags, FLAG_ZLIB | FLAG_KART_CRYPTO);
         assert_eq!(
@@ -516,6 +558,22 @@ mod tests {
                 .auth_methods
                 .iter()
                 .all(|auth| auth.login_servers == [endpoint])
+        );
+        assert_eq!(patched.storage_config, Some(p5136_storage_config()));
+        let document = &patched.storage_config.as_ref().unwrap().children[0];
+        assert_eq!(
+            document.attributes,
+            [
+                ("root".to_owned(), P5136_STORAGE_ROOT.to_owned()),
+                (
+                    "screenShot".to_owned(),
+                    P5136_SCREENSHOT_DIRECTORY.to_owned()
+                ),
+                (
+                    "riderData".to_owned(),
+                    P5136_RIDER_DATA_DIRECTORY.to_owned()
+                ),
+            ]
         );
 
         let extra = patched.extra_config.as_ref().unwrap();
@@ -547,6 +605,7 @@ mod tests {
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 39_312),
             PinPatchOptions {
                 remove_ngs_on: false,
+                override_storage: false,
             },
         )
         .unwrap();

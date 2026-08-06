@@ -106,6 +106,7 @@ pub fn prepare_installation(
         login_endpoint,
         PinPatchOptions {
             remove_ngs_on: options.remove_ngs_on,
+            override_storage: true,
         },
         &options.codec_limits,
     )?;
@@ -141,6 +142,7 @@ mod tests {
 
     use super::{InstallationOptions, prepare_installation};
     use crate::{
+        P5136_RIDER_DATA_DIRECTORY, P5136_SCREENSHOT_DIRECTORY, P5136_STORAGE_ROOT,
         detection::{BuildEvidence, PinDetectionSource},
         file_safety::{
             PRISTINE_ABSENT_SUFFIX, PRISTINE_BACKUP_SUFFIX, PristineAction, append_suffix,
@@ -175,6 +177,7 @@ mod tests {
         );
         assert_eq!(first.pin_patch.authentication_methods, 2);
         assert_eq!(first.pin_patch.removed_ngs_on_entries, 1);
+        assert!(first.pin_patch.storage_overridden);
         assert_eq!(
             fs::read(append_suffix(&pin_path, PRISTINE_BACKUP_SUFFIX)).unwrap(),
             pristine_pin
@@ -199,6 +202,7 @@ mod tests {
                 .iter()
                 .all(|auth| auth.login_servers == [first_endpoint])
         );
+        assert_p5136_storage(&patched);
 
         let second_endpoint = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 21), 46_002);
         options.remove_ngs_on = false;
@@ -223,6 +227,8 @@ mod tests {
             fs::read(&launcher_profile_path).unwrap(),
             launcher_profile_xml("second-user")
         );
+        let repatched = PinDocument::decode(&fs::read(&pin_path).unwrap()).unwrap();
+        assert_p5136_storage(&repatched);
         for parent in [
             directory.path().to_owned(),
             directory.path().join("Profile/kr"),
@@ -235,6 +241,29 @@ mod tests {
                     .starts_with(".p5136-connector-")
             }));
         }
+    }
+
+    fn assert_p5136_storage(pin: &PinDocument) {
+        let storage = pin.storage_config.as_ref().unwrap();
+        assert_eq!(storage.name, "storage");
+        assert!(storage.attributes.is_empty());
+        assert_eq!(storage.children.len(), 1);
+        let document = &storage.children[0];
+        assert_eq!(document.name, "document");
+        assert_eq!(
+            document.attributes,
+            [
+                ("root".to_owned(), P5136_STORAGE_ROOT.to_owned()),
+                (
+                    "screenShot".to_owned(),
+                    P5136_SCREENSHOT_DIRECTORY.to_owned()
+                ),
+                (
+                    "riderData".to_owned(),
+                    P5136_RIDER_DATA_DIRECTORY.to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

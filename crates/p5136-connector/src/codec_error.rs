@@ -35,6 +35,9 @@ pub enum PinCodecError {
     #[error("patched P5136 PIN failed endpoint verification")]
     EndpointVerificationFailed,
 
+    #[error("patched P5136 PIN failed storage-path verification")]
+    StorageVerificationFailed,
+
     #[error("BML node contains duplicate attribute {0:?}")]
     DuplicateBmlAttribute(String),
 

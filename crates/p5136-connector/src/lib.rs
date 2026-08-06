@@ -45,7 +45,8 @@ pub use launch::{
 };
 pub use limits::CodecLimits;
 pub use pin::{
-    AuthMethod, P5136_MINOR_VERSION, P5136_PIN_MAGIC, PinDocument, PinHeader, PinPatchOptions,
+    AuthMethod, P5136_MINOR_VERSION, P5136_PIN_MAGIC, P5136_RIDER_DATA_DIRECTORY,
+    P5136_SCREENSHOT_DIRECTORY, P5136_STORAGE_ROOT, PinDocument, PinHeader, PinPatchOptions,
     PinPatchReport, ShallowPinHeader, decode_shallow_pin_header,
     decode_shallow_pin_header_with_limits, patch_p5136_pin, patch_p5136_pin_with_limits,
 };
