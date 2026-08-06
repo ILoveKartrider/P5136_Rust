@@ -134,6 +134,7 @@ pub struct CatalogInventory {
     stats: CatalogInventoryStats,
     kart_names: BTreeMap<u16, String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
+    kart_enchant_caps: BTreeMap<String, u8>,
     kart_spec_stats: CatalogKartSpecStats,
     emblem_catalog: Option<EmblemCatalog>,
     item_transforms: BTreeMap<(u16, i16), Vec<CatalogItemTransformRule>>,
@@ -211,6 +212,23 @@ impl CatalogInventory {
     #[must_use]
     pub fn kart_spec_by_name(&self, name: &str) -> Option<&P5136KartSpecSnapshot> {
         self.kart_specs.get(&normalize_spec_name(name))
+    }
+
+    /// Returns the stock client's legacy kart-enhancement capacity marker.
+    ///
+    /// Korean P5136 exports this as `BodyParam.DescEnchantCap` for kart bodies
+    /// that participate in the Floater/grade-five enhancement system. X and V1
+    /// bodies omit the marker and use their newer parts systems instead.
+    #[must_use]
+    pub fn kart_enchant_cap(&self, kart_id: u16) -> Option<u8> {
+        self.kart_name(kart_id)
+            .and_then(|name| self.kart_enchant_caps.get(&normalize_spec_name(name)))
+            .copied()
+    }
+
+    #[must_use]
+    pub fn supports_legacy_kart_enhancements(&self, kart_id: u16) -> bool {
+        self.kart_enchant_cap(kart_id).is_some()
     }
 
     #[must_use]
@@ -568,6 +586,7 @@ struct CatalogParser {
     kart_names: BTreeMap<u16, String>,
     spec_keys: HashSet<String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
+    kart_enchant_caps: BTreeMap<String, u8>,
     active_spec: Option<PendingKartSpec>,
     transform_section_seen: bool,
     in_transform_section: bool,
@@ -580,6 +599,7 @@ struct PendingKartSpec {
     name: String,
     normalized_name: String,
     body: Option<P5136KartSpecSnapshot>,
+    enchant_cap: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,6 +635,7 @@ impl CatalogParser {
             kart_names: BTreeMap::new(),
             spec_keys: HashSet::new(),
             kart_specs: BTreeMap::new(),
+            kart_enchant_caps: BTreeMap::new(),
             active_spec: None,
             transform_section_seen: false,
             in_transform_section: false,
@@ -1017,6 +1038,7 @@ impl CatalogParser {
             name,
             normalized_name,
             body: None,
+            enchant_cap: None,
         });
         Ok(())
     }
@@ -1035,6 +1057,17 @@ impl CatalogParser {
                 name: pending.name.clone(),
             });
         }
+        pending.enchant_cap = attribute(reader, element, b"DescEnchantCap")?
+            .map(|value| {
+                value.trim().parse::<u8>().map_err(|_| {
+                    CatalogInventoryError::InvalidBodyParamValue {
+                        spec: pending.name.clone(),
+                        field: "DescEnchantCap",
+                    }
+                })
+            })
+            .transpose()?
+            .filter(|capacity| *capacity != 0);
         pending.body = Some(parse_body_param(reader, element, &pending.name)?);
         Ok(())
     }
@@ -1049,6 +1082,10 @@ impl CatalogParser {
             .ok_or_else(|| CatalogInventoryError::MissingBodyParam {
                 name: pending.name.clone(),
             })?;
+        if let Some(enchant_cap) = pending.enchant_cap {
+            self.kart_enchant_caps
+                .insert(pending.normalized_name.clone(), enchant_cap);
+        }
         self.kart_specs.insert(pending.normalized_name, body);
         Ok(())
     }
@@ -1231,6 +1268,7 @@ impl CatalogParser {
             stats,
             kart_names: std::mem::take(&mut self.kart_names),
             kart_specs: std::mem::take(&mut self.kart_specs),
+            kart_enchant_caps: std::mem::take(&mut self.kart_enchant_caps),
             kart_spec_stats,
             emblem_catalog,
             item_transforms: std::mem::take(&mut self.item_transforms),
@@ -2220,6 +2258,7 @@ mod tests {
                 <Specs>
                     <Spec name="shurikenV1">
                         <BodyParam
+                            DescEnchantCap="31"
                             ForwardAccelForce="147"
                             NormalBoosterTime="-100"
                             DriftLeanFactor="-0.005"
@@ -2244,6 +2283,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(catalog.kart_name(1450), Some("SHURIKENV1"));
+        assert_eq!(catalog.kart_enchant_cap(1450), Some(31));
+        assert!(catalog.supports_legacy_kart_enhancements(1450));
+        assert_eq!(catalog.kart_enchant_cap(1451), None);
+        assert!(!catalog.supports_legacy_kart_enhancements(1451));
         let spec = catalog.kart_spec(1450).unwrap();
         assert_eq!(spec.forward_accel_force.to_bits(), 147.0_f32.to_bits());
         assert_eq!(spec.normal_booster_time.to_bits(), 2_900.0_f32.to_bits());

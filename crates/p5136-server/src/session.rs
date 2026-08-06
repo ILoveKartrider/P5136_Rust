@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use chrono::{Local, NaiveDate, Timelike};
+use chrono::{Datelike, Local, NaiveDate, Timelike};
 use p5136_core::{
     adler32,
     captured_query_protocol::{
@@ -24,8 +24,10 @@ use p5136_core::{
     club_query_protocol::{
         ClubQueryProtocolError, ClubQueryRequest, classify_club_query_request,
         parse_club_query_request, serialize_club_creation_unavailable_reply,
-        serialize_empty_club_list_count_reply, serialize_no_club_state_reply,
-        serialize_no_pending_club_join_reply, serialize_unavailable_waiting_crew_count_reply,
+        serialize_empty_club_list_count_reply, serialize_empty_club_search_reply,
+        serialize_fixed_init_club_info_reply, serialize_init_club_reply,
+        serialize_no_pending_club_join_reply, serialize_profile_club_state_reply,
+        serialize_unavailable_waiting_crew_count_reply,
     },
     equipment_protocol::{
         EquipmentProtocolError, EquipmentRequest, PlantPartEquipRequest, RiderItemSelection,
@@ -33,7 +35,7 @@ use p5136_core::{
         parse_set_rider_items, serialize_equip_tuning_failure, serialize_equip_tuning_success,
         serialize_equip_x_part_failure, serialize_equip_x_part_success,
     },
-    floater_physics::p5136_floater_spec,
+    floater_physics::{intrinsic_floater_codes, p5136_floater_spec},
     floater_protocol::{
         FLOATER_PROTECT_RESULT_ALREADY_PROTECTED, FLOATER_PROTECT_RESULT_KART_UNAVAILABLE,
         FLOATER_PROTECT_RESULT_SOCKET_MISSING, FLOATER_RESULT_FAILURE, FLOATER_RESULT_SUCCESS,
@@ -119,17 +121,22 @@ use p5136_core::{
         serialize_shop_buy_failure,
     },
     single_player_protocol::{
-        FinishTimeAttackRequest, SinglePlayerProtocolError, SinglePlayerRequest,
-        SinglePlayerRequestKind, StartTimeAttackRequest, classify_single_player_request,
-        parse_single_player_request, serialize_finish_time_attack_reply, serialize_kart_spec_reply,
+        ChallengerKartSpecRequest, CompleteChallengerRequest, FinishTimeAttackRequest,
+        SinglePlayerProtocolError, SinglePlayerRequest, SinglePlayerRequestKind,
+        StartChallengerRequest, StartTimeAttackRequest, classify_single_player_request,
+        parse_single_player_request, serialize_challenger_kart_spec_reply,
+        serialize_complete_challenger_reply, serialize_finish_time_attack_reply,
+        serialize_kart_spec_reply, serialize_start_challenger_reply,
         serialize_start_time_attack_reply,
     },
     startup::{
-        self, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
-        classify_startup_request, is_startup_noop, parse_pq_favorite_track_map_get,
-        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_ranker_info,
-        parse_pq_request_extradata, parse_pq_rider_school_expired_check,
-        parse_pq_start_rider_school, parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
+        self, LoRqDecLucci, LoRqGetTrackRank, PqUpdateGameOption, PrGetRiderFields,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest, classify_startup_request,
+        is_startup_noop, parse_lo_rq_dec_lucci, parse_lo_rq_get_track_rank,
+        parse_pq_favorite_track_map_get, parse_pq_get_rider_task_context, parse_pq_locked_item_get,
+        parse_pq_ranker_info, parse_pq_request_exchange_init, parse_pq_request_extradata,
+        parse_pq_rider_school_expired_check, parse_pq_start_rider_school,
+        parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
         parse_pq_web_event_complete_check, parse_sp_rq_get_cash_inventory,
         parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance, parse_sp_rq_remain_cash,
         parse_sp_rq_remain_tc_cash,
@@ -145,8 +152,7 @@ use p5136_profile::{
     EquipmentLoadWarning, EquipmentMutationOutcome, EquipmentProfileError, EquipmentStateError,
     InventoryBuildError, MAX_MYROOM_ITEM_RECORDS, MyRoomItemStateError, MyRoomOwnerInventory,
     Profile, ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction, RaceRunLease,
-    build_inventory_snapshot_with_equipment, finish_reward, generated_x_part_is_granted,
-    rider_item_snapshot,
+    build_inventory_snapshot_with_equipment, finish_reward, rider_item_snapshot,
 };
 use rand::Rng;
 use thiserror::Error;
@@ -162,7 +168,7 @@ use crate::{
     ServerConfig, SessionId, UserNo, WorldError, WorldHandle,
     equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
-        RiderEquipmentWriteError, catalog_grants, kart_is_owned,
+        RiderEquipmentWriteError, kart_is_owned,
     },
     favorite_persistence::{
         DurableFavoriteItems, FAVORITE_ITEM_UPDATE_OPERATION, FavoriteItemPersistError,
@@ -905,7 +911,7 @@ impl ProfileCoordinator {
     async fn update_game_options(
         &self,
         nickname: String,
-        options: startup::GameOptions,
+        request: PqUpdateGameOption,
         admission: ProfileJobAdmission,
     ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
         Self::ensure_admitted_subject(&admission, &nickname)?;
@@ -919,7 +925,59 @@ impl ProfileCoordinator {
                     hook.release.wait();
                 }
                 store.update(subject.nickname(), |profile| {
-                    apply_game_options(&mut profile.game_option, &options);
+                    apply_game_options(&mut profile.game_option, &request);
+                })
+            })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
+        Ok((
+            ProfileSnapshot {
+                profile,
+                revision: Some(saved.revision),
+                source_path: saved.path,
+            },
+            lane,
+        ))
+    }
+
+    async fn decrement_lucci(
+        &self,
+        nickname: String,
+        amount: u32,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run("decrement Lucci", move |store, _, subject| {
+                store.update(subject.nickname(), |profile| {
+                    profile.rider.lucci = profile.rider.lucci.saturating_sub(amount);
+                })
+            })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
+        Ok((
+            ProfileSnapshot {
+                profile,
+                revision: Some(saved.revision),
+                source_path: saved.path,
+            },
+            lane,
+        ))
+    }
+
+    async fn select_track_rank(
+        &self,
+        nickname: String,
+        track: u32,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run("select track rank", move |store, _, subject| {
+                store.update(subject.nickname(), |profile| {
+                    profile.rider.track = track;
                 })
             })
             .await?;
@@ -1169,14 +1227,7 @@ impl ProfileCoordinator {
         &self,
         request: PlantPartEquipRequest,
         admission: ProfileJobAdmission,
-    ) -> Result<
-        (
-            Option<p5136_core::inventory::PlantExcRecord>,
-            ProfileLanePermit,
-        ),
-        LoginSessionError,
-    > {
-        let catalog = self.catalog.clone();
+    ) -> Result<(p5136_core::inventory::PlantExcRecord, ProfileLanePermit), LoginSessionError> {
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
         let completed = admission
@@ -1186,17 +1237,13 @@ impl ProfileCoordinator {
                     hook.entered.wait();
                     hook.release.wait();
                 }
-                let loaded = store.load_or_create(subject.nickname())?;
-                if !plant_part_is_owned(catalog.as_deref(), &loaded.profile, request) {
-                    return Ok::<_, LoginSessionError>(None);
-                }
                 let outcome = store.equip_plant_part(lease, subject.nickname(), request)?;
                 log_equipment_durability_warning(
                     subject.nickname(),
                     "PlantData.json",
                     outcome.durability_warning.as_ref(),
                 );
-                Ok(Some(outcome.value))
+                Ok::<_, LoginSessionError>(outcome.value)
             })
             .await?;
         let (result, lane) = completed.into_parts();
@@ -1207,8 +1254,7 @@ impl ProfileCoordinator {
         &self,
         request: XPartEquipRequest,
         admission: ProfileJobAdmission,
-    ) -> Result<(bool, ProfileLanePermit), LoginSessionError> {
-        let catalog = self.catalog.clone();
+    ) -> Result<(p5136_core::inventory::PartsExcRecord, ProfileLanePermit), LoginSessionError> {
         #[cfg(test)]
         let blocking_update_hook = self.blocking_update_hook.clone();
         let completed = admission
@@ -1218,17 +1264,13 @@ impl ProfileCoordinator {
                     hook.entered.wait();
                     hook.release.wait();
                 }
-                let loaded = store.load_or_create(subject.nickname())?;
-                if !x_part_is_owned(catalog.as_deref(), &loaded.profile, request) {
-                    return Ok::<_, LoginSessionError>(false);
-                }
                 let outcome = store.equip_x_part(lease, subject.nickname(), request)?;
                 log_equipment_durability_warning(
                     subject.nickname(),
                     "PartsData.json",
                     outcome.durability_warning.as_ref(),
                 );
-                Ok(true)
+                Ok::<_, LoginSessionError>(outcome.value)
             })
             .await?;
         let (result, lane) = completed.into_parts();
@@ -1240,21 +1282,15 @@ impl ProfileCoordinator {
         request: FloaterRequest,
         admission: ProfileJobAdmission,
     ) -> Result<(FloaterProfileResult, ProfileLanePermit), LoginSessionError> {
-        let catalog = self.catalog.clone();
         let completed = admission
             .run("apply Floater request", move |store, lease, subject| {
-                let loaded = store.load_or_create(subject.nickname())?;
                 let equipment_load =
                     store.load_equipment_exceptions_lenient(lease, subject.nickname())?;
                 log_equipment_load_warnings(subject.nickname(), &equipment_load.warnings);
                 let mut equipment = equipment_load.equipment;
                 let target = floater_request_target(request);
                 let current = floater_state_for(&equipment, target);
-                let owned = floater_request_has_valid_kart_category(request)
-                    && catalog.as_deref().is_some_and(|catalog| {
-                        kart_instance_is_owned(catalog, &loaded.profile, target)
-                    });
-                if !owned {
+                if !floater_request_has_valid_kart_category(request) {
                     return Ok::<_, LoginSessionError>(FloaterProfileResult {
                         result_code: if matches!(request, FloaterRequest::ProtectSlot(_)) {
                             FLOATER_PROTECT_RESULT_KART_UNAVAILABLE
@@ -1601,6 +1637,21 @@ fn upsert_plant_record(
     }
 }
 
+fn upsert_parts_record(
+    equipment: &mut EquipmentExceptions,
+    record: p5136_core::inventory::PartsExcRecord,
+) {
+    if let Some(existing) = equipment
+        .parts
+        .iter_mut()
+        .find(|existing| existing.id == record.id && existing.serial == record.serial)
+    {
+        *existing = record;
+    } else {
+        equipment.parts.push(record);
+    }
+}
+
 fn upsert_tune_record(
     equipment: &mut EquipmentExceptions,
     record: p5136_core::inventory::TuneExcRecord,
@@ -1800,71 +1851,6 @@ fn committed_profile_transaction<T>(
     }
 }
 
-fn plant_part_is_owned(
-    catalog: Option<&CatalogInventory>,
-    profile: &Profile,
-    request: PlantPartEquipRequest,
-) -> bool {
-    let Some(catalog) = catalog else {
-        return false;
-    };
-    if request.kart_category != 3 {
-        return false;
-    }
-    let Ok(kart_id) = u16::try_from(request.kart_id) else {
-        return false;
-    };
-    let Ok(mut kart_serial) = u16::try_from(request.kart_serial) else {
-        return false;
-    };
-    if kart_id != 0 && kart_serial == 0 {
-        kart_serial = 1;
-    }
-    if !kart_is_owned(catalog, profile, kart_id, kart_serial) {
-        return false;
-    }
-    request.item_id == 0
-        || u16::try_from(request.item_category)
-            .ok()
-            .zip(u16::try_from(request.item_id).ok())
-            .is_some_and(|(category, item_id)| catalog_grants(catalog, category, item_id))
-}
-
-fn x_part_is_owned(
-    catalog: Option<&CatalogInventory>,
-    profile: &Profile,
-    request: XPartEquipRequest,
-) -> bool {
-    let Some(catalog) = catalog else {
-        return false;
-    };
-    let Ok(kart_id) = u16::try_from(request.kart_id) else {
-        return false;
-    };
-    let Ok(mut kart_serial) = u16::try_from(request.kart_serial) else {
-        return false;
-    };
-    if kart_id != 0 && kart_serial == 0 {
-        kart_serial = 1;
-    }
-    if !kart_is_owned(catalog, profile, kart_id, kart_serial) {
-        return false;
-    }
-    if request.item_id == 0 {
-        return true;
-    }
-    let Ok(category) = u16::try_from(request.item_category) else {
-        return false;
-    };
-    match category {
-        63..=66 => generated_x_part_is_granted(profile.rider.slot_changer, request),
-        68 | 69 => u16::try_from(request.item_id)
-            .ok()
-            .is_some_and(|item_id| catalog_grants(catalog, category, item_id)),
-        _ => false,
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ProfileSnapshot {
     profile: Profile,
@@ -1878,10 +1864,16 @@ struct ActiveTimeAttack {
     track: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveChallenger {
+    request: StartChallengerRequest,
+}
+
 #[derive(Debug, Default)]
 struct SessionContext {
     profile: Option<BoundProfile>,
     active_time_attack: Option<ActiveTimeAttack>,
+    active_challenger: Option<ActiveChallenger>,
 }
 
 impl SessionContext {
@@ -1914,6 +1906,7 @@ impl SessionContext {
             });
         if !binding_unchanged {
             self.active_time_attack = None;
+            self.active_challenger = None;
         }
         tracing::trace!(
             nickname = %identity.nickname,
@@ -1959,6 +1952,14 @@ impl SessionContext {
 
     fn complete_time_attack(&mut self) {
         self.active_time_attack = None;
+    }
+
+    fn begin_challenger(&mut self, request: StartChallengerRequest) -> Option<ActiveChallenger> {
+        self.active_challenger.replace(ActiveChallenger { request })
+    }
+
+    fn complete_challenger(&mut self) -> Option<ActiveChallenger> {
+        self.active_challenger.take()
     }
 
     fn bound_identity(&self) -> Result<&IdentityBinding, LoginSessionError> {
@@ -2921,7 +2922,81 @@ async fn handle_single_player_request(
         SinglePlayerRequest::FinishTimeAttack(request) => {
             handle_finish_time_attack(world, profiles, request, context).await
         }
+        SinglePlayerRequest::StartChallenger(request) => {
+            handle_start_challenger(world, request, context).await
+        }
+        SinglePlayerRequest::ChallengerKartSpec(request) => {
+            handle_challenger_kart_spec(world, profiles, request, context).await
+        }
+        SinglePlayerRequest::CompleteChallenger(request) => {
+            handle_complete_challenger(world, request, context).await
+        }
     }
+}
+
+async fn handle_start_challenger(
+    world: &AdmittedWorldHandle<'_>,
+    request: StartChallengerRequest,
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+    if let Some(previous) = context.begin_challenger(request) {
+        tracing::debug!(
+            nickname = %identity.nickname,
+            previous_stage_id = previous.request.stage_id,
+            replacement_stage_id = request.stage_id,
+            "replaced an unfinished challenger attempt"
+        );
+    }
+    Ok(vec![serialize_start_challenger_reply(request)])
+}
+
+async fn handle_challenger_kart_spec(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    request: ChallengerKartSpecRequest,
+    context: &SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let identity = world.authorize_identity().await?;
+    let profile = context.profile_for(&identity)?;
+    let equipment = context.equipment_for(&identity)?;
+    let physics = selected_physics_metadata(
+        profile,
+        Some(equipment),
+        profiles.catalog(),
+        PhysicsSelection {
+            kart_id: request.kart_id,
+            flying_pet_id: request.flying_pet_id,
+            requested_speed_type: request.speed_type,
+            plant_game_mode: P5136PlantGameMode::Speed,
+            apply_profile_equipment: true,
+        },
+    )?;
+    trace_single_player_physics_fallback(&identity, &physics, "PqchallengerKartSpec");
+    Ok(vec![serialize_challenger_kart_spec_reply(&physics.block)])
+}
+
+async fn handle_complete_challenger(
+    world: &AdmittedWorldHandle<'_>,
+    request: CompleteChallengerRequest,
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let identity = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&identity)?;
+    let active = context.complete_challenger();
+    tracing::trace!(
+        nickname = %identity.nickname,
+        stage_type = request.stage_type,
+        end_type = request.end_type,
+        producer_proof_length = request.producer_proof_length,
+        had_active_challenger = active.is_some(),
+        "accepted complete P5136 challenger result proof"
+    );
+    Ok(vec![serialize_complete_challenger_reply(
+        request.stage_type,
+        request.end_type,
+    )])
 }
 
 async fn handle_start_time_attack(
@@ -3313,19 +3388,28 @@ async fn handle_club_query(
     // outside this handler.
     let request = parse_club_query_request(packet)?;
     let identity = world.authorize_identity().await?;
-    let _ = context.bound_profile_for(&identity)?;
+    let profile = context.profile_for(&identity)?;
 
-    // There is no authoritative club repository yet. Return only the
-    // consumer-evidenced empty/unavailable state without request-specific
-    // World commands, profile I/O, persistence, mutation, or peer fanout.
+    // There is no authoritative club repository yet. Membership identity can
+    // still be projected from the authenticated profile without mutation or
+    // peer fanout; the remaining repository queries fail closed.
     let response = match request.kind() {
-        ClubQueryRequest::CheckMyClubState => serialize_no_club_state_reply()?,
+        ClubQueryRequest::InitClub => serialize_init_club_reply(profile.rider.club_mark_logo != 0),
+        ClubQueryRequest::InitClubInfo => serialize_fixed_init_club_info_reply(),
+        ClubQueryRequest::CheckMyClubState => serialize_profile_club_state_reply(
+            profile.rider.club_code,
+            &profile.rider.club_name,
+            profile.rider.club_mark_logo,
+            profile.rider.club_mark_line,
+            &identity.nickname,
+        )?,
         ClubQueryRequest::GetUserWaitingJoinClub => serialize_no_pending_club_join_reply()?,
         ClubQueryRequest::CheckCreateClubCondition => serialize_club_creation_unavailable_reply(),
         ClubQueryRequest::GetClubListCount => serialize_empty_club_list_count_reply(),
         ClubQueryRequest::GetClubWaitingCrewCount => {
             serialize_unavailable_waiting_crew_count_reply()
         }
+        ClubQueryRequest::SearchClubList => serialize_empty_club_search_reply(),
     };
     Ok(vec![response])
 }
@@ -3828,15 +3912,8 @@ async fn handle_lobby_request_admitted(
             let profile = context
                 .ok_or(LoginSessionError::ProfileNotBound)?
                 .profile_for(&identity)?;
-            let messages = if request.chat_type == 0 {
-                &profile.game_option.quick_messages
-            } else {
-                &profile.game_option.team_quick_messages
-            };
-            let resolved_message = messages
-                .get(&i32::from(request.message_id))
-                .cloned()
-                .unwrap_or_default();
+            let resolved_message =
+                resolve_macro_chat_message(profile, request.chat_type, request.message_id);
             LobbyCommandPayload::MacroChat {
                 request,
                 resolved_message,
@@ -4763,46 +4840,37 @@ async fn equip_plant_part(
     ensure_identity_fence(&before, &after_write)?;
     let profile = context.profile_for(&after_write)?.clone();
     let mut equipment = context.equipment_for(&after_write)?.clone();
-    let equipped = record.is_some();
-    if let Some(record) = record {
-        upsert_plant_record(&mut equipment, record);
-    }
+    upsert_plant_record(&mut equipment, record);
     context.replace_equipment(&after_write, equipment.clone())?;
-    if equipped {
-        let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
-        let refreshed_room_physics = world
-            .refresh_room_kart_physics(physics.variants.clone())
-            .await?;
-        tracing::info!(
-            nickname = %after_write.nickname,
-            kart_id = request.kart_id,
-            kart_serial = request.kart_serial,
-            item_category = request.item_category,
-            item_id = request.item_id,
-            refreshed_room_physics,
-            "installed durable P5136 plant part in the bound physics cache"
-        );
-    }
+    let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
+    let refreshed_room_physics = world
+        .refresh_room_kart_physics(physics.variants.clone())
+        .await?;
+    tracing::info!(
+        nickname = %after_write.nickname,
+        kart_id = request.kart_id,
+        kart_serial = request.kart_serial,
+        item_category = request.item_category,
+        item_id = request.item_id,
+        refreshed_room_physics,
+        "installed durable P5136 plant part in the bound physics cache"
+    );
     drop(lane);
-    Ok(vec![if equipped {
-        serialize_equip_tuning_success(request)
-    } else {
-        serialize_equip_tuning_failure()
-    }])
+    Ok(vec![serialize_equip_tuning_success(request)])
 }
 
 async fn equip_x_part(
     world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     request: XPartEquipRequest,
-    context: &SessionContext,
+    context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
     let admission = profiles
         .admit_for_operation(world.operation(), &before.nickname, "equip X-part")
         .await?;
-    let (equipped, lane) = match profiles.equip_x_part(request, admission).await {
+    let (record, lane) = match profiles.equip_x_part(request, admission).await {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(%error, "failed to persist P5136 X-part selection");
@@ -4811,18 +4879,24 @@ async fn equip_x_part(
     };
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
-    let _ = context.profile_for(&after)?;
+    let profile = context.profile_for(&after)?.clone();
+    let mut equipment = context.equipment_for(&after)?.clone();
+    upsert_parts_record(&mut equipment, record);
+    context.replace_equipment(&after, equipment.clone())?;
+    let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
+    let refreshed_room_physics = world
+        .refresh_room_kart_physics(physics.variants.clone())
+        .await?;
+    tracing::info!(
+        nickname = %after.nickname,
+        kart_id = request.kart_id,
+        kart_serial = request.kart_serial,
+        item_category = request.item_category,
+        item_id = request.item_id,
+        refreshed_room_physics,
+        "installed durable P5136 X-part in the bound physics cache"
+    );
     drop(lane);
-    if !equipped {
-        tracing::warn!(
-            category = request.item_category,
-            item_id = request.item_id,
-            kart_id = request.kart_id,
-            kart_serial = request.kart_serial,
-            "rejected ungranted P5136 X-part without terminating the session"
-        );
-        return Ok(vec![serialize_equip_x_part_failure(request)]);
-    }
     Ok(vec![serialize_equip_x_part_success(request)])
 }
 
@@ -5102,6 +5176,11 @@ fn selected_physics_metadata(
         RoomKartBaseResolution::MissingCatalogFallback
     };
 
+    if let Some(codes) = intrinsic_floater_codes(kart_id) {
+        snapshot.exc.tune = p5136_floater_spec(codes)
+            .expect("the compiled intrinsic Floater table contains only validated triples");
+    }
+
     if flying_pet_id != 0 {
         if let Some(spec) =
             p5136_core::kart_physics::P5136FlyingPetSpecSnapshot::korean_5136(flying_pet_id)
@@ -5264,7 +5343,7 @@ fn room_participant_from_profile_with_p2p_port(
             rp: profile.rider.rp,
             team: 0,
             ranking: 0,
-            rider_school_level: 0,
+            rider_school_level: startup::P5136_RIDER_SCHOOL_LEVEL,
             club_name,
             club_mark_logo: profile.rider.club_mark_logo,
         },
@@ -5318,6 +5397,14 @@ async fn handle_startup_request(
         update_game_options_admitted(world, profiles, session_id, packet, context).await?;
         return Ok(Vec::new());
     }
+    if request == StartupRequest::DecLucci {
+        let request = parse_lo_rq_dec_lucci(packet)?;
+        return decrement_lucci_admitted(world, profiles, request, context).await;
+    }
+    if request == StartupRequest::GetTrackRank {
+        let request = parse_lo_rq_get_track_rank(packet)?;
+        return get_track_rank_admitted(world, profiles, request, context).await;
+    }
     match request {
         StartupRequest::GetRiderTaskContext => parse_pq_get_rider_task_context(packet)?,
         StartupRequest::VersusModeRankOne => parse_pq_versus_mode_rank_one(packet)?,
@@ -5337,6 +5424,7 @@ async fn handle_startup_request(
         StartupRequest::StartRiderSchool => {
             let _ = parse_pq_start_rider_school(packet)?;
         }
+        StartupRequest::RequestExchangeInit => parse_pq_request_exchange_init(packet)?,
         _ => {}
     }
 
@@ -5387,7 +5475,7 @@ async fn update_game_options_admitted(
     let before = world.authorize_identity().await?;
     let _ = context.profile_for(&before)?;
     let (profile, lane) = profiles
-        .update_game_options(before.nickname.clone(), request.options, admission)
+        .update_game_options(before.nickname.clone(), request, admission)
         .await?;
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
@@ -5395,6 +5483,50 @@ async fn update_game_options_admitted(
     context.bind_profile(after, profile);
     drop(lane);
     Ok(())
+}
+
+async fn decrement_lucci_admitted(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    request: LoRqDecLucci,
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let admission = profiles
+        .admit_for_operation(world.operation(), &before.nickname, "decrement Lucci")
+        .await?;
+    let (profile, lane) = profiles
+        .decrement_lucci(before.nickname.clone(), request.amount, admission)
+        .await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let _ = context.profile_for(&after)?;
+    context.bind_profile(after, profile);
+    drop(lane);
+    Ok(Vec::new())
+}
+
+async fn get_track_rank_admitted(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    request: LoRqGetTrackRank,
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let admission = profiles
+        .admit_for_operation(world.operation(), &before.nickname, "select track rank")
+        .await?;
+    let (profile, lane) = profiles
+        .select_track_rank(before.nickname.clone(), request.track, admission)
+        .await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let _ = context.profile_for(&after)?;
+    context.bind_profile(after, profile);
+    drop(lane);
+    Ok(vec![startup::serialize_lo_rp_get_track_rank(request)])
 }
 
 fn profile_rider_fields(nickname: String, profile: &Profile) -> PrGetRiderFields {
@@ -5412,7 +5544,7 @@ fn profile_rider_fields(nickname: String, profile: &Profile) -> PrGetRiderFields
 fn startup_response(
     request: StartupRequest,
     profile: &Profile,
-) -> Result<Option<Vec<u8>>, KartPhysicsBuildError> {
+) -> Result<Option<Vec<u8>>, LoginSessionError> {
     let time = current_legacy_time();
     let response = match request {
         StartupRequest::LoginVipInfo => startup::serialize_pr_login_vip_info(profile.rider.premium),
@@ -5427,7 +5559,9 @@ fn startup_response(
         StartupRequest::ChapterInfo => startup::serialize_pr_chapter_info(),
         StartupRequest::GetDuelMissionBulk => startup::serialize_pr_get_duel_mission_bulk(time),
         StartupRequest::RiderSchoolData => startup::serialize_pr_rider_school_data(time),
-        StartupRequest::RiderSchoolProgress => startup::serialize_pr_rider_school_progress(),
+        StartupRequest::RiderSchoolProgress => {
+            startup::serialize_pr_rider_school_progress(current_rider_school_pro_pair_index())
+        }
         StartupRequest::RiderSchoolExpiredCheck => {
             startup::serialize_pr_rider_school_expired_check()
         }
@@ -5457,7 +5591,11 @@ fn startup_response(
         StartupRequest::RequestExtradata => startup::serialize_pr_request_extradata(),
         StartupRequest::WebEventCompleteCheck => startup::serialize_pr_web_event_complete_check(),
         StartupRequest::StartRiderSchool => startup::serialize_pr_start_rider_school()?,
-        StartupRequest::GetRider | StartupRequest::UpdateGameOption => return Ok(None),
+        StartupRequest::RequestExchangeInit => startup::serialize_pr_request_exchange_init(),
+        StartupRequest::GetRider
+        | StartupRequest::UpdateGameOption
+        | StartupRequest::DecLucci
+        | StartupRequest::GetTrackRank => return Ok(None),
     };
     Ok(Some(response))
 }
@@ -5496,7 +5634,20 @@ fn profile_game_options(options: &p5136_profile::GameOptions) -> startup::GameOp
     }
 }
 
-fn apply_game_options(destination: &mut p5136_profile::GameOptions, source: &startup::GameOptions) {
+fn resolve_macro_chat_message(profile: &Profile, chat_type: i32, message_id: u8) -> String {
+    let messages = if chat_type == 0 {
+        &profile.game_option.quick_messages
+    } else {
+        &profile.game_option.team_quick_messages
+    };
+    messages
+        .get(&i32::from(message_id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn apply_game_options(destination: &mut p5136_profile::GameOptions, request: &PqUpdateGameOption) {
+    let source = &request.options;
     destination.bgm_volume = source.bgm_volume;
     destination.sound_volume = source.sound_volume;
     destination.main_bgm = source.main_bgm;
@@ -5526,6 +5677,28 @@ fn apply_game_options(destination: &mut p5136_profile::GameOptions, source: &sta
     destination.show_team_color = source.show_team_color;
     destination.screen = source.set_screen;
     destination.hide_competitive_rank = source.hide_competitive_rank;
+    destination.quick_messages = request
+        .quick_messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            (
+                i32::try_from(index).expect("ten macro indexes fit in i32"),
+                message.clone(),
+            )
+        })
+        .collect();
+    destination.team_quick_messages = request
+        .team_quick_messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            (
+                i32::try_from(index).expect("ten macro indexes fit in i32"),
+                message.clone(),
+            )
+        })
+        .collect();
 }
 
 fn packet_hash(packet: &[u8]) -> Result<u32, LoginSessionError> {
@@ -5554,6 +5727,20 @@ fn current_legacy_time() -> LegacyTime {
         quarter_seconds: u16::try_from(quarter_seconds)
             .expect("one day of quarter-seconds fits in u16"),
     }
+}
+
+fn current_rider_school_pro_pair_index() -> usize {
+    let now = Local::now();
+    let month_count =
+        (now.year() - 1900) * 12 + i32::try_from(now.month()).expect("calendar month fits in i32");
+    let odd_month_count = (month_count + 1) / 2;
+    usize::try_from(
+        (odd_month_count - 1).rem_euclid(
+            i32::try_from(startup::P5136_RIDER_SCHOOL_PRO_PAIR_COUNT)
+                .expect("six Pro pairs fit in i32"),
+        ),
+    )
+    .expect("non-negative Pro pair index fits usize")
 }
 
 fn peer_label(stream: &TcpStream) -> Option<SocketAddr> {
@@ -5739,13 +5926,15 @@ mod tests {
         client_event_protocol::ClientEventProtocolError,
         club_query_protocol::{
             ClubQueryProtocolError, ClubQueryRequest, serialize_club_creation_unavailable_reply,
-            serialize_empty_club_list_count_reply, serialize_no_club_state_reply,
-            serialize_no_pending_club_join_reply, serialize_unavailable_waiting_crew_count_reply,
+            serialize_empty_club_list_count_reply, serialize_empty_club_search_reply,
+            serialize_fixed_init_club_info_reply, serialize_init_club_reply,
+            serialize_no_pending_club_join_reply, serialize_profile_club_state_reply,
+            serialize_unavailable_waiting_crew_count_reply,
         },
         equipment_protocol::{
             EquipmentRequest, PlantPartEquipRequest, RiderItemSelection, XPartEquipRequest,
             serialize_equip_tuning_failure, serialize_equip_tuning_success,
-            serialize_equip_x_part_failure, serialize_equip_x_part_success,
+            serialize_equip_x_part_success,
         },
         floater_physics::p5136_floater_spec,
         floater_protocol::{
@@ -5800,12 +5989,13 @@ mod tests {
             serialize_complete_scenario_reply, serialize_start_scenario_reply,
         },
         shop_protocol::{ShopBuyRequest, serialize_shop_buy_failure},
+        single_player_protocol::SinglePlayerProtocolError,
         startup::{
-            GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
-            RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, START_RIDER_SCHOOL_REQUEST_NAME, StartupError,
-            WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME, serialize_empty_locked_item_list,
-            serialize_pr_request_extradata, serialize_pr_start_rider_school,
-            serialize_pr_web_event_complete_check,
+            GAME_OPTION_MACRO_COUNT, GameOptions, LOCKED_ITEM_LIST_REQUEST_NAME,
+            PqUpdateGameOption, REQUEST_EXTRADATA_REQUEST_NAME, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
+            START_RIDER_SCHOOL_REQUEST_NAME, StartupError, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+            serialize_empty_locked_item_list, serialize_pr_request_extradata,
+            serialize_pr_start_rider_school, serialize_pr_web_event_complete_check,
         },
         udp_protocol::parse_routed_udp_packet,
     };
@@ -5976,7 +6166,9 @@ mod tests {
     fn exact_club_query_request(kind: ClubQueryRequest) -> Vec<u8> {
         let mut packet = PacketWriter::named(kind.request_name());
         match kind {
-            ClubQueryRequest::CheckMyClubState
+            ClubQueryRequest::InitClub
+            | ClubQueryRequest::InitClubInfo
+            | ClubQueryRequest::CheckMyClubState
             | ClubQueryRequest::GetUserWaitingJoinClub
             | ClubQueryRequest::CheckCreateClubCondition => {}
             ClubQueryRequest::GetClubListCount => {
@@ -5988,6 +6180,16 @@ mod tests {
                     .expect("test master filter fits");
             }
             ClubQueryRequest::GetClubWaitingCrewCount => packet.write_u32(10_000),
+            ClubQueryRequest::SearchClubList => {
+                packet.write_i32(12);
+                packet.write_i32(0);
+                packet
+                    .write_utf16("ClubFilter")
+                    .expect("test club filter fits");
+                packet
+                    .write_utf16("MasterFilter")
+                    .expect("test master filter fits");
+            }
         }
         packet.into_inner()
     }
@@ -6000,10 +6202,13 @@ mod tests {
         ]
     }
 
-    fn expected_club_query_reply(kind: ClubQueryRequest) -> Vec<u8> {
+    fn expected_club_query_reply(kind: ClubQueryRequest, nickname: &str) -> Vec<u8> {
         match kind {
+            ClubQueryRequest::InitClub => serialize_init_club_reply(false),
+            ClubQueryRequest::InitClubInfo => serialize_fixed_init_club_info_reply(),
             ClubQueryRequest::CheckMyClubState => {
-                serialize_no_club_state_reply().expect("fixed strings fit")
+                serialize_profile_club_state_reply(10_000, "TCCstar", 0, 0, nickname)
+                    .expect("fixed strings fit")
             }
             ClubQueryRequest::GetUserWaitingJoinClub => {
                 serialize_no_pending_club_join_reply().expect("fixed string fits")
@@ -6015,6 +6220,7 @@ mod tests {
             ClubQueryRequest::GetClubWaitingCrewCount => {
                 serialize_unavailable_waiting_crew_count_reply()
             }
+            ClubQueryRequest::SearchClubList => serialize_empty_club_search_reply(),
         }
     }
 
@@ -6080,6 +6286,52 @@ mod tests {
         packet.write_u8(mode_type);
         packet.write_i32(0);
         packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    fn captured_challenge_time_attack_start_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqStartTimeAttack");
+        packet.write_i32(0);
+        packet.write_i32(24);
+        packet.write_u32(0x2C6A_03AB);
+        packet.write_u8(4);
+        packet.write_u8(0);
+        packet.write_u16(787);
+        packet.write_u16(32);
+        packet.write_u8(0);
+        packet.write_i32(0);
+        packet.write_i32(0x116A_CC78);
+        packet.write_u8(0);
+        packet.write_u8(0);
+        packet.write_u8(0);
+        packet.write_i32(0);
+        packet.write_u8(0);
+        packet.into_inner()
+    }
+
+    fn captured_challenger_battle_start_request() -> Vec<u8> {
+        vec![
+            0xC4, 0x06, 0xC2, 0x3B, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x03,
+            0x01, 0x00, 0x00,
+        ]
+    }
+
+    fn challenger_kart_spec_request() -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqchallengerKartSpec");
+        packet.write_u8(4);
+        packet.write_u16(787);
+        packet.write_u16(32);
+        packet.write_bytes(&[0x14, 0, 0, 0, 1, 0, 0, 0]);
+        packet.into_inner()
+    }
+
+    fn challenger_complete_request(stage_type: u16, end_type: u32) -> Vec<u8> {
+        let mut packet = PacketWriter::named("PqCompleteChallenger");
+        packet.write_u16(stage_type);
+        packet.write_u16(0);
+        packet.write_u8(0);
+        packet.write_u32(end_type);
+        packet.write_bytes(&[0; 345]);
         packet.into_inner()
     }
 
@@ -6621,6 +6873,29 @@ mod tests {
         );
         let start_packets = rider.outbound.recv().await.unwrap().into_packets();
         assert_eq!(start_packets.len(), 2);
+    }
+
+    #[test]
+    fn macro_chat_resolution_uses_the_saved_global_and_team_profiles() {
+        let mut profile = Profile::default();
+        profile
+            .game_option
+            .quick_messages
+            .insert(3, "일반 저장 문자열".to_owned());
+        profile
+            .game_option
+            .team_quick_messages
+            .insert(3, "팀 저장 문자열".to_owned());
+
+        assert_eq!(
+            super::resolve_macro_chat_message(&profile, 0, 3),
+            "일반 저장 문자열"
+        );
+        assert_eq!(
+            super::resolve_macro_chat_message(&profile, 1, 3),
+            "팀 저장 문자열"
+        );
+        assert!(super::resolve_macro_chat_message(&profile, 0, 9).is_empty());
     }
 
     #[tokio::test]
@@ -7688,6 +7963,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the captured start-replace-finish sequence is clearer as one ordered protocol proof"
+    )]
     async fn captured_single_player_time_attack_flow_replaces_an_unfinished_attempt() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
@@ -7805,6 +8084,206 @@ mod tests {
             dispatch_packet(&services, &finish, &mut context).await,
             Err(LoginSessionError::TimeAttackFinishWithoutStart)
         ));
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the captured challenge-time-attack sequence is clearer as one ordered protocol proof"
+    )]
+    async fn pro_license_projection_unlocks_the_captured_challenge_time_attack_sequence() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_713))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ChallengeTimeAttack")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let school_data = dispatch_packet(
+            &services,
+            PacketWriter::named("PqRiderSchoolDataPacket").as_slice(),
+            &mut context,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert_eq!(school_data.len(), 31);
+        assert_eq!(
+            school_data[4],
+            p5136_core::startup::P5136_RIDER_SCHOOL_LEVEL
+        );
+        assert_eq!(
+            school_data[5],
+            p5136_core::startup::P5136_RIDER_SCHOOL_MAX_STEP
+        );
+        assert_eq!(
+            i32::from_le_bytes(school_data[15..19].try_into().unwrap()),
+            3
+        );
+        assert_eq!(&school_data[19..], &[1, 0, 4, 0, 2, 0, 4, 0, 3, 0, 4, 0]);
+
+        let pro = dispatch_packet(
+            &services,
+            PacketWriter::named("PqRiderSchoolProPacket").as_slice(),
+            &mut context,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert_eq!(pro.len(), 20);
+        assert_eq!(pro[4], 1);
+        assert!([31, 33, 35, 37, 39, 41].contains(&pro[5]));
+        assert_eq!(pro[6], p5136_core::startup::P5136_RIDER_SCHOOL_LEVEL);
+        assert_eq!(pro[7], pro[5] + 1);
+
+        let mut mission = PacketWriter::named("PqGetTrainingMission");
+        mission.write_i32(0);
+        mission.write_u32(0x2C6A_03AB);
+        let mission_reply = dispatch_packet(&services, mission.as_slice(), &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(mission_reply.len(), 20);
+        assert_eq!(
+            i32::from_le_bytes(mission_reply[4..8].try_into().unwrap()),
+            0
+        );
+
+        let start = captured_challenge_time_attack_start_request();
+        assert_eq!(start.len(), 39);
+        let start_reply = dispatch_packet(&services, &start, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            start_reply.len(),
+            p5136_core::single_player_protocol::START_TIME_ATTACK_REPLY_LENGTH
+        );
+        assert_eq!(
+            &start_reply[..4],
+            &adler32::packet_hash("PrStartTimeAttack").to_le_bytes()
+        );
+        assert_eq!(i32::from_le_bytes(start_reply[4..8].try_into().unwrap()), 0);
+        assert_eq!(
+            i32::from_le_bytes(start_reply[8..12].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(start_reply[start_reply.len() - 4..].try_into().unwrap()),
+            0x2C6A_03AB
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn challenger_battle_start_spec_and_completion_are_one_live_session_flow() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_714))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "ChallengerBattle")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let start = captured_challenger_battle_start_request();
+        let start_reply = dispatch_packet(&services, &start, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(
+            start_reply,
+            vec![
+                p5136_core::single_player_protocol::serialize_start_challenger_reply(
+                    p5136_core::single_player_protocol::StartChallengerRequest {
+                        stage_id: 40,
+                        stage_context: 0,
+                        game_type: 0,
+                        kart_id: 787,
+                        secondary_equipment_id: 1,
+                        producer_flag: 0,
+                    }
+                )
+            ]
+        );
+        assert!(context.active_challenger.is_some());
+
+        let spec_reply = dispatch_packet(&services, &challenger_kart_spec_request(), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(spec_reply.len(), 1);
+        assert_eq!(
+            spec_reply[0].len(),
+            p5136_core::single_player_protocol::CHALLENGER_KART_SPEC_REPLY_LENGTH
+        );
+        assert_eq!(
+            &spec_reply[0][..4],
+            &adler32::packet_hash("PrchallengerKartSpec").to_le_bytes()
+        );
+
+        let complete = challenger_complete_request(2, 7);
+        let complete_reply = dispatch_packet(&services, &complete, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete_reply,
+            vec![p5136_core::single_player_protocol::serialize_complete_challenger_reply(2, 7)]
+        );
+        assert!(context.active_challenger.is_none());
+
+        let mut truncated = complete;
+        truncated.pop();
+        assert!(matches!(
+            dispatch_packet(&services, &truncated, &mut context).await,
+            Err(LoginSessionError::SinglePlayerProtocol(
+                SinglePlayerProtocolError::InvalidLength {
+                    actual: 357,
+                    expected: 358,
+                    ..
+                }
+            ))
+        ));
+
+        let follow_up = dispatch_packet(
+            &services,
+            PacketWriter::named("PqServerTime").as_slice(),
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(follow_up.len(), 1);
 
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
@@ -8533,11 +9012,14 @@ mod tests {
         };
 
         let requests = [
+            ClubQueryRequest::InitClub,
+            ClubQueryRequest::InitClubInfo,
             ClubQueryRequest::CheckMyClubState,
             ClubQueryRequest::GetUserWaitingJoinClub,
             ClubQueryRequest::CheckCreateClubCondition,
             ClubQueryRequest::GetClubListCount,
             ClubQueryRequest::GetClubWaitingCrewCount,
+            ClubQueryRequest::SearchClubList,
         ];
         let mut unbound_context = SessionContext::default();
         for kind in requests {
@@ -8585,7 +9067,7 @@ mod tests {
                     dispatch_packet(&services, &exact_club_query_request(kind), &mut context)
                         .await
                         .unwrap(),
-                    vec![expected_club_query_reply(kind)],
+                    vec![expected_club_query_reply(kind, &identity.nickname)],
                     "{}",
                     kind.request_name()
                 );
@@ -9538,6 +10020,72 @@ mod tests {
         assert_eq!(resolved.block.as_bytes().len(), 235);
         assert_ne!(resolved.block, baseline);
         assert_eq!(resolved.block, expected);
+    }
+
+    #[test]
+    fn mixed_grade_floater_codes_are_converted_into_selected_kart_physics() {
+        let catalog = test_catalog();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+        profile.rider_item.kart_serial = 1;
+        let equipment = EquipmentExceptions {
+            tune: vec![p5136_core::inventory::TuneExcRecord {
+                id: 1_450,
+                serial: 1,
+                tune1: 603,
+                tune2: 903,
+                tune3: 702,
+                slot1: -1,
+                count1: 0,
+                slot2: -1,
+                count2: 0,
+            }],
+            ..EquipmentExceptions::default()
+        };
+
+        let resolved = room_physics_metadata(&profile, &equipment, Some(catalog.as_ref())).unwrap();
+        let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected_snapshot.kart = *catalog.kart_spec(1_450).unwrap();
+        expected_snapshot.exc.tune = p5136_floater_spec([603, 903, 702]).unwrap();
+        let baseline = {
+            let mut snapshot = expected_snapshot;
+            snapshot.exc.tune = p5136_core::kart_physics::P5136TuneSpecSnapshot::default();
+            build_p5136_kart_physics_block(&snapshot).unwrap()
+        };
+
+        assert!(resolved.fallback_reasons.is_empty());
+        assert_ne!(resolved.block, baseline);
+        assert_eq!(
+            resolved.block,
+            build_p5136_kart_physics_block(&expected_snapshot).unwrap()
+        );
+    }
+
+    #[test]
+    fn intrinsic_floater_codes_apply_to_time_attack_without_a_profile_sidecar() {
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 787;
+        profile.rider_item.kart_serial = 1;
+        let resolved = selected_physics_metadata(
+            &profile,
+            Some(&EquipmentExceptions::default()),
+            None,
+            PhysicsSelection {
+                kart_id: 787,
+                flying_pet_id: 0,
+                requested_speed_type: 7,
+                plant_game_mode: p5136_core::plant_physics::P5136PlantGameMode::TimeAttack,
+                apply_profile_equipment: true,
+            },
+        )
+        .unwrap();
+        let mut expected = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected.exc.tune = p5136_floater_spec([603, 903, 702]).unwrap();
+
+        assert_eq!(
+            resolved.block,
+            build_p5136_kart_physics_block(&expected).unwrap()
+        );
     }
 
     #[test]
@@ -13134,7 +13682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_plant_request_persists_sidecar_before_exact_success() {
+    async fn unlimited_plant_part_policy_does_not_require_catalog_grants() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
@@ -13159,9 +13707,9 @@ mod tests {
         fs::write(rider_directory.join("LevelData.json"), b"[malformed").unwrap();
         let request = PlantPartEquipRequest {
             item_category: 43,
-            item_id: 1_000,
+            item_id: 999,
             kart_category: 3,
-            kart_id: 1,
+            kart_id: 1_300,
             kart_serial: 1,
             replaced_part: None,
         };
@@ -13186,9 +13734,9 @@ mod tests {
         fs::remove_file(rider_directory.join("LevelData.json")).unwrap();
         let equipment = EquipmentExceptions::load(profile_root.path(), rider_directory).unwrap();
         assert_eq!(equipment.plant.len(), 1);
-        assert_eq!(equipment.plant[0].id, 1);
+        assert_eq!(equipment.plant[0].id, 1_300);
         assert_eq!(equipment.plant[0].engine_category, 43);
-        assert_eq!(equipment.plant[0].engine_id, 1_000);
+        assert_eq!(equipment.plant[0].engine_id, 999);
 
         world.session_closed(session).await.unwrap();
         world.shutdown().await.unwrap();
@@ -13430,6 +13978,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlimited_floater_policy_does_not_require_catalog_or_kart_grants() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let mut initial_profile = Profile::default();
+        initial_profile.rider_item.kart = 1_453;
+        initial_profile.rider_item.kart_serial = 7;
+        ProfileStore::new(profile_root.path())
+            .save("UnlimitedFloater", &initial_profile)
+            .unwrap();
+        let (profiles, _profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_802))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session, "UnlimitedFloater")
+            .await
+            .unwrap();
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        for request in [
+            floater_item_request(USE_SOCKET_REQUEST_NAME, 1, 3, 1_453, 7),
+            floater_item_request(USE_TUNE_REQUEST_NAME, 5, 3, 1_453, 7),
+        ] {
+            let reply = handle_floater(&world, &profiles, session, &request, &mut context)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(i32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
+        }
+
+        let equipment = context.equipment_for(&identity).unwrap();
+        assert_eq!(equipment.tune.len(), 1);
+        assert_eq!(
+            [
+                equipment.tune[0].tune1,
+                equipment.tune[0].tune2,
+                equipment.tune[0].tune3,
+            ],
+            [603, 703, 903]
+        );
+        let physics =
+            room_physics_metadata(context.profile_for(&identity).unwrap(), equipment, None)
+                .unwrap();
+        let mut expected = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected.exc.tune = p5136_floater_spec([603, 703, 903]).unwrap();
+        assert_eq!(
+            physics.block,
+            build_p5136_kart_physics_block(&expected).unwrap()
+        );
+
+        world.session_closed(session).await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     #[allow(
         clippy::too_many_lines,
         reason = "one end-to-end test proves all four Floater mutations, reconnect preload, and physics share one durable identity"
@@ -13616,7 +14222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_x_part_request_persists_sidecar_before_exact_success() {
+    async fn unlimited_v1_x_part_policy_does_not_require_catalog_grants() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, _profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), Some(test_catalog()));
@@ -13639,10 +14245,10 @@ mod tests {
         context.bind_profile(identity, profile);
         drop(lane);
         let request = XPartEquipRequest {
-            kart_id: 1,
+            kart_id: 1_300,
             kart_serial: 0,
             item_category: 68,
-            item_id: 1_000,
+            item_id: 999,
             quantity: i16::MAX,
             unknown_1: 0,
             grade: 0,
@@ -13675,9 +14281,9 @@ mod tests {
         assert_eq!(responses, vec![serialize_equip_x_part_success(request)]);
         let equipment = EquipmentExceptions::load(profile_root.path(), rider_directory).unwrap();
         assert_eq!(equipment.parts.len(), 1);
-        assert_eq!(equipment.parts[0].id, 1);
+        assert_eq!(equipment.parts[0].id, 1_300);
         assert_eq!(equipment.parts[0].serial, 1);
-        assert_eq!(equipment.parts[0].coating, 1_000);
+        assert_eq!(equipment.parts[0].coating, 999);
 
         world.session_closed(session).await.unwrap();
         world.shutdown().await.unwrap();
@@ -13685,7 +14291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generated_v1_x_part_is_accepted_and_invalid_value_is_non_terminal() {
+    async fn unlimited_generated_x_part_ignores_quantity_and_series_ownership() {
         fn packet(request: XPartEquipRequest) -> Vec<u8> {
             let mut packet = PacketWriter::named("PqEquipXPartsItem");
             packet.write_i16(request.kart_id);
@@ -13728,7 +14334,7 @@ mod tests {
             kart_serial: 1,
             item_category: 63,
             item_id: 2,
-            quantity: i16::MAX,
+            quantity: i16::MAX - 1,
             unknown_1: 0,
             grade: 2,
             unknown_2: 1,
@@ -13754,7 +14360,7 @@ mod tests {
         assert_eq!(equipment.parts[0].engine_grade, 2);
         assert_eq!(equipment.parts[0].engine_value, 1_150);
 
-        let rejected = XPartEquipRequest {
+        let non_catalog_series_value = XPartEquipRequest {
             parts_value: 1_149,
             ..request
         };
@@ -13763,14 +14369,17 @@ mod tests {
             &profiles,
             session,
             EquipmentRequest::EquipXPart,
-            &packet(rejected),
+            &packet(non_catalog_series_value),
             &mut context,
         )
         .await
         .unwrap();
-        assert_eq!(responses, vec![serialize_equip_x_part_failure(rejected)]);
+        assert_eq!(
+            responses,
+            vec![serialize_equip_x_part_success(non_catalog_series_value)]
+        );
         let equipment = EquipmentExceptions::load(profile_root.path(), rider_directory).unwrap();
-        assert_eq!(equipment.parts[0].engine_value, 1_150);
+        assert_eq!(equipment.parts[0].engine_value, 1_149);
 
         world.session_closed(session).await.unwrap();
         world.shutdown().await.unwrap();
@@ -14580,9 +15189,13 @@ mod tests {
             update_profiles
                 .update_game_options(
                     update_nickname,
-                    GameOptions {
-                        video_quality: 77,
-                        ..GameOptions::default()
+                    PqUpdateGameOption {
+                        options: GameOptions {
+                            video_quality: 77,
+                            ..GameOptions::default()
+                        },
+                        quick_messages: std::array::from_fn(|_| String::new()),
+                        team_quick_messages: std::array::from_fn(|_| String::new()),
                     },
                     admission,
                 )
@@ -14896,6 +15509,9 @@ mod tests {
         update.write_f32(0.25);
         update.write_f32(0.5);
         update.write_bytes(&[99; 27]);
+        for _ in 0..(2 * GAME_OPTION_MACRO_COUNT) {
+            update.write_utf16("").unwrap();
+        }
         assert!(matches!(
             update_game_options(
                 &world,

@@ -169,6 +169,26 @@ pub struct ResolvedRandomTracks {
 }
 
 impl ResolvedRandomTracks {
+    #[cfg(test)]
+    pub(crate) fn from_pools_for_tests(
+        pools: impl IntoIterator<Item = ((u8, u32), Vec<u32>, Vec<u32>)>,
+    ) -> Self {
+        Self {
+            pools: pools
+                .into_iter()
+                .map(|(key, hashes, basic_ai_hashes)| {
+                    (
+                        key,
+                        ResolvedRandomTrackPool {
+                            hashes: hashes.into(),
+                            basic_ai_hashes: basic_ai_hashes.into(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub fn candidates(&self, room_game_type: u8, selector: u32, basic_ai_only: bool) -> &[u32] {
         let catalog_game_type = u8::from(matches!(room_game_type, 2 | 4));

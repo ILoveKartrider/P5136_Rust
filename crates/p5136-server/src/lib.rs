@@ -66,7 +66,9 @@ pub use random_track::{
     RandomTrackPool, RandomTrackPoolOverride, ResolvedRandomTracks,
     load_client_random_track_catalog,
 };
-pub use runtime::{BoundServer, RewardPersistenceRuntimeError, ServerError, ServerHandle};
+pub use runtime::{
+    BoundServer, OperatorKartGrantError, RewardPersistenceRuntimeError, ServerError, ServerHandle,
+};
 pub use session::{LoginSessionError, read_encrypted_frame};
 pub use udp_runtime::{
     DEFAULT_MAX_ACTIVE_UDP_IDENTITIES, DEFAULT_MAX_RELAY_TARGETS, DEFAULT_UDP_ADMISSION_CAPACITY,

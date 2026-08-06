@@ -19,7 +19,16 @@ use crate::{
 };
 
 pub const RIDER_ITEM_SNAPSHOT_WIRE_LENGTH: usize = 65;
-pub const MAX_GAME_OPTION_TRAILING_BYTES: usize = 80;
+pub const GAME_OPTION_MACRO_COUNT: usize = 10;
+pub const MAX_GAME_OPTION_MACRO_UTF16_UNITS: usize = 256;
+const GAME_OPTION_REPLY_SLOT_BYTES: usize = size_of::<u32>();
+const GAME_OPTION_REPLY_SLOT_COUNT: usize = 2 * GAME_OPTION_MACRO_COUNT;
+pub const P5136_RIDER_SCHOOL_LEVEL: u8 = 6;
+pub const P5136_RIDER_SCHOOL_MAX_STEP: u8 = 42;
+pub const P5136_RIDER_SCHOOL_PRO_PAIR_COUNT: usize = 6;
+const P5136_RIDER_SCHOOL_PRO_STEPS: [[u8; 2]; P5136_RIDER_SCHOOL_PRO_PAIR_COUNT] =
+    [[31, 32], [33, 34], [35, 36], [37, 38], [39, 40], [41, 42]];
+const P5136_TRAINING_CENTERS: [[i16; 2]; 3] = [[1, 4], [2, 4], [3, 4]];
 pub const LOCKED_ITEM_LIST_REQUEST_NAME: &str = "PqLockedItemGet";
 pub const LOCKED_ITEM_LIST_REPLY_NAME: &str = "PrLockedItemGet";
 pub const REQUEST_EXTRADATA_REQUEST_NAME: &str = "PqRequestExtradata";
@@ -70,6 +79,11 @@ pub const REMAIN_TC_CASH_REQUEST_NAME: &str = "SpRqRemainTcCashPacket";
 pub const REMAIN_TC_CASH_REPLY_NAME: &str = "SpRpRemainTcCashPacket";
 pub const REMAIN_TC_CASH_REQUEST_HASH: u32 = 0x5FE1_0870;
 pub const REMAIN_TC_CASH_REPLY_HASH: u32 = 0x5FCE_086F;
+pub const DEC_LUCCI_REQUEST_NAME: &str = "LoRqDecLucciPacket";
+pub const GET_TRACK_RANK_REQUEST_NAME: &str = "LoRqGetTrackRankPacket";
+pub const GET_TRACK_RANK_REPLY_NAME: &str = "LoRpGetTrackRankPacket";
+pub const REQUEST_EXCHANGE_INIT_REQUEST_NAME: &str = "PqRequestExchangeInitPacket";
+pub const REQUEST_EXCHANGE_INIT_REPLY_NAME: &str = "PrRequestExchangeInitPacket";
 
 const CHANNEL_STATIC_REPLY_BODY_LENGTH: usize = 852;
 const CHANNEL_STATIC_REPLY_BASE64: &str = concat!(
@@ -155,6 +169,9 @@ pub enum StartupRequest {
     ServerTime,
     RequestExtradata,
     WebEventCompleteCheck,
+    DecLucci,
+    GetTrackRank,
+    RequestExchangeInit,
 }
 
 pub const STARTUP_REQUESTS: &[StartupRequest] = &[
@@ -196,6 +213,9 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::ServerTime,
     StartupRequest::RequestExtradata,
     StartupRequest::WebEventCompleteCheck,
+    StartupRequest::DecLucci,
+    StartupRequest::GetTrackRank,
+    StartupRequest::RequestExchangeInit,
 ];
 
 impl StartupRequest {
@@ -240,6 +260,9 @@ impl StartupRequest {
             Self::ServerTime => "PqServerTime",
             Self::RequestExtradata => REQUEST_EXTRADATA_REQUEST_NAME,
             Self::WebEventCompleteCheck => WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
+            Self::DecLucci => DEC_LUCCI_REQUEST_NAME,
+            Self::GetTrackRank => GET_TRACK_RANK_REQUEST_NAME,
+            Self::RequestExchangeInit => REQUEST_EXCHANGE_INIT_REQUEST_NAME,
         }
     }
 
@@ -253,7 +276,7 @@ impl StartupRequest {
             Self::GetRider => Some("PrGetRider"),
             Self::GetRiderTaskContext => Some(GET_RIDER_TASK_CONTEXT_REPLY_NAME),
             Self::VersusModeRankOne => Some(VERSUS_MODE_RANK_ONE_REPLY_NAME),
-            Self::UpdateGameOption => None,
+            Self::UpdateGameOption | Self::DecLucci => None,
             Self::GetGameOption => Some("PrGetGameOption"),
             Self::SetPlaytimeEventTick => Some("PrSetPlaytimeEventTick"),
             Self::ChapterInfo => Some("PrChapterInfoPacket"),
@@ -284,6 +307,8 @@ impl StartupRequest {
             Self::ServerTime => Some("PrServerTime"),
             Self::RequestExtradata => Some(REQUEST_EXTRADATA_REPLY_NAME),
             Self::WebEventCompleteCheck => Some(WEB_EVENT_COMPLETE_CHECK_REPLY_NAME),
+            Self::GetTrackRank => Some(GET_TRACK_RANK_REPLY_NAME),
+            Self::RequestExchangeInit => Some(REQUEST_EXCHANGE_INIT_REPLY_NAME),
         }
     }
 }
@@ -324,7 +349,22 @@ pub struct GameOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PqUpdateGameOption {
     pub options: GameOptions,
-    pub trailing: Vec<u8>,
+    pub quick_messages: [String; GAME_OPTION_MACRO_COUNT],
+    pub team_quick_messages: [String; GAME_OPTION_MACRO_COUNT],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoRqDecLucci {
+    /// The stock-era handler consumes this byte without assigning a meaning.
+    pub mode: u8,
+    pub amount: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoRqGetTrackRank {
+    pub track: u32,
+    pub speed_type: u8,
+    pub game_type: u8,
 }
 
 /// The single encoded byte produced by the stock `PqStartRiderSchool` client.
@@ -400,24 +440,47 @@ pub fn is_startup_noop(hash: u32) -> bool {
         .any(|name| adler32::packet_hash(name) == hash)
 }
 
-/// Parses the persisted portion of `PqUpdateGameOption`. The legacy handler
-/// ignores an optional suffix; this parser preserves it but caps the copied
-/// data at the largest known option suffix.
+/// Parses the complete P5136 game-option update: fixed settings followed by
+/// ten global and ten team macro-chat strings.
 pub fn parse_pq_update_game_option(packet: &[u8]) -> Result<PqUpdateGameOption, StartupError> {
     let mut reader = PacketReader::new(packet);
     expect_hash(&mut reader, "PqUpdateGameOption")?;
     let options = read_game_options(&mut reader)?;
-    let trailing = reader.remaining();
-    if trailing.len() > MAX_GAME_OPTION_TRAILING_BYTES {
-        return Err(StartupError::TrailingLimitExceeded {
-            length: trailing.len(),
-            maximum: MAX_GAME_OPTION_TRAILING_BYTES,
-        });
-    }
+    let quick_messages = read_game_option_macros(&mut reader)?;
+    let team_quick_messages = read_game_option_macros(&mut reader)?;
+    ensure_exhausted(&reader, "PqUpdateGameOption")?;
     Ok(PqUpdateGameOption {
         options,
-        trailing: trailing.to_vec(),
+        quick_messages,
+        team_quick_messages,
     })
+}
+
+pub fn parse_lo_rq_dec_lucci(packet: &[u8]) -> Result<LoRqDecLucci, StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, DEC_LUCCI_REQUEST_NAME)?;
+    let request = LoRqDecLucci {
+        mode: reader.read_u8()?,
+        amount: reader.read_u32()?,
+    };
+    ensure_exhausted(&reader, DEC_LUCCI_REQUEST_NAME)?;
+    Ok(request)
+}
+
+pub fn parse_lo_rq_get_track_rank(packet: &[u8]) -> Result<LoRqGetTrackRank, StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, GET_TRACK_RANK_REQUEST_NAME)?;
+    let request = LoRqGetTrackRank {
+        track: reader.read_u32()?,
+        speed_type: reader.read_u8()?,
+        game_type: reader.read_u8()?,
+    };
+    ensure_exhausted(&reader, GET_TRACK_RANK_REQUEST_NAME)?;
+    Ok(request)
+}
+
+pub fn parse_pq_request_exchange_init(packet: &[u8]) -> Result<(), StartupError> {
+    parse_hash_only_request(packet, REQUEST_EXCHANGE_INIT_REQUEST_NAME)
 }
 
 /// Parses the P5136 protected-item list request.
@@ -551,6 +614,15 @@ fn parse_hash_only_request(packet: &[u8], name: &'static str) -> Result<(), Star
     }
 }
 
+fn ensure_exhausted(reader: &PacketReader<'_>, name: &'static str) -> Result<(), StartupError> {
+    let count = reader.remaining().len();
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(StartupError::TrailingBytes { name, count })
+    }
+}
+
 #[must_use]
 pub fn serialize_pr_login_vip_info(premium: i32) -> Vec<u8> {
     let mut packet = PacketWriter::named("PrLoginVipInfo");
@@ -585,11 +657,38 @@ pub fn serialize_pr_equip_tuning_failure() -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the asymmetric P5136 game-option reply.
+///
+/// `PqUpdateGameOption` uploads twenty variable-length UTF-16 macro strings,
+/// but `PrGetGameOption` does not return those strings. Its tail is twenty
+/// fixed four-byte slots. Treating the slots as strings happens to work while
+/// every message is empty, then shifts the packet boundary and crashes the
+/// client as soon as a non-empty macro is persisted.
 #[must_use]
 pub fn serialize_pr_get_game_option(options: &GameOptions) -> Vec<u8> {
     let mut packet = PacketWriter::named("PrGetGameOption");
     write_game_options(&mut packet, options);
-    packet.write_bytes(&[0; 80]);
+    packet.write_bytes(&[0; GAME_OPTION_REPLY_SLOT_BYTES * GAME_OPTION_REPLY_SLOT_COUNT]);
+    packet.into_inner()
+}
+
+#[must_use]
+pub fn serialize_lo_rp_get_track_rank(request: LoRqGetTrackRank) -> Vec<u8> {
+    let mut packet = PacketWriter::named(GET_TRACK_RANK_REPLY_NAME);
+    packet.write_u32(request.track);
+    packet.write_u8(request.speed_type);
+    packet.write_u8(request.game_type);
+    packet.write_i32(0);
+    packet.into_inner()
+}
+
+#[must_use]
+pub fn serialize_pr_request_exchange_init() -> Vec<u8> {
+    let mut packet = PacketWriter::named(REQUEST_EXCHANGE_INIT_REPLY_NAME);
+    packet.write_bytes(&[
+        0x01, 0x03, 0x00, 0x00, 0x00, 0xF4, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00,
+        0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    ]);
     packet.into_inner()
 }
 
@@ -641,18 +740,27 @@ pub fn serialize_pr_get_duel_mission_bulk(time: LegacyTime) -> Vec<u8> {
 #[must_use]
 pub fn serialize_pr_rider_school_data(time: LegacyTime) -> Vec<u8> {
     let mut packet = PacketWriter::named("PrRiderSchoolDataPacket");
-    packet.write_u8(6);
-    packet.write_u8(34);
+    packet.write_u8(P5136_RIDER_SCHOOL_LEVEL);
+    packet.write_u8(P5136_RIDER_SCHOOL_MAX_STEP);
     write_legacy_time(&mut packet, time);
     packet.write_i32(0);
     packet.write_u8(0);
+    packet.write_i32(
+        i32::try_from(P5136_TRAINING_CENTERS.len()).expect("three training centers fit in i32"),
+    );
+    for [center, level] in P5136_TRAINING_CENTERS {
+        packet.write_i16(center);
+        packet.write_i16(level);
+    }
     packet.into_inner()
 }
 
 #[must_use]
-pub fn serialize_pr_rider_school_progress() -> Vec<u8> {
+pub fn serialize_pr_rider_school_progress(pro_pair_index: usize) -> Vec<u8> {
+    let [first_step, second_step] =
+        P5136_RIDER_SCHOOL_PRO_STEPS[pro_pair_index % P5136_RIDER_SCHOOL_PRO_PAIR_COUNT];
     let mut packet = PacketWriter::named("PrRiderSchoolProPacket");
-    packet.write_bytes(&[1, 33, 6, 34]);
+    packet.write_bytes(&[1, first_step, P5136_RIDER_SCHOOL_LEVEL, second_step]);
     packet.write_bytes(&[0; 12]);
     packet.into_inner()
 }
@@ -1006,6 +1114,34 @@ fn write_game_options(packet: &mut PacketWriter, options: &GameOptions) {
     ]);
 }
 
+fn read_game_option_macros(
+    reader: &mut PacketReader<'_>,
+) -> Result<[String; GAME_OPTION_MACRO_COUNT], PacketError> {
+    let mut messages = std::array::from_fn(|_| String::new());
+    for message in &mut messages {
+        *message = reader.read_utf16_bounded(MAX_GAME_OPTION_MACRO_UTF16_UNITS)?;
+    }
+    Ok(messages)
+}
+
+#[cfg(test)]
+fn write_game_option_macros(
+    packet: &mut PacketWriter,
+    messages: &[String; GAME_OPTION_MACRO_COUNT],
+) -> Result<(), PacketError> {
+    for message in messages {
+        let length = message.encode_utf16().count();
+        if length > MAX_GAME_OPTION_MACRO_UTF16_UNITS {
+            return Err(PacketError::StringLimitExceeded {
+                length,
+                maximum: MAX_GAME_OPTION_MACRO_UTF16_UNITS,
+            });
+        }
+        packet.write_utf16(message)?;
+    }
+    Ok(())
+}
+
 fn write_legacy_time(packet: &mut PacketWriter, time: LegacyTime) {
     packet.write_u16(time.days_since_1900);
     packet.write_u16(time.quarter_seconds);
@@ -1049,16 +1185,17 @@ mod tests {
 
     use super::{
         FAVORITE_TRACK_MAP_REPLY_HASH, FAVORITE_TRACK_MAP_REPLY_NAME,
-        FAVORITE_TRACK_MAP_REQUEST_HASH, FAVORITE_TRACK_MAP_REQUEST_NAME,
+        FAVORITE_TRACK_MAP_REQUEST_HASH, FAVORITE_TRACK_MAP_REQUEST_NAME, GAME_OPTION_MACRO_COUNT,
         GET_CASH_INVENTORY_REPLY_HASH, GET_CASH_INVENTORY_REPLY_NAME,
         GET_CASH_INVENTORY_REQUEST_HASH, GET_CASH_INVENTORY_REQUEST_NAME,
         GET_MAX_GIFT_ID_REPLY_HASH, GET_MAX_GIFT_ID_REPLY_NAME, GET_MAX_GIFT_ID_REQUEST_HASH,
         GET_MAX_GIFT_ID_REQUEST_NAME, GET_RIDER_TASK_CONTEXT_REPLY_HASH,
         GET_RIDER_TASK_CONTEXT_REPLY_NAME, GET_RIDER_TASK_CONTEXT_REQUEST_HASH,
-        GET_RIDER_TASK_CONTEXT_REQUEST_NAME, GameOptions, KOIN_BALANCE_REPLY_HASH,
-        KOIN_BALANCE_REPLY_NAME, KOIN_BALANCE_REQUEST_HASH, KOIN_BALANCE_REQUEST_NAME,
-        LOCKED_ITEM_LIST_REPLY_NAME, LOCKED_ITEM_LIST_REQUEST_NAME, MAX_GAME_OPTION_TRAILING_BYTES,
-        PrGetRiderFields, RANKER_INFO_REPLY_HASH, RANKER_INFO_REPLY_NAME, RANKER_INFO_REQUEST_HASH,
+        GET_RIDER_TASK_CONTEXT_REQUEST_NAME, GET_TRACK_RANK_REPLY_NAME,
+        GET_TRACK_RANK_REQUEST_NAME, GameOptions, KOIN_BALANCE_REPLY_HASH, KOIN_BALANCE_REPLY_NAME,
+        KOIN_BALANCE_REQUEST_HASH, KOIN_BALANCE_REQUEST_NAME, LOCKED_ITEM_LIST_REPLY_NAME,
+        LOCKED_ITEM_LIST_REQUEST_NAME, MAX_GAME_OPTION_MACRO_UTF16_UNITS, PrGetRiderFields,
+        RANKER_INFO_REPLY_HASH, RANKER_INFO_REPLY_NAME, RANKER_INFO_REQUEST_HASH,
         RANKER_INFO_REQUEST_NAME, REMAIN_CASH_REPLY_HASH, REMAIN_CASH_REPLY_NAME,
         REMAIN_CASH_REQUEST_HASH, REMAIN_CASH_REQUEST_NAME, REMAIN_TC_CASH_REPLY_HASH,
         REMAIN_TC_CASH_REPLY_NAME, REMAIN_TC_CASH_REQUEST_HASH, REMAIN_TC_CASH_REQUEST_NAME,
@@ -1072,28 +1209,31 @@ mod tests {
         VERSUS_MODE_RANK_ONE_REQUEST_HASH, VERSUS_MODE_RANK_ONE_REQUEST_NAME,
         WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_pq_favorite_track_map_get, parse_pq_get_rider_task_context, parse_pq_locked_item_get,
-        parse_pq_ranker_info, parse_pq_request_extradata, parse_pq_rider_school_expired_check,
-        parse_pq_start_rider_school, parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
+        parse_lo_rq_dec_lucci, parse_lo_rq_get_track_rank, parse_pq_favorite_track_map_get,
+        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_ranker_info,
+        parse_pq_request_exchange_init, parse_pq_request_extradata,
+        parse_pq_rider_school_expired_check, parse_pq_start_rider_school,
+        parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
         parse_pq_web_event_complete_check, parse_sp_rq_get_cash_inventory,
         parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance, parse_sp_rq_remain_cash,
         parse_sp_rq_remain_tc_cash, serialize_channel_static_reply,
         serialize_empty_locked_item_list, serialize_empty_pr_favorite_track_map_get,
         serialize_empty_sp_rp_get_cash_inventory, serialize_lo_rp_add_racing_time,
-        serialize_lo_rp_event_reward, serialize_pr_add_time_event_init, serialize_pr_chapter_info,
+        serialize_lo_rp_event_reward, serialize_lo_rp_get_track_rank,
+        serialize_pr_add_time_event_init, serialize_pr_chapter_info,
         serialize_pr_disassemble_fee_info, serialize_pr_dynamic_command,
         serialize_pr_equip_tuning_failure, serialize_pr_get_current_rider,
         serialize_pr_get_duel_mission_bulk, serialize_pr_get_favorite_channel,
         serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_get_rider_task_context,
         serialize_pr_kart_pass_init, serialize_pr_kart_pass_reward, serialize_pr_login_vip_info,
         serialize_pr_public_command, serialize_pr_quest_ux_second, serialize_pr_ranker_info,
-        serialize_pr_request_extradata, serialize_pr_rider_school_data,
-        serialize_pr_rider_school_expired_check, serialize_pr_rider_school_progress,
-        serialize_pr_server_time, serialize_pr_set_playtime_event_tick,
-        serialize_pr_start_rider_school, serialize_pr_sync_dictionary_info,
-        serialize_pr_versus_mode_rank_one, serialize_pr_web_event_complete_check,
-        serialize_sp_rp_get_max_gift_id, serialize_sp_rp_koin_balance, serialize_sp_rp_remain_cash,
-        serialize_sp_rp_remain_tc_cash,
+        serialize_pr_request_exchange_init, serialize_pr_request_extradata,
+        serialize_pr_rider_school_data, serialize_pr_rider_school_expired_check,
+        serialize_pr_rider_school_progress, serialize_pr_server_time,
+        serialize_pr_set_playtime_event_tick, serialize_pr_start_rider_school,
+        serialize_pr_sync_dictionary_info, serialize_pr_versus_mode_rank_one,
+        serialize_pr_web_event_complete_check, serialize_sp_rp_get_max_gift_id,
+        serialize_sp_rp_koin_balance, serialize_sp_rp_remain_cash, serialize_sp_rp_remain_tc_cash,
     };
     use crate::{
         adler32, encoded,
@@ -1520,28 +1660,89 @@ mod tests {
     }
 
     #[test]
-    fn game_options_round_trip_and_bound_the_ignored_suffix() {
+    fn game_options_round_trip_all_twenty_macro_strings() {
         let options = fixture_options();
+        let quick_messages = std::array::from_fn(|index| format!("일반 매크로 {index}"));
+        let team_quick_messages = std::array::from_fn(|index| format!("팀 매크로 {index}"));
         let mut request = PacketWriter::named("PqUpdateGameOption");
         super::write_game_options(&mut request, &options);
-        request.write_bytes(&[0xa5; MAX_GAME_OPTION_TRAILING_BYTES]);
+        super::write_game_option_macros(&mut request, &quick_messages).unwrap();
+        super::write_game_option_macros(&mut request, &team_quick_messages).unwrap();
         let parsed = parse_pq_update_game_option(request.as_slice()).unwrap();
         assert_eq!(parsed.options, options);
-        assert_eq!(parsed.trailing, [0xa5; MAX_GAME_OPTION_TRAILING_BYTES]);
+        assert_eq!(parsed.quick_messages, quick_messages);
+        assert_eq!(parsed.team_quick_messages, team_quick_messages);
 
-        let mut oversized = request.into_inner();
-        oversized.push(0);
+        let mut trailing = request.into_inner();
+        trailing.push(0xa5);
         assert!(matches!(
-            parse_pq_update_game_option(&oversized),
-            Err(StartupError::TrailingLimitExceeded {
-                length: 81,
-                maximum: MAX_GAME_OPTION_TRAILING_BYTES
+            parse_pq_update_game_option(&trailing),
+            Err(StartupError::TrailingBytes {
+                name: "PqUpdateGameOption",
+                count: 1,
             })
         ));
         assert!(matches!(
-            parse_pq_update_game_option(&oversized[..20]),
+            parse_pq_update_game_option(&trailing[..20]),
             Err(StartupError::Packet(_))
         ));
+
+        let mut oversized = PacketWriter::named("PqUpdateGameOption");
+        super::write_game_options(&mut oversized, &options);
+        oversized
+            .write_utf16(&"가".repeat(MAX_GAME_OPTION_MACRO_UTF16_UNITS + 1))
+            .unwrap();
+        assert!(matches!(
+            parse_pq_update_game_option(oversized.as_slice()),
+            Err(StartupError::Packet(crate::packet::PacketError::StringLimitExceeded {
+                length,
+                maximum: MAX_GAME_OPTION_MACRO_UTF16_UNITS,
+            })) if length == MAX_GAME_OPTION_MACRO_UTF16_UNITS + 1
+        ));
+    }
+
+    #[test]
+    fn recovered_lucci_rank_and_exchange_packets_match_legacy_shapes() {
+        let mut dec_lucci = PacketWriter::named("LoRqDecLucciPacket");
+        dec_lucci.write_u8(0x50);
+        dec_lucci.write_u32(1_000);
+        assert_eq!(
+            parse_lo_rq_dec_lucci(dec_lucci.as_slice()).unwrap(),
+            super::LoRqDecLucci {
+                mode: 0x50,
+                amount: 1_000,
+            }
+        );
+
+        let mut rank = PacketWriter::named(GET_TRACK_RANK_REQUEST_NAME);
+        rank.write_u32(0x0102_0304);
+        rank.write_u8(7);
+        rank.write_u8(0);
+        let rank = parse_lo_rq_get_track_rank(rank.as_slice()).unwrap();
+        assert_eq!(
+            &serialize_lo_rp_get_track_rank(rank)[4..],
+            &[4, 3, 2, 1, 7, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            adler32::packet_hash(GET_TRACK_RANK_REPLY_NAME),
+            u32::from_le_bytes(
+                serialize_lo_rp_get_track_rank(rank)[..4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+
+        let exchange = PacketWriter::named("PqRequestExchangeInitPacket").into_inner();
+        parse_pq_request_exchange_init(&exchange).unwrap();
+        assert_eq!(
+            &serialize_pr_request_exchange_init()[4..],
+            &[
+                0x01, 0x03, 0x00, 0x00, 0x00, 0xF4, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+                0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            ]
+        );
+
+        assert_eq!(GAME_OPTION_MACRO_COUNT, 10);
     }
 
     #[test]
@@ -1565,9 +1766,18 @@ mod tests {
         assert_packet(&serialize_pr_set_playtime_event_tick(), 1_671_366_848, &[0]);
         assert_packet(&serialize_pr_chapter_info(), 1_224_542_061, &[0; 4]);
         assert_packet(
-            &serialize_pr_rider_school_progress(),
+            &serialize_pr_rider_school_progress(1),
             1_648_560_297,
             &[1, 33, 6, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            &serialize_pr_rider_school_progress(5)[4..8],
+            &[1, 41, 6, 42]
+        );
+        assert_eq!(
+            serialize_pr_rider_school_progress(6),
+            serialize_pr_rider_school_progress(0),
+            "the six evidenced Pro pairs rotate without emitting an invalid step"
         );
         assert_packet(
             &serialize_pr_dynamic_command(),
@@ -1612,7 +1822,13 @@ mod tests {
         assert_packet(
             &school,
             1_783_761_138,
-            &[6, 34, 0x34, 0x12, 0x78, 0x56, 0, 0, 0, 0, 0],
+            &[
+                6, 42, 0x34, 0x12, 0x78, 0x56, 0, 0, 0, 0, 0, // school head
+                3, 0, 0, 0, // training-center count
+                1, 0, 4, 0, // center 1, level 4
+                2, 0, 4, 0, // center 2, level 4
+                3, 0, 4, 0, // center 3, level 4
+            ],
         );
 
         let duel = serialize_pr_get_duel_mission_bulk(time);
@@ -1679,6 +1895,7 @@ mod tests {
     fn game_option_reply_and_rider_snapshot_match_golden_layouts() {
         let options_packet = serialize_pr_get_game_option(&fixture_options());
         assert_eq!(options_packet.len(), 119);
+        assert_eq!(&options_packet[39..], &[0; 80]);
         assert_eq!(
             format!("{:X}", Sha256::digest(&options_packet)),
             "27CD829FED00597AE4B0ECA9378D860FEA195FA7F608E0486133E66BE50D3B96"

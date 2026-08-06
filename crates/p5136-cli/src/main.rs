@@ -1,8 +1,12 @@
 use std::{
     fs::OpenOptions,
-    io,
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -19,7 +23,7 @@ use p5136_server::{
     RewardPersistenceRuntimeError, ServerConfig, ServerError, ServerHandle,
     load_item_probability_xml,
 };
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod client_paths;
@@ -177,7 +181,7 @@ enum RunnerKind {
 fn main() -> Result<()> {
     if should_start_gui(std::env::args_os()) {
         let logging = init_tracing(false)?;
-        return gui::run(logging.log_path.clone(), logging);
+        return gui::run(&logging);
     }
 
     let cli = Cli::parse();
@@ -208,7 +212,50 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
 struct LoggingRuntime {
     log_path: PathBuf,
+    control: FileLoggingControl,
     _file_worker: WorkerGuard,
+}
+
+#[derive(Clone)]
+struct FileLoggingControl(Arc<AtomicBool>);
+
+impl Default for FileLoggingControl {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl FileLoggingControl {
+    fn enabled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.0.store(enabled, Ordering::Release);
+    }
+}
+
+struct ConditionalFileWriter {
+    inner: NonBlocking,
+    control: FileLoggingControl,
+}
+
+impl Write for ConditionalFileWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.control.enabled() {
+            self.inner.write(buffer)
+        } else {
+            Ok(buffer.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.control.enabled() {
+            self.inner.flush()
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn init_tracing(verbose: bool) -> Result<LoggingRuntime> {
@@ -231,9 +278,14 @@ fn init_tracing(verbose: bool) -> Result<LoggingRuntime> {
         .buffered_lines_limit(4_096)
         .lossy(true)
         .finish(file);
+    let control = FileLoggingControl::default();
+    let writer_control = control.clone();
     let packet_file = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .with_writer(file_writer)
+        .with_writer(move || ConditionalFileWriter {
+            inner: file_writer.clone(),
+            control: writer_control.clone(),
+        })
         .with_filter(EnvFilter::new("info,p5136_packet=debug"));
     tracing_subscriber::registry()
         .with(console)
@@ -242,6 +294,7 @@ fn init_tracing(verbose: bool) -> Result<LoggingRuntime> {
     tracing::info!(log_file = %log_path.display(), "file logging enabled");
     Ok(LoggingRuntime {
         log_path,
+        control,
         _file_worker: file_worker,
     })
 }
@@ -571,14 +624,19 @@ fn reject_unspecified_server(address: Ipv4Addr) -> Result<()> {
 mod tests {
     use std::{
         ffi::OsString,
+        io::Write as _,
         net::Ipv4Addr,
         path::{Path, PathBuf},
     };
 
     use clap::Parser;
     use tempfile::tempdir;
+    use tracing_appender::non_blocking::NonBlockingBuilder;
 
-    use super::{Cli, Command, ConnectArgs, RunnerKind, run_connector};
+    use super::{
+        Cli, Command, ConditionalFileWriter, ConnectArgs, FileLoggingControl, RunnerKind,
+        run_connector,
+    };
 
     #[test]
     fn no_arguments_select_gui_and_any_argument_selects_cli() {
@@ -738,5 +796,29 @@ mod tests {
         assert_eq!(second.file_name().unwrap(), "p5136-123-456-1.log");
         assert!(first.is_file());
         assert!(second.is_file());
+    }
+
+    #[test]
+    fn file_logging_checkbox_gate_drops_only_the_disabled_interval() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("toggle.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(file);
+        let control = FileLoggingControl::default();
+        let mut writer = ConditionalFileWriter {
+            inner: writer,
+            control: control.clone(),
+        };
+
+        writer.write_all(b"before\n").unwrap();
+        control.set_enabled(false);
+        writer.write_all(b"hidden\n").unwrap();
+        control.set_enabled(true);
+        writer.write_all(b"after\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        drop(guard);
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before\nafter\n");
     }
 }

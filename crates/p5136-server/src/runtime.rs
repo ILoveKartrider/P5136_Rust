@@ -11,8 +11,9 @@ use std::{
 };
 
 use p5136_profile::{
-    CatalogInventory, CatalogInventoryError, EmblemCatalog, EmblemCatalogError,
-    MAX_EMBLEM_XML_BYTES, ProfileStoreError,
+    AddKartOutcome, CatalogInventory, CatalogInventoryError, EmblemCatalog, EmblemCatalogError,
+    KartGrantOptions, KartInventoryEditError, MAX_EMBLEM_XML_BYTES, ProfileStoreError,
+    add_kart_during_race_run_with_options,
 };
 use p5136_rho5::{Rho5Directory, Rho5Error, Rho5Limits};
 use thiserror::Error;
@@ -31,8 +32,8 @@ use crate::{
     WorldError, WorldHandle, load_client_item_probabilities, load_client_kart_catalog,
     operation_gate::WireOperationGate,
     profile_io::{
-        DurableRewardReceipt, ProfileIoBootstrap, ProfileIoConfigError, ProfileIoHandle,
-        ProfileIoRuntime, ProfileIoShutdownError, RewardFailureClassification,
+        DurableRewardReceipt, ProfileIoBootstrap, ProfileIoConfigError, ProfileIoError,
+        ProfileIoHandle, ProfileIoRuntime, ProfileIoShutdownError, RewardFailureClassification,
         RewardPersistenceFailure,
     },
     random_track::{RandomTrackError, ResolvedRandomTracks, load_client_random_track_catalog},
@@ -200,6 +201,18 @@ pub enum ServerError {
 
     #[error(transparent)]
     World(#[from] WorldError),
+}
+
+#[derive(Debug, Error)]
+pub enum OperatorKartGrantError {
+    #[error("active profile runtime is unavailable")]
+    ProfileRuntimeUnavailable,
+
+    #[error(transparent)]
+    ProfileIo(#[from] ProfileIoError),
+
+    #[error(transparent)]
+    Inventory(#[from] KartInventoryEditError),
 }
 
 #[derive(Debug, Error)]
@@ -396,6 +409,10 @@ impl BoundServer {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "server startup keeps transport, actor, profile, and supervisor ownership transfer auditable in one transaction"
+    )]
     pub fn start(self) -> Result<ServerHandle, ServerError> {
         let endpoints = self.endpoints()?;
         let BoundServer {
@@ -422,14 +439,17 @@ impl BoundServer {
         let udp = UdpRuntime::spawn_with_clock(game_udp, p2p_udp, udp_config, clock.clone())?;
         let (messenger, messenger_task) = MessengerServiceHandle::spawn(messenger_config)?;
         let item_probability = item_service(item_probabilities, &config, catalog.as_ref());
+        let random_tracks = config.resolved_random_tracks.clone();
         let (world, world_task) = spawn_world_services(
             udp_mailbox_capacity,
             &messenger,
             &udp,
             clock,
             item_probability,
+            random_tracks,
         );
         let (profile_io, profile_runtime) = profiles.spawn();
+        let operator_profiles = profile_io.clone();
         let wire_operations = WireOperationGate::new();
         let supervisor_world = world.clone();
         let supervisor_force_shutdown = Arc::clone(&force_shutdown_requested);
@@ -491,6 +511,7 @@ impl BoundServer {
             endpoints,
             shutdown,
             world,
+            profiles: Some(operator_profiles),
             force_shutdown_requested,
             wire_operations,
             supervisor: AsyncMutex::new(SupervisorJoin::Running(task)),
@@ -521,14 +542,16 @@ fn spawn_world_services(
     udp: &UdpRuntime,
     clock: ServerClock,
     item_probability: ItemProbabilityService,
+    random_tracks: Option<Arc<ResolvedRandomTracks>>,
 ) -> (WorldHandle, JoinHandle<Result<(), WorldSidecarError>>) {
-    WorldHandle::spawn_with_services_and_item_probabilities(
+    WorldHandle::spawn_with_services_and_gameplay_configuration(
         1_024,
         udp_mailbox_capacity,
         messenger.clone(),
         udp.service(),
         clock,
         item_probability,
+        random_tracks,
     )
 }
 
@@ -605,6 +628,7 @@ pub struct ServerHandle {
     endpoints: ServerEndpoints,
     shutdown: watch::Sender<bool>,
     world: WorldHandle,
+    profiles: Option<ProfileIoHandle>,
     force_shutdown_requested: Arc<AtomicBool>,
     wire_operations: WireOperationGate,
     supervisor: AsyncMutex<SupervisorJoin>,
@@ -619,6 +643,46 @@ impl ServerHandle {
     #[must_use]
     pub fn world(&self) -> WorldHandle {
         self.world.clone()
+    }
+
+    /// Applies resolved random-track pools to future race starts without
+    /// restarting listeners or disconnecting current sessions.
+    pub async fn update_random_tracks(
+        &self,
+        random_tracks: ResolvedRandomTracks,
+    ) -> Result<(), WorldError> {
+        self.world.update_random_tracks(random_tracks).await
+    }
+
+    /// Adds one nickname-scoped kart grant through the active profile runtime.
+    /// Existing client inventory snapshots remain unchanged until reconnect.
+    pub async fn grant_kart(
+        &self,
+        catalog: Arc<CatalogInventory>,
+        nickname: String,
+        kart_id: u16,
+        options: KartGrantOptions,
+    ) -> Result<AddKartOutcome, OperatorKartGrantError> {
+        let profiles = self
+            .profiles
+            .as_ref()
+            .ok_or(OperatorKartGrantError::ProfileRuntimeUnavailable)?;
+        let admission = profiles.admit(&nickname, "operator kart grant").await?;
+        let completed = admission
+            .run("operator kart grant", move |store, lease, subject| {
+                add_kart_during_race_run_with_options(
+                    store,
+                    lease,
+                    &catalog,
+                    subject.nickname(),
+                    kart_id,
+                    options,
+                )
+            })
+            .await?;
+        let (result, lane) = completed.into_parts();
+        drop(lane);
+        result.map_err(OperatorKartGrantError::from)
     }
 
     /// Returns the current actor-owned reward drain and recovery state.
@@ -2336,10 +2400,11 @@ mod tests {
             serialize_ch_join_room_reply, serialize_ch_leave_room_reply,
         },
         startup::{
-            GameOptions, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
+            GameOptions, LoRqGetTrackRank, PrGetRiderFields, RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
             serialize_channel_static_reply, serialize_lo_rp_event_reward,
-            serialize_pr_add_time_event_init, serialize_pr_get_game_option, serialize_pr_get_rider,
-            serialize_pr_login_vip_info,
+            serialize_lo_rp_get_track_rank, serialize_pr_add_time_event_init,
+            serialize_pr_get_game_option, serialize_pr_get_rider, serialize_pr_login_vip_info,
+            serialize_pr_request_exchange_init,
         },
         udp_protocol::{
             PqUdpEchoBody, PqUdpTimeSyncBody, RoutedUdpPacket, UdpLogicalBody,
@@ -2540,6 +2605,7 @@ mod tests {
                 endpoints: loopback_endpoints(),
                 shutdown,
                 world,
+                profiles: None,
                 force_shutdown_requested: Arc::new(AtomicBool::new(false)),
                 wire_operations: WireOperationGate::new(),
                 supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor_task)),
@@ -2616,6 +2682,7 @@ mod tests {
                 endpoints: loopback_endpoints(),
                 shutdown,
                 world,
+                profiles: Some(test_profile_io.clone()),
                 force_shutdown_requested,
                 wire_operations,
                 supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor)),
@@ -3196,6 +3263,7 @@ mod tests {
             endpoints: loopback_endpoints(),
             shutdown,
             world: fixture.handle,
+            profiles: None,
             force_shutdown_requested: Arc::new(AtomicBool::new(false)),
             wire_operations: WireOperationGate::new(),
             supervisor: tokio::sync::Mutex::new(SupervisorJoin::Running(supervisor_task)),
@@ -3909,6 +3977,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the real-TCP profile round trip is one ordered end-to-end protocol proof"
+    )]
     async fn profile_backed_startup_pairs_and_updates_flow_over_real_tcp() {
         let profile_root = tempfile::tempdir().unwrap();
         let mut profile = Profile::default();
@@ -3917,6 +3989,15 @@ mod tests {
         let mut initial_options = fixture_game_options(1);
         initial_options.set_screen = 7;
         apply_fixture_options(&mut profile, &initial_options);
+        let initial_quick_messages =
+            std::array::from_fn(|index| format!("초기 일반 매크로 {index}"));
+        let initial_team_quick_messages =
+            std::array::from_fn(|index| format!("초기 팀 매크로 {index}"));
+        apply_fixture_macro_messages(
+            &mut profile,
+            &initial_quick_messages,
+            &initial_team_quick_messages,
+        );
         ProfileStore::new(profile_root.path())
             .save("ProfileRider", &profile)
             .unwrap();
@@ -3954,8 +4035,56 @@ mod tests {
             serialize_pr_get_game_option(&initial_options)
         );
 
+        let mut decrement = PacketWriter::named("LoRqDecLucciPacket");
+        decrement.write_u8(0x50);
+        decrement.write_u32(1_000);
+        send_packet(
+            &mut client.stream,
+            decrement.as_slice(),
+            &mut client.send_iv,
+            maximum,
+        )
+        .await;
+        assert_no_login_data(&mut client.stream).await;
+
+        let rank_request = LoRqGetTrackRank {
+            track: 0x0102_0304,
+            speed_type: 7,
+            game_type: 0,
+        };
+        let mut rank = PacketWriter::named("LoRqGetTrackRankPacket");
+        rank.write_u32(rank_request.track);
+        rank.write_u8(rank_request.speed_type);
+        rank.write_u8(rank_request.game_type);
+        send_packet(
+            &mut client.stream,
+            rank.as_slice(),
+            &mut client.send_iv,
+            maximum,
+        )
+        .await;
+        assert_eq!(
+            read_login_packet(&mut client, maximum).await,
+            serialize_lo_rp_get_track_rank(rank_request)
+        );
+        assert_eq!(
+            request_named(&mut client, "PqRequestExchangeInitPacket", maximum).await,
+            serialize_pr_request_exchange_init()
+        );
+
         let updated_options = fixture_game_options(31);
-        send_game_option_update(&mut client, &updated_options, maximum).await;
+        let updated_quick_messages =
+            std::array::from_fn(|index| format!("저장한 일반 매크로 {index}"));
+        let updated_team_quick_messages =
+            std::array::from_fn(|index| format!("저장한 팀 매크로 {index}"));
+        send_game_option_update(
+            &mut client,
+            &updated_options,
+            &updated_quick_messages,
+            &updated_team_quick_messages,
+            maximum,
+        )
+        .await;
         assert_eq!(
             request_named(&mut client, "PqGetGameOption", maximum).await,
             serialize_pr_get_game_option(&updated_options)
@@ -3970,7 +4099,7 @@ mod tests {
         let persisted = ProfileStore::new(profile_root.path())
             .load_or_create("ProfileRider")
             .unwrap();
-        assert_eq!(persisted.revision, Some(2));
+        assert_eq!(persisted.revision, Some(4));
         assert_eq!(
             persisted.profile.game_option.video_quality,
             updated_options.video_quality
@@ -3979,6 +4108,19 @@ mod tests {
             persisted.profile.game_option.screen,
             updated_options.set_screen
         );
+        for index in 0..10 {
+            let key = i32::try_from(index).expect("ten macro indexes fit in i32");
+            assert_eq!(
+                persisted.profile.game_option.quick_messages[&key],
+                updated_quick_messages[index]
+            );
+            assert_eq!(
+                persisted.profile.game_option.team_quick_messages[&key],
+                updated_team_quick_messages[index]
+            );
+        }
+        assert_eq!(persisted.profile.rider.lucci, 999_000);
+        assert_eq!(persisted.profile.rider.track, rank_request.track);
     }
 
     #[tokio::test]
@@ -4784,6 +4926,8 @@ mod tests {
     async fn send_game_option_update(
         client: &mut LoginClient,
         options: &GameOptions,
+        quick_messages: &[String; 10],
+        team_quick_messages: &[String; 10],
         maximum: usize,
     ) {
         let mut request = PacketWriter::named("PqUpdateGameOption");
@@ -4818,6 +4962,9 @@ mod tests {
             options.set_screen,
             options.hide_competitive_rank,
         ]);
+        for message in quick_messages.iter().chain(team_quick_messages) {
+            request.write_utf16(message).unwrap();
+        }
         send_packet(
             &mut client.stream,
             request.as_slice(),
@@ -4892,6 +5039,33 @@ mod tests {
         destination.show_team_color = options.show_team_color;
         destination.screen = options.set_screen;
         destination.hide_competitive_rank = options.hide_competitive_rank;
+    }
+
+    fn apply_fixture_macro_messages(
+        profile: &mut Profile,
+        quick_messages: &[String; 10],
+        team_quick_messages: &[String; 10],
+    ) {
+        profile.game_option.quick_messages = quick_messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                (
+                    i32::try_from(index).expect("ten macro indexes fit in i32"),
+                    message.clone(),
+                )
+            })
+            .collect();
+        profile.game_option.team_quick_messages = team_quick_messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                (
+                    i32::try_from(index).expect("ten macro indexes fit in i32"),
+                    message.clone(),
+                )
+            })
+            .collect();
     }
 
     fn complete_catalog_xml() -> String {

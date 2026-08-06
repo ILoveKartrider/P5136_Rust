@@ -22,6 +22,12 @@ pub const START_TIME_ATTACK_REQUEST_NAME: &str = "PqStartTimeAttack";
 pub const START_TIME_ATTACK_REPLY_NAME: &str = "PrStartTimeAttack";
 pub const FINISH_TIME_ATTACK_REQUEST_NAME: &str = "PqFinishTimeAttack";
 pub const FINISH_TIME_ATTACK_REPLY_NAME: &str = "PrFinishTimeAttack";
+pub const START_CHALLENGER_REQUEST_NAME: &str = "PqStartChallenger";
+pub const START_CHALLENGER_REPLY_NAME: &str = "PrStartChallenger";
+pub const CHALLENGER_KART_SPEC_REQUEST_NAME: &str = "PqchallengerKartSpec";
+pub const CHALLENGER_KART_SPEC_REPLY_NAME: &str = "PrchallengerKartSpec";
+pub const COMPLETE_CHALLENGER_REQUEST_NAME: &str = "PqCompleteChallenger";
+pub const COMPLETE_CHALLENGER_REPLY_NAME: &str = "PrCompleteChallenger";
 
 pub const START_SINGLE_PACKET_LENGTH: usize = 41;
 pub const USE_SINGLE_ITEM_PACKET_LENGTH: usize = 10;
@@ -31,6 +37,12 @@ pub const START_TIME_ATTACK_REQUEST_LENGTH: usize = 39;
 pub const START_TIME_ATTACK_REPLY_LENGTH: usize = 268;
 pub const FINISH_TIME_ATTACK_REQUEST_LENGTH: usize = 33;
 pub const FINISH_TIME_ATTACK_REPLY_LENGTH: usize = 37;
+pub const START_CHALLENGER_REQUEST_LENGTH: usize = 17;
+pub const START_CHALLENGER_REPLY_LENGTH: usize = 14;
+pub const CHALLENGER_KART_SPEC_REQUEST_LENGTH: usize = 17;
+pub const CHALLENGER_KART_SPEC_REPLY_LENGTH: usize = 245;
+pub const COMPLETE_CHALLENGER_REQUEST_LENGTH: usize = 358;
+pub const COMPLETE_CHALLENGER_REPLY_LENGTH: usize = 122;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinglePlayerRequestKind {
@@ -39,6 +51,9 @@ pub enum SinglePlayerRequestKind {
     KartSpec,
     StartTimeAttack,
     FinishTimeAttack,
+    StartChallenger,
+    ChallengerKartSpec,
+    CompleteChallenger,
 }
 
 impl SinglePlayerRequestKind {
@@ -50,6 +65,9 @@ impl SinglePlayerRequestKind {
             Self::KartSpec => KART_SPEC_REQUEST_NAME,
             Self::StartTimeAttack => START_TIME_ATTACK_REQUEST_NAME,
             Self::FinishTimeAttack => FINISH_TIME_ATTACK_REQUEST_NAME,
+            Self::StartChallenger => START_CHALLENGER_REQUEST_NAME,
+            Self::ChallengerKartSpec => CHALLENGER_KART_SPEC_REQUEST_NAME,
+            Self::CompleteChallenger => COMPLETE_CHALLENGER_REQUEST_NAME,
         }
     }
 }
@@ -113,6 +131,40 @@ pub struct FinishTimeAttackRequest {
     pub race_time: u32,
 }
 
+/// The six fields emitted by the stock `PqStartChallenger` codec. The legacy
+/// C# server grouped the first two words and the next dword as two `Int32`s;
+/// retaining the native field boundaries prevents that accidental aliasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartChallengerRequest {
+    pub stage_id: u16,
+    pub stage_context: u16,
+    pub game_type: u32,
+    pub kart_id: u16,
+    pub secondary_equipment_id: u16,
+    pub producer_flag: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChallengerKartSpecRequest {
+    pub speed_type: u8,
+    pub kart_id: u16,
+    pub flying_pet_id: u16,
+    pub producer_context: [u8; 8],
+}
+
+/// The stock completion producer is a 358-byte report containing diagnostics,
+/// `GameControl` state, and a `KartSpec` snapshot. Only the leading stage and end
+/// fields affect the compatibility response; the remaining 345 bytes are
+/// nevertheless required as proof of the complete producer shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompleteChallengerRequest {
+    pub stage_type: u16,
+    pub stage_context: u16,
+    pub stage_flag: u8,
+    pub end_type: u32,
+    pub producer_proof_length: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinglePlayerRequest {
     StartSingle(StartSingleRequest),
@@ -120,6 +172,9 @@ pub enum SinglePlayerRequest {
     KartSpec(KartSpecRequest),
     StartTimeAttack(StartTimeAttackRequest),
     FinishTimeAttack(FinishTimeAttackRequest),
+    StartChallenger(StartChallengerRequest),
+    ChallengerKartSpec(ChallengerKartSpecRequest),
+    CompleteChallenger(CompleteChallengerRequest),
 }
 
 #[derive(Debug, Error)]
@@ -161,6 +216,9 @@ pub fn classify_single_player_request(hash: u32) -> Option<SinglePlayerRequestKi
         SinglePlayerRequestKind::KartSpec,
         SinglePlayerRequestKind::StartTimeAttack,
         SinglePlayerRequestKind::FinishTimeAttack,
+        SinglePlayerRequestKind::StartChallenger,
+        SinglePlayerRequestKind::ChallengerKartSpec,
+        SinglePlayerRequestKind::CompleteChallenger,
     ]
     .into_iter()
     .find(|kind| adler32::packet_hash(kind.request_name()) == hash)
@@ -227,6 +285,38 @@ pub fn parse_single_player_request(
                 ));
             }
             SinglePlayerRequest::FinishTimeAttack(request)
+        }
+        SinglePlayerRequestKind::StartChallenger => {
+            SinglePlayerRequest::StartChallenger(StartChallengerRequest {
+                stage_id: reader.read_u16()?,
+                stage_context: reader.read_u16()?,
+                game_type: reader.read_u32()?,
+                kart_id: reader.read_u16()?,
+                secondary_equipment_id: reader.read_u16()?,
+                producer_flag: reader.read_u8()?,
+            })
+        }
+        SinglePlayerRequestKind::ChallengerKartSpec => {
+            SinglePlayerRequest::ChallengerKartSpec(ChallengerKartSpecRequest {
+                speed_type: reader.read_u8()?,
+                kart_id: reader.read_u16()?,
+                flying_pet_id: reader.read_u16()?,
+                producer_context: reader.read_bytes(8)?.try_into()?,
+            })
+        }
+        SinglePlayerRequestKind::CompleteChallenger => {
+            let stage_type = reader.read_u16()?;
+            let stage_context = reader.read_u16()?;
+            let stage_flag = reader.read_u8()?;
+            let end_type = reader.read_u32()?;
+            let producer_proof_length = reader.read_bytes(345)?.len();
+            SinglePlayerRequest::CompleteChallenger(CompleteChallengerRequest {
+                stage_type,
+                stage_context,
+                stage_flag,
+                end_type,
+                producer_proof_length,
+            })
         }
     };
     debug_assert!(reader.remaining().is_empty());
@@ -304,6 +394,53 @@ pub fn serialize_finish_time_attack_reply(
     packet
 }
 
+#[must_use]
+pub fn serialize_start_challenger_reply(request: StartChallengerRequest) -> Vec<u8> {
+    let mut packet = PacketWriter::named(START_CHALLENGER_REPLY_NAME);
+    packet.write_u16(request.stage_id);
+    packet.write_u16(request.stage_context);
+    packet.write_u32(request.game_type);
+    packet.write_u8(0);
+    packet.write_u8(1);
+    let packet = packet.into_inner();
+    debug_assert_eq!(packet.len(), START_CHALLENGER_REPLY_LENGTH);
+    packet
+}
+
+#[must_use]
+pub fn serialize_challenger_kart_spec_reply(physics: &P5136KartPhysicsBlock) -> Vec<u8> {
+    let mut packet = PacketWriter::named(CHALLENGER_KART_SPEC_REPLY_NAME);
+    packet.write_u8(1);
+    packet.write_bytes(physics.as_bytes());
+    packet.write_u8(0);
+    packet.write_u32(0);
+    let packet = packet.into_inner();
+    debug_assert_eq!(packet.len(), CHALLENGER_KART_SPEC_REPLY_LENGTH);
+    packet
+}
+
+#[must_use]
+pub fn serialize_complete_challenger_reply(stage_type: u16, end_type: u32) -> Vec<u8> {
+    let mut packet = PacketWriter::named(COMPLETE_CHALLENGER_REPLY_NAME);
+    packet.write_u16(stage_type);
+    packet.write_u16(0);
+    packet.write_u8(0);
+    packet.write_u32(end_type);
+    packet.write_u32(0);
+    packet.write_u32(0);
+    packet.write_u32(40);
+    for _ in 0..40 {
+        packet.write_u16(55);
+    }
+    for _ in 0..4 {
+        packet.write_u32(0);
+    }
+    packet.write_u8(0);
+    let packet = packet.into_inner();
+    debug_assert_eq!(packet.len(), COMPLETE_CHALLENGER_REPLY_LENGTH);
+    packet
+}
+
 fn expected_length(kind: SinglePlayerRequestKind) -> usize {
     match kind {
         SinglePlayerRequestKind::StartSingle => START_SINGLE_PACKET_LENGTH,
@@ -311,6 +448,9 @@ fn expected_length(kind: SinglePlayerRequestKind) -> usize {
         SinglePlayerRequestKind::KartSpec => KART_SPEC_REQUEST_LENGTH,
         SinglePlayerRequestKind::StartTimeAttack => START_TIME_ATTACK_REQUEST_LENGTH,
         SinglePlayerRequestKind::FinishTimeAttack => FINISH_TIME_ATTACK_REQUEST_LENGTH,
+        SinglePlayerRequestKind::StartChallenger => START_CHALLENGER_REQUEST_LENGTH,
+        SinglePlayerRequestKind::ChallengerKartSpec => CHALLENGER_KART_SPEC_REQUEST_LENGTH,
+        SinglePlayerRequestKind::CompleteChallenger => COMPLETE_CHALLENGER_REQUEST_LENGTH,
     }
 }
 
@@ -350,10 +490,14 @@ fn require_hash(
 #[cfg(test)]
 mod tests {
     use super::{
-        FINISH_TIME_ATTACK_REPLY_LENGTH, KART_SPEC_REPLY_LENGTH, SinglePlayerProtocolError,
+        CHALLENGER_KART_SPEC_REPLY_LENGTH, COMPLETE_CHALLENGER_REPLY_LENGTH,
+        COMPLETE_CHALLENGER_REQUEST_LENGTH, FINISH_TIME_ATTACK_REPLY_LENGTH,
+        KART_SPEC_REPLY_LENGTH, START_CHALLENGER_REPLY_LENGTH, SinglePlayerProtocolError,
         SinglePlayerRequest, SinglePlayerRequestKind, USE_SINGLE_ITEM_REQUEST_NAME,
         UseSingleItemRequest, classify_single_player_request, parse_single_player_request,
+        serialize_challenger_kart_spec_reply, serialize_complete_challenger_reply,
         serialize_finish_time_attack_reply, serialize_kart_spec_reply,
+        serialize_start_challenger_reply,
     };
     use crate::{adler32, packet::PacketWriter, race_start_protocol::P5136KartPhysicsBlock};
 
@@ -420,6 +564,100 @@ mod tests {
         );
         assert_eq!(serialize_finish_time_attack_reply(2, 0, 1, 1), expected);
         assert_eq!(expected.len(), FINISH_TIME_ATTACK_REPLY_LENGTH);
+    }
+
+    #[test]
+    fn challenger_flow_uses_the_stock_field_boundaries_and_complete_report_shape() {
+        let start = captured("C4 06 C2 3B 28 00 00 00 00 00 00 00 13 03 01 00 00");
+        let request =
+            parse_single_player_request(SinglePlayerRequestKind::StartChallenger, &start).unwrap();
+        let SinglePlayerRequest::StartChallenger(start_request) = request else {
+            panic!("expected challenger start")
+        };
+        assert_eq!(start_request.stage_id, 40);
+        assert_eq!(start_request.stage_context, 0);
+        assert_eq!(start_request.game_type, 0);
+        assert_eq!(start_request.kart_id, 787);
+        assert_eq!(start_request.secondary_equipment_id, 1);
+        assert_eq!(start_request.producer_flag, 0);
+        assert_eq!(
+            serialize_start_challenger_reply(start_request),
+            captured("C5 06 D2 3B 28 00 00 00 00 00 00 00 00 01")
+        );
+        assert_eq!(
+            serialize_start_challenger_reply(start_request).len(),
+            START_CHALLENGER_REPLY_LENGTH
+        );
+
+        let mut spec = PacketWriter::named("PqchallengerKartSpec");
+        spec.write_u8(4);
+        spec.write_u16(787);
+        spec.write_u16(32);
+        spec.write_bytes(&[0x14, 0, 0, 0, 1, 0, 0, 0]);
+        assert!(matches!(
+            parse_single_player_request(
+                SinglePlayerRequestKind::ChallengerKartSpec,
+                spec.as_slice()
+            ),
+            Ok(SinglePlayerRequest::ChallengerKartSpec(request))
+                if request.speed_type == 4
+                    && request.kart_id == 787
+                    && request.flying_pet_id == 32
+                    && request.producer_context == [0x14, 0, 0, 0, 1, 0, 0, 0]
+        ));
+
+        let mut complete = PacketWriter::named("PqCompleteChallenger");
+        complete.write_u16(2);
+        complete.write_u16(0);
+        complete.write_u8(0);
+        complete.write_u32(7);
+        complete.write_bytes(&[0x5a; 345]);
+        assert_eq!(
+            complete.as_slice().len(),
+            COMPLETE_CHALLENGER_REQUEST_LENGTH
+        );
+        assert!(matches!(
+            parse_single_player_request(
+                SinglePlayerRequestKind::CompleteChallenger,
+                complete.as_slice()
+            ),
+            Ok(SinglePlayerRequest::CompleteChallenger(request))
+                if request.stage_type == 2
+                    && request.stage_context == 0
+                    && request.stage_flag == 0
+                    && request.end_type == 7
+                    && request.producer_proof_length == 345
+        ));
+    }
+
+    #[test]
+    fn challenger_kart_spec_and_completion_replies_match_the_stock_codecs() {
+        let block = P5136KartPhysicsBlock::from([0x5a; 235]);
+        let spec = serialize_challenger_kart_spec_reply(&block);
+        assert_eq!(spec.len(), CHALLENGER_KART_SPEC_REPLY_LENGTH);
+        assert_eq!(
+            &spec[..4],
+            &adler32::packet_hash("PrchallengerKartSpec").to_le_bytes()
+        );
+        assert_eq!(spec[4], 1);
+        assert_eq!(&spec[5..240], block.as_bytes());
+        assert_eq!(&spec[240..], &[0, 0, 0, 0, 0]);
+
+        let complete = serialize_complete_challenger_reply(2, 7);
+        assert_eq!(complete.len(), COMPLETE_CHALLENGER_REPLY_LENGTH);
+        assert_eq!(
+            &complete[..4],
+            &adler32::packet_hash("PrCompleteChallenger").to_le_bytes()
+        );
+        assert_eq!(&complete[4..9], &[2, 0, 0, 0, 0]);
+        assert_eq!(u32::from_le_bytes(complete[9..13].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(complete[21..25].try_into().unwrap()), 40);
+        assert!(
+            complete[25..105]
+                .chunks_exact(2)
+                .all(|word| word == [55, 0])
+        );
+        assert_eq!(&complete[105..], &[0; 17]);
     }
 
     #[test]

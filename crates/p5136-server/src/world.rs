@@ -287,6 +287,12 @@ impl ItemProbabilityService {
     }
 }
 
+#[derive(Debug, Default)]
+struct WorldGameplayConfiguration {
+    item_probability: ItemProbabilityService,
+    random_tracks: Option<Arc<ResolvedRandomTracks>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ItemAwardSelection {
     rank_band: ItemProbabilityRankBand,
@@ -2192,6 +2198,10 @@ impl Drop for RegisteredMigrationPreflight {
 
 #[derive(Debug)]
 enum WorldCommand {
+    UpdateRandomTracks {
+        random_tracks: Arc<ResolvedRandomTracks>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
     AdmitIdentityOperation {
         session: SessionId,
         reply: oneshot::Sender<Result<IdentityOperationLease, WorldError>>,
@@ -2466,6 +2476,23 @@ impl WorldSidecars {
 }
 
 impl WorldHandle {
+    /// Atomically replaces the random-track pools used by future race starts.
+    /// Rooms already loading or racing keep their selected concrete track.
+    pub async fn update_random_tracks(
+        &self,
+        random_tracks: ResolvedRandomTracks,
+    ) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(WorldCommand::UpdateRandomTracks {
+                random_tracks: Arc::new(random_tracks),
+                reply,
+            })
+            .await
+            .map_err(|_| WorldError::Stopped)?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub(crate) async fn admit_identity_operation(
         &self,
         session: SessionId,
@@ -2515,7 +2542,7 @@ impl WorldHandle {
                 WorldSidecars::default(),
                 ServerClock::new(),
                 identities,
-                ItemProbabilityService::default(),
+                WorldGameplayConfiguration::default(),
             )
             .await
             .map_err(WorldActorError::from)
@@ -2557,7 +2584,7 @@ impl WorldHandle {
                 sidecars,
                 ServerClock::new(),
                 identities,
-                ItemProbabilityService::default(),
+                WorldGameplayConfiguration::default(),
             )
             .await
             {
@@ -2589,23 +2616,25 @@ impl WorldHandle {
         udp: UdpService,
         clock: ServerClock,
     ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
-        Self::spawn_with_services_and_item_probabilities(
+        Self::spawn_with_services_and_gameplay_configuration(
             mailbox_capacity,
             udp_mailbox_capacity,
             messenger,
             udp,
             clock,
             ItemProbabilityService::default(),
+            None,
         )
     }
 
-    pub(crate) fn spawn_with_services_and_item_probabilities(
+    pub(crate) fn spawn_with_services_and_gameplay_configuration(
         mailbox_capacity: usize,
         udp_mailbox_capacity: usize,
         messenger: MessengerServiceHandle,
         udp: UdpService,
         clock: ServerClock,
         item_probability: ItemProbabilityService,
+        random_tracks: Option<Arc<ResolvedRandomTracks>>,
     ) -> (Self, JoinHandle<Result<(), WorldSidecarError>>) {
         let (sender, receiver) = mpsc::channel(mailbox_capacity);
         let (udp_sender, udp_receiver) = mpsc::channel(udp_mailbox_capacity);
@@ -2638,7 +2667,10 @@ impl WorldHandle {
             sidecars,
             clock,
             identities,
-            item_probability,
+            WorldGameplayConfiguration {
+                item_probability,
+                random_tracks,
+            },
         ));
         (handle, task)
     }
@@ -3749,6 +3781,7 @@ impl AdmittedWorldHandle<'_> {
 #[derive(Debug)]
 struct World {
     item_probability: ItemProbabilityService,
+    random_tracks: Option<Arc<ResolvedRandomTracks>>,
     sessions: HashMap<SessionId, SessionState>,
     identities: IdentityRegistry,
     myroom: MyRoomHub,
@@ -5282,6 +5315,7 @@ impl Default for World {
             .expect("the default world identity capacity is nonzero");
         Self {
             item_probability: ItemProbabilityService::default(),
+            random_tracks: None,
             sessions: HashMap::new(),
             identities: IdentityRegistry::new(),
             myroom: MyRoomHub::with_identity_capacity(identity_capacity),
@@ -9612,14 +9646,19 @@ impl World {
             LobbyCommandPayload::ChangeMaster(nickname) => {
                 self.change_master(&identity, &nickname).map_err(Into::into)
             }
-            LobbyCommandPayload::StartRoom(plan) => match self.start_room(&identity, &plan) {
-                Ok(outcome) => Ok(outcome),
-                Err(error @ LobbyError::OutboundUnavailable { .. }) => Err(error.into()),
-                Err(error) => {
-                    self.publish_start_rejection(session)?;
-                    Err(error.into())
+            LobbyCommandPayload::StartRoom(mut plan) => {
+                if self.random_tracks.is_some() {
+                    plan.random_tracks.clone_from(&self.random_tracks);
                 }
-            },
+                match self.start_room(&identity, &plan) {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error @ LobbyError::OutboundUnavailable { .. }) => Err(error.into()),
+                    Err(error) => {
+                        self.publish_start_rejection(session)?;
+                        Err(error.into())
+                    }
+                }
+            }
             LobbyCommandPayload::ChangeTrack(request) => {
                 self.change_track(&identity, request).map_err(Into::into)
             }
@@ -12438,15 +12477,20 @@ async fn run_world(
     sidecars: WorldSidecars,
     clock: ServerClock,
     identities: IdentityRegistry,
-    item_probability: ItemProbabilityService,
+    gameplay: WorldGameplayConfiguration,
 ) -> Result<(), WorldSidecarError> {
     let identity_capacity = sidecars
         .identity_capacity()
         .unwrap_or(DEFAULT_WORLD_IDENTITY_CAPACITY);
     let identity_capacity =
         NonZeroUsize::new(identity_capacity).ok_or(WorldSidecarError::InvalidIdentityCapacity)?;
+    let WorldGameplayConfiguration {
+        item_probability,
+        random_tracks,
+    } = gameplay;
     let world = World {
         item_probability,
+        random_tracks,
         identities,
         identity_capacity,
         myroom: MyRoomHub::with_identity_capacity(identity_capacity),
@@ -12712,6 +12756,14 @@ async fn dispatch_unwrapped_command(
         | WorldCommand::AdmittedIdentityOperation { .. } => {
             unreachable!("identity-operation envelopes are removed before ordinary dispatch")
         }
+        WorldCommand::UpdateRandomTracks {
+            random_tracks,
+            reply,
+        } => {
+            world.random_tracks = Some(random_tracks);
+            tracing::info!("applied live random-track pools");
+            let _ = reply.send(Ok(()));
+        }
         WorldCommand::RegisterSession {
             peer,
             cancellation,
@@ -12961,6 +13013,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
+        WorldCommand::UpdateRandomTracks { reply, .. } => reject_quiesced_reply(reply),
         WorldCommand::RefreshRoomKartPhysics { reply, .. } => reject_quiesced_reply(reply),
         WorldCommand::Lobby { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
@@ -12970,10 +13023,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
-        WorldCommand::CreateRoom { reply } => {
-            let _ = reply.send(Err(WorldError::OutboundProductionClosed));
-            None
-        }
+        WorldCommand::CreateRoom { reply } => reject_quiesced_reply(reply),
         WorldCommand::JoinRoom { reply, .. } | WorldCommand::JoinRoomForSession { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
@@ -13367,7 +13417,8 @@ async fn dispatch_utility_command(
         WorldCommand::CompleteMigration { .. } => {
             unreachable!("test migration completion is dispatched by dispatch_command")
         }
-        WorldCommand::AdmitIdentityOperation { .. }
+        WorldCommand::UpdateRandomTracks { .. }
+        | WorldCommand::AdmitIdentityOperation { .. }
         | WorldCommand::AdmittedIdentityOperation { .. }
         | WorldCommand::RegisterSession { .. }
         | WorldCommand::SessionClosed { .. }
@@ -21263,6 +21314,61 @@ mod tests {
                 ..
             } if candidates.contains(&concrete_track)
         ));
+    }
+
+    #[test]
+    fn live_random_track_snapshot_overrides_a_stale_session_start_plan() {
+        let live_track = 0x4444_5555;
+        let mut world = World {
+            random_tracks: Some(Arc::new(
+                crate::random_track::ResolvedRandomTracks::from_pools_for_tests([(
+                    (0, 1),
+                    vec![live_track],
+                    Vec::new(),
+                )]),
+            )),
+            ..World::default()
+        };
+        let mut owner = register_channel_session(&mut world, "LiveRandom", 67, 44_101, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        world
+            .protocol_rooms
+            .get_mut(&room_id)
+            .unwrap()
+            .settings
+            .track = 1;
+        drain_batches(&mut owner.outbound);
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                        vec![0x1111_2222],
+                        Vec::new(),
+                    )),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::Started { concrete_track, .. }
+                if concrete_track == live_track
+        ));
+    }
+
+    #[tokio::test]
+    async fn actor_accepts_a_live_random_track_replacement() {
+        let (handle, actor) = WorldHandle::spawn(4).unwrap();
+        handle
+            .update_random_tracks(
+                crate::random_track::ResolvedRandomTracks::from_pools_for_tests([(
+                    (0, 1),
+                    vec![0x4444_5555],
+                    Vec::new(),
+                )]),
+            )
+            .await
+            .unwrap();
+        handle.shutdown().await.unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[test]

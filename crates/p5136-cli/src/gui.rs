@@ -18,19 +18,19 @@ use p5136_connector::{
 };
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
 use p5136_profile::{
-    AddKartOutcome, AdditionalKart, CatalogInventory, KartCatalogSearchResult, ProfileStore,
-    add_kart, additional_karts, search_karts,
+    AddKartOutcome, AdditionalKart, CatalogInventory, KartCatalogSearchResult, KartGrantOptions,
+    ProfileStore, add_kart_with_options, additional_karts, search_karts,
 };
 use p5136_server::{
     BoundServer, ItemProbabilityConfiguration, ItemProbabilityEntry, ItemProbabilityRankBand,
     ItemProbabilityRankPolicy, RandomTrackCatalog, RandomTrackConfiguration, RandomTrackDefinition,
-    RandomTrackPool, RandomTrackPoolOverride, ServerConfig, ServerEndpoints,
+    RandomTrackPool, RandomTrackPoolOverride, ResolvedRandomTracks, ServerConfig, ServerEndpoints,
     load_client_item_probabilities, load_client_kart_catalog, load_client_random_track_catalog,
     load_item_probability_xml,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{LoggingRuntime, client_paths};
+use crate::{FileLoggingControl, LoggingRuntime, client_paths};
 
 const WINDOW_TITLE: &str = "카트라이더 P5136";
 const BUILD_VERSION_LABEL: &str = concat!("빌드 버전: ", env!("CARGO_PKG_VERSION"));
@@ -38,7 +38,9 @@ const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const GUI_SETTINGS_KEY: &str = "p5136-gui-settings-v2";
 const MAX_GUI_SETTINGS_BYTES: usize = 2 * 1024 * 1024;
 
-pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
+pub(crate) fn run(logging: &LoggingRuntime) -> Result<()> {
+    let log_path = logging.log_path.clone();
+    let logging_control = logging.control.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 680.0])
@@ -52,8 +54,9 @@ pub(crate) fn run(log_path: PathBuf, _logging: LoggingRuntime) -> Result<()> {
         options,
         Box::new(move |creation_context| {
             configure_platform_fonts(&creation_context.egui_ctx);
-            Ok(Box::new(P5136GuiApp::new(
+            Ok(Box::new(P5136GuiApp::new_with_logging(
                 log_path,
+                logging_control,
                 creation_context.storage,
             )))
         }),
@@ -269,6 +272,7 @@ struct ServerInputs {
     item_probability_xml: String,
     show_team_item_probabilities: bool,
     random_tracks: RandomTrackConfiguration,
+    file_logging: GuiFileLogging,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +328,19 @@ enum GuiItemProbabilitySource {
     Edited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum GuiFileLogging {
+    Disabled,
+    #[default]
+    Enabled,
+}
+
+impl GuiFileLogging {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 impl Default for ServerInputs {
     fn default() -> Self {
         Self {
@@ -345,6 +362,7 @@ impl Default for ServerInputs {
             item_probability_xml: String::new(),
             show_team_item_probabilities: false,
             random_tracks: RandomTrackConfiguration::default(),
+            file_logging: GuiFileLogging::Enabled,
         }
     }
 }
@@ -664,21 +682,30 @@ enum ConnectorGuiEvent {
     Finished(Result<GuiSuccess, String>),
 }
 
-#[derive(Debug, Clone, Copy)]
 enum ServerControl {
     GracefulShutdown,
     ForceShutdown,
+    UpdateRandomTracks(ResolvedRandomTracks),
+    GrantKart {
+        catalog: Arc<CatalogInventory>,
+        nickname: String,
+        kart_id: u16,
+        options: KartGrantOptions,
+    },
 }
 
 enum GuiEvent {
     Connector(ConnectorGuiEvent),
     ServerStarted(ServerEndpoints),
     ServerStopBlocked(String),
+    RandomTracksUpdated(Result<(), String>),
+    KartGranted(Result<AddKartOutcome, String>),
     ServerFinished(Result<(), String>),
 }
 
 struct P5136GuiApp {
     log_path: PathBuf,
+    logging_control: FileLoggingControl,
     selected_tab: GuiTab,
     connector_inputs: GuiInputs,
     connector_run_state: GuiRunState,
@@ -705,12 +732,22 @@ struct P5136GuiApp {
     inventory_kart_query: String,
     inventory_kart_results: Vec<KartCatalogSearchResult>,
     inventory_selected_kart: Option<KartCatalogSearchResult>,
+    inventory_kart_grant_options: KartGrantOptions,
     inventory_additional_karts: Vec<AdditionalKart>,
     inventory_status: String,
 }
 
 impl P5136GuiApp {
+    #[cfg(test)]
     fn new(log_path: PathBuf, storage: Option<&dyn eframe::Storage>) -> Self {
+        Self::new_with_logging(log_path, FileLoggingControl::default(), storage)
+    }
+
+    fn new_with_logging(
+        log_path: PathBuf,
+        logging_control: FileLoggingControl,
+        storage: Option<&dyn eframe::Storage>,
+    ) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         let persisted = GuiPersistedSettings::load(storage);
         let connector_inputs = persisted
@@ -719,8 +756,10 @@ impl P5136GuiApp {
         let server_inputs =
             persisted.map_or_else(ServerInputs::default, |settings| settings.server);
         let inventory_nickname = connector_inputs.nickname.clone();
+        logging_control.set_enabled(server_inputs.file_logging.enabled());
         Self {
             log_path,
+            logging_control,
             selected_tab: GuiTab::Server,
             connector_inputs,
             connector_run_state: GuiRunState::Idle,
@@ -750,6 +789,7 @@ impl P5136GuiApp {
             inventory_kart_query: String::new(),
             inventory_kart_results: Vec::new(),
             inventory_selected_kart: None,
+            inventory_kart_grant_options: KartGrantOptions::default(),
             inventory_additional_karts: Vec::new(),
             inventory_status: "카트 목록을 불러온 뒤 닉네임별 추가 소유 카트를 관리할 수 있습니다."
                 .to_owned(),
@@ -776,6 +816,16 @@ impl P5136GuiApp {
                 GuiEvent::ServerStopBlocked(error) => {
                     self.server_run_state = ServerRunState::StopBlocked(error);
                 }
+                GuiEvent::RandomTracksUpdated(result) => match result {
+                    Ok(()) => {
+                        "실행 중 서버에 랜덤 트랙 설정을 적용했습니다. 다음 경기 시작부터 사용합니다."
+                            .clone_into(&mut self.random_track_status);
+                    }
+                    Err(error) => {
+                        self.random_track_status = format!("랜덤 트랙 실시간 적용 실패: {error}");
+                    }
+                },
+                GuiEvent::KartGranted(result) => self.apply_inventory_grant_result(result),
                 GuiEvent::ServerFinished(result) => self.finish_server_worker(result),
             }
         }
@@ -1070,6 +1120,10 @@ impl P5136GuiApp {
     }
 
     fn request_server_control(&mut self, command: ServerControl) {
+        let requests_shutdown = matches!(
+            &command,
+            ServerControl::GracefulShutdown | ServerControl::ForceShutdown
+        );
         let Some(controller) = &self.server_controller else {
             self.server_run_state = ServerRunState::Failed(
                 "서버 제어 채널을 사용할 수 없습니다. 서버 작업이 끝날 때까지 기다리세요"
@@ -1083,7 +1137,9 @@ impl P5136GuiApp {
             );
             return;
         }
-        self.server_run_state = ServerRunState::Stopping;
+        if requests_shutdown {
+            self.server_run_state = ServerRunState::Stopping;
+        }
     }
 
     fn handle_close_request(&mut self, context: &egui::Context) {
@@ -1310,7 +1366,7 @@ impl P5136GuiApp {
     }
 
     fn add_selected_inventory_kart(&mut self) {
-        let outcome = (|| -> Result<AddKartOutcome> {
+        let request = (|| -> Result<(Arc<CatalogInventory>, String, u16, KartGrantOptions)> {
             self.validate_current_inventory_catalog_source()?;
             let catalog = self
                 .inventory_catalog
@@ -1320,33 +1376,126 @@ impl P5136GuiApp {
                 .inventory_selected_kart
                 .as_ref()
                 .ok_or_else(|| anyhow!("검색 결과에서 추가할 카트를 선택하세요"))?;
-            let nickname = required_text(&self.inventory_nickname, "인벤토리 닉네임")?;
+            let nickname = required_text(&self.inventory_nickname, "인벤토리 닉네임")?.to_owned();
+            let supports_enhancements = catalog.supports_legacy_kart_enhancements(selected.kart_id);
+            Ok((
+                Arc::clone(catalog),
+                nickname,
+                selected.kart_id,
+                KartGrantOptions {
+                    apply_floater_333: supports_enhancements
+                        && self.inventory_kart_grant_options.apply_floater_333,
+                    apply_grade_five: supports_enhancements
+                        && self.inventory_kart_grant_options.apply_grade_five,
+                },
+            ))
+        })();
+        let (catalog, nickname, kart_id, options) = match request {
+            Ok(request) => request,
+            Err(error) => {
+                self.inventory_status = format!("카트 추가 실패: {error:#}");
+                return;
+            }
+        };
+
+        if matches!(self.server_run_state, ServerRunState::Running(_)) {
+            self.request_server_control(ServerControl::GrantKart {
+                catalog,
+                nickname,
+                kart_id,
+                options,
+            });
+            "실행 중 서버의 프로필 저장 큐에 카트 지급을 요청했습니다."
+                .clone_into(&mut self.inventory_status);
+            return;
+        }
+        if self.server_run_state.is_active() {
+            "서버가 시작 또는 종료 중입니다. 실행 완료 후 다시 지급하세요."
+                .clone_into(&mut self.inventory_status);
+            return;
+        }
+
+        let outcome = (|| -> Result<AddKartOutcome> {
             let store = ProfileStore::new(required_path(
                 &self.server_inputs.profile_root,
                 "프로필 저장 경로",
             )?);
-            Ok(add_kart(&store, catalog, nickname, selected.kart_id)?)
+            Ok(add_kart_with_options(
+                &store, &catalog, &nickname, kart_id, options,
+            )?)
         })();
+        self.apply_inventory_grant_result(outcome.map_err(|error| format!("{error:#}")));
+    }
+
+    fn apply_inventory_grant_result(&mut self, outcome: Result<AddKartOutcome, String>) {
         match outcome {
             Ok(added) => {
                 self.inventory_additional_karts = added.additional_karts().to_vec();
                 let kart = added.kart();
                 let revision = added.saved().revision;
-                self.inventory_status = match added {
+                let enhancements = added.enhancements();
+                let mut applied = Vec::new();
+                if enhancements.floater_333 {
+                    applied.push("333 (603/903/703)");
+                }
+                if enhancements.grade_five {
+                    applied.push("5강");
+                }
+                let enhancement_suffix = if applied.is_empty() {
+                    String::new()
+                } else {
+                    format!(" 강화 적용: {}.", applied.join(", "))
+                };
+                let durability_suffix = if enhancements.durability_warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " 강화 파일 동기화 경고: {}",
+                        enhancements.durability_warnings.join("; ")
+                    )
+                };
+                self.inventory_status = match &added {
                     AddKartOutcome::Durable { .. } => format!(
-                        "{}에 {} (ID {}, serial {})을 추가했습니다. 프로필 revision {revision}.",
+                        "{}에 {} (ID {}, serial {})을 추가했습니다. 프로필 revision {revision}.{enhancement_suffix}{durability_suffix}",
                         self.inventory_nickname.trim(),
                         kart.name,
                         kart.kart_id,
                         kart.serial,
                     ),
                     AddKartOutcome::DurabilityUncertain { error, .. } => format!(
-                        "카트는 revision {revision}에 추가됐지만 디렉터리 동기화를 확인하지 못했습니다: {error}. 재추가하지 말고 새로고침으로 확인하세요."
+                        "카트는 revision {revision}에 추가됐지만 디렉터리 동기화를 확인하지 못했습니다: {error}. 재추가하지 말고 새로고침으로 확인하세요.{enhancement_suffix}{durability_suffix}"
                     ),
                 };
             }
             Err(error) => {
-                self.inventory_status = format!("카트 추가 실패: {error:#}");
+                self.inventory_status = format!("카트 추가 실패: {error}");
+            }
+        }
+    }
+
+    fn apply_live_random_tracks(&mut self) {
+        if !matches!(self.server_run_state, ServerRunState::Running(_)) {
+            "서버가 실행 중일 때만 실시간 적용할 수 있습니다."
+                .clone_into(&mut self.random_track_status);
+            return;
+        }
+        let resolved = self
+            .random_track_catalog
+            .as_ref()
+            .ok_or_else(|| anyhow!("먼저 클라이언트 랜덤 트랙 목록을 불러오세요"))
+            .and_then(|catalog| {
+                catalog
+                    .resolve(&self.server_inputs.random_tracks)
+                    .map_err(Into::into)
+            });
+        match resolved {
+            Ok(resolved) => {
+                self.request_server_control(ServerControl::UpdateRandomTracks(resolved));
+                "실행 중 서버에 랜덤 트랙 설정 적용을 요청했습니다."
+                    .clone_into(&mut self.random_track_status);
+            }
+            Err(error) => {
+                self.random_track_status = format!("랜덤 트랙 실시간 적용 실패: {error:#}");
             }
         }
     }
@@ -1512,6 +1661,35 @@ impl P5136GuiApp {
                 self.add_selected_inventory_kart();
             }
         });
+        self.inventory_kart_enhancement_controls(ui);
+    }
+
+    fn inventory_kart_enhancement_controls(&mut self, ui: &mut egui::Ui) {
+        let enhancements_supported = self
+            .inventory_selected_kart
+            .as_ref()
+            .zip(self.inventory_catalog.as_ref())
+            .is_some_and(|(kart, catalog)| catalog.supports_legacy_kart_enhancements(kart.kart_id));
+        if !enhancements_supported {
+            self.inventory_kart_grant_options = KartGrantOptions::default();
+        }
+        ui.horizontal(|ui| {
+            ui.label("지급 시 강화");
+            ui.add_enabled(
+                enhancements_supported,
+                egui::Checkbox::new(
+                    &mut self.inventory_kart_grant_options.apply_floater_333,
+                    "333 적용 (603/903/703)",
+                ),
+            );
+            ui.add_enabled(
+                enhancements_supported,
+                egui::Checkbox::new(
+                    &mut self.inventory_kart_grant_options.apply_grade_five,
+                    "5강 적용",
+                ),
+            );
+        });
         if let Some(selected) = &self.inventory_selected_kart {
             ui.weak(format!(
                 "이름 → kart_id 변환: {} → {}",
@@ -1521,6 +1699,11 @@ impl P5136GuiApp {
                 ui.colored_label(
                     egui::Color32::YELLOW,
                     "이 카트는 리소스/개발 데이터 보수 검사에서 자동 지급이 제외됐습니다. 실제 클라이언트 지원을 확인한 경우에만 정확한 ID로 수동 추가하세요.",
+                );
+            }
+            if !enhancements_supported {
+                ui.weak(
+                    "이 카트는 클라이언트 BodyParam.DescEnchantCap이 없어 플로터/5강 옵션을 적용하지 않습니다.",
                 );
             }
         }
@@ -1557,6 +1740,17 @@ impl P5136GuiApp {
                     self.server_inputs.random_tracks = RandomTrackConfiguration::default();
                     "모든 풀을 클라이언트 기본 목록으로 되돌렸습니다."
                         .clone_into(&mut self.random_track_status);
+                }
+                if ui
+                    .add_enabled(
+                        matches!(self.server_run_state, ServerRunState::Running(_))
+                            && self.random_track_catalog.is_some(),
+                        egui::Button::new("실행 중 서버에 적용"),
+                    )
+                    .on_hover_text("현재 선택을 다음 경기 시작부터 사용합니다.")
+                    .clicked()
+                {
+                    self.apply_live_random_tracks();
                 }
             });
 
@@ -1969,8 +2163,6 @@ impl P5136GuiApp {
 
         self.server_advanced_input_panel(ui);
         self.item_probability_editor(ui);
-        self.random_track_editor(ui);
-        self.inventory_editor(ui);
 
         ui.weak("포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2.");
         ui.weak(
@@ -2082,7 +2274,22 @@ impl P5136GuiApp {
         ui.heading("서버");
         ui.label("P5136 서버를 설정하고 클라이언트가 접속하는 동안 실행합니다.");
         ui.add_space(10.0);
+        let mut file_logging_enabled = self.server_inputs.file_logging.enabled();
+        if ui
+            .checkbox(&mut file_logging_enabled, "상세 로그 파일 저장")
+            .on_hover_text("해제하면 이후 파일 기록을 중단하며 화면/터미널 요약은 유지합니다.")
+            .changed()
+        {
+            self.server_inputs.file_logging = if file_logging_enabled {
+                GuiFileLogging::Enabled
+            } else {
+                GuiFileLogging::Disabled
+            };
+            self.logging_control.set_enabled(file_logging_enabled);
+        }
         ui.add_enabled_ui(!active, |ui| self.server_input_panel(ui));
+        self.random_track_editor(ui);
+        self.inventory_editor(ui);
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui
@@ -2187,7 +2394,11 @@ impl eframe::App for P5136GuiApp {
         });
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(WINDOW_TITLE);
-            ui.small(format!("실행 로그: {}", self.log_path.display()));
+            ui.small(if self.server_inputs.file_logging.enabled() {
+                format!("실행 로그 저장 중: {}", self.log_path.display())
+            } else {
+                "실행 로그 파일 저장 꺼짐".to_owned()
+            });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, GuiTab::Server, "서버");
                 ui.selectable_value(&mut self.selected_tab, GuiTab::Connector, "접속기");
@@ -2285,7 +2496,7 @@ async fn run_server_control_loop(
         tokio::select! {
             result = server.wait() => return result.context("P5136 서버 런타임이 종료되었습니다"),
             control = controls.recv() => match control {
-                Some(ServerControl::GracefulShutdown) => match await_graceful_shutdown_or_force(server, controls).await? {
+                Some(ServerControl::GracefulShutdown) => match await_graceful_shutdown_or_force(server, controls, notifier).await? {
                     GracefulShutdownOutcome::Stopped => return Ok(()),
                     GracefulShutdownOutcome::Blocked(error) => {
                         if !notifier.send(GuiEvent::ServerStopBlocked(error)) {
@@ -2295,6 +2506,35 @@ async fn run_server_control_loop(
                 },
                 Some(ServerControl::ForceShutdown) | None => {
                     return server.force_shutdown().await.context("서버 강제 종료에 실패했습니다");
+                }
+                Some(ServerControl::UpdateRandomTracks(random_tracks)) => {
+                    let result = server
+                        .update_random_tracks(random_tracks)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    if !notifier.send(GuiEvent::RandomTracksUpdated(result)) {
+                        return server
+                            .force_shutdown()
+                            .await
+                            .context("GUI 종료 후 서버 강제 종료에 실패했습니다");
+                    }
+                }
+                Some(ServerControl::GrantKart {
+                    catalog,
+                    nickname,
+                    kart_id,
+                    options,
+                }) => {
+                    let result = server
+                        .grant_kart(catalog, nickname, kart_id, options)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    if !notifier.send(GuiEvent::KartGranted(result)) {
+                        return server
+                            .force_shutdown()
+                            .await
+                            .context("GUI 종료 후 서버 강제 종료에 실패했습니다");
+                    }
                 }
             }
         }
@@ -2309,6 +2549,7 @@ enum GracefulShutdownOutcome {
 async fn await_graceful_shutdown_or_force(
     server: &p5136_server::ServerHandle,
     controls: &mut tokio::sync::mpsc::UnboundedReceiver<ServerControl>,
+    notifier: &GuiNotifier,
 ) -> Result<GracefulShutdownOutcome> {
     let mut graceful = Box::pin(server.shutdown());
     loop {
@@ -2324,6 +2565,16 @@ async fn await_graceful_shutdown_or_force(
                     forced.context("서버 강제 종료에 실패했습니다")?;
                     graceful_result.context("강제 종료 후에도 안전 종료 작업이 끝나지 않았습니다")?;
                     return Ok(GracefulShutdownOutcome::Stopped);
+                }
+                Some(ServerControl::UpdateRandomTracks(_)) => {
+                    notifier.send(GuiEvent::RandomTracksUpdated(Err(
+                        "서버가 종료 중이어서 설정을 적용하지 않았습니다".to_owned()
+                    )));
+                }
+                Some(ServerControl::GrantKart { .. }) => {
+                    notifier.send(GuiEvent::KartGranted(Err(
+                        "서버가 종료 중이어서 카트를 지급하지 않았습니다".to_owned()
+                    )));
                 }
             }
         }

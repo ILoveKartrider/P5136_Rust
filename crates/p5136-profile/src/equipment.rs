@@ -401,6 +401,28 @@ impl EquipmentExceptions {
         )
     }
 
+    /// Installs an operator-selected validated Floater triple, creating the
+    /// socket state when the granted kart copy does not have one yet.
+    pub(crate) fn set_floater_codes_capability(
+        rider_directory: &CapabilityDir,
+        rider_directory_path: &Path,
+        kart_id: i16,
+        kart_serial: i16,
+        codes: [i16; 3],
+    ) -> Result<EquipmentMutationOutcome<TuneExcRecord>, EquipmentStateError> {
+        mutate_tune_state_capability(
+            rider_directory,
+            rider_directory_path,
+            kart_id,
+            kart_serial,
+            true,
+            move |state| {
+                [state.tune1, state.tune2, state.tune3] = codes;
+                Ok(())
+            },
+        )
+    }
+
     /// Applies an activation kit without consuming it. Empty tune slots are
     /// filled with distinct codes from the C# pool; selector 5 installs the
     /// fixed Black-H triple.

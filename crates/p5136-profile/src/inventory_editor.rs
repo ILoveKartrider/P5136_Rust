@@ -11,13 +11,35 @@ use thiserror::Error;
 
 use crate::{
     CatalogInventory, EquipmentExceptions, EquipmentProfileError, GrantedKart, Profile,
-    ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction, SavedProfile,
+    ProfileMutation, ProfileStore, ProfileStoreError, ProfileTransaction, RaceRunLease,
+    SavedProfile,
 };
 
 pub const MAX_ADDITIONAL_KARTS_PER_PROFILE: usize = 4_096;
 pub const MAX_KART_SEARCH_QUERY_CHARS: usize = 64;
 pub const MAX_KART_SEARCH_RESULTS: usize = 50;
 const MAX_CLIENT_SAFE_KART_SERIAL: u16 = 32_767;
+pub const FLOATER_333_CODES: [i16; 3] = [603, 903, 703];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KartGrantOptions {
+    pub apply_floater_333: bool,
+    pub apply_grade_five: bool,
+}
+
+impl KartGrantOptions {
+    #[must_use]
+    pub const fn requests_enhancements(self) -> bool {
+        self.apply_floater_333 || self.apply_grade_five
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AppliedKartGrantEnhancements {
+    pub floater_333: bool,
+    pub grade_five: bool,
+    pub durability_warnings: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KartCatalogSearchResult {
@@ -39,12 +61,14 @@ pub enum AddKartOutcome {
         kart: AdditionalKart,
         additional_karts: Vec<AdditionalKart>,
         saved: SavedProfile,
+        enhancements: AppliedKartGrantEnhancements,
     },
     DurabilityUncertain {
         kart: AdditionalKart,
         additional_karts: Vec<AdditionalKart>,
         saved: SavedProfile,
         error: ProfileStoreError,
+        enhancements: AppliedKartGrantEnhancements,
     },
 }
 
@@ -79,6 +103,23 @@ impl AddKartOutcome {
     pub const fn is_durability_uncertain(&self) -> bool {
         matches!(self, Self::DurabilityUncertain { .. })
     }
+
+    #[must_use]
+    pub const fn enhancements(&self) -> &AppliedKartGrantEnhancements {
+        match self {
+            Self::Durable { enhancements, .. } | Self::DurabilityUncertain { enhancements, .. } => {
+                enhancements
+            }
+        }
+    }
+
+    fn set_enhancements(&mut self, applied: AppliedKartGrantEnhancements) {
+        match self {
+            Self::Durable { enhancements, .. } | Self::DurabilityUncertain { enhancements, .. } => {
+                *enhancements = applied;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +138,25 @@ pub enum KartInventoryEditError {
 
     #[error("kart ID {kart_id} has no free client-safe serial")]
     SerialExhausted { kart_id: u16 },
+
+    #[error(
+        "kart ID {kart_id} does not expose the P5136 DescEnchantCap required for Floater/grade-five enhancements"
+    )]
+    LegacyEnhancementUnsupported { kart_id: u16 },
+
+    #[error("kart ID {kart_id} cannot be represented by the signed P5136 enhancement codec")]
+    EnhancementTargetOutOfRange { kart_id: u16 },
+
+    #[error(
+        "kart {kart_id}:{serial} was granted, but the requested {stage} enhancement was not fully applied: {source}"
+    )]
+    EnhancementAfterGrant {
+        kart_id: u16,
+        serial: u16,
+        stage: &'static str,
+        #[source]
+        source: EquipmentProfileError,
+    },
 
     #[error("inventory transaction unexpectedly returned unchanged after a successful mutation")]
     UnexpectedUnchanged,
@@ -198,6 +258,23 @@ pub fn add_kart(
     nickname: &str,
     kart_id: u16,
 ) -> Result<AddKartOutcome, KartInventoryEditError> {
+    add_kart_with_options(
+        store,
+        catalog,
+        nickname,
+        kart_id,
+        KartGrantOptions::default(),
+    )
+}
+
+pub fn add_kart_with_options(
+    store: &ProfileStore,
+    catalog: &CatalogInventory,
+    nickname: &str,
+    kart_id: u16,
+    options: KartGrantOptions,
+) -> Result<AddKartOutcome, KartInventoryEditError> {
+    validate_grant_enhancement_options(catalog, kart_id, options)?;
     let lease = store.acquire_offline_edit_lease()?;
     let transaction =
         store.transaction_with_equipment_exceptions(&lease, nickname, |profile, equipment| {
@@ -208,6 +285,67 @@ pub fn add_kart(
             }
         })?;
 
+    let mut outcome = finish_add_kart_transaction(catalog, transaction)?;
+    let applied =
+        apply_offline_grant_enhancements(store, &lease, nickname, outcome.kart(), options)?;
+    outcome.set_enhancements(applied);
+    Ok(outcome)
+}
+
+/// Adds one kart through an active server's run lease.
+///
+/// The caller must submit this operation through the server's nickname-scoped
+/// profile lane. That lane keeps this equipment snapshot ordered with live
+/// Floater/plant/level/parts mutations, while the run lease prevents an
+/// independent offline editor from racing the active server.
+pub fn add_kart_during_race_run(
+    store: &ProfileStore,
+    lease: &RaceRunLease,
+    catalog: &CatalogInventory,
+    nickname: &str,
+    kart_id: u16,
+) -> Result<AddKartOutcome, KartInventoryEditError> {
+    add_kart_during_race_run_with_options(
+        store,
+        lease,
+        catalog,
+        nickname,
+        kart_id,
+        KartGrantOptions::default(),
+    )
+}
+
+pub fn add_kart_during_race_run_with_options(
+    store: &ProfileStore,
+    lease: &RaceRunLease,
+    catalog: &CatalogInventory,
+    nickname: &str,
+    kart_id: u16,
+    options: KartGrantOptions,
+) -> Result<AddKartOutcome, KartInventoryEditError> {
+    validate_grant_enhancement_options(catalog, kart_id, options)?;
+    let equipment = if store.profile_exists(nickname)? {
+        store.load_equipment_exceptions(lease, nickname)?
+    } else {
+        EquipmentExceptions::default()
+    };
+    let transaction = store.transaction(nickname, |profile| {
+        let mut next = profile.clone();
+        match add_kart_to_profile(catalog, &equipment, &mut next, kart_id) {
+            Ok(grant) => ProfileMutation::changed(Ok(grant), next),
+            Err(error) => ProfileMutation::Unchanged(Err(error)),
+        }
+    })?;
+    let mut outcome = finish_add_kart_transaction(catalog, transaction)?;
+    let applied = apply_live_grant_enhancements(store, lease, nickname, outcome.kart(), options)?;
+    outcome.set_enhancements(applied);
+    Ok(outcome)
+}
+
+fn finish_add_kart_transaction(
+    catalog: &CatalogInventory,
+    transaction: ProfileTransaction<Result<GrantedKart, KartInventoryEditError>>,
+) -> Result<AddKartOutcome, KartInventoryEditError> {
     match transaction {
         ProfileTransaction::Unchanged { value, .. } => match value {
             Ok(_) => Err(KartInventoryEditError::UnexpectedUnchanged),
@@ -224,6 +362,7 @@ pub fn add_kart(
                 kart,
                 additional_karts,
                 saved,
+                enhancements: AppliedKartGrantEnhancements::default(),
             })
         }
         ProfileTransaction::CommittedButDurabilityUncertain {
@@ -239,9 +378,120 @@ pub fn add_kart(
                 additional_karts,
                 saved,
                 error,
+                enhancements: AppliedKartGrantEnhancements::default(),
             })
         }
     }
+}
+
+fn validate_grant_enhancement_options(
+    catalog: &CatalogInventory,
+    kart_id: u16,
+    options: KartGrantOptions,
+) -> Result<(), KartInventoryEditError> {
+    if !options.requests_enhancements() {
+        return Ok(());
+    }
+    if !catalog.supports_legacy_kart_enhancements(kart_id) {
+        return Err(KartInventoryEditError::LegacyEnhancementUnsupported { kart_id });
+    }
+    i16::try_from(kart_id)
+        .map(|_| ())
+        .map_err(|_| KartInventoryEditError::EnhancementTargetOutOfRange { kart_id })
+}
+
+fn apply_offline_grant_enhancements(
+    store: &ProfileStore,
+    lease: &crate::store::OfflineProfileEditLease,
+    nickname: &str,
+    kart: &AdditionalKart,
+    options: KartGrantOptions,
+) -> Result<AppliedKartGrantEnhancements, KartInventoryEditError> {
+    apply_grant_enhancements(
+        kart,
+        options,
+        |kart_id, serial| {
+            store.set_floater_codes_offline(lease, nickname, kart_id, serial, FLOATER_333_CODES)
+        },
+        |kart_id, serial| store.upgrade_kart_level_offline(lease, nickname, kart_id, serial),
+    )
+}
+
+fn apply_live_grant_enhancements(
+    store: &ProfileStore,
+    lease: &RaceRunLease,
+    nickname: &str,
+    kart: &AdditionalKart,
+    options: KartGrantOptions,
+) -> Result<AppliedKartGrantEnhancements, KartInventoryEditError> {
+    apply_grant_enhancements(
+        kart,
+        options,
+        |kart_id, serial| {
+            store.set_floater_codes(lease, nickname, kart_id, serial, FLOATER_333_CODES)
+        },
+        |kart_id, serial| store.upgrade_kart_level(lease, nickname, kart_id, serial),
+    )
+}
+
+fn apply_grant_enhancements<FTune, FLevel>(
+    kart: &AdditionalKart,
+    options: KartGrantOptions,
+    apply_tune: FTune,
+    apply_level: FLevel,
+) -> Result<AppliedKartGrantEnhancements, KartInventoryEditError>
+where
+    FTune: FnOnce(
+        i16,
+        i16,
+    ) -> Result<
+        crate::EquipmentMutationOutcome<p5136_core::inventory::TuneExcRecord>,
+        EquipmentProfileError,
+    >,
+    FLevel: FnOnce(
+        i16,
+        i16,
+    ) -> Result<
+        crate::EquipmentMutationOutcome<p5136_core::inventory::KartLevelExcRecord>,
+        EquipmentProfileError,
+    >,
+{
+    let kart_id = i16::try_from(kart.kart_id).map_err(|_| {
+        KartInventoryEditError::EnhancementTargetOutOfRange {
+            kart_id: kart.kart_id,
+        }
+    })?;
+    let serial = i16::try_from(kart.serial).expect("allocated kart serial is client-safe");
+    let mut applied = AppliedKartGrantEnhancements::default();
+    if options.apply_floater_333 {
+        let outcome = apply_tune(kart_id, serial).map_err(|source| {
+            KartInventoryEditError::EnhancementAfterGrant {
+                kart_id: kart.kart_id,
+                serial: kart.serial,
+                stage: "333 Floater",
+                source,
+            }
+        })?;
+        applied.floater_333 = true;
+        if let Some(warning) = outcome.durability_warning {
+            applied.durability_warnings.push(warning.to_string());
+        }
+    }
+    if options.apply_grade_five {
+        let outcome = apply_level(kart_id, serial).map_err(|source| {
+            KartInventoryEditError::EnhancementAfterGrant {
+                kart_id: kart.kart_id,
+                serial: kart.serial,
+                stage: "grade-five",
+                source,
+            }
+        })?;
+        applied.grade_five = true;
+        if let Some(warning) = outcome.durability_warning {
+            applied.durability_warnings.push(warning.to_string());
+        }
+    }
+    Ok(applied)
 }
 
 fn add_kart_to_profile(
@@ -373,14 +623,19 @@ mod tests {
     use crate::{CatalogInventory, EquipmentExceptions, Profile, ProfileStore};
 
     use super::{
-        AddKartOutcome, KartInventoryEditError, MAX_ADDITIONAL_KARTS_PER_PROFILE, add_kart,
-        add_kart_to_profile, additional_karts, search_karts,
+        AddKartOutcome, FLOATER_333_CODES, KartGrantOptions, KartInventoryEditError,
+        MAX_ADDITIONAL_KARTS_PER_PROFILE, add_kart, add_kart_during_race_run,
+        add_kart_during_race_run_with_options, add_kart_to_profile, add_kart_with_options,
+        additional_karts, search_karts,
     };
 
     fn catalog() -> CatalogInventory {
         CatalogInventory::from_structural_xml_for_tests(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
-                <Inventory total="4" categories="1">
+                <Names><Kart id="764" name="marathon13" /></Names>
+                <Specs><Spec name="marathon13"><BodyParam DescEnchantCap="25" /></Spec></Specs>
+                <Inventory total="5" categories="1">
+                    <Item category="3" id="764" name="뉴 마라톤" />
                     <Item category="3" id="1395" name="세베크 V1" />
                     <Item category="3" id="1410" name="기간테스 V1" />
                     <Item category="3" id="1430" name="흑기사 V1" />
@@ -455,6 +710,129 @@ mod tests {
         );
         let bob = store.reload("BOB").unwrap();
         assert_eq!(additional_karts(&catalog, &bob.profile)[0].serial, 2);
+    }
+
+    #[test]
+    fn active_run_grant_uses_the_server_lease_and_supports_a_new_nickname() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let catalog = catalog();
+        let lease = store.acquire_race_run_lease().unwrap();
+
+        let first = add_kart_during_race_run(&store, &lease, &catalog, "LiveRider", 1_410).unwrap();
+        let second =
+            add_kart_during_race_run(&store, &lease, &catalog, "LiveRider", 1_410).unwrap();
+        assert_eq!(first.kart().serial, 2);
+        assert_eq!(second.kart().serial, 3);
+        assert_eq!(
+            additional_karts(&catalog, &store.reload("liverider").unwrap().profile)
+                .iter()
+                .map(|kart| kart.serial)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(matches!(
+            add_kart(&store, &catalog, "OfflineRacer", 1_410),
+            Err(KartInventoryEditError::Store(
+                crate::ProfileStoreError::RaceRunLeaseBusy { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn offline_grant_can_apply_exact_333_and_grade_five_sidecars() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let catalog = catalog();
+        let outcome = add_kart_with_options(
+            &store,
+            &catalog,
+            "EnhancedRider",
+            764,
+            KartGrantOptions {
+                apply_floater_333: true,
+                apply_grade_five: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.kart().serial, 2);
+        assert!(outcome.enhancements().floater_333);
+        assert!(outcome.enhancements().grade_five);
+        assert!(outcome.enhancements().durability_warnings.is_empty());
+        let loaded = store.reload("enhancedrider").unwrap();
+        let rider_directory = loaded.source_path.parent().unwrap();
+        let equipment = EquipmentExceptions::load(root.path(), rider_directory).unwrap();
+        let tune = equipment
+            .tune
+            .iter()
+            .find(|record| record.id == 764 && record.serial == 2)
+            .unwrap();
+        assert_eq!([tune.tune1, tune.tune2, tune.tune3], FLOATER_333_CODES);
+        let level = equipment
+            .kart_level
+            .iter()
+            .find(|record| record.id == 764 && record.serial == 2)
+            .unwrap();
+        assert_eq!(level.grade, 5);
+        assert_eq!(level.points, 35);
+        assert_eq!(
+            [level.level1, level.level2, level.level3, level.level4],
+            [0; 4]
+        );
+    }
+
+    #[test]
+    fn live_grant_applies_enhancements_through_the_run_lease() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let catalog = catalog();
+        let lease = store.acquire_race_run_lease().unwrap();
+        let outcome = add_kart_during_race_run_with_options(
+            &store,
+            &lease,
+            &catalog,
+            "LiveEnhanced",
+            764,
+            KartGrantOptions {
+                apply_floater_333: true,
+                apply_grade_five: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.kart().serial, 2);
+        let equipment = store
+            .load_equipment_exceptions(&lease, "LiveEnhanced")
+            .unwrap();
+        assert!(equipment.tune.iter().any(|record| {
+            record.id == 764
+                && record.serial == 2
+                && [record.tune1, record.tune2, record.tune3] == FLOATER_333_CODES
+        }));
+        assert!(equipment.kart_level.iter().any(|record| {
+            record.id == 764 && record.serial == 2 && record.grade == 5 && record.points == 35
+        }));
+    }
+
+    #[test]
+    fn rejects_enhancements_for_a_client_incompatible_kart_before_granting() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let catalog = catalog();
+        assert!(matches!(
+            add_kart_with_options(
+                &store,
+                &catalog,
+                "V1Rider",
+                1_410,
+                KartGrantOptions {
+                    apply_floater_333: true,
+                    apply_grade_five: false,
+                },
+            ),
+            Err(KartInventoryEditError::LegacyEnhancementUnsupported { kart_id: 1_410 })
+        ));
+        assert!(!store.profile_exists("V1Rider").unwrap());
     }
 
     #[test]

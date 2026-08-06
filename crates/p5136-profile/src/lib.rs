@@ -31,9 +31,11 @@ pub use inventory::{
     build_inventory_snapshot_with_equipment, generated_x_part_is_granted, rider_item_snapshot,
 };
 pub use inventory_editor::{
-    AddKartOutcome, AdditionalKart, KartCatalogSearchResult, KartInventoryEditError,
+    AddKartOutcome, AdditionalKart, AppliedKartGrantEnhancements, FLOATER_333_CODES,
+    KartCatalogSearchResult, KartGrantOptions, KartInventoryEditError,
     MAX_ADDITIONAL_KARTS_PER_PROFILE, MAX_KART_SEARCH_QUERY_CHARS, MAX_KART_SEARCH_RESULTS,
-    add_kart, additional_karts, search_karts,
+    add_kart, add_kart_during_race_run, add_kart_during_race_run_with_options,
+    add_kart_with_options, additional_karts, search_karts,
 };
 pub use model::{
     ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,

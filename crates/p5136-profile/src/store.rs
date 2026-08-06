@@ -636,6 +636,70 @@ impl ProfileStore {
         )?)
     }
 
+    fn with_offline_equipment_profile_directory<T, F>(
+        &self,
+        lease: &OfflineProfileEditLease,
+        nickname: &str,
+        operation: F,
+    ) -> Result<T, EquipmentProfileError>
+    where
+        F: FnOnce(
+            &CapabilityDir,
+            &CapabilityDir,
+            &Path,
+            &Path,
+        ) -> Result<T, crate::equipment::EquipmentStateError>,
+    {
+        create_dir_all_durable(&self.root)?;
+        let canonical_root =
+            fs::canonicalize(&self.root).map_err(|source| ProfileStoreError::Io {
+                operation: "canonicalize profile root during offline equipment edit",
+                path: self.root.clone(),
+                source,
+            })?;
+        if canonical_root != lease.canonical_root {
+            return Err(ProfileStoreError::RaceRunLeaseStoreMismatch {
+                issued_for: lease.canonical_root.clone(),
+                used_with: canonical_root,
+            }
+            .into());
+        }
+        let actual_store_id = read_store_id(&canonical_root)?;
+        if actual_store_id != lease.store_id {
+            return Err(ProfileStoreError::ProfileStoreIdentityChanged {
+                expected: lease.store_id,
+                actual: actual_store_id,
+            }
+            .into());
+        }
+
+        let nickname = Self::normalize_storage_nickname(nickname)?;
+        let profile_lock = self.profile_lock(&nickname)?;
+        let _guard = lock(&profile_lock)?;
+        let snapshot = self.load_or_default_from_disk(&nickname)?;
+        let directory_name =
+            snapshot
+                .directory
+                .file_name()
+                .ok_or(ProfileStoreError::InternalInvariant {
+                    message: "offline equipment profile directory must have one terminal component",
+                })?;
+        let profile_directory = lease
+            .root_capability
+            .open_dir_nofollow(directory_name)
+            .map_err(|source| ProfileStoreError::Io {
+                operation: "open offline equipment profile directory without following links",
+                path: snapshot.directory.clone(),
+                source,
+            })?;
+        Ok(operation(
+            &lease.root_capability,
+            &profile_directory,
+            &lease.canonical_root,
+            &snapshot.directory,
+        )?)
+    }
+
     /// Applies one plant-part selection through the run-bound, no-follow
     /// profile capability and publishes `PlantData.json` atomically.
     pub fn equip_plant_part(
@@ -662,6 +726,44 @@ impl ProfileStore {
                 rider_path,
                 kart_id,
                 kart_serial,
+            )
+        })
+    }
+
+    pub fn set_floater_codes(
+        &self,
+        lease: &RaceRunLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+        codes: [i16; 3],
+    ) -> Result<EquipmentMutationOutcome<TuneExcRecord>, EquipmentProfileError> {
+        self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::set_floater_codes_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+                codes,
+            )
+        })
+    }
+
+    pub(crate) fn set_floater_codes_offline(
+        &self,
+        lease: &OfflineProfileEditLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+        codes: [i16; 3],
+    ) -> Result<EquipmentMutationOutcome<TuneExcRecord>, EquipmentProfileError> {
+        self.with_offline_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::set_floater_codes_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+                codes,
             )
         })
     }
@@ -745,6 +847,23 @@ impl ProfileStore {
         kart_serial: i16,
     ) -> Result<EquipmentMutationOutcome<KartLevelExcRecord>, EquipmentProfileError> {
         self.with_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
+            EquipmentExceptions::upgrade_kart_level_capability(
+                rider,
+                rider_path,
+                kart_id,
+                kart_serial,
+            )
+        })
+    }
+
+    pub(crate) fn upgrade_kart_level_offline(
+        &self,
+        lease: &OfflineProfileEditLease,
+        nickname: &str,
+        kart_id: i16,
+        kart_serial: i16,
+    ) -> Result<EquipmentMutationOutcome<KartLevelExcRecord>, EquipmentProfileError> {
+        self.with_offline_equipment_profile_directory(lease, nickname, |_, rider, _, rider_path| {
             EquipmentExceptions::upgrade_kart_level_capability(
                 rider,
                 rider_path,
