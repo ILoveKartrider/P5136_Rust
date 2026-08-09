@@ -15,7 +15,10 @@ use p5136_core::{
     bml::{BmlError, BmlLimits, BmlNode},
     packet::PacketReader,
 };
-use p5136_profile::{CatalogInventory, CatalogInventoryError, MAX_CATALOG_BYTES};
+use p5136_profile::{
+    CatalogInventory, CatalogInventoryError, MAX_CATALOG_BYTES,
+    is_stock_item_safe_for_implicit_grant,
+};
 use p5136_rho5::{
     LegacyRhoArchive, LegacyRhoError, LegacyRhoLimits, Rho5Directory, Rho5Error, Rho5Limits,
 };
@@ -674,7 +677,7 @@ fn parse_inventory(
             category,
             id,
             name,
-            auto_grant: true,
+            auto_grant: is_stock_item_safe_for_implicit_grant(category, id),
         })
         .collect())
 }
@@ -1405,6 +1408,14 @@ mod tests {
         assert!(loaded.catalog().grants_item(28, 49));
         for unsafe_myroom_id in [14, 37, 50] {
             assert!(!loaded.catalog().grants_item(28, unsafe_myroom_id));
+        }
+        for (category, id) in [(4, 198), (9, 1019), (21, 85)] {
+            assert!(!loaded.catalog().item(category, id).unwrap().auto_grant);
+            assert!(!loaded.catalog().grants_item(category, id));
+        }
+        for (category, id) in [(4, 200), (9, 1020), (21, 86)] {
+            assert!(loaded.catalog().item(category, id).unwrap().auto_grant);
+            assert!(loaded.catalog().grants_item(category, id));
         }
         assert_eq!(
             loaded

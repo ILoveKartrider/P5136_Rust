@@ -15,6 +15,7 @@ pub use catalog::{
     CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogInventoryStats,
     CatalogItemTransformRule, CatalogKartSpecStats, MAX_CATALOG_BYTES, MAX_CATALOG_EMBLEMS,
     MAX_CATALOG_ITEM_TRANSFORMS, P5136KartSpecSnapshot, is_grant_category, is_grant_item,
+    is_stock_item_safe_for_implicit_grant,
 };
 pub use emblem_catalog::{EmblemCatalog, EmblemCatalogError, MAX_EMBLEM_XML_BYTES};
 pub use equipment::{

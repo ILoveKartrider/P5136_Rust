@@ -42,7 +42,10 @@ const CATALOG_REGION: &str = "kr";
 const MINIMUM_INVENTORY_ITEMS: usize = 6_800;
 const MINIMUM_INVENTORY_CATEGORIES: usize = 60;
 const MINIMUM_INVENTORY_KARTS: usize = 1_200;
-const MINIMUM_GRANT_ITEMS: usize = 5_250;
+// The Korean resource-safe ownership set contains 5,133 records after
+// excluding foreign-region cosmetic rows. Keep the completeness floor aligned
+// with the runtime inventory builder while still rejecting truncated exports.
+const MINIMUM_GRANT_ITEMS: usize = 5_000;
 const MINIMUM_GRANT_CATEGORIES: usize = 41;
 
 const GRANT_CATEGORY_IDS: &[u16] = &[
@@ -54,6 +57,30 @@ const UNSAFE_CHARACTER_ITEM_IDS: &[u16] = &[
     45, 47, 48, 52, 59, 116, 117, 124, 128, 130, 137, 144, 147, 149, 159, 175, 176, 184, 192, 193,
     194, 195, 196, 197, 231, 245, 246, 247, 265, 301, 302, 333, 350, 376, 377, 391, 392, 396, 397,
 ];
+
+// `zeta_/kr/shop/data/item.kml` is a display catalog, not an ownership
+// allow-list. It still contains foreign-region and retired rows whose Korean
+// 5136 client resources are absent. The client can draw the preceding card,
+// then fault while preloading one of these entries. These build-specific IDs
+// are the complement of the stock Korean ownership list for the three affected
+// cosmetic categories.
+const UNSAFE_PLATE_ITEM_IDS: &[u16] = &[
+    80, 81, 88, 97, 110, 111, 116, 120, 122, 123, 125, 127, 128, 129, 130, 131, 133, 134, 146, 147,
+    148, 150, 152, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 186,
+    188, 189, 190, 191, 192, 193, 195, 196, 197, 198, 204, 206, 210, 211, 214, 215, 216, 218, 221,
+    227, 231,
+];
+
+const UNSAFE_BALLOON_ITEM_IDS: &[u16] = &[
+    92, 93, 107, 131, 138, 173, 174, 218, 232, 253, 270, 274, 276, 278, 303, 309, 329, 336, 342,
+    346, 357, 358, 359, 376, 386, 389, 401, 411, 412, 413, 419, 420, 429, 451, 453, 454, 463, 477,
+    481, 488, 489, 491, 492, 493, 494, 495, 496, 497, 498, 499, 500, 501, 502, 503, 505, 506, 508,
+    510, 511, 513, 516, 562, 571, 587, 588, 624, 628, 652, 661, 663, 668, 672, 698, 699, 713, 715,
+    719, 720, 721, 722, 723, 724, 725, 743, 753, 754, 793, 829, 857, 858, 997, 1013, 1019, 1037,
+    30022,
+];
+
+const UNSAFE_PET_ITEM_IDS: &[u16] = &[8, 10, 11, 14, 18, 50, 77, 85, 92, 155];
 
 // These stock shop rows are visible as owned MyRoom cards, but their
 // `roomCard` metadata is incomplete.  Publishing them makes the stock client
@@ -379,12 +406,25 @@ pub fn is_grant_category(category: u16) -> bool {
     GRANT_CATEGORY_IDS.binary_search(&category).is_ok()
 }
 
+/// Returns whether a stock shop row is safe to publish as an implicit owned
+/// item to the Korean protocol-5136 client.
+#[must_use]
+pub fn is_stock_item_safe_for_implicit_grant(category: u16, item_id: u16) -> bool {
+    match category {
+        1 => UNSAFE_CHARACTER_ITEM_IDS.binary_search(&item_id).is_err(),
+        4 => UNSAFE_PLATE_ITEM_IDS.binary_search(&item_id).is_err(),
+        9 => UNSAFE_BALLOON_ITEM_IDS.binary_search(&item_id).is_err(),
+        21 => UNSAFE_PET_ITEM_IDS.binary_search(&item_id).is_err(),
+        28 => UNSAFE_MYROOM_ITEM_IDS.binary_search(&item_id).is_err(),
+        _ => true,
+    }
+}
+
 #[must_use]
 pub fn is_grant_item(item: &CatalogInventoryItem) -> bool {
     item.auto_grant
         && is_grant_category(item.category)
-        && (item.category != 1 || UNSAFE_CHARACTER_ITEM_IDS.binary_search(&item.id).is_err())
-        && (item.category != 28 || UNSAFE_MYROOM_ITEM_IDS.binary_search(&item.id).is_err())
+        && is_stock_item_safe_for_implicit_grant(item.category, item.id)
 }
 
 #[derive(Debug, Error)]
@@ -2005,8 +2045,9 @@ mod tests {
     use super::{
         CatalogInventory, CatalogInventoryError, CatalogInventoryItem, CatalogParser,
         MAX_CATALOG_EMBLEMS, MAX_KART_NAME_BYTES, MAX_XML_ATTRIBUTE_VALUE_BYTES,
-        MAX_XML_ATTRIBUTES_PER_ELEMENT, MAX_XML_TEXT_BYTES, ValidationPolicy, is_grant_category,
-        is_grant_item,
+        MAX_XML_ATTRIBUTES_PER_ELEMENT, MAX_XML_TEXT_BYTES, UNSAFE_BALLOON_ITEM_IDS,
+        UNSAFE_PET_ITEM_IDS, UNSAFE_PLATE_ITEM_IDS, ValidationPolicy, is_grant_category,
+        is_grant_item, is_stock_item_safe_for_implicit_grant,
     };
 
     fn parse_structural(xml: &str) -> Result<CatalogInventory, CatalogInventoryError> {
@@ -2101,6 +2142,42 @@ mod tests {
             name: "놀이동산 마이룸".to_owned(),
             auto_grant: true,
         }));
+    }
+
+    #[test]
+    fn excludes_foreign_cosmetics_with_missing_korean_client_resources() {
+        for ids in [
+            UNSAFE_PLATE_ITEM_IDS,
+            UNSAFE_BALLOON_ITEM_IDS,
+            UNSAFE_PET_ITEM_IDS,
+        ] {
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+
+        // These are the first missing-resource rows reached immediately after
+        // the last cards reported visible by the client.
+        for (category, id) in [(4, 198), (9, 1019), (21, 85)] {
+            assert!(!is_stock_item_safe_for_implicit_grant(category, id));
+            assert!(!is_grant_item(&CatalogInventoryItem {
+                category,
+                id,
+                serial: 0,
+                name: String::new(),
+                auto_grant: true,
+            }));
+        }
+
+        // Keep the three reported last-visible Korean assets themselves.
+        for (category, id) in [(4, 200), (9, 1020), (21, 86)] {
+            assert!(is_stock_item_safe_for_implicit_grant(category, id));
+            assert!(is_grant_item(&CatalogInventoryItem {
+                category,
+                id,
+                serial: 0,
+                name: String::new(),
+                auto_grant: true,
+            }));
+        }
     }
 
     #[test]
