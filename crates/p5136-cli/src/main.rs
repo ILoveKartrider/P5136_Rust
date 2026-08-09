@@ -14,8 +14,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use p5136_connector::{
-    ConnectorPlan, ConnectorRequest, DEFAULT_PROBE_TIMEOUT, InstallationOptions, Runner,
-    execute_connector, launcher_profile_xml, probe_messenger, server_config_xml,
+    ConnectorPlan, ConnectorRequest, DEFAULT_PROBE_TIMEOUT, InstallationOptions,
+    LauncherProfileRole, Runner, execute_connector, launcher_profile_xml_for_role, probe_messenger,
+    server_config_xml,
 };
 use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
 use p5136_server::{
@@ -28,6 +29,7 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 mod client_paths;
 mod gui;
+mod gui_i18n;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -132,6 +134,10 @@ struct ConnectArgs {
 
     #[arg(long)]
     username: String,
+
+    /// Request the P5136 observer-master login role (pmap 718).
+    #[arg(long)]
+    observer: bool,
 
     #[arg(long, default_value = "127.0.0.1")]
     server: Ipv4Addr,
@@ -510,6 +516,14 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
     } else {
         Duration::from_millis(args.timeout_ms)
     };
+    let installation_options = InstallationOptions {
+        launcher_profile_role: if args.observer {
+            LauncherProfileRole::ObserverMaster
+        } else {
+            LauncherProfileRole::Regular
+        },
+        ..InstallationOptions::default()
+    };
     let plan = ConnectorPlan::new(ConnectorRequest {
         game_directory: args.game_dir,
         game_executable: args.game_exe,
@@ -518,7 +532,7 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
         ports,
         runner,
         probe_timeout: timeout,
-        installation_options: InstallationOptions::default(),
+        installation_options,
     })
     .context("failed to construct the connector plan")?;
 
@@ -534,7 +548,10 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
     println!("\nProfile/kr/launcher.xml (UTF-8, no BOM):");
     println!(
         "{}",
-        String::from_utf8_lossy(&launcher_profile_xml(&plan.nickname))
+        String::from_utf8_lossy(&launcher_profile_xml_for_role(
+            &plan.nickname,
+            plan.installation_options.launcher_profile_role,
+        ))
     );
     println!("\nGame target:");
     println!(
@@ -712,6 +729,7 @@ mod tests {
             game_dir: missing_game_directory.clone(),
             game_exe: None,
             username: "dry-run-user".to_owned(),
+            observer: false,
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
             runner: RunnerKind::Native,
@@ -735,6 +753,7 @@ mod tests {
             game_dir: PathBuf::from("game"),
             game_exe: None,
             username: "user".to_owned(),
+            observer: false,
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
             runner: RunnerKind::Native,

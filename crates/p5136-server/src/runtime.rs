@@ -2758,6 +2758,7 @@ mod tests {
                             club_mark_logo: 0,
                         },
                         observer: false,
+                        observer_master: false,
                         kart_physics: P5136KartPhysicsBlock::from([0; 235]),
                         kart_physics_variants: None,
                     },

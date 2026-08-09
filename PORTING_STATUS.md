@@ -37,7 +37,8 @@ short feature ledger is in [PORTING.md](PORTING.md).
   other half is used without violating the slot/team mapping.
 - Room creation derives its advertised `speed_type` from the channel whenever
   the title has no standalone S0-S8 token. Individual/team infinite-booster
-  channels 23/24 use S6, item channels use S8, and speed/newbie channels use S7.
+  channels 23/24 use the stock S4 preset, item channels use S8, and speed/newbie
+  channels use S7. S6 remains available only as an explicit event preset.
   The race-start physics lookup receives that same fallback, while game types
   2/4 still select their individual/team item matrix rows. Thus channel/session
   metadata and the emitted 235-byte physics block no longer disagree.
@@ -55,7 +56,7 @@ short feature ledger is in [PORTING.md](PORTING.md).
   carries the prior race order (including DNF ordering) instead of the original
   join order, without leaving an empty grid position when a racer disconnected.
 - Regression coverage includes alternating team admission and physical slots,
-  true team-full rejection, S6 infinite/S8 item channel creation, matrix
+  true team-full rejection, S4 infinite/S8 item channel creation, matrix
   fallback selection, GUI persistence and required-path rejection, and exact
   next-start `RoomPlayer.ranking` serialization.
 - The refreshed fixed-path release is

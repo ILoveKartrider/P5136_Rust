@@ -74,8 +74,8 @@ use p5136_core::{
         parse_rider_talk_request, parse_set_slot_state_request, parse_start_room_request,
     },
     login::{
-        LegacyTime, LoginError, PrLoginFields, parse_pq_login, serialize_pr_cn_authen_login,
-        serialize_pr_login,
+        LegacyTime, LoginError, P5136_OBSERVER_MASTER_PMAP, P5136_OBSERVER_PMAP, PrLoginFields,
+        parse_pq_login, serialize_pr_cn_authen_login, serialize_pr_login,
     },
     matching_protocol::{
         MatchingProtocolError, MatchingRequest, classify_matching_request, parse_matching_request,
@@ -766,6 +766,17 @@ impl ProfileCoordinator {
         allow_creation: bool,
         admission: ProfileJobAdmission,
     ) -> Result<(ProfileSnapshot, EquipmentExceptions, ProfileLanePermit), LoginSessionError> {
+        self.load_with_equipment_and_pmap(nickname, allow_creation, None, admission)
+            .await
+    }
+
+    async fn load_with_equipment_and_pmap(
+        &self,
+        nickname: String,
+        allow_creation: bool,
+        requested_pmap: Option<u32>,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, EquipmentExceptions, ProfileLanePermit), LoginSessionError> {
         Self::ensure_admitted_subject(&admission, &nickname)?;
         let completed = admission
             .run(
@@ -774,7 +785,17 @@ impl ProfileCoordinator {
                     if !allow_creation && !store.profile_exists(subject.nickname())? {
                         return Err(LoginSessionError::ProfileCreationDenied { nickname });
                     }
-                    let loaded = store.load_or_create(subject.nickname())?;
+                    let mut loaded = store.load_or_create(subject.nickname())?;
+                    if let Some(requested_pmap) = requested_pmap
+                        && loaded.profile.rider.pmap != requested_pmap
+                    {
+                        let (saved, profile) = store.update(subject.nickname(), |profile| {
+                            profile.rider.pmap = requested_pmap;
+                        })?;
+                        loaded.profile = profile;
+                        loaded.revision = Some(saved.revision);
+                        loaded.source_path = saved.path;
+                    }
                     let equipment_load =
                         store.load_equipment_exceptions_lenient(lease, subject.nickname())?;
                     log_equipment_load_warnings(subject.nickname(), &equipment_load.warnings);
@@ -3748,12 +3769,14 @@ async fn handle_login(
     context: &mut SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let login = parse_pq_login(packet)?;
+    let requested_pmap = login.requested_pmap;
     let admission = profiles.admit(&login.nickname, "login profile").await?;
     let claimed = world.claim_identity(session_id, login.nickname).await?;
     let (profile, equipment, lane) = profiles
-        .load_with_equipment(
+        .load_with_equipment_and_pmap(
             claimed.nickname.clone(),
             config.allow_remote_profile_creation || claimed.source_ip.is_loopback(),
+            requested_pmap,
             admission,
         )
         .await?;
@@ -3761,6 +3784,13 @@ async fn handle_login(
     ensure_identity_fence(&claimed, &identity)?;
     context.bind_profile_with_equipment(identity.clone(), profile, equipment);
     let profile = context.profile_for(&identity)?;
+    tracing::info!(
+        nickname = %identity.nickname,
+        pmap = profile.rider.pmap,
+        observer = matches!(profile.rider.pmap, 590 | 718),
+        connector_override = requested_pmap.is_some(),
+        "authenticated P5136 account role"
+    );
 
     let response = serialize_pr_login(&PrLoginFields {
         time: current_legacy_time(),
@@ -5321,7 +5351,11 @@ fn room_participant_from_profile_with_p2p_port(
             "using bounded room-entry kart physics with omitted optional contributions"
         );
     }
-    let observer = matches!(profile.rider.pmap, 590 | 718);
+    let observer = matches!(
+        profile.rider.pmap,
+        P5136_OBSERVER_PMAP | P5136_OBSERVER_MASTER_PMAP
+    );
+    let observer_master = profile.rider.pmap == P5136_OBSERVER_MASTER_PMAP;
     let endpoint = legacy_p2p_endpoint(identity.source_ip, reported_p2p_port);
     let club_name = if profile.rider.club_mark_logo == 0 {
         String::new()
@@ -5348,6 +5382,7 @@ fn room_participant_from_profile_with_p2p_port(
             club_mark_logo: profile.rider.club_mark_logo,
         },
         observer,
+        observer_master,
         kart_physics: physics.block,
         kart_physics_variants: Some(physics.variants),
     })
@@ -6558,6 +6593,64 @@ mod tests {
         context.bind_profile(identity.clone(), profile);
         drop(lane);
         context
+    }
+
+    #[tokio::test]
+    async fn connector_role_override_is_durable_across_channel_profile_reload() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+
+        let observer_admission = profiles
+            .admit("Caster", "test observer connector role")
+            .await
+            .unwrap();
+        let (observer, _equipment, observer_lane) = profiles
+            .load_with_equipment_and_pmap(
+                "Caster".to_owned(),
+                true,
+                Some(p5136_core::login::P5136_OBSERVER_MASTER_PMAP),
+                observer_admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            observer.profile.rider.pmap,
+            p5136_core::login::P5136_OBSERVER_MASTER_PMAP
+        );
+        drop(observer_lane);
+
+        let migration_admission = profiles
+            .admit("Caster", "test observer channel reload")
+            .await
+            .unwrap();
+        let (migrated, _equipment, migration_lane) = profiles
+            .load_with_equipment("Caster".to_owned(), true, migration_admission)
+            .await
+            .unwrap();
+        assert_eq!(
+            migrated.profile.rider.pmap,
+            p5136_core::login::P5136_OBSERVER_MASTER_PMAP
+        );
+        drop(migration_lane);
+
+        let regular_admission = profiles
+            .admit("Caster", "test regular connector role")
+            .await
+            .unwrap();
+        let (regular, _equipment, regular_lane) = profiles
+            .load_with_equipment_and_pmap(
+                "Caster".to_owned(),
+                true,
+                Some(p5136_core::login::P5136_REGULAR_PMAP),
+                regular_admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(regular.profile.rider.pmap, 0);
+        drop(regular_lane);
+
+        profile_runtime.shutdown().await.unwrap();
     }
 
     async fn shutdown_myroom_test(

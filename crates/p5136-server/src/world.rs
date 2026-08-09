@@ -742,6 +742,9 @@ pub struct RoomSnapshot {
 pub(crate) struct RoomParticipant {
     pub(crate) player: RoomPlayer,
     pub(crate) observer: bool,
+    /// P5136 pmap 718 is an observer master, while pmap 590 is a spectator
+    /// without automatic room authority.
+    pub(crate) observer_master: bool,
     pub(crate) kart_physics: P5136KartPhysicsBlock,
     pub(crate) kart_physics_variants: Option<RoomKartPhysicsVariants>,
 }
@@ -1060,7 +1063,7 @@ pub enum LobbyError {
     #[error("preparing slot state is server-owned")]
     PreparingStateServerOwned,
 
-    #[error("only the current human room master may perform this command")]
+    #[error("only the current room master may perform this command")]
     NotRoomMaster,
 
     #[error("room-master target {nickname:?} is not a human racer in this room")]
@@ -4371,6 +4374,7 @@ impl ProtocolRoomState {
             let Some(observer_id) = self.observers.iter().position(Option::is_none) else {
                 return false;
             };
+            let observer_master = participant.observer_master;
             participant.player.player_type = 4;
             participant.player.team = 0;
             self.observers[observer_id] = Some(ProtocolRoomMember {
@@ -4379,6 +4383,10 @@ impl ProtocolRoomState {
                 kart_physics: participant.kart_physics,
                 kart_physics_variants: participant.kart_physics_variants,
             });
+            if observer_master {
+                self.room_master = i32::try_from(ROOM_SLOT_COUNT + observer_id)
+                    .expect("the fixed observer player ID always fits in i32");
+            }
             return true;
         }
 
@@ -4401,7 +4409,7 @@ impl ProtocolRoomState {
             kart_physics_variants: participant.kart_physics_variants,
         });
         self.slot_positions[slot_id] = Some(member_id);
-        if self.members_by_id.iter().flatten().count() == 1 {
+        if self.member_by_player_id(self.room_master).is_none() {
             self.room_master = i32::from(member_id);
         }
         true
@@ -4477,11 +4485,18 @@ impl ProtocolRoomState {
         }
     }
 
-    /// Selects the next lobby master from humans who still occupy the room.
-    /// Individual rooms use the highest previous-race finisher. Team rooms
-    /// first restrict candidates to the server-decided winning team, then use
-    /// that team's highest finisher. AI and departed racers are never eligible.
+    /// Preserves a live observer master, matching the C# settlement path.
+    /// Otherwise selects the next lobby master from humans who still occupy
+    /// the room. Individual rooms use the highest previous-race finisher. Team
+    /// rooms first restrict candidates to the server-decided winning team,
+    /// then use that team's highest finisher. AI and departed racers are never
+    /// eligible.
     fn apply_next_lobby_master(&mut self, ranking: &SettlementRanking) -> Option<i32> {
+        if self.room_master >= i32::try_from(ROOM_SLOT_COUNT).ok()?
+            && self.member_by_player_id(self.room_master).is_some()
+        {
+            return Some(self.room_master);
+        }
         let next_master = self
             .members_by_id
             .iter()
@@ -4511,7 +4526,13 @@ impl ProtocolRoomState {
                 .as_ref()
                 .is_some_and(|member| member.user_no == user_no)
         }) {
+            let removed_master = self.room_master
+                == i32::try_from(ROOM_SLOT_COUNT + observer_id)
+                    .expect("the fixed observer player ID always fits in i32");
             self.observers[observer_id] = None;
+            if removed_master {
+                self.assign_next_room_master();
+            }
             return true;
         }
 
@@ -4535,18 +4556,7 @@ impl ProtocolRoomState {
         }
 
         if removed_master {
-            self.room_master = self
-                .members_by_id
-                .iter()
-                .position(Option::is_some)
-                .map_or(0, |id| {
-                    i32::try_from(id).expect("an eight-member room ID always fits in i32")
-                });
-            if let Ok(master) = usize::try_from(self.room_master)
-                && let Some(master) = self.members_by_id[master].as_mut()
-            {
-                master.player.player_type = 2;
-            }
+            self.assign_next_room_master();
         }
         let mut rankings = self
             .members_by_id
@@ -4564,6 +4574,40 @@ impl ProtocolRoomState {
                 i32::try_from(ranking).expect("an eight-member room ranking always fits in i32");
         }
         true
+    }
+
+    fn assign_next_room_master(&mut self) {
+        if let Some((member_id, member)) = self
+            .members_by_id
+            .iter_mut()
+            .enumerate()
+            .find(|(_, member)| member.is_some())
+        {
+            self.room_master =
+                i32::try_from(member_id).expect("the fixed room member ID always fits in i32");
+            member
+                .as_mut()
+                .expect("the selected room member remains occupied")
+                .player
+                .player_type = PlayerSlotState::NotReady as i32;
+            return;
+        }
+        if let Some((observer_id, observer)) = self
+            .observers
+            .iter_mut()
+            .enumerate()
+            .find(|(_, observer)| observer.is_some())
+        {
+            self.room_master = i32::try_from(ROOM_SLOT_COUNT + observer_id)
+                .expect("the fixed observer player ID always fits in i32");
+            observer
+                .as_mut()
+                .expect("the selected observer remains occupied")
+                .player
+                .player_type = PlayerSlotState::Observer as i32;
+            return;
+        }
+        self.room_master = -1;
     }
 
     fn is_empty(&self) -> bool {
@@ -4820,6 +4864,16 @@ impl ProtocolRoomState {
             .and_then(|observer_id| i32::try_from(ROOM_SLOT_COUNT + observer_id).ok())
     }
 
+    fn member_by_player_id(&self, player_id: i32) -> Option<&ProtocolRoomMember> {
+        let player_id = usize::try_from(player_id).ok()?;
+        if player_id < ROOM_SLOT_COUNT {
+            return self.members_by_id[player_id].as_ref();
+        }
+        self.observers
+            .get(player_id.checked_sub(ROOM_SLOT_COUNT)?)?
+            .as_ref()
+    }
+
     fn set_equipment_snapshot(&mut self, user_no: UserNo, snapshot: [u8; 65]) -> bool {
         let updated = if let Some(member) = self
             .members_by_id
@@ -4974,11 +5028,11 @@ const fn expected_room_game_type(channel_game_type: u8) -> Option<u8> {
     }
 }
 
-/// P5136 infinite-booster channels use wire speed type S6, item channels use
+/// P5136 stock infinite-booster channels use wire speed type S4, item channels use
 /// the integrated-item S8 preset, and the remaining stock channels use S7.
 const fn channel_default_speed_type(channel_game_type: u8) -> u8 {
     match channel_game_type {
-        23 | 24 => 6,
+        23 | 24 => 4,
         65 | 66 | 8 | 7 => 8,
         _ => 7,
     }
@@ -10726,13 +10780,7 @@ impl World {
             .protocol_rooms
             .get(&room_id)
             .expect("protocol membership always references an existing room");
-        Self::require_lobby(room)?;
-        let requester_id = room
-            .member_id(identity.user_no)
-            .ok_or(LobbyError::HumanRacerRequired)?;
-        if room.room_master != i32::try_from(requester_id).expect("room member ID fits in i32") {
-            return Err(LobbyError::NotRoomMaster);
-        }
+        Self::require_lobby_master(room, identity.user_no)?;
 
         let mut next = room.clone();
         next.settings.room_name.clone_from(&request.room_name);
@@ -10834,18 +10882,12 @@ impl World {
             .protocol_rooms
             .get(&room_id)
             .expect("protocol membership always references an existing room");
-        Self::require_lobby(room)?;
-        let requester_id = room
-            .member_id(identity.user_no)
-            .ok_or(LobbyError::HumanRacerRequired)?;
-        if room.room_master != i32::try_from(requester_id).expect("room member ID fits in i32") {
-            return Err(LobbyError::NotRoomMaster);
-        }
+        let requester_player_id = Self::require_lobby_master(room, identity.user_no)?;
         if !plan.ai_specs.is_empty() {
             return Err(LobbyError::AiParticipantsUnsupported);
         }
 
-        let racer_count = self.validate_start_racers(room, requester_id)?;
+        let racer_count = self.validate_start_racers(room, requester_player_id)?;
 
         let allocated_race_epoch = self.next_race_epoch.ok_or(LobbyError::RaceEpochExhausted)?;
         let race_epoch = allocated_race_epoch.get();
@@ -10944,7 +10986,7 @@ impl World {
     fn validate_start_racers(
         &self,
         room: &ProtocolRoomState,
-        requester_id: usize,
+        requester_player_id: i32,
     ) -> Result<usize, LobbyError> {
         let racer_count = room.members_by_id.iter().flatten().count();
         if racer_count == 0 {
@@ -10956,7 +10998,8 @@ impl World {
             .enumerate()
             .filter_map(|(member_id, member)| member.as_ref().map(|member| (member_id, member)))
         {
-            if member_id != requester_id
+            if i32::try_from(member_id).expect("the fixed room member ID always fits in i32")
+                != requester_player_id
                 && member.player.player_type != PlayerSlotState::Ready as i32
             {
                 return Err(LobbyError::RacerNotReady {
@@ -11067,20 +11110,15 @@ impl World {
         }
     }
 
-    fn require_lobby_master(
-        room: &ProtocolRoomState,
-        user_no: UserNo,
-    ) -> Result<usize, LobbyError> {
+    fn require_lobby_master(room: &ProtocolRoomState, user_no: UserNo) -> Result<i32, LobbyError> {
         Self::require_lobby(room)?;
-        let member_id = room
-            .member_id(user_no)
+        let player_id = room
+            .equipment_player_id(user_no)
             .ok_or(LobbyError::HumanRacerRequired)?;
-        if room.room_master
-            != i32::try_from(member_id).expect("the fixed room member ID fits in i32")
-        {
+        if room.room_master != player_id {
             return Err(LobbyError::NotRoomMaster);
         }
-        Ok(member_id)
+        Ok(player_id)
     }
 
     fn publish_start_rejection(&self, session: SessionId) -> Result<(), LobbyError> {
@@ -12070,11 +12108,13 @@ impl World {
                         Some(room_id)
                     );
                 }
-                if room.members_by_id.iter().any(Option::is_some) {
-                    let master =
-                        usize::try_from(room.room_master).expect("room master is non-negative");
-                    debug_assert!(master < ROOM_SLOT_COUNT);
-                    debug_assert!(room.members_by_id[master].is_some());
+                if !room.is_empty() {
+                    debug_assert!(
+                        room.member_by_player_id(room.room_master).is_some()
+                            || (room.members_by_id.iter().all(Option::is_none)
+                                && room.room_master == 0),
+                        "a populated room has either a live racer/observer master or the C# pmap-590 observer-only placeholder"
+                    );
                 }
                 debug_assert_frozen_race_invariants(*room_id, room, &mut expected_reward_lanes);
                 debug_assert_loading_handshake_invariants(room);
@@ -13547,6 +13587,7 @@ pub(crate) mod test_support {
                 club_mark_logo: 0,
             },
             observer: false,
+            observer_master: false,
             kart_physics: P5136KartPhysicsBlock::from([0; 235]),
             kart_physics_variants: None,
         }
@@ -13608,10 +13649,10 @@ pub(crate) mod test_support {
             variants.for_room("친선전", 3, 7),
             &P5136KartPhysicsBlock::from([39; 235])
         );
-        // Infinite-booster channels instead supply S6 as their fallback.
+        // Stock infinite-booster channels instead supply S4 as their fallback.
         assert_eq!(
-            variants.for_room("무한부스터", 3, 6),
-            &P5136KartPhysicsBlock::from([38; 235])
+            variants.for_room("무한부스터", 3, 4),
+            &P5136KartPhysicsBlock::from([36; 235])
         );
         // Item channels use S8 while selecting their own game-type rows.
         assert_eq!(
@@ -13637,8 +13678,8 @@ pub(crate) mod test_support {
 
     #[test]
     fn channel_fallback_speed_matches_infinite_and_item_channel_semantics() {
-        assert_eq!(super::channel_default_speed_type(23), 6);
-        assert_eq!(super::channel_default_speed_type(24), 6);
+        assert_eq!(super::channel_default_speed_type(23), 4);
+        assert_eq!(super::channel_default_speed_type(24), 4);
         for channel_game_type in [65, 66, 8, 7] {
             assert_eq!(super::channel_default_speed_type(channel_game_type), 8);
         }
@@ -14079,7 +14120,7 @@ mod tests {
     }
 
     #[test]
-    fn infinite_booster_channels_advertise_s6_without_a_room_title_token() {
+    fn infinite_booster_channels_advertise_stock_s4_without_a_room_title_token() {
         let mut world = World::default();
         for (nickname, channel_game_type, room_game_type, port) in [
             ("InfiniteIndividual", 23, 1, 40_123),
@@ -14098,7 +14139,7 @@ mod tests {
                 .unwrap();
             assert_eq!(take_single_packet(&mut owner.outbound)[4], 1);
             let room_id = world.protocol_room_by_user[&owner.identity.user_no];
-            assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 6);
+            assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 4);
         }
     }
 
@@ -14646,6 +14687,7 @@ mod tests {
                 club_mark_logo: 0,
             },
             observer: false,
+            observer_master: false,
             kart_physics: P5136KartPhysicsBlock::from([0; 235]),
             kart_physics_variants: None,
         }
@@ -15475,6 +15517,192 @@ mod tests {
             1
         );
         assert!(sessions[2].outbound.try_recv().is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture keeps pmap-718 room-master topology, chat, map fanout, and start authority on the same two room modes"
+    )]
+    fn pmap_718_observer_master_changes_maps_in_individual_and_team_rooms() {
+        for (index, (channel_game_type, room_game_type)) in
+            [(67_u8, 1_u8), (65_u8, 2_u8), (68_u8, 3_u8), (66_u8, 4_u8)]
+                .into_iter()
+                .enumerate()
+        {
+            let mut world = World::default();
+            let mut observer = register_channel_session(
+                &mut world,
+                &format!("ObserverMaster{index}"),
+                channel_game_type,
+                41_800 + u16::try_from(index).unwrap() * 10,
+                64,
+            );
+            let mut racer = register_channel_session(
+                &mut world,
+                &format!("ObserverRoomRacer{index}"),
+                channel_game_type,
+                41_840 + u16::try_from(index).unwrap() * 10,
+                64,
+            );
+            let mut participant = room_participant();
+            participant.observer = true;
+            participant.observer_master = true;
+            world
+                .room_protocol(
+                    observer.session,
+                    RoomCommandPayload::Create {
+                        request: create_request("Observer-owned room", room_game_type),
+                        participant,
+                    },
+                )
+                .unwrap();
+            let room_id = world.protocol_room_by_user[&observer.identity.user_no];
+            assert_eq!(world.protocol_rooms[&room_id].room_master, 8);
+            drain_batches(&mut observer.outbound);
+            join_protocol_room(&mut world, &racer, room_id, false);
+            assert_eq!(
+                world.protocol_rooms[&room_id].room_master, 8,
+                "the first racer must not steal pmap-718 observer authority"
+            );
+            drain_batches(&mut observer.outbound);
+            drain_batches(&mut racer.outbound);
+
+            assert!(matches!(
+                world
+                    .lobby_command(
+                        observer.session,
+                        LobbyCommandPayload::RiderTalk(LobbyRiderTalkRequest {
+                            message: "observer master chat".to_owned(),
+                            reserved: 0,
+                        }),
+                    )
+                    .unwrap(),
+                LobbyCommandOutcome::MessageRelayed {
+                    room_id: relayed_room_id,
+                    recipients: 1,
+                } if relayed_room_id == room_id
+            ));
+            let observer_echo = take_single_packet(&mut racer.outbound);
+            assert_eq!(
+                logical_packet_hash(&observer_echo),
+                adler32::packet_hash(RIDER_ECHO_NAME)
+            );
+            assert_eq!(
+                i32::from_le_bytes(observer_echo[4..8].try_into().unwrap()),
+                8
+            );
+            assert!(observer.outbound.try_recv().is_err());
+
+            let request = ChangeTrackRequest {
+                track: 0x3CA2_0442 + u32::try_from(index).unwrap(),
+                room_data_header: 0x104F_C220,
+                room_data: [u8::try_from(index).unwrap(); ROOM_DATA_LENGTH],
+            };
+            assert!(matches!(
+                world
+                    .lobby_command(
+                        observer.session,
+                        LobbyCommandPayload::ChangeTrack(request),
+                    )
+                    .unwrap(),
+                LobbyCommandOutcome::TrackChanged {
+                    room_id: changed_room_id,
+                    track,
+                } if changed_room_id == room_id && track == request.track
+            ));
+            assert_eq!(world.protocol_rooms[&room_id].settings.track, request.track);
+            assert_eq!(
+                logical_packet_hash(&take_single_packet(&mut observer.outbound)),
+                adler32::packet_hash("GrSlotDataPacket")
+            );
+            assert_eq!(
+                logical_packet_hash(&take_single_packet(&mut racer.outbound)),
+                adler32::packet_hash("GrSlotDataPacket")
+            );
+
+            let ranking = super::SettlementRanking {
+                winning_team: None,
+                by_player_id: HashMap::from([(
+                    0,
+                    super::RankedRaceResult {
+                        finish_time: 1_000,
+                        rank: 0,
+                        team: None,
+                        team_points: 0,
+                    },
+                )]),
+            };
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            assert_eq!(
+                room.apply_next_lobby_master(&ranking),
+                Some(8),
+                "settlement must not transfer pmap-718 observer authority to the race winner"
+            );
+            assert_eq!(room.room_master, 8);
+
+            world
+                .lobby_command(
+                    racer.session,
+                    LobbyCommandPayload::SetSlotState(PlayerSlotState::Ready),
+                )
+                .unwrap();
+            drain_batches(&mut observer.outbound);
+            drain_batches(&mut racer.outbound);
+            assert!(matches!(
+                world
+                    .lobby_command(
+                        observer.session,
+                        LobbyCommandPayload::StartRoom(StartRoomPlan::new(
+                            vec![request.track],
+                            Vec::new(),
+                        )),
+                    )
+                    .unwrap(),
+                LobbyCommandOutcome::Started {
+                    room_id: started_room_id,
+                    racer_count: 1,
+                    observer_count: 1,
+                    ..
+                } if started_room_id == room_id
+            ));
+        }
+    }
+
+    #[test]
+    fn pmap_590_observer_does_not_gain_observer_master_map_authority() {
+        let mut world = World::default();
+        let mut observer = register_channel_session(&mut world, "RegularObserver", 67, 41_830, 64);
+        let mut participant = room_participant();
+        participant.observer = true;
+        participant.observer_master = false;
+        world
+            .room_protocol(
+                observer.session,
+                RoomCommandPayload::Create {
+                    request: create_request("Regular observer room", 1),
+                    participant,
+                },
+            )
+            .unwrap();
+        let room_id = world.protocol_room_by_user[&observer.identity.user_no];
+        assert_eq!(world.protocol_rooms[&room_id].room_master, 0);
+        drain_batches(&mut observer.outbound);
+        let before = world.protocol_rooms[&room_id].clone();
+
+        assert!(matches!(
+            world.lobby_command(
+                observer.session,
+                LobbyCommandPayload::ChangeTrack(ChangeTrackRequest {
+                    track: 0x3CA2_0442,
+                    room_data_header: 0,
+                    room_data: [0; ROOM_DATA_LENGTH],
+                }),
+            ),
+            Err(WorldError::Lobby(LobbyError::NotRoomMaster))
+        ));
+        assert_eq!(world.protocol_rooms[&room_id], before);
+        assert!(observer.outbound.try_recv().is_err());
     }
 
     fn prepare_single_reward_persistence(

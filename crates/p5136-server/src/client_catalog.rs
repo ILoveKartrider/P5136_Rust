@@ -1402,6 +1402,10 @@ mod tests {
         assert!(loaded.catalog().grants_item(3, 1_410));
         assert!(loaded.catalog().contains_kart(814));
         assert!(!loaded.catalog().grants_item(3, 814));
+        assert!(loaded.catalog().grants_item(28, 49));
+        for unsafe_myroom_id in [14, 37, 50] {
+            assert!(!loaded.catalog().grants_item(28, unsafe_myroom_id));
+        }
         assert_eq!(
             loaded
                 .catalog()

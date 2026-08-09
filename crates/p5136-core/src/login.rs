@@ -11,6 +11,9 @@ use crate::{
 };
 
 pub const ACCOUNT_DATA_PROFILE_NAME: &str = "AccountDataProfile";
+pub const P5136_REGULAR_PMAP: u32 = 0;
+pub const P5136_OBSERVER_PMAP: u32 = 590;
+pub const P5136_OBSERVER_MASTER_PMAP: u32 = 718;
 pub const LEGACY_LOGIN_TOKEN: &str = "lppicekedkgjdqmncddpddecdogjppqhrghqifqjmjhcfiorecpmockdlngloorhqmekhrpdpejlgnclklrmddhoprcqknrfjolidjhndejiokfjoogqrgldgigqlhpp";
 pub const AGREEMENT_URL: &str = "https://www.tiancity.com/agreement";
 
@@ -20,6 +23,12 @@ pub struct PqLogin {
     pub varying_value_2: u32,
     pub profile: BmlNode,
     pub nickname: String,
+    /// Optional role selector supplied by the local connector profile.
+    ///
+    /// Stock launchers omit this node. The server accepts only the known
+    /// regular/observer presets and otherwise rejects the login rather than
+    /// exposing arbitrary permission-map bits to a client.
+    pub requested_pmap: Option<u32>,
     pub trailing: Vec<u8>,
 }
 
@@ -67,6 +76,12 @@ pub enum LoginError {
 
     #[error("AccountDataProfile does not contain a non-empty username value")]
     MissingUsername,
+
+    #[error("AccountDataProfile pmap value {value:?} is not an unsigned decimal integer")]
+    InvalidRequestedPmap { value: String },
+
+    #[error("AccountDataProfile pmap value {0} is not a supported P5136 role preset")]
+    UnsupportedRequestedPmap(u32),
 }
 
 /// Parses a complete logical `PqLogin` packet and extracts its first
@@ -103,12 +118,28 @@ pub fn parse_pq_login(packet: &[u8]) -> Result<PqLogin, LoginError> {
         .filter(|value| !value.is_empty())
         .ok_or(LoginError::MissingUsername)?
         .to_owned();
+    let requested_pmap = profile
+        .first_value_named("pmap")
+        .map(str::trim)
+        .map(|value| {
+            let pmap = value
+                .parse::<u32>()
+                .map_err(|_| LoginError::InvalidRequestedPmap {
+                    value: value.to_owned(),
+                })?;
+            match pmap {
+                P5136_REGULAR_PMAP | P5136_OBSERVER_PMAP | P5136_OBSERVER_MASTER_PMAP => Ok(pmap),
+                _ => Err(LoginError::UnsupportedRequestedPmap(pmap)),
+            }
+        })
+        .transpose()?;
 
     Ok(PqLogin {
         varying_value_1,
         varying_value_2,
         profile,
         nickname,
+        requested_pmap,
         trailing: reader.remaining().to_vec(),
     })
 }
@@ -186,10 +217,14 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        AGREEMENT_URL, LEGACY_LOGIN_TOKEN, LegacyTime, PrLoginFields, parse_pq_login,
-        serialize_pr_cn_authen_login, serialize_pr_login,
+        AGREEMENT_URL, LEGACY_LOGIN_TOKEN, LegacyTime, P5136_OBSERVER_MASTER_PMAP, PrLoginFields,
+        parse_pq_login, serialize_pr_cn_authen_login, serialize_pr_login,
     };
-    use crate::{adler32, packet::PacketReader};
+    use crate::{
+        adler32,
+        bml::BmlNode,
+        packet::{PacketReader, PacketWriter},
+    };
 
     #[test]
     fn parses_the_csharp_pq_login_fixture_and_keeps_trailing_bytes() {
@@ -204,12 +239,34 @@ mod tests {
         assert_eq!(login.varying_value_1, 0x8b01_9610);
         assert_eq!(login.varying_value_2, 0xba06_b093);
         assert_eq!(login.nickname, "Yany2");
+        assert_eq!(login.requested_pmap, None);
         assert_eq!(login.profile.name, "profile");
         assert_eq!(login.trailing, [0xaa, 0xbb]);
         assert_eq!(
             format!("{:X}", Sha256::digest(&packet[..packet.len() - 2])),
             "6B020D4F8C308D67432D02EA79BBA78E9A9D43CAD199432EBCFE6CD4B81B1FA7"
         );
+    }
+
+    #[test]
+    fn connector_pmap_accepts_only_known_regular_and_observer_presets() {
+        let observer = login_packet_with_pmap("718");
+        assert_eq!(
+            parse_pq_login(&observer).unwrap().requested_pmap,
+            Some(P5136_OBSERVER_MASTER_PMAP)
+        );
+
+        let regular = login_packet_with_pmap("0");
+        assert_eq!(parse_pq_login(&regular).unwrap().requested_pmap, Some(0));
+
+        assert!(matches!(
+            parse_pq_login(&login_packet_with_pmap("3130")),
+            Err(super::LoginError::UnsupportedRequestedPmap(3130))
+        ));
+        assert!(matches!(
+            parse_pq_login(&login_packet_with_pmap("observer")),
+            Err(super::LoginError::InvalidRequestedPmap { .. })
+        ));
     }
 
     #[test]
@@ -274,5 +331,19 @@ mod tests {
                 u8::from_str_radix(text, 16).unwrap()
             })
             .collect()
+    }
+
+    fn login_packet_with_pmap(pmap: &str) -> Vec<u8> {
+        let mut profile = BmlNode::new("profile", "");
+        profile.children.push(BmlNode::new("username", "Observer"));
+        profile.children.push(BmlNode::new("pmap", pmap));
+
+        let mut packet = PacketWriter::named("PqLogin");
+        packet.write_u32(1);
+        packet.write_u32(2);
+        packet.write_u32(adler32::packet_hash(super::ACCOUNT_DATA_PROFILE_NAME));
+        packet.write_u8(0);
+        profile.encode(&mut packet).unwrap();
+        packet.into_inner()
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     identity::{IdentityError, normalize_nickname},
     limits::CodecLimits,
     pin::{PinPatchOptions, PinPatchReport, patch_p5136_pin_with_limits},
-    xml::{launcher_profile_xml, server_config_xml},
+    xml::{LauncherProfileRole, launcher_profile_xml_for_role, server_config_xml},
 };
 use std::net::SocketAddrV4;
 
@@ -25,6 +25,7 @@ pub const DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallationOptions {
     pub remove_ngs_on: bool,
+    pub launcher_profile_role: LauncherProfileRole,
     pub lock_timeout: Duration,
     pub maximum_persistent_file_bytes: usize,
     pub codec_limits: CodecLimits,
@@ -35,6 +36,7 @@ impl Default for InstallationOptions {
         Self {
             // Matches the original connector's default Setting.NgsOn=false.
             remove_ngs_on: true,
+            launcher_profile_role: LauncherProfileRole::Regular,
             lock_timeout: DEFAULT_INSTALLATION_LOCK_TIMEOUT,
             maximum_persistent_file_bytes: DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES,
             codec_limits: CodecLimits::default(),
@@ -111,7 +113,7 @@ pub fn prepare_installation(
         &options.codec_limits,
     )?;
     let game_config = server_config_xml(login_endpoint);
-    let launcher_profile = launcher_profile_xml(&nickname);
+    let launcher_profile = launcher_profile_xml_for_role(&nickname, options.launcher_profile_role);
 
     // All three outputs are fully generated and the PIN has been reparsed
     // before the first live file is replaced.
@@ -149,7 +151,7 @@ mod tests {
         },
         pin::PinDocument,
         test_fixture::csharp_synthetic_pin,
-        xml::{launcher_profile_xml, server_config_xml},
+        xml::{LauncherProfileRole, launcher_profile_xml_for_role, server_config_xml},
     };
 
     #[test]
@@ -193,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(&launcher_profile_path).unwrap(),
-            launcher_profile_xml("first-user")
+            launcher_profile_xml_for_role("first-user", LauncherProfileRole::Regular)
         );
         let patched = PinDocument::decode(&fs::read(&pin_path).unwrap()).unwrap();
         assert!(
@@ -206,6 +208,7 @@ mod tests {
 
         let second_endpoint = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 21), 46_002);
         options.remove_ngs_on = false;
+        options.launcher_profile_role = LauncherProfileRole::ObserverMaster;
         let second =
             prepare_installation(directory.path(), second_endpoint, "second-user", &options)
                 .unwrap();
@@ -225,7 +228,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(&launcher_profile_path).unwrap(),
-            launcher_profile_xml("second-user")
+            launcher_profile_xml_for_role("second-user", LauncherProfileRole::ObserverMaster)
         );
         let repatched = PinDocument::decode(&fs::read(&pin_path).unwrap()).unwrap();
         assert_p5136_storage(&repatched);

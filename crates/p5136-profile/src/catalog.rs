@@ -55,6 +55,11 @@ const UNSAFE_CHARACTER_ITEM_IDS: &[u16] = &[
     194, 195, 196, 197, 231, 245, 246, 247, 265, 301, 302, 333, 350, 376, 377, 391, 392, 396, 397,
 ];
 
+// These stock shop rows are visible as owned MyRoom cards, but their
+// `roomCard` metadata is incomplete.  Publishing them makes the stock client
+// instantiate an invalid card while scrolling the "use/other" inventory.
+const UNSAFE_MYROOM_ITEM_IDS: &[u16] = &[14, 37, 50];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogInventoryItem {
     pub category: u16,
@@ -379,6 +384,7 @@ pub fn is_grant_item(item: &CatalogInventoryItem) -> bool {
     item.auto_grant
         && is_grant_category(item.category)
         && (item.category != 1 || UNSAFE_CHARACTER_ITEM_IDS.binary_search(&item.id).is_err())
+        && (item.category != 28 || UNSAFE_MYROOM_ITEM_IDS.binary_search(&item.id).is_err())
 }
 
 #[derive(Debug, Error)]
@@ -2074,6 +2080,27 @@ mod tests {
         assert!(catalog.kart_spec(1450).is_none());
         assert_eq!(catalog.emblem_catalog(), None);
         assert!(catalog.emblems().is_empty());
+    }
+
+    #[test]
+    fn excludes_incomplete_myroom_cards_from_implicit_grants() {
+        for id in [14, 37, 50] {
+            assert!(!is_grant_item(&CatalogInventoryItem {
+                category: 28,
+                id,
+                serial: 0,
+                name: String::new(),
+                auto_grant: true,
+            }));
+        }
+
+        assert!(is_grant_item(&CatalogInventoryItem {
+            category: 28,
+            id: 49,
+            serial: 0,
+            name: "놀이동산 마이룸".to_owned(),
+            auto_grant: true,
+        }));
     }
 
     #[test]

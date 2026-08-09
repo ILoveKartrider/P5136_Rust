@@ -51,4 +51,6 @@ pub use pin::{
     decode_shallow_pin_header_with_limits, patch_p5136_pin, patch_p5136_pin_with_limits,
 };
 pub use probe::{DEFAULT_PROBE_TIMEOUT, ProbeError, probe_messenger, probe_tcp};
-pub use xml::{launcher_profile_xml, server_config_xml};
+pub use xml::{
+    LauncherProfileRole, launcher_profile_xml, launcher_profile_xml_for_role, server_config_xml,
+};

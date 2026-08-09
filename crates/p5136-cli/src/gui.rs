@@ -30,10 +30,13 @@ use p5136_server::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{FileLoggingControl, LoggingRuntime, client_paths};
+use crate::{
+    FileLoggingControl, LoggingRuntime, client_paths,
+    gui_i18n::{GuiLanguage, tr, tr_format},
+};
 
-const WINDOW_TITLE: &str = "카트라이더 P5136";
-const BUILD_VERSION_LABEL: &str = concat!("빌드 버전: ", env!("CARGO_PKG_VERSION"));
+const WINDOW_TITLE: &str = "KartRider P5136";
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GUI_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const GUI_SETTINGS_KEY: &str = "p5136-gui-settings-v2";
 const MAX_GUI_SETTINGS_BYTES: usize = 2 * 1024 * 1024;
@@ -61,49 +64,60 @@ pub(crate) fn run(logging: &LoggingRuntime) -> Result<()> {
             )))
         }),
     )
-    .map_err(|error| anyhow!("데스크톱 GUI를 실행하지 못했습니다: {error}"))
+    .map_err(|error| anyhow!("failed to run the desktop GUI: {error}"))
 }
 
 fn configure_platform_fonts(context: &egui::Context) {
-    let Some((font_path, font_bytes)) = platform_korean_font_candidates()
+    let loaded = platform_cjk_font_candidates()
         .into_iter()
-        .find_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
-    else {
+        .filter_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+        .collect::<Vec<_>>();
+    if loaded.is_empty() {
         tracing::warn!(
-            "Korean UI font was unavailable; install Noto Sans CJK KR or NanumGothic if text renders as boxes"
+            "CJK UI font was unavailable; install Noto Sans CJK if Korean or Chinese text renders as boxes"
         );
         return;
-    };
+    }
 
-    let font_name = "platform-korean-ui".to_owned();
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        font_name.clone(),
-        std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
-    );
+    let mut loaded_names = Vec::with_capacity(loaded.len());
+    for (index, (font_path, font_bytes)) in loaded.into_iter().enumerate() {
+        let font_name = format!("platform-cjk-ui-{index}");
+        fonts.font_data.insert(
+            font_name.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
+        );
+        tracing::info!(font_path = %font_path.display(), "loaded CJK UI font");
+        loaded_names.push(font_name);
+    }
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         if let Some(family_fonts) = fonts.families.get_mut(&family) {
-            family_fonts.insert(0, font_name.clone());
+            for (index, font_name) in loaded_names.iter().enumerate() {
+                family_fonts.insert(index, font_name.clone());
+            }
         }
     }
     context.set_fonts(fonts);
-    tracing::info!(font_path = %font_path.display(), "loaded Korean UI font");
 }
 
 #[cfg(target_os = "windows")]
-fn platform_korean_font_candidates() -> Vec<PathBuf> {
+fn platform_cjk_font_candidates() -> Vec<PathBuf> {
     let windows_root =
         std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
     vec![
         windows_root.join("Fonts").join("malgun.ttf"),
         windows_root.join("Fonts").join("malgunbd.ttf"),
+        windows_root.join("Fonts").join("msyh.ttc"),
+        windows_root.join("Fonts").join("msyhbd.ttc"),
+        windows_root.join("Fonts").join("simsun.ttc"),
     ]
 }
 
 #[cfg(target_os = "macos")]
-fn platform_korean_font_candidates() -> Vec<PathBuf> {
+fn platform_cjk_font_candidates() -> Vec<PathBuf> {
     [
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
         "/Library/Fonts/NanumGothic.ttf",
     ]
@@ -113,7 +127,7 @@ fn platform_korean_font_candidates() -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_korean_font_candidates() -> Vec<PathBuf> {
+fn platform_cjk_font_candidates() -> Vec<PathBuf> {
     [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -127,7 +141,7 @@ fn platform_korean_font_candidates() -> Vec<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn platform_korean_font_candidates() -> Vec<PathBuf> {
+fn platform_cjk_font_candidates() -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -151,11 +165,21 @@ impl GuiRunner {
         Self::Sikarugir,
     ];
 
-    const fn label(self) -> &'static str {
+    fn label(self, language: GuiLanguage) -> &'static str {
         match self {
-            Self::Auto => "자동",
-            Self::Native => "직접 실행 (관리자 권한 없음)",
-            Self::NativeElevated => "직접 실행 (Windows UAC)",
+            Self::Auto => tr!(language, "자동", "Automatic", "自动"),
+            Self::Native => tr!(
+                language,
+                "직접 실행 (관리자 권한 없음)",
+                "Direct launch (no administrator rights)",
+                "直接启动（无管理员权限）"
+            ),
+            Self::NativeElevated => tr!(
+                language,
+                "직접 실행 (Windows UAC)",
+                "Direct launch (Windows UAC)",
+                "直接启动（Windows UAC）"
+            ),
             Self::Wine => "Wine",
             Self::CrossOver => "CrossOver",
             Self::Sikarugir => "Sikarugir wrapper",
@@ -169,6 +193,7 @@ struct GuiInputs {
     game_directory: String,
     game_executable: String,
     nickname: String,
+    observer_mode: bool,
     server: String,
     configured_port: String,
     runner: GuiRunner,
@@ -185,6 +210,7 @@ impl Default for GuiInputs {
             game_directory: default_game_directory().display().to_string(),
             game_executable: String::new(),
             nickname: "player".to_owned(),
+            observer_mode: false,
             server: Ipv4Addr::LOCALHOST.to_string(),
             configured_port: DEFAULT_CONFIGURED_PORT.to_string(),
             runner: GuiRunner::Auto,
@@ -198,25 +224,59 @@ impl Default for GuiInputs {
 }
 
 impl GuiInputs {
-    fn connector_plan(&self) -> Result<ConnectorPlan> {
-        let game_directory = required_path(&self.game_directory, "게임 디렉터리")?;
+    fn connector_plan(&self, language: GuiLanguage) -> Result<ConnectorPlan> {
+        let game_directory = required_path(
+            &self.game_directory,
+            tr!(language, "게임 디렉터리", "Game directory", "游戏目录"),
+            language,
+        )?;
         let game_executable = optional_path(&self.game_executable);
-        let server_address = self
-            .server
-            .trim()
-            .parse::<Ipv4Addr>()
-            .context("서버 주소는 IPv4여야 합니다")?;
+        let server_address = self.server.trim().parse::<Ipv4Addr>().with_context(|| {
+            tr!(
+                language,
+                "서버 주소는 IPv4여야 합니다",
+                "The server address must be IPv4",
+                "服务器地址必须是 IPv4"
+            )
+        })?;
         if server_address.is_unspecified() {
-            return Err(anyhow!("서버 주소로 0.0.0.0을 사용할 수 없습니다"));
+            return Err(anyhow!(tr!(
+                language,
+                "서버 주소로 0.0.0.0을 사용할 수 없습니다",
+                "0.0.0.0 cannot be used as the server address",
+                "不能将 0.0.0.0 用作服务器地址"
+            )));
         }
         let configured_port = self
             .configured_port
             .trim()
             .parse::<u16>()
-            .context("기준 포트는 0~65535 범위여야 합니다")?;
-        let ports = PortTopology::new(configured_port)
-            .context("기준 포트에서 필요한 접속기 포트를 모두 만들 수 없습니다")?;
-        let runner = self.runner()?;
+            .with_context(|| {
+                tr!(
+                    language,
+                    "기준 포트는 0~65535 범위여야 합니다",
+                    "The base port must be in the range 0–65535",
+                    "基准端口必须在 0–65535 范围内"
+                )
+            })?;
+        let ports = PortTopology::new(configured_port).with_context(|| {
+            tr!(
+                language,
+                "기준 포트에서 필요한 접속기 포트를 모두 만들 수 없습니다",
+                "The required connector ports cannot be derived from the base port",
+                "无法从基准端口生成所需的连接器端口"
+            )
+        })?;
+        let runner = self.runner(language)?;
+
+        let installation_options = InstallationOptions {
+            launcher_profile_role: if self.observer_mode {
+                p5136_connector::LauncherProfileRole::ObserverMaster
+            } else {
+                p5136_connector::LauncherProfileRole::Regular
+            },
+            ..InstallationOptions::default()
+        };
 
         ConnectorPlan::new(ConnectorRequest {
             game_directory,
@@ -226,26 +286,70 @@ impl GuiInputs {
             ports,
             runner,
             probe_timeout: p5136_connector::DEFAULT_PROBE_TIMEOUT,
-            installation_options: InstallationOptions::default(),
+            installation_options,
         })
-        .context("접속기 설정이 올바르지 않습니다")
+        .with_context(|| {
+            tr!(
+                language,
+                "접속기 설정이 올바르지 않습니다",
+                "The connector settings are invalid",
+                "连接器设置无效"
+            )
+        })
     }
 
-    fn runner(&self) -> Result<Runner> {
+    fn runner(&self, language: GuiLanguage) -> Result<Runner> {
         match self.runner {
             GuiRunner::Auto => Ok(Runner::Auto),
             GuiRunner::Native => Ok(Runner::Native),
             GuiRunner::NativeElevated => Ok(Runner::NativeElevated),
             GuiRunner::Wine => Ok(Runner::Wine {
-                binary: required_path(&self.wine_binary, "Wine 실행 파일")?,
+                binary: required_path(
+                    &self.wine_binary,
+                    tr!(
+                        language,
+                        "Wine 실행 파일",
+                        "Wine executable",
+                        "Wine 可执行文件"
+                    ),
+                    language,
+                )?,
                 prefix: optional_path(&self.wine_prefix),
             }),
             GuiRunner::CrossOver => Ok(Runner::CrossOver {
-                wine_binary: required_path(&self.crossover_binary, "CrossOver 실행 파일")?,
-                bottle: required_text(&self.crossover_bottle, "CrossOver 보틀")?.to_owned(),
+                wine_binary: required_path(
+                    &self.crossover_binary,
+                    tr!(
+                        language,
+                        "CrossOver 실행 파일",
+                        "CrossOver executable",
+                        "CrossOver 可执行文件"
+                    ),
+                    language,
+                )?,
+                bottle: required_text(
+                    &self.crossover_bottle,
+                    tr!(
+                        language,
+                        "CrossOver 보틀",
+                        "CrossOver bottle",
+                        "CrossOver 容器"
+                    ),
+                    language,
+                )?
+                .to_owned(),
             }),
             GuiRunner::Sikarugir => Ok(Runner::Sikarugir {
-                app: required_path(&self.sikarugir_app, "Sikarugir wrapper 앱")?,
+                app: required_path(
+                    &self.sikarugir_app,
+                    tr!(
+                        language,
+                        "Sikarugir wrapper 앱",
+                        "Sikarugir wrapper app",
+                        "Sikarugir 包装器应用"
+                    ),
+                    language,
+                )?,
             }),
         }
     }
@@ -277,6 +381,8 @@ struct ServerInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GuiPersistedSettings {
+    #[serde(default)]
+    language: GuiLanguage,
     connector: GuiInputs,
     server: ServerInputs,
 }
@@ -316,6 +422,7 @@ impl GuiPersistedSettings {
 
     fn from_app(app: &P5136GuiApp) -> Self {
         Self {
+            language: app.language,
             connector: app.connector_inputs.clone(),
             server: app.server_inputs.clone(),
         }
@@ -368,35 +475,81 @@ impl Default for ServerInputs {
 }
 
 impl ServerInputs {
-    fn server_config(&self) -> Result<ServerConfig> {
+    // Each validation message is kept beside its field in all three GUI languages.
+    #[allow(clippy::too_many_lines)]
+    fn server_config(&self, language: GuiLanguage) -> Result<ServerConfig> {
         let bind_address = self
             .bind_address
             .trim()
             .parse::<IpAddr>()
-            .context("바인드 주소는 IPv4 또는 IPv6여야 합니다")?;
+            .with_context(|| {
+                tr!(
+                    language,
+                    "바인드 주소는 IPv4 또는 IPv6여야 합니다",
+                    "The bind address must be IPv4 or IPv6",
+                    "绑定地址必须是 IPv4 或 IPv6"
+                )
+            })?;
         let advertised_address = self
             .advertised_address
             .trim()
             .parse::<Ipv4Addr>()
-            .context("클라이언트에 알릴 주소는 IPv4여야 합니다")?;
+            .with_context(|| {
+                tr!(
+                    language,
+                    "클라이언트에 알릴 주소는 IPv4여야 합니다",
+                    "The advertised client address must be IPv4",
+                    "向客户端公布的地址必须是 IPv4"
+                )
+            })?;
         if advertised_address.is_unspecified()
             || advertised_address.is_multicast()
             || advertised_address == Ipv4Addr::BROADCAST
         {
-            return Err(anyhow!(
-                "클라이언트에 알릴 IPv4는 0.0.0.0, 멀티캐스트, 브로드캐스트 주소일 수 없습니다"
-            ));
+            return Err(anyhow!(tr!(
+                language,
+                "클라이언트에 알릴 IPv4는 0.0.0.0, 멀티캐스트, 브로드캐스트 주소일 수 없습니다",
+                "The advertised IPv4 cannot be 0.0.0.0, multicast, or broadcast",
+                "向客户端公布的 IPv4 不能是 0.0.0.0、组播或广播地址"
+            )));
         }
         let configured_port = self
             .configured_port
             .trim()
             .parse::<u16>()
-            .context("기준 포트는 0~65535 범위여야 합니다")?;
-        let ports = PortTopology::new(configured_port)
-            .context("기준 포트에서 P5136 서비스 포트를 모두 만들 수 없습니다")?;
-        let max_login_sessions = parse_usize(&self.max_login_sessions, "최대 로그인 세션 수")?;
+            .with_context(|| {
+                tr!(
+                    language,
+                    "기준 포트는 0~65535 범위여야 합니다",
+                    "The base port must be in the range 0–65535",
+                    "基准端口必须在 0–65535 范围内"
+                )
+            })?;
+        let ports = PortTopology::new(configured_port).with_context(|| {
+            tr!(
+                language,
+                "기준 포트에서 P5136 서비스 포트를 모두 만들 수 없습니다",
+                "The P5136 service ports cannot be derived from the base port",
+                "无法从基准端口生成全部 P5136 服务端口"
+            )
+        })?;
+        let max_login_sessions = parse_usize(
+            &self.max_login_sessions,
+            tr!(
+                language,
+                "최대 로그인 세션 수",
+                "Maximum login sessions",
+                "最大登录会话数"
+            ),
+            language,
+        )?;
         if max_login_sessions == 0 {
-            return Err(anyhow!("최대 로그인 세션 수는 1 이상이어야 합니다"));
+            return Err(anyhow!(tr!(
+                language,
+                "최대 로그인 세션 수는 1 이상이어야 합니다",
+                "Maximum login sessions must be at least 1",
+                "最大登录会话数必须至少为 1"
+            )));
         }
         if let Some(pool) = self
             .random_tracks
@@ -404,13 +557,25 @@ impl ServerInputs {
             .iter()
             .find(|pool| pool.track_ids.is_empty())
         {
-            return Err(anyhow!(
+            return Err(anyhow!(tr_format!(
+                language,
                 "랜덤 맵 사용자 지정 목록에는 맵이 1개 이상 필요합니다: game_type={}, selector={}",
+                "A custom random-track pool needs at least one track: game_type={}, selector={}",
+                "自定义随机地图池至少需要一张地图：game_type={}，selector={}",
                 pool.game_type,
                 pool.selector
-            ));
+            )));
         }
-        let client_path = required_path(&self.client_path, "클라이언트 또는 Profile 경로")?;
+        let client_path = required_path(
+            &self.client_path,
+            tr!(
+                language,
+                "클라이언트 또는 Profile 경로",
+                "Client or Profile path",
+                "客户端或 Profile 路径"
+            ),
+            language,
+        )?;
         let client_paths = client_paths::resolve_client_runtime_paths(
             Some(&client_path),
             optional_path_ref(&self.client_data_dir),
@@ -420,7 +585,16 @@ impl ServerInputs {
             bind_address,
             advertised_address,
             ports,
-            profile_root: required_path(&self.profile_root, "프로필 저장 경로")?,
+            profile_root: required_path(
+                &self.profile_root,
+                tr!(
+                    language,
+                    "프로필 저장 경로",
+                    "Profile storage path",
+                    "配置文件保存路径"
+                ),
+                language,
+            )?,
             catalog_path: None,
             client_data_dir: client_paths.client_data_dir,
             item_probability_rank_policy: if self.trust_client_item_rank {
@@ -438,19 +612,38 @@ impl ServerInputs {
             random_tracks: self.random_tracks.clone(),
             first_message_delay: Duration::from_millis(parse_u64(
                 &self.first_message_delay_ms,
-                "첫 메시지 지연",
+                tr!(
+                    language,
+                    "첫 메시지 지연",
+                    "First-message delay",
+                    "首条消息延迟"
+                ),
+                language,
             )?),
             login_timeout: Duration::from_secs(parse_u64(
                 &self.login_timeout_seconds,
-                "로그인 제한 시간",
+                tr!(language, "로그인 제한 시간", "Login timeout", "登录超时"),
+                language,
             )?),
             session_idle_timeout: Duration::from_secs(parse_u64(
                 &self.session_idle_timeout_seconds,
-                "세션 유휴 제한 시간",
+                tr!(
+                    language,
+                    "세션 유휴 제한 시간",
+                    "Session idle timeout",
+                    "会话空闲超时"
+                ),
+                language,
             )?),
             session_write_timeout: Duration::from_secs(parse_u64(
                 &self.session_write_timeout_seconds,
-                "세션 전송 제한 시간",
+                tr!(
+                    language,
+                    "세션 전송 제한 시간",
+                    "Session write timeout",
+                    "会话写入超时"
+                ),
+                language,
             )?),
             max_login_sessions,
             allow_remote_profile_creation: self.allow_remote_profile_creation,
@@ -459,16 +652,21 @@ impl ServerInputs {
     }
 }
 
-fn required_text<'a>(value: &'a str, label: &str) -> Result<&'a str> {
+fn required_text<'a>(value: &'a str, label: &str, language: GuiLanguage) -> Result<&'a str> {
     if value.trim().is_empty() {
-        Err(anyhow!("{label}을(를) 비워 둘 수 없습니다"))
+        Err(anyhow!(tr_format!(
+            language,
+            "{label}을(를) 비워 둘 수 없습니다",
+            "{label} cannot be empty",
+            "{label}不能为空"
+        )))
     } else {
         Ok(value)
     }
 }
 
-fn required_path(value: &str, label: &str) -> Result<PathBuf> {
-    required_text(value, label).map(PathBuf::from)
+fn required_path(value: &str, label: &str, language: GuiLanguage) -> Result<PathBuf> {
+    required_text(value, label, language).map(PathBuf::from)
 }
 
 fn optional_path_ref(value: &str) -> Option<&Path> {
@@ -479,23 +677,38 @@ fn optional_path(value: &str) -> Option<PathBuf> {
     optional_path_ref(value).map(Path::to_owned)
 }
 
-fn parse_u64(value: &str, label: &str) -> Result<u64> {
-    value
-        .trim()
-        .parse::<u64>()
-        .with_context(|| format!("{label}은(는) 0 이상의 정수여야 합니다"))
+fn parse_u64(value: &str, label: &str, language: GuiLanguage) -> Result<u64> {
+    value.trim().parse::<u64>().with_context(|| {
+        tr_format!(
+            language,
+            "{label}은(는) 0 이상의 정수여야 합니다",
+            "{label} must be a non-negative integer",
+            "{label}必须是非负整数"
+        )
+    })
 }
 
-fn parse_usize(value: &str, label: &str) -> Result<usize> {
-    value
-        .trim()
-        .parse::<usize>()
-        .with_context(|| format!("{label}은(는) 0 이상의 정수여야 합니다"))
+fn parse_usize(value: &str, label: &str, language: GuiLanguage) -> Result<usize> {
+    value.trim().parse::<usize>().with_context(|| {
+        tr_format!(
+            language,
+            "{label}은(는) 0 이상의 정수여야 합니다",
+            "{label} must be a non-negative integer",
+            "{label}必须是非负整数"
+        )
+    })
 }
 
-fn discover_lan_ipv4_candidates() -> Result<Vec<(String, Ipv4Addr)>> {
+fn discover_lan_ipv4_candidates(language: GuiLanguage) -> Result<Vec<(String, Ipv4Addr)>> {
     let mut candidates = local_ip_address::list_afinet_netifas()
-        .context("네트워크 어댑터 목록을 읽지 못했습니다")?
+        .with_context(|| {
+            tr!(
+                language,
+                "네트워크 어댑터 목록을 읽지 못했습니다",
+                "Failed to read the network-adapter list",
+                "无法读取网络适配器列表"
+            )
+        })?
         .into_iter()
         .filter_map(|(name, address)| match address {
             IpAddr::V4(address)
@@ -518,7 +731,12 @@ fn discover_lan_ipv4_candidates() -> Result<Vec<(String, Ipv4Addr)>> {
     });
     candidates.dedup_by_key(|(_, address)| *address);
     if candidates.is_empty() {
-        return Err(anyhow!("사용 가능한 LAN IPv4 주소를 찾지 못했습니다"));
+        return Err(anyhow!(tr!(
+            language,
+            "사용 가능한 LAN IPv4 주소를 찾지 못했습니다",
+            "No usable LAN IPv4 address was found",
+            "未找到可用的局域网 IPv4 地址"
+        )));
     }
     Ok(candidates)
 }
@@ -553,7 +771,21 @@ fn virtual_adapter_rank(name: &str) -> u8 {
     )
 }
 
-fn item_probability_grid(ui: &mut egui::Ui, entries: &mut [ItemProbabilityEntry]) -> bool {
+fn status_is_error(status: &str) -> bool {
+    status.contains("실패") || status.contains("Failed") || status.contains("失败")
+}
+
+fn status_is_uncertain(status: &str) -> bool {
+    status.contains("확인하지 못했습니다")
+        || status.contains("could not be confirmed")
+        || status.contains("无法确认")
+}
+
+fn item_probability_grid(
+    ui: &mut egui::Ui,
+    entries: &mut [ItemProbabilityEntry],
+    language: GuiLanguage,
+) -> bool {
     let mut changed = false;
     egui::ScrollArea::horizontal()
         .id_salt("item-probability-table-scroll")
@@ -563,7 +795,14 @@ fn item_probability_grid(ui: &mut egui::Ui, entries: &mut [ItemProbabilityEntry]
                 .striped(true)
                 .spacing([12.0, 5.0])
                 .show(ui, |ui| {
-                    for heading in ["ID", "아이템", "1등", "상위", "중위", "하위"] {
+                    for heading in [
+                        "ID",
+                        tr!(language, "아이템", "Item", "道具"),
+                        tr!(language, "1등", "1st", "第1名"),
+                        tr!(language, "상위", "High", "前列"),
+                        tr!(language, "중위", "Middle", "中游"),
+                        tr!(language, "하위", "Low", "后列"),
+                    ] {
                         ui.strong(heading);
                     }
                     ui.end_row();
@@ -591,14 +830,19 @@ fn item_probability_grid(ui: &mut egui::Ui, entries: &mut [ItemProbabilityEntry]
     changed
 }
 
-const fn rank_band_label_ko(rank_band: ItemProbabilityRankBand) -> &'static str {
+fn rank_band_label(rank_band: ItemProbabilityRankBand, language: GuiLanguage) -> &'static str {
     match rank_band {
-        ItemProbabilityRankBand::Live => "현재 순위 자동",
-        ItemProbabilityRankBand::Top => "1등",
-        ItemProbabilityRankBand::High => "상위",
-        ItemProbabilityRankBand::Middle => "중위",
-        ItemProbabilityRankBand::Low => "하위",
-        ItemProbabilityRankBand::Combined => "통합",
+        ItemProbabilityRankBand::Live => tr!(
+            language,
+            "현재 순위 자동",
+            "Automatic live rank",
+            "自动使用当前排名"
+        ),
+        ItemProbabilityRankBand::Top => tr!(language, "1등", "1st", "第1名"),
+        ItemProbabilityRankBand::High => tr!(language, "상위", "High", "前列"),
+        ItemProbabilityRankBand::Middle => tr!(language, "중위", "Middle", "中游"),
+        ItemProbabilityRankBand::Low => tr!(language, "하위", "Low", "后列"),
+        ItemProbabilityRankBand::Combined => tr!(language, "통합", "Combined", "综合"),
     }
 }
 
@@ -706,6 +950,7 @@ enum GuiEvent {
 struct P5136GuiApp {
     log_path: PathBuf,
     logging_control: FileLoggingControl,
+    language: GuiLanguage,
     selected_tab: GuiTab,
     connector_inputs: GuiInputs,
     connector_run_state: GuiRunState,
@@ -750,6 +995,9 @@ impl P5136GuiApp {
     ) -> Self {
         let (event_sender, event_receiver) = mpsc::channel();
         let persisted = GuiPersistedSettings::load(storage);
+        let language = persisted
+            .as_ref()
+            .map_or_else(GuiLanguage::default, |settings| settings.language);
         let connector_inputs = persisted
             .as_ref()
             .map_or_else(GuiInputs::default, |settings| settings.connector.clone());
@@ -760,6 +1008,7 @@ impl P5136GuiApp {
         Self {
             log_path,
             logging_control,
+            language,
             selected_tab: GuiTab::Server,
             connector_inputs,
             connector_run_state: GuiRunState::Idle,
@@ -773,16 +1022,31 @@ impl P5136GuiApp {
             close_requested: false,
             close_force_deadline: None,
             close_force_requested: false,
-            item_probability_status:
-                "자동: 서버 시작 시 클라이언트의 item.rho/RHO5 확률표를 적용합니다.".to_owned(),
+            item_probability_status: tr!(
+                language,
+                "자동: 서버 시작 시 클라이언트의 item.rho/RHO5 확률표를 적용합니다.",
+                "Automatic: applies the client's item.rho/RHO5 probability table when the server starts.",
+                "自动：服务器启动时应用客户端的 item.rho/RHO5 概率表。"
+            )
+            .to_owned(),
             lan_candidates: Vec::new(),
             selected_lan_candidate: 0,
-            lan_status: "LAN 자동 설정은 활성 네트워크 어댑터의 IPv4를 사용합니다.".to_owned(),
+            lan_status: tr!(
+                language,
+                "LAN 자동 설정은 활성 네트워크 어댑터의 IPv4를 사용합니다.",
+                "Automatic LAN setup uses an IPv4 address from an active network adapter.",
+                "局域网自动设置会使用活动网络适配器的 IPv4 地址。"
+            )
+            .to_owned(),
             random_track_catalog: None,
             selected_random_track_pool: 0,
-            random_track_status:
-                "자동: 서버 시작 시 클라이언트의 track_common.rho 기본 목록을 적용합니다."
-                    .to_owned(),
+            random_track_status: tr!(
+                language,
+                "자동: 서버 시작 시 클라이언트의 track_common.rho 기본 목록을 적용합니다.",
+                "Automatic: applies the client's default track_common.rho pools when the server starts.",
+                "自动：服务器启动时应用客户端 track_common.rho 的默认地图池。"
+            )
+            .to_owned(),
             inventory_catalog: None,
             inventory_catalog_data_dir: None,
             inventory_nickname,
@@ -791,8 +1055,13 @@ impl P5136GuiApp {
             inventory_selected_kart: None,
             inventory_kart_grant_options: KartGrantOptions::default(),
             inventory_additional_karts: Vec::new(),
-            inventory_status: "카트 목록을 불러온 뒤 닉네임별 추가 소유 카트를 관리할 수 있습니다."
-                .to_owned(),
+            inventory_status: tr!(
+                language,
+                "카트 목록을 불러온 뒤 닉네임별 추가 소유 카트를 관리할 수 있습니다.",
+                "Load the kart list to manage additional owned karts for each nickname.",
+                "加载车辆列表后，可按昵称管理额外拥有的车辆。"
+            )
+            .to_owned(),
         }
     }
 
@@ -818,11 +1087,21 @@ impl P5136GuiApp {
                 }
                 GuiEvent::RandomTracksUpdated(result) => match result {
                     Ok(()) => {
-                        "실행 중 서버에 랜덤 트랙 설정을 적용했습니다. 다음 경기 시작부터 사용합니다."
-                            .clone_into(&mut self.random_track_status);
+                        tr!(
+                            self.language,
+                            "실행 중 서버에 랜덤 트랙 설정을 적용했습니다. 다음 경기 시작부터 사용합니다.",
+                            "Applied the random-track settings to the running server. They take effect from the next race.",
+                            "已将随机地图设置应用到运行中的服务器，将从下一场比赛开始生效。"
+                        )
+                        .clone_into(&mut self.random_track_status);
                     }
                     Err(error) => {
-                        self.random_track_status = format!("랜덤 트랙 실시간 적용 실패: {error}");
+                        self.random_track_status = tr_format!(
+                            self.language,
+                            "랜덤 트랙 실시간 적용 실패: {error}",
+                            "Failed to apply random tracks live: {error}",
+                            "实时应用随机地图失败：{error}"
+                        );
                     }
                 },
                 GuiEvent::KartGranted(result) => self.apply_inventory_grant_result(result),
@@ -845,7 +1124,15 @@ impl P5136GuiApp {
                 Err(error) => ServerRunState::Failed(error),
             }
         } else {
-            ServerRunState::Failed("서버 작업 스레드가 종료 중 패닉했습니다".to_owned())
+            ServerRunState::Failed(
+                tr!(
+                    self.language,
+                    "서버 작업 스레드가 종료 중 패닉했습니다",
+                    "The server worker thread panicked while stopping",
+                    "服务器工作线程在停止时发生崩溃"
+                )
+                .to_owned(),
+            )
         };
     }
 
@@ -853,7 +1140,8 @@ impl P5136GuiApp {
         if self.connector_run_state.is_running() {
             return;
         }
-        let plan = match self.connector_inputs.connector_plan() {
+        let language = self.language;
+        let plan = match self.connector_inputs.connector_plan(language) {
             Ok(plan) => plan,
             Err(error) => {
                 self.connector_run_state = GuiRunState::Failed(format!("{error:#}"));
@@ -874,69 +1162,105 @@ impl P5136GuiApp {
         if let Err(error) = thread::Builder::new()
             .name("p5136-connector-worker".to_owned())
             .spawn(move || {
-                let outcome = run_connector_worker(&plan, &worker_notifier, &worker_cancellation)
-                    .map_err(|error| format!("{error:#}"));
+                let outcome =
+                    run_connector_worker(&plan, &worker_notifier, &worker_cancellation, language)
+                        .map_err(|error| format!("{error:#}"));
                 worker_notifier.send(GuiEvent::Connector(ConnectorGuiEvent::Finished(outcome)));
             })
         {
             if let Some(cancellation) = self.cancellation.take() {
                 cancellation.cancel();
             }
-            self.connector_run_state =
-                GuiRunState::Failed(format!("접속기 작업 스레드를 시작하지 못했습니다: {error}"));
+            self.connector_run_state = GuiRunState::Failed(tr_format!(
+                language,
+                "접속기 작업 스레드를 시작하지 못했습니다: {error}",
+                "Failed to start the connector worker thread: {error}",
+                "无法启动连接器工作线程：{error}"
+            ));
         }
     }
 
+    // Keeping translated labels beside their controls makes this form intentionally verbose.
+    #[allow(clippy::too_many_lines)]
     fn connector_input_panel(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         egui::Grid::new("connector-inputs")
             .num_columns(2)
             .spacing([14.0, 10.0])
             .show(ui, |ui| {
-                ui.label("게임 디렉터리");
+                ui.label(tr!(language, "게임 디렉터리", "Game directory", "游戏目录"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.game_directory)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("실행 파일 (선택)");
+                ui.label(tr!(
+                    language,
+                    "실행 파일 (선택)",
+                    "Executable (optional)",
+                    "可执行文件（可选）"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.game_executable)
-                        .hint_text("비우면 KartRider.exe")
+                        .hint_text(tr!(
+                            language,
+                            "비우면 KartRider.exe",
+                            "Leave empty for KartRider.exe",
+                            "留空则使用 KartRider.exe"
+                        ))
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("닉네임");
+                ui.label(tr!(language, "닉네임", "Nickname", "昵称"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.nickname)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("서버 IPv4");
+                ui.label(tr!(language, "계정 역할", "Account role", "账号角色"));
+                ui.checkbox(
+                    &mut self.connector_inputs.observer_mode,
+                    tr!(
+                        language,
+                        "옵저버 모드 (pmap 718)",
+                        "Observer mode (pmap 718)",
+                        "观察者模式（pmap 718）"
+                    ),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "옵저버 방장 역할로 로그인합니다. 현재는 역할/슬롯 진입만 지원하며, 옵저버 채팅과 개인전 맵 교체는 패킷 캡처 후 보강할 예정입니다.",
+                    "Logs in as an observer room master. Role and slot entry are supported; observer chat and solo map replacement still need packet captures.",
+                    "以观察者房主身份登录。目前支持角色和槽位进入；观察者聊天及个人赛换图仍需抓包完善。"
+                ));
+                ui.end_row();
+
+                ui.label(tr!(language, "서버 IPv4", "Server IPv4", "服务器 IPv4"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.server)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("기준 포트");
+                ui.label(tr!(language, "기준 포트", "Base port", "基准端口"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.configured_port)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("실행 방식");
+                ui.label(tr!(language, "실행 방식", "Launch method", "启动方式"));
                 egui::ComboBox::from_id_salt("connector-runner")
-                    .selected_text(self.connector_inputs.runner.label())
+                    .selected_text(self.connector_inputs.runner.label(language))
                     .show_ui(ui, |ui| {
                         for runner in GuiRunner::ALL {
                             ui.selectable_value(
                                 &mut self.connector_inputs.runner,
                                 runner,
-                                runner.label(),
+                                runner.label(language),
                             );
                         }
                     });
@@ -948,34 +1272,58 @@ impl P5136GuiApp {
         if self.connector_inputs.runner == GuiRunner::NativeElevated && !cfg!(windows) {
             ui.colored_label(
                 egui::Color32::YELLOW,
-                "이 운영체제에서는 Windows UAC 실행을 사용할 수 없습니다.",
+                tr!(
+                    language,
+                    "이 운영체제에서는 Windows UAC 실행을 사용할 수 없습니다.",
+                    "Windows UAC launch is unavailable on this operating system.",
+                    "此操作系统不支持 Windows UAC 启动。"
+                ),
             );
         }
         if self.connector_inputs.runner == GuiRunner::Auto {
             let resolution = if cfg!(windows) { "Windows UAC" } else { "Wine" };
-            ui.weak(format!(
-                "자동 모드는 이 운영체제에서 {resolution}(으)로 실행합니다."
+            ui.weak(tr_format!(
+                language,
+                "자동 모드는 이 운영체제에서 {resolution}(으)로 실행합니다.",
+                "Automatic mode uses {resolution} on this operating system.",
+                "自动模式在此操作系统上使用 {resolution}。"
             ));
         }
         if self.connector_inputs.runner == GuiRunner::Sikarugir && !cfg!(target_os = "macos") {
             ui.colored_label(
                 egui::Color32::YELLOW,
-                "Sikarugir wrapper 실행은 macOS에서만 사용할 수 있습니다.",
+                tr!(
+                    language,
+                    "Sikarugir wrapper 실행은 macOS에서만 사용할 수 있습니다.",
+                    "The Sikarugir wrapper is available only on macOS.",
+                    "Sikarugir 包装器仅可在 macOS 上使用。"
+                ),
             );
         }
     }
 
     fn connector_runner_inputs(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         match self.connector_inputs.runner {
             GuiRunner::Wine => {
-                ui.label("Wine 실행 파일");
+                ui.label(tr!(
+                    language,
+                    "Wine 실행 파일",
+                    "Wine executable",
+                    "Wine 可执行文件"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.wine_binary)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("Wine prefix (선택)");
+                ui.label(tr!(
+                    language,
+                    "Wine prefix (선택)",
+                    "Wine prefix (optional)",
+                    "Wine prefix（可选）"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.wine_prefix)
                         .desired_width(f32::INFINITY),
@@ -983,14 +1331,24 @@ impl P5136GuiApp {
                 ui.end_row();
             }
             GuiRunner::CrossOver => {
-                ui.label("CrossOver Wine 실행 파일");
+                ui.label(tr!(
+                    language,
+                    "CrossOver Wine 실행 파일",
+                    "CrossOver Wine executable",
+                    "CrossOver Wine 可执行文件"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.crossover_binary)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("CrossOver 보틀");
+                ui.label(tr!(
+                    language,
+                    "CrossOver 보틀",
+                    "CrossOver bottle",
+                    "CrossOver 容器"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.crossover_bottle)
                         .desired_width(f32::INFINITY),
@@ -998,10 +1356,20 @@ impl P5136GuiApp {
                 ui.end_row();
             }
             GuiRunner::Sikarugir => {
-                ui.label("Sikarugir wrapper 앱");
+                ui.label(tr!(
+                    language,
+                    "Sikarugir wrapper 앱",
+                    "Sikarugir wrapper app",
+                    "Sikarugir 包装器应用"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.connector_inputs.sikarugir_app)
-                        .hint_text("예: /Applications/KartRider.app")
+                        .hint_text(tr!(
+                            language,
+                            "예: /Applications/KartRider.app",
+                            "Example: /Applications/KartRider.app",
+                            "示例：/Applications/KartRider.app"
+                        ))
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
@@ -1011,25 +1379,31 @@ impl P5136GuiApp {
     }
 
     fn connector_status_panel(&self, ui: &mut egui::Ui) {
+        let language = self.language;
         match &self.connector_run_state {
             GuiRunState::Idle => {
-                ui.weak("준비됨.");
+                ui.weak(tr!(language, "준비됨.", "Ready.", "就绪。"));
             }
             GuiRunState::Running(stage) => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(stage_label(*stage));
+                    ui.label(stage_label(*stage, language));
                 });
             }
             GuiRunState::Succeeded(success) => {
-                let pid = success
-                    .pid
-                    .map_or_else(|| "확인 불가".to_owned(), |pid| pid.to_string());
+                let pid = success.pid.map_or_else(
+                    || tr!(language, "확인 불가", "Unavailable", "不可用").to_owned(),
+                    |pid| pid.to_string(),
+                );
                 ui.colored_label(
                     egui::Color32::LIGHT_GREEN,
-                    format!(
+                    tr_format!(
+                        language,
                         "{} 방식으로 실행했습니다 — PID {pid}, {}.",
-                        success.backend, success.status
+                        "Launched with {} — PID {pid}, {}.",
+                        "已通过 {} 启动 — PID {pid}，{}。",
+                        success.backend,
+                        success.status
                     ),
                 );
             }
@@ -1051,7 +1425,8 @@ impl P5136GuiApp {
         if self.server_run_state.is_active() {
             return;
         }
-        let mut config = match self.server_inputs.server_config() {
+        let language = self.language;
+        let mut config = match self.server_inputs.server_config(language) {
             Ok(config) => config,
             Err(error) => {
                 self.server_run_state = ServerRunState::Failed(format!("{error:#}"));
@@ -1071,8 +1446,11 @@ impl P5136GuiApp {
             if let Some(data_dir) = &config.client_data_dir {
                 match load_client_item_probabilities(data_dir) {
                     Ok(configuration) => {
-                        self.item_probability_status = format!(
+                        self.item_probability_status = tr_format!(
+                            language,
                             "자동 적용 확인: {} (개인 {}개 / 팀 {}개).",
+                            "Automatic table verified: {} ({} solo / {} team entries).",
+                            "已确认自动应用：{}（个人 {} 项 / 组队 {} 项）。",
                             data_dir.display(),
                             configuration.individual.len(),
                             configuration.team.len(),
@@ -1083,15 +1461,23 @@ impl P5136GuiApp {
                         config.item_probabilities = Some(configuration);
                     }
                     Err(error) => {
-                        self.server_run_state = ServerRunState::Failed(format!(
-                            "클라이언트 아이템 확률표를 읽지 못했습니다: {error:#}"
+                        self.server_run_state = ServerRunState::Failed(tr_format!(
+                            language,
+                            "클라이언트 아이템 확률표를 읽지 못했습니다: {error:#}",
+                            "Failed to read the client item-probability table: {error:#}",
+                            "无法读取客户端道具概率表：{error:#}"
                         ));
                         return;
                     }
                 }
             } else {
-                "클라이언트 Data 경로가 없어 안전 기본 확률표를 사용합니다."
-                    .clone_into(&mut self.item_probability_status);
+                tr!(
+                    language,
+                    "클라이언트 Data 경로가 없어 안전 기본 확률표를 사용합니다.",
+                    "No client Data path is configured; using the safe fallback probability table.",
+                    "未配置客户端 Data 路径，将使用安全的默认概率表。"
+                )
+                .clone_into(&mut self.item_probability_status);
             }
         }
         self.server_run_state = ServerRunState::Starting;
@@ -1105,15 +1491,18 @@ impl P5136GuiApp {
         match thread::Builder::new()
             .name("p5136-server-worker".to_owned())
             .spawn(move || {
-                let outcome = run_server_worker(config, controls, &worker_notifier)
+                let outcome = run_server_worker(config, controls, &worker_notifier, language)
                     .map_err(|error| format!("{error:#}"));
                 worker_notifier.send(GuiEvent::ServerFinished(outcome));
             }) {
             Ok(worker) => self.server_worker = Some(worker),
             Err(error) => {
                 self.server_controller = None;
-                self.server_run_state = ServerRunState::Failed(format!(
-                    "서버 작업 스레드를 시작하지 못했습니다: {error}"
+                self.server_run_state = ServerRunState::Failed(tr_format!(
+                    language,
+                    "서버 작업 스레드를 시작하지 못했습니다: {error}",
+                    "Failed to start the server worker thread: {error}",
+                    "无法启动服务器工作线程：{error}"
                 ));
             }
         }
@@ -1126,14 +1515,25 @@ impl P5136GuiApp {
         );
         let Some(controller) = &self.server_controller else {
             self.server_run_state = ServerRunState::Failed(
-                "서버 제어 채널을 사용할 수 없습니다. 서버 작업이 끝날 때까지 기다리세요"
-                    .to_owned(),
+                tr!(
+                    self.language,
+                    "서버 제어 채널을 사용할 수 없습니다. 서버 작업이 끝날 때까지 기다리세요",
+                    "The server control channel is unavailable. Wait for the server task to finish.",
+                    "服务器控制通道不可用，请等待服务器任务结束。"
+                )
+                .to_owned(),
             );
             return;
         };
         if controller.send(command).is_err() {
             self.server_run_state = ServerRunState::Failed(
-                "요청을 전달하기 전에 서버 제어 채널이 닫혔습니다".to_owned(),
+                tr!(
+                    self.language,
+                    "요청을 전달하기 전에 서버 제어 채널이 닫혔습니다",
+                    "The server control channel closed before the request was delivered",
+                    "请求发送前服务器控制通道已关闭"
+                )
+                .to_owned(),
             );
             return;
         }
@@ -1187,69 +1587,113 @@ impl P5136GuiApp {
     }
 
     fn load_client_item_probability_defaults(&mut self) {
+        let language = self.language;
         let outcome = (|| -> Result<(ItemProbabilityConfiguration, PathBuf)> {
             let paths = client_paths::resolve_client_runtime_paths(
                 optional_path_ref(&self.server_inputs.client_path),
                 optional_path_ref(&self.server_inputs.client_data_dir),
             )?;
-            let data_dir = paths
-                .client_data_dir
-                .ok_or_else(|| anyhow!("먼저 클라이언트 디렉터리 또는 Data 경로를 설정하세요"))?;
-            let configuration = load_client_item_probabilities(&data_dir)
-                .with_context(|| format!("{}을(를) 읽지 못했습니다", data_dir.display()))?;
+            let data_dir = paths.client_data_dir.ok_or_else(|| {
+                anyhow!(tr!(
+                    language,
+                    "먼저 클라이언트 디렉터리 또는 Data 경로를 설정하세요",
+                    "Set the client directory or Data path first",
+                    "请先设置客户端目录或 Data 路径"
+                ))
+            })?;
+            let configuration = load_client_item_probabilities(&data_dir).with_context(|| {
+                tr_format!(
+                    language,
+                    "{}을(를) 읽지 못했습니다",
+                    "Failed to read {}",
+                    "无法读取 {}",
+                    data_dir.display()
+                )
+            })?;
             Ok((configuration, data_dir))
         })();
         match outcome {
             Ok((configuration, data_dir)) => {
                 self.server_inputs.item_probabilities = configuration;
                 self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
-                self.item_probability_status = format!(
+                self.item_probability_status = tr_format!(
+                    language,
                     "클라이언트 확률표를 불러와 편집값으로 고정했습니다: {}.",
+                    "Loaded the client probability table and pinned it as editable values: {}.",
+                    "已加载客户端概率表并固定为可编辑值：{}。",
                     data_dir.display()
                 );
             }
             Err(error) => {
-                self.item_probability_status = format!("item.rho/RHO5 로드 실패: {error:#}");
+                self.item_probability_status = tr_format!(
+                    language,
+                    "item.rho/RHO5 로드 실패: {error:#}",
+                    "Failed to load item.rho/RHO5: {error:#}",
+                    "加载 item.rho/RHO5 失败：{error:#}"
+                );
             }
         }
     }
 
     fn apply_best_lan_ipv4(&mut self) {
-        match discover_lan_ipv4_candidates() {
+        let language = self.language;
+        match discover_lan_ipv4_candidates(language) {
             Ok(candidates) => {
                 self.lan_candidates = candidates;
                 self.selected_lan_candidate = 0;
                 let (_, address) = &self.lan_candidates[0];
                 self.server_inputs.bind_address = address.to_string();
                 self.server_inputs.advertised_address = address.to_string();
-                self.lan_status = format!(
-                    "바인드 주소와 광고 주소를 {address}로 설정했습니다. 다른 어댑터도 아래에서 선택할 수 있습니다."
+                self.lan_status = tr_format!(
+                    language,
+                    "바인드 주소와 광고 주소를 {address}로 설정했습니다. 다른 어댑터도 아래에서 선택할 수 있습니다.",
+                    "Set both bind and advertised addresses to {address}. You can select another adapter below.",
+                    "已将绑定地址和公布地址设为 {address}。可在下方选择其他适配器。"
                 );
             }
-            Err(error) => self.lan_status = format!("LAN 주소 검색 실패: {error:#}"),
+            Err(error) => {
+                self.lan_status = tr_format!(
+                    language,
+                    "LAN 주소 검색 실패: {error:#}",
+                    "Failed to discover a LAN address: {error:#}",
+                    "查找局域网地址失败：{error:#}"
+                );
+            }
         }
     }
 
     fn load_random_track_catalog(&mut self) {
+        let language = self.language;
         let outcome = (|| -> Result<RandomTrackCatalog> {
             let paths = client_paths::resolve_client_runtime_paths(
                 optional_path_ref(&self.server_inputs.client_path),
                 optional_path_ref(&self.server_inputs.client_data_dir),
             )?;
-            let data_dir = paths
-                .client_data_dir
-                .ok_or_else(|| anyhow!("먼저 클라이언트 디렉터리 또는 Data 경로를 설정하세요"))?;
+            let data_dir = paths.client_data_dir.ok_or_else(|| {
+                anyhow!(tr!(
+                    language,
+                    "먼저 클라이언트 디렉터리 또는 Data 경로를 설정하세요",
+                    "Set the client directory or Data path first",
+                    "请先设置客户端目录或 Data 路径"
+                ))
+            })?;
             load_client_random_track_catalog(&data_dir).with_context(|| {
-                format!(
+                tr_format!(
+                    language,
                     "{}의 track_common.rho를 읽지 못했습니다",
+                    "Failed to read track_common.rho from {}",
+                    "无法读取 {} 中的 track_common.rho",
                     data_dir.display()
                 )
             })
         })();
         match outcome {
             Ok(catalog) => {
-                self.random_track_status = format!(
+                self.random_track_status = tr_format!(
+                    language,
                     "랜덤 트랙 {}개, 선택 풀 {}개를 읽었습니다: {}",
+                    "Loaded {} random tracks across {} selectable pools: {}",
+                    "已加载 {} 张随机地图和 {} 个可选地图池：{}",
                     catalog.tracks().len(),
                     catalog.pools().len(),
                     catalog.source_path().display(),
@@ -1259,25 +1703,47 @@ impl P5136GuiApp {
                     .min(catalog.pools().len().saturating_sub(1));
                 self.random_track_catalog = Some(catalog);
             }
-            Err(error) => self.random_track_status = format!("랜덤 트랙 로드 실패: {error:#}"),
+            Err(error) => {
+                self.random_track_status = tr_format!(
+                    language,
+                    "랜덤 트랙 로드 실패: {error:#}",
+                    "Failed to load random tracks: {error:#}",
+                    "加载随机地图失败：{error:#}"
+                );
+            }
         }
     }
 
     fn load_inventory_catalog(&mut self) {
+        let language = self.language;
         let outcome = (|| -> Result<(Arc<CatalogInventory>, PathBuf, String)> {
             let paths = client_paths::resolve_client_runtime_paths(
                 optional_path_ref(&self.server_inputs.client_path),
                 optional_path_ref(&self.server_inputs.client_data_dir),
             )?;
             let data_dir = paths.client_data_dir.ok_or_else(|| {
-                anyhow!("먼저 클라이언트 루트, Profile 또는 Data 경로를 설정하세요")
+                anyhow!(tr!(
+                    language,
+                    "먼저 클라이언트 루트, Profile 또는 Data 경로를 설정하세요",
+                    "Set the client root, Profile, or Data path first",
+                    "请先设置客户端根目录、Profile 或 Data 路径"
+                ))
             })?;
             let loaded = load_client_kart_catalog(&data_dir).with_context(|| {
-                format!("{}의 RHO 카트 데이터를 읽지 못했습니다", data_dir.display())
+                tr_format!(
+                    language,
+                    "{}의 RHO 카트 데이터를 읽지 못했습니다",
+                    "Failed to read RHO kart data from {}",
+                    "无法读取 {} 中的 RHO 车辆数据",
+                    data_dir.display()
+                )
             })?;
             let stats = loaded.stats();
-            let summary = format!(
+            let summary = tr_format!(
+                language,
                 "이름 {}, 물리 {}, 상점 {}개/{}분류, 자동 카트 {}개, 수동 확인 카트 {}개, 변환 {}개",
+                "{} names, {} physics specs, {} shop items/{} categories, {} automatic karts, {} manual-review karts, {} transforms",
+                "名称 {}、物理 {}、商店 {} 项/{} 类、自动车辆 {}、需手动确认车辆 {}、转换规则 {}",
                 stats.names,
                 stats.specs,
                 stats.inventory_items,
@@ -1301,8 +1767,11 @@ impl P5136GuiApp {
                 self.inventory_catalog = Some(catalog);
                 self.inventory_catalog_data_dir = Some(data_dir.clone());
                 self.refresh_inventory_search_results();
-                self.inventory_status = format!(
+                self.inventory_status = tr_format!(
+                    language,
                     "RHO에서 자동 지급 가능한 카트 {kart_count}개를 읽었습니다. 보수적 검사에서 빠진 카트는 정확한 ID로 수동 추가할 수 있습니다 ({summary}): {}",
+                    "Loaded {kart_count} automatically grantable karts from RHO. Karts excluded by conservative checks can be added manually by exact ID ({summary}): {}",
+                    "已从 RHO 加载 {kart_count} 辆可自动发放的车辆。被保守检查排除的车辆可用精确 ID 手动添加（{summary}）：{}",
                     data_dir.display()
                 );
             }
@@ -1311,7 +1780,12 @@ impl P5136GuiApp {
                 self.inventory_catalog_data_dir = None;
                 self.inventory_kart_results.clear();
                 self.inventory_selected_kart = None;
-                self.inventory_status = format!("RHO 카트 목록 로드 실패: {error:#}");
+                self.inventory_status = tr_format!(
+                    language,
+                    "RHO 카트 목록 로드 실패: {error:#}",
+                    "Failed to load the RHO kart list: {error:#}",
+                    "加载 RHO 车辆列表失败：{error:#}"
+                );
             }
         }
     }
@@ -1327,15 +1801,35 @@ impl P5136GuiApp {
     }
 
     fn refresh_inventory_profile(&mut self) {
+        let language = self.language;
         let outcome = (|| -> Result<(bool, Vec<AdditionalKart>)> {
-            let catalog = self
-                .inventory_catalog
-                .as_ref()
-                .ok_or_else(|| anyhow!("먼저 카트 목록을 불러오세요"))?;
-            let nickname = required_text(&self.inventory_nickname, "인벤토리 닉네임")?;
+            let catalog = self.inventory_catalog.as_ref().ok_or_else(|| {
+                anyhow!(tr!(
+                    language,
+                    "먼저 카트 목록을 불러오세요",
+                    "Load the kart list first",
+                    "请先加载车辆列表"
+                ))
+            })?;
+            let nickname = required_text(
+                &self.inventory_nickname,
+                tr!(
+                    language,
+                    "인벤토리 닉네임",
+                    "Inventory nickname",
+                    "库存昵称"
+                ),
+                language,
+            )?;
             let store = ProfileStore::new(required_path(
                 &self.server_inputs.profile_root,
-                "프로필 저장 경로",
+                tr!(
+                    language,
+                    "프로필 저장 경로",
+                    "Profile storage path",
+                    "配置文件保存路径"
+                ),
+                language,
             )?);
             if !store.profile_exists(nickname)? {
                 return Ok((false, Vec::new()));
@@ -1347,36 +1841,66 @@ impl P5136GuiApp {
             Ok((true, karts)) => {
                 let count = karts.len();
                 self.inventory_additional_karts = karts;
-                self.inventory_status = format!(
+                self.inventory_status = tr_format!(
+                    language,
                     "{}의 추가 소유 카트 {count}개를 읽었습니다.",
+                    "Loaded {count} additional owned karts for {}.",
+                    "已为 {} 加载 {count} 辆额外拥有的车辆。",
                     self.inventory_nickname.trim()
                 );
             }
             Ok((false, _)) => {
                 self.inventory_additional_karts.clear();
-                self.inventory_status = format!(
+                self.inventory_status = tr_format!(
+                    language,
                     "{} 프로필은 아직 없습니다. 카트를 추가하면 새 프로필을 만듭니다.",
+                    "The profile for {} does not exist yet. Adding a kart will create it.",
+                    "尚无 {} 的配置文件。添加车辆时将创建新配置文件。",
                     self.inventory_nickname.trim()
                 );
             }
             Err(error) => {
-                self.inventory_status = format!("인벤토리 조회 실패: {error:#}");
+                self.inventory_status = tr_format!(
+                    language,
+                    "인벤토리 조회 실패: {error:#}",
+                    "Failed to query the inventory: {error:#}",
+                    "查询库存失败：{error:#}"
+                );
             }
         }
     }
 
     fn add_selected_inventory_kart(&mut self) {
+        let language = self.language;
         let request = (|| -> Result<(Arc<CatalogInventory>, String, u16, KartGrantOptions)> {
             self.validate_current_inventory_catalog_source()?;
-            let catalog = self
-                .inventory_catalog
-                .as_ref()
-                .ok_or_else(|| anyhow!("먼저 카트 목록을 불러오세요"))?;
-            let selected = self
-                .inventory_selected_kart
-                .as_ref()
-                .ok_or_else(|| anyhow!("검색 결과에서 추가할 카트를 선택하세요"))?;
-            let nickname = required_text(&self.inventory_nickname, "인벤토리 닉네임")?.to_owned();
+            let catalog = self.inventory_catalog.as_ref().ok_or_else(|| {
+                anyhow!(tr!(
+                    language,
+                    "먼저 카트 목록을 불러오세요",
+                    "Load the kart list first",
+                    "请先加载车辆列表"
+                ))
+            })?;
+            let selected = self.inventory_selected_kart.as_ref().ok_or_else(|| {
+                anyhow!(tr!(
+                    language,
+                    "검색 결과에서 추가할 카트를 선택하세요",
+                    "Select a kart from the search results",
+                    "请从搜索结果中选择要添加的车辆"
+                ))
+            })?;
+            let nickname = required_text(
+                &self.inventory_nickname,
+                tr!(
+                    language,
+                    "인벤토리 닉네임",
+                    "Inventory nickname",
+                    "库存昵称"
+                ),
+                language,
+            )?
+            .to_owned();
             let supports_enhancements = catalog.supports_legacy_kart_enhancements(selected.kart_id);
             Ok((
                 Arc::clone(catalog),
@@ -1393,7 +1917,12 @@ impl P5136GuiApp {
         let (catalog, nickname, kart_id, options) = match request {
             Ok(request) => request,
             Err(error) => {
-                self.inventory_status = format!("카트 추가 실패: {error:#}");
+                self.inventory_status = tr_format!(
+                    language,
+                    "카트 추가 실패: {error:#}",
+                    "Failed to add the kart: {error:#}",
+                    "添加车辆失败：{error:#}"
+                );
                 return;
             }
         };
@@ -1405,20 +1934,36 @@ impl P5136GuiApp {
                 kart_id,
                 options,
             });
-            "실행 중 서버의 프로필 저장 큐에 카트 지급을 요청했습니다."
-                .clone_into(&mut self.inventory_status);
+            tr!(
+                language,
+                "실행 중 서버의 프로필 저장 큐에 카트 지급을 요청했습니다.",
+                "Requested the running server to grant the kart through its profile queue.",
+                "已请求运行中的服务器通过配置文件队列发放车辆。"
+            )
+            .clone_into(&mut self.inventory_status);
             return;
         }
         if self.server_run_state.is_active() {
-            "서버가 시작 또는 종료 중입니다. 실행 완료 후 다시 지급하세요."
-                .clone_into(&mut self.inventory_status);
+            tr!(
+                language,
+                "서버가 시작 또는 종료 중입니다. 실행 완료 후 다시 지급하세요.",
+                "The server is starting or stopping. Try granting the kart again after it finishes.",
+                "服务器正在启动或停止，请在完成后再次发放车辆。"
+            )
+            .clone_into(&mut self.inventory_status);
             return;
         }
 
         let outcome = (|| -> Result<AddKartOutcome> {
             let store = ProfileStore::new(required_path(
                 &self.server_inputs.profile_root,
-                "프로필 저장 경로",
+                tr!(
+                    language,
+                    "프로필 저장 경로",
+                    "Profile storage path",
+                    "配置文件保存路径"
+                ),
+                language,
             )?);
             Ok(add_kart_with_options(
                 &store, &catalog, &nickname, kart_id, options,
@@ -1428,6 +1973,7 @@ impl P5136GuiApp {
     }
 
     fn apply_inventory_grant_result(&mut self, outcome: Result<AddKartOutcome, String>) {
+        let language = self.language;
         match outcome {
             Ok(added) => {
                 self.inventory_additional_karts = added.additional_karts().to_vec();
@@ -1439,50 +1985,83 @@ impl P5136GuiApp {
                     applied.push("333 (603/903/703)");
                 }
                 if enhancements.grade_five {
-                    applied.push("5강");
+                    applied.push(tr!(language, "5강", "grade 5", "强化 5"));
                 }
                 let enhancement_suffix = if applied.is_empty() {
                     String::new()
                 } else {
-                    format!(" 강화 적용: {}.", applied.join(", "))
+                    tr_format!(
+                        language,
+                        " 강화 적용: {}.",
+                        " Enhancements applied: {}.",
+                        " 已应用强化：{}。",
+                        applied.join(", ")
+                    )
                 };
                 let durability_suffix = if enhancements.durability_warnings.is_empty() {
                     String::new()
                 } else {
-                    format!(
+                    tr_format!(
+                        language,
                         " 강화 파일 동기화 경고: {}",
+                        " Enhancement-file synchronization warning: {}",
+                        " 强化文件同步警告：{}",
                         enhancements.durability_warnings.join("; ")
                     )
                 };
                 self.inventory_status = match &added {
-                    AddKartOutcome::Durable { .. } => format!(
+                    AddKartOutcome::Durable { .. } => tr_format!(
+                        language,
                         "{}에 {} (ID {}, serial {})을 추가했습니다. 프로필 revision {revision}.{enhancement_suffix}{durability_suffix}",
+                        "For {}, added {} (ID {}, serial {}). Profile revision {revision}.{enhancement_suffix}{durability_suffix}",
+                        "已向 {} 添加 {}（ID {}，serial {}）。配置文件 revision {revision}.{enhancement_suffix}{durability_suffix}",
                         self.inventory_nickname.trim(),
                         kart.name,
                         kart.kart_id,
                         kart.serial,
                     ),
-                    AddKartOutcome::DurabilityUncertain { error, .. } => format!(
-                        "카트는 revision {revision}에 추가됐지만 디렉터리 동기화를 확인하지 못했습니다: {error}. 재추가하지 말고 새로고침으로 확인하세요.{enhancement_suffix}{durability_suffix}"
+                    AddKartOutcome::DurabilityUncertain { error, .. } => tr_format!(
+                        language,
+                        "카트는 revision {revision}에 추가됐지만 디렉터리 동기화를 확인하지 못했습니다: {error}. 재추가하지 말고 새로고침으로 확인하세요.{enhancement_suffix}{durability_suffix}",
+                        "The kart was added at revision {revision}, but directory synchronization could not be confirmed: {error}. Do not add it again; refresh to verify.{enhancement_suffix}{durability_suffix}",
+                        "车辆已在 revision {revision} 添加，但无法确认目录同步：{error}。请勿重复添加，请刷新确认。{enhancement_suffix}{durability_suffix}"
                     ),
                 };
             }
             Err(error) => {
-                self.inventory_status = format!("카트 추가 실패: {error}");
+                self.inventory_status = tr_format!(
+                    language,
+                    "카트 추가 실패: {error}",
+                    "Failed to add the kart: {error}",
+                    "添加车辆失败：{error}"
+                );
             }
         }
     }
 
     fn apply_live_random_tracks(&mut self) {
+        let language = self.language;
         if !matches!(self.server_run_state, ServerRunState::Running(_)) {
-            "서버가 실행 중일 때만 실시간 적용할 수 있습니다."
-                .clone_into(&mut self.random_track_status);
+            tr!(
+                language,
+                "서버가 실행 중일 때만 실시간 적용할 수 있습니다.",
+                "Live settings can be applied only while the server is running.",
+                "仅可在服务器运行时实时应用设置。"
+            )
+            .clone_into(&mut self.random_track_status);
             return;
         }
         let resolved = self
             .random_track_catalog
             .as_ref()
-            .ok_or_else(|| anyhow!("먼저 클라이언트 랜덤 트랙 목록을 불러오세요"))
+            .ok_or_else(|| {
+                anyhow!(tr!(
+                    language,
+                    "먼저 클라이언트 랜덤 트랙 목록을 불러오세요",
+                    "Load the client random-track list first",
+                    "请先加载客户端随机地图列表"
+                ))
+            })
             .and_then(|catalog| {
                 catalog
                     .resolve(&self.server_inputs.random_tracks)
@@ -1491,39 +2070,65 @@ impl P5136GuiApp {
         match resolved {
             Ok(resolved) => {
                 self.request_server_control(ServerControl::UpdateRandomTracks(resolved));
-                "실행 중 서버에 랜덤 트랙 설정 적용을 요청했습니다."
-                    .clone_into(&mut self.random_track_status);
+                tr!(
+                    language,
+                    "실행 중 서버에 랜덤 트랙 설정 적용을 요청했습니다.",
+                    "Requested the running server to apply the random-track settings.",
+                    "已请求运行中的服务器应用随机地图设置。"
+                )
+                .clone_into(&mut self.random_track_status);
             }
             Err(error) => {
-                self.random_track_status = format!("랜덤 트랙 실시간 적용 실패: {error:#}");
+                self.random_track_status = tr_format!(
+                    language,
+                    "랜덤 트랙 실시간 적용 실패: {error:#}",
+                    "Failed to apply random tracks live: {error:#}",
+                    "实时应用随机地图失败：{error:#}"
+                );
             }
         }
     }
 
     fn validate_current_inventory_catalog_source(&self) -> Result<()> {
-        let loaded_data_dir = self
-            .inventory_catalog_data_dir
-            .as_ref()
-            .ok_or_else(|| anyhow!("먼저 카트 목록을 불러오세요"))?;
+        let language = self.language;
+        let loaded_data_dir = self.inventory_catalog_data_dir.as_ref().ok_or_else(|| {
+            anyhow!(tr!(
+                language,
+                "먼저 카트 목록을 불러오세요",
+                "Load the kart list first",
+                "请先加载车辆列表"
+            ))
+        })?;
         let paths = client_paths::resolve_client_runtime_paths(
             optional_path_ref(&self.server_inputs.client_path),
             optional_path_ref(&self.server_inputs.client_data_dir),
         )?;
-        let current_data_dir = paths
-            .client_data_dir
-            .ok_or_else(|| anyhow!("클라이언트 또는 Data 경로가 비어 있습니다"))?;
+        let current_data_dir = paths.client_data_dir.ok_or_else(|| {
+            anyhow!(tr!(
+                language,
+                "클라이언트 또는 Data 경로가 비어 있습니다",
+                "The client or Data path is empty",
+                "客户端或 Data 路径为空"
+            ))
+        })?;
         let current_data_dir = std::fs::canonicalize(&current_data_dir).with_context(|| {
-            format!(
+            tr_format!(
+                language,
                 "{}의 실제 경로를 확인하지 못했습니다",
+                "Failed to resolve the canonical path of {}",
+                "无法解析 {} 的实际路径",
                 current_data_dir.display()
             )
         })?;
         if current_data_dir != *loaded_data_dir {
-            return Err(anyhow!(
+            return Err(anyhow!(tr_format!(
+                language,
                 "클라이언트 Data 경로가 바뀌었습니다. RHO 카트 목록을 다시 불러오세요: {} → {}",
+                "The client Data path changed. Reload the RHO kart list: {} → {}",
+                "客户端 Data 路径已更改，请重新加载 RHO 车辆列表：{} → {}",
                 loaded_data_dir.display(),
                 current_data_dir.display()
-            ));
+            )));
         }
         Ok(())
     }
@@ -1534,20 +2139,33 @@ impl P5136GuiApp {
         self.inventory_kart_results.clear();
         self.inventory_selected_kart = None;
         self.inventory_additional_karts.clear();
-        "클라이언트 경로가 바뀌었습니다. 카트 목록을 다시 불러오세요."
-            .clone_into(&mut self.inventory_status);
+        tr!(
+            self.language,
+            "클라이언트 경로가 바뀌었습니다. 카트 목록을 다시 불러오세요.",
+            "The client path changed. Reload the kart list.",
+            "客户端路径已更改，请重新加载车辆列表。"
+        )
+        .clone_into(&mut self.inventory_status);
     }
 
     fn inventory_editor(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("닉네임별 인벤토리 편집", |ui| {
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "닉네임별 인벤토리 편집",
+                "Inventory editor by nickname",
+                "按昵称编辑库存"
+            ),
+            |ui| {
             self.inventory_catalog_controls(ui);
             ui.separator();
             self.inventory_profile_controls(ui);
             ui.separator();
             self.inventory_kart_search_controls(ui);
             self.inventory_additional_kart_list(ui);
-            let failed = self.inventory_status.contains("실패");
-            let uncertain = self.inventory_status.contains("확인하지 못했습니다");
+            let failed = status_is_error(&self.inventory_status);
+            let uncertain = status_is_uncertain(&self.inventory_status);
             ui.colored_label(
                 if failed {
                     egui::Color32::LIGHT_RED
@@ -1558,51 +2176,107 @@ impl P5136GuiApp {
                 },
                 &self.inventory_status,
             );
-            ui.weak(
+            ui.weak(tr!(
+                language,
                 "기본 카트는 모두 serial 1로 제공됩니다. 여기서 추가한 복사본은 serial 2 이상을 받아 서로 다른 강화·파츠 상태를 가질 수 있습니다.",
-            );
-            ui.weak("편집 결과는 해당 닉네임의 프로필 revision에 즉시 저장됩니다. 접속 중이었다면 재접속 후 반영됩니다.");
-        });
+                "Default karts use serial 1. Copies added here receive serial 2 or higher and can keep separate enhancement and parts states.",
+                "默认车辆使用 serial 1。此处添加的副本会获得 serial 2 或更高编号，并可保存独立的强化和部件状态。"
+            ));
+            ui.weak(tr!(
+                language,
+                "편집 결과는 해당 닉네임의 프로필 revision에 즉시 저장됩니다. 접속 중이었다면 재접속 후 반영됩니다.",
+                "Edits are saved immediately to the nickname's profile revision. Reconnect if the client was already online.",
+                "编辑结果会立即保存到该昵称的配置文件 revision。若客户端已在线，请重新连接后查看。"
+            ));
+        },
+        );
     }
 
     fn inventory_catalog_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.horizontal(|ui| {
-            if ui.button("카트 목록 불러오기").clicked() {
+            if ui
+                .button(tr!(
+                    language,
+                    "카트 목록 불러오기",
+                    "Load kart list",
+                    "加载车辆列表"
+                ))
+                .clicked()
+            {
                 self.load_inventory_catalog();
             }
-            ui.weak("클라이언트 Data의 kart.rho/item.rho/RHO5를 직접 읽음");
+            ui.weak(tr!(
+                language,
+                "클라이언트 Data의 kart.rho/item.rho/RHO5를 직접 읽음",
+                "Reads kart.rho, item.rho, and RHO5 directly from client Data",
+                "直接读取客户端 Data 中的 kart.rho、item.rho 和 RHO5"
+            ));
         });
     }
 
     fn inventory_profile_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.horizontal(|ui| {
-            ui.label("닉네임");
+            ui.label(tr!(language, "닉네임", "Nickname", "昵称"));
             if ui
                 .add(egui::TextEdit::singleline(&mut self.inventory_nickname).desired_width(180.0))
                 .changed()
             {
                 self.inventory_additional_karts.clear();
-                "닉네임이 바뀌었습니다. 프로필을 새로고침하거나 카트를 추가하세요."
-                    .clone_into(&mut self.inventory_status);
+                tr!(
+                    language,
+                    "닉네임이 바뀌었습니다. 프로필을 새로고침하거나 카트를 추가하세요.",
+                    "The nickname changed. Refresh the profile or add a kart.",
+                    "昵称已更改，请刷新配置文件或添加车辆。"
+                )
+                .clone_into(&mut self.inventory_status);
             }
-            if ui.button("접속기 닉네임 사용").clicked() {
+            if ui
+                .button(tr!(
+                    language,
+                    "접속기 닉네임 사용",
+                    "Use connector nickname",
+                    "使用连接器昵称"
+                ))
+                .clicked()
+            {
                 self.inventory_nickname
                     .clone_from(&self.connector_inputs.nickname);
                 self.inventory_additional_karts.clear();
             }
-            if ui.button("프로필 새로고침").clicked() {
+            if ui
+                .button(tr!(
+                    language,
+                    "프로필 새로고침",
+                    "Refresh profile",
+                    "刷新配置文件"
+                ))
+                .clicked()
+            {
                 self.refresh_inventory_profile();
             }
         });
     }
 
     fn inventory_kart_search_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.horizontal(|ui| {
-            ui.label("카트 이름 또는 ID");
+            ui.label(tr!(
+                language,
+                "카트 이름 또는 ID",
+                "Kart name or ID",
+                "车辆名称或 ID"
+            ));
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut self.inventory_kart_query)
-                        .hint_text("예: 기간테스 V1 또는 1410")
+                        .hint_text(tr!(
+                            language,
+                            "예: 기간테스 V1 또는 1410",
+                            "Example: Gigantes V1 or 1410",
+                            "示例：Gigantes V1 或 1410"
+                        ))
                         .desired_width(260.0),
                 )
                 .changed()
@@ -1612,7 +2286,15 @@ impl P5136GuiApp {
         });
 
         let selected_text = self.inventory_selected_kart.as_ref().map_or_else(
-            || "검색 후보 선택".to_owned(),
+            || {
+                tr!(
+                    language,
+                    "검색 후보 선택",
+                    "Select a search result",
+                    "选择搜索结果"
+                )
+                .to_owned()
+            },
             |kart| {
                 format!(
                     "{} (ID {}){}",
@@ -1621,7 +2303,7 @@ impl P5136GuiApp {
                     if kart.auto_granted {
                         ""
                     } else {
-                        " [수동 확인]"
+                        tr!(language, " [수동 확인]", " [manual review]", " [手动确认]")
                     }
                 )
             },
@@ -1632,7 +2314,12 @@ impl P5136GuiApp {
                 .width(330.0)
                 .show_ui(ui, |ui| {
                     if self.inventory_kart_results.is_empty() {
-                        ui.weak("일치하는 카트가 없습니다");
+                        ui.weak(tr!(
+                            language,
+                            "일치하는 카트가 없습니다",
+                            "No matching karts",
+                            "没有匹配的车辆"
+                        ));
                     }
                     for candidate in &self.inventory_kart_results {
                         ui.selectable_value(
@@ -1645,7 +2332,7 @@ impl P5136GuiApp {
                                 if candidate.auto_granted {
                                     ""
                                 } else {
-                                    " [수동 확인]"
+                                    tr!(language, " [수동 확인]", " [manual review]", " [手动确认]")
                                 }
                             ),
                         );
@@ -1654,7 +2341,12 @@ impl P5136GuiApp {
             if ui
                 .add_enabled(
                     self.inventory_selected_kart.is_some(),
-                    egui::Button::new("선택 카트 추가"),
+                    egui::Button::new(tr!(
+                        language,
+                        "선택 카트 추가",
+                        "Add selected kart",
+                        "添加所选车辆"
+                    )),
                 )
                 .clicked()
             {
@@ -1665,6 +2357,7 @@ impl P5136GuiApp {
     }
 
     fn inventory_kart_enhancement_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         let enhancements_supported = self
             .inventory_selected_kart
             .as_ref()
@@ -1674,48 +2367,81 @@ impl P5136GuiApp {
             self.inventory_kart_grant_options = KartGrantOptions::default();
         }
         ui.horizontal(|ui| {
-            ui.label("지급 시 강화");
+            ui.label(tr!(
+                language,
+                "지급 시 강화",
+                "Enhance on grant",
+                "发放时强化"
+            ));
             ui.add_enabled(
                 enhancements_supported,
                 egui::Checkbox::new(
                     &mut self.inventory_kart_grant_options.apply_floater_333,
-                    "333 적용 (603/903/703)",
+                    tr!(
+                        language,
+                        "333 적용 (603/903/703)",
+                        "Apply 333 (603/903/703)",
+                        "应用 333（603/903/703）"
+                    ),
                 ),
             );
             ui.add_enabled(
                 enhancements_supported,
                 egui::Checkbox::new(
                     &mut self.inventory_kart_grant_options.apply_grade_five,
-                    "5강 적용",
+                    tr!(language, "5강 적용", "Apply grade 5", "应用强化 5"),
                 ),
             );
         });
         if let Some(selected) = &self.inventory_selected_kart {
-            ui.weak(format!(
+            ui.weak(tr_format!(
+                language,
                 "이름 → kart_id 변환: {} → {}",
-                selected.name, selected.kart_id
+                "Name → kart_id mapping: {} → {}",
+                "名称 → kart_id 映射：{} → {}",
+                selected.name,
+                selected.kart_id
             ));
             if !selected.auto_granted {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "이 카트는 리소스/개발 데이터 보수 검사에서 자동 지급이 제외됐습니다. 실제 클라이언트 지원을 확인한 경우에만 정확한 ID로 수동 추가하세요.",
+                    tr!(
+                        language,
+                        "이 카트는 리소스/개발 데이터 보수 검사에서 자동 지급이 제외됐습니다. 실제 클라이언트 지원을 확인한 경우에만 정확한 ID로 수동 추가하세요.",
+                        "This kart was excluded from automatic grants by conservative resource/development-data checks. Add it by exact ID only after confirming client support.",
+                        "此车辆因保守的资源/开发数据检查而未自动发放。仅在确认客户端支持后，才使用精确 ID 手动添加。"
+                    ),
                 );
             }
             if !enhancements_supported {
                 ui.weak(
-                    "이 카트는 클라이언트 BodyParam.DescEnchantCap이 없어 플로터/5강 옵션을 적용하지 않습니다.",
+                    tr!(
+                        language,
+                        "이 카트는 클라이언트 BodyParam.DescEnchantCap이 없어 플로터/5강 옵션을 적용하지 않습니다.",
+                        "This kart has no client BodyParam.DescEnchantCap, so floater and grade-5 options are unavailable.",
+                        "此车辆没有客户端 BodyParam.DescEnchantCap，因此无法使用强化属性和强化 5 选项。"
+                    ),
                 );
             }
         }
     }
 
     fn inventory_additional_kart_list(&self, ui: &mut egui::Ui) {
-        ui.label(format!(
+        let language = self.language;
+        ui.label(tr_format!(
+            language,
             "현재 추가 소유 카트: {}개",
+            "Additional owned karts: {}",
+            "当前额外拥有的车辆：{}",
             self.inventory_additional_karts.len()
         ));
         if self.inventory_additional_karts.is_empty() {
-            ui.weak("추가 소유분이 없습니다. 기본 serial 1 카트는 이 목록에서 생략합니다.");
+            ui.weak(tr!(
+                language,
+                "추가 소유분이 없습니다. 기본 serial 1 카트는 이 목록에서 생략합니다.",
+                "No additional copies are owned. Default serial-1 karts are omitted from this list.",
+                "没有额外拥有的副本。默认 serial 1 车辆不会显示在此列表中。"
+            ));
             return;
         }
         egui::ScrollArea::vertical()
@@ -1731,23 +2457,62 @@ impl P5136GuiApp {
     }
 
     fn random_track_editor(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("랜덤 트랙 설정", |ui| {
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "랜덤 트랙 설정",
+                "Random-track settings",
+                "随机地图设置"
+            ),
+            |ui| {
             ui.horizontal(|ui| {
-                if ui.button("클라이언트 목록 불러오기").clicked() {
+                if ui
+                    .button(tr!(
+                        language,
+                        "클라이언트 목록 불러오기",
+                        "Load client list",
+                        "加载客户端列表"
+                    ))
+                    .clicked()
+                {
                     self.load_random_track_catalog();
                 }
-                if ui.button("모든 수동 설정 초기화").clicked() {
+                if ui
+                    .button(tr!(
+                        language,
+                        "모든 수동 설정 초기화",
+                        "Reset all overrides",
+                        "重置全部手动设置"
+                    ))
+                    .clicked()
+                {
                     self.server_inputs.random_tracks = RandomTrackConfiguration::default();
-                    "모든 풀을 클라이언트 기본 목록으로 되돌렸습니다."
-                        .clone_into(&mut self.random_track_status);
+                    tr!(
+                        language,
+                        "모든 풀을 클라이언트 기본 목록으로 되돌렸습니다.",
+                        "Restored every pool to the client defaults.",
+                        "已将所有地图池恢复为客户端默认值。"
+                    )
+                    .clone_into(&mut self.random_track_status);
                 }
                 if ui
                     .add_enabled(
                         matches!(self.server_run_state, ServerRunState::Running(_))
                             && self.random_track_catalog.is_some(),
-                        egui::Button::new("실행 중 서버에 적용"),
+                        egui::Button::new(tr!(
+                            language,
+                            "실행 중 서버에 적용",
+                            "Apply to running server",
+                            "应用到运行中的服务器"
+                        )),
                     )
-                    .on_hover_text("현재 선택을 다음 경기 시작부터 사용합니다.")
+                    .on_hover_text(tr!(
+                        language,
+                        "현재 선택을 다음 경기 시작부터 사용합니다.",
+                        "Uses the current selection from the next race onward.",
+                        "从下一场比赛开始使用当前选择。"
+                    ))
                     .clicked()
                 {
                     self.apply_live_random_tracks();
@@ -1755,9 +2520,14 @@ impl P5136GuiApp {
             });
 
             let Some(catalog) = &self.random_track_catalog else {
-                ui.weak("서버 시작 시에는 자동으로 track_common.rho를 읽습니다. 목록을 편집하려면 위 버튼으로 미리 불러오세요.");
+                ui.weak(tr!(
+                    language,
+                    "서버 시작 시에는 자동으로 track_common.rho를 읽습니다. 목록을 편집하려면 위 버튼으로 미리 불러오세요.",
+                    "The server reads track_common.rho automatically at startup. Load it above first if you want to edit the pools.",
+                    "服务器启动时会自动读取 track_common.rho。如需编辑地图池，请先点击上方按钮加载。"
+                ));
                 ui.colored_label(
-                    if self.random_track_status.contains("실패") { egui::Color32::LIGHT_RED } else { egui::Color32::GRAY },
+                    if status_is_error(&self.random_track_status) { egui::Color32::LIGHT_RED } else { egui::Color32::GRAY },
                     &self.random_track_status,
                 );
                 return;
@@ -1780,12 +2550,14 @@ impl P5136GuiApp {
                 catalog,
                 &pool,
                 &mut self.server_inputs.random_tracks,
+                language,
             );
             ui.colored_label(
-                if self.random_track_status.contains("실패") { egui::Color32::LIGHT_RED } else { egui::Color32::GRAY },
+                if status_is_error(&self.random_track_status) { egui::Color32::LIGHT_RED } else { egui::Color32::GRAY },
                 &self.random_track_status,
             );
-        });
+        },
+        );
     }
 
     fn random_track_pool_checker(
@@ -1793,6 +2565,7 @@ impl P5136GuiApp {
         catalog: &RandomTrackCatalog,
         pool: &RandomTrackPool,
         configuration: &mut RandomTrackConfiguration,
+        language: GuiLanguage,
     ) {
         let compatible = catalog
             .compatible_tracks(pool)
@@ -1802,12 +2575,21 @@ impl P5136GuiApp {
         let original_override = Self::random_track_override_index(configuration, pool);
         let (mut select_all, mut clear_all, mut restore_defaults) = (false, false, false);
         ui.horizontal(|ui| {
-            select_all = ui.button("모두 선택").clicked();
-            clear_all = ui.button("모두 해제").clicked();
+            select_all = ui
+                .button(tr!(language, "모두 선택", "Select all", "全选"))
+                .clicked();
+            clear_all = ui
+                .button(tr!(language, "모두 해제", "Clear all", "全部取消"))
+                .clicked();
             restore_defaults = ui
                 .add_enabled(
                     original_override.is_some(),
-                    egui::Button::new("클라이언트 기본값"),
+                    egui::Button::new(tr!(
+                        language,
+                        "클라이언트 기본값",
+                        "Client defaults",
+                        "客户端默认值"
+                    )),
                 )
                 .clicked();
         });
@@ -1844,7 +2626,7 @@ impl P5136GuiApp {
                 override_index,
             );
         }
-        Self::random_track_selection_status(ui, configuration, pool, compatible.len());
+        Self::random_track_selection_status(ui, configuration, pool, compatible.len(), language);
     }
 
     fn random_track_checkbox_list(
@@ -1906,6 +2688,7 @@ impl P5136GuiApp {
         configuration: &RandomTrackConfiguration,
         pool: &RandomTrackPool,
         compatible_count: usize,
+        language: GuiLanguage,
     ) {
         let current_override = Self::random_track_override_index(configuration, pool)
             .map(|index| &configuration.pools[index]);
@@ -1914,16 +2697,31 @@ impl P5136GuiApp {
         });
         ui.horizontal(|ui| {
             ui.weak(if current_override.is_some() {
-                "사용자 지정 목록"
+                tr!(language, "사용자 지정 목록", "Custom list", "自定义列表")
             } else {
-                "클라이언트 기본 목록"
+                tr!(
+                    language,
+                    "클라이언트 기본 목록",
+                    "Client default list",
+                    "客户端默认列表"
+                )
             });
-            ui.weak(format!("· 선택: {selected_count}/{compatible_count}개"));
+            ui.weak(tr_format!(
+                language,
+                "· 선택: {selected_count}/{compatible_count}개",
+                "· Selected: {selected_count}/{compatible_count}",
+                "· 已选择：{selected_count}/{compatible_count}"
+            ));
         });
         if selected_count == 0 {
             ui.colored_label(
                 egui::Color32::LIGHT_RED,
-                "맵을 1개 이상 선택해야 서버를 시작할 수 있습니다.",
+                tr!(
+                    language,
+                    "맵을 1개 이상 선택해야 서버를 시작할 수 있습니다.",
+                    "Select at least one track before starting the server.",
+                    "启动服务器前至少选择一张地图。"
+                ),
             );
         }
     }
@@ -1938,45 +2736,99 @@ impl P5136GuiApp {
     }
 
     fn load_item_probability_xml_override(&mut self) {
-        let outcome = required_path(&self.server_inputs.item_probability_xml, "아이템 확률 XML")
-            .and_then(|path| {
-                load_item_probability_xml(&path)
-                    .with_context(|| format!("{}을(를) 불러오지 못했습니다", path.display()))
-            });
+        let language = self.language;
+        let outcome = required_path(
+            &self.server_inputs.item_probability_xml,
+            tr!(
+                language,
+                "아이템 확률 XML",
+                "Item-probability XML",
+                "道具概率 XML"
+            ),
+            language,
+        )
+        .and_then(|path| {
+            load_item_probability_xml(&path).with_context(|| {
+                tr_format!(
+                    language,
+                    "{}을(를) 불러오지 못했습니다",
+                    "Failed to load {}",
+                    "无法加载 {}",
+                    path.display()
+                )
+            })
+        });
         match outcome {
             Ok(configuration) => {
                 self.server_inputs.item_probabilities = configuration;
                 self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
-                "이식 가능한 XML 확률표를 불러와 고정했습니다."
-                    .clone_into(&mut self.item_probability_status);
+                tr!(
+                    language,
+                    "이식 가능한 XML 확률표를 불러와 고정했습니다.",
+                    "Loaded and pinned the portable XML probability table.",
+                    "已加载并固定可移植的 XML 概率表。"
+                )
+                .clone_into(&mut self.item_probability_status);
             }
             Err(error) => {
-                self.item_probability_status = format!("XML 로드 실패: {error:#}");
+                self.item_probability_status = tr_format!(
+                    language,
+                    "XML 로드 실패: {error:#}",
+                    "Failed to load XML: {error:#}",
+                    "加载 XML 失败：{error:#}"
+                );
             }
         }
     }
 
     fn item_probability_rank_policy_editor(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.checkbox(
             &mut self.server_inputs.trust_client_item_rank,
-            "클라이언트가 보고한 현재 순위 신뢰 (LAN/친구용)",
+            tr!(
+                language,
+                "클라이언트가 보고한 현재 순위 신뢰 (LAN/친구용)",
+                "Trust client-reported live rank (LAN/friends)",
+                "信任客户端上报的当前排名（局域网/好友）"
+            ),
         )
-        .on_hover_text(
+        .on_hover_text(tr!(
+            language,
             "체크하면 클라이언트의 1등/상위/중위/하위 순위를 사용합니다. 해제하면 통합 확률을 사용합니다.",
-        );
+            "When enabled, uses the client's 1st/high/middle/low rank band. When disabled, uses combined probabilities.",
+            "勾选后使用客户端的第1名/前列/中游/后列排名；取消后使用综合概率。"
+        ));
     }
 
+    // Keeping translated labels beside their controls makes this editor intentionally verbose.
+    #[allow(clippy::too_many_lines)]
     fn item_probability_editor(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("아이템 확률표", |ui| {
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "아이템 확률표",
+                "Item-probability table",
+                "道具概率表"
+            ),
+            |ui| {
             let mut edited = false;
             self.item_probability_rank_policy_editor(ui);
             let pinned =
                 self.server_inputs.item_probability_source == GuiItemProbabilitySource::Edited;
             ui.add_enabled_ui(pinned, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("순위 가중치");
+                    ui.label(tr!(
+                        language,
+                        "순위 가중치",
+                        "Rank weights",
+                        "排名权重"
+                    ));
                     egui::ComboBox::from_id_salt("item-probability-rank-band")
-                        .selected_text(rank_band_label_ko(self.server_inputs.item_probabilities.rank_band))
+                        .selected_text(rank_band_label(
+                            self.server_inputs.item_probabilities.rank_band,
+                            language,
+                        ))
                         .show_ui(ui, |ui| {
                             for rank_band in [
                                 ItemProbabilityRankBand::Live,
@@ -1990,7 +2842,7 @@ impl P5136GuiApp {
                                     .selectable_value(
                                         &mut self.server_inputs.item_probabilities.rank_band,
                                         rank_band,
-                                        rank_band_label_ko(rank_band),
+                                        rank_band_label(rank_band, language),
                                     )
                                     .changed();
                             }
@@ -1999,32 +2851,74 @@ impl P5136GuiApp {
             });
 
             ui.horizontal(|ui| {
-                if ui.button("클라이언트 item.rho/RHO5 불러와 고정").clicked() {
+                if ui
+                    .button(tr!(
+                        language,
+                        "클라이언트 item.rho/RHO5 불러와 고정",
+                        "Load and pin client item.rho/RHO5",
+                        "加载并固定客户端 item.rho/RHO5"
+                    ))
+                    .clicked()
+                {
                     self.load_client_item_probability_defaults();
                 }
-                if ui.button("서버 시작 시 자동 적용").clicked() {
+                if ui
+                    .button(tr!(
+                        language,
+                        "서버 시작 시 자동 적용",
+                        "Apply automatically at server start",
+                        "服务器启动时自动应用"
+                    ))
+                    .clicked()
+                {
                     self.server_inputs.item_probability_source =
                         GuiItemProbabilitySource::AutoClient;
-                    "자동: 서버를 시작할 때마다 클라이언트 item.rho/RHO5를 다시 읽습니다."
-                        .clone_into(&mut self.item_probability_status);
+                    tr!(
+                        language,
+                        "자동: 서버를 시작할 때마다 클라이언트 item.rho/RHO5를 다시 읽습니다.",
+                        "Automatic: rereads client item.rho/RHO5 whenever the server starts.",
+                        "自动：每次服务器启动时重新读取客户端 item.rho/RHO5。"
+                    )
+                    .clone_into(&mut self.item_probability_status);
                 }
-                if ui.button("안전 기본값 사용").clicked() {
+                if ui
+                    .button(tr!(
+                        language,
+                        "안전 기본값 사용",
+                        "Use safe defaults",
+                        "使用安全默认值"
+                    ))
+                    .clicked()
+                {
                     self.server_inputs.item_probabilities =
                         ItemProbabilityConfiguration::safe_fallback();
                     self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
-                    "개인 14개/팀 18개 안전 기본 확률표를 고정했습니다."
-                        .clone_into(&mut self.item_probability_status);
+                    tr!(
+                        language,
+                        "개인 14개/팀 18개 안전 기본 확률표를 고정했습니다.",
+                        "Pinned the safe fallback table with 14 solo and 18 team entries.",
+                        "已固定安全默认概率表：个人 14 项、组队 18 项。"
+                    )
+                    .clone_into(&mut self.item_probability_status);
                 }
             });
 
             ui.horizontal(|ui| {
-                ui.label("이식 가능한 XML");
+                ui.label(tr!(
+                    language,
+                    "이식 가능한 XML",
+                    "Portable XML",
+                    "可移植 XML"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.server_inputs.item_probability_xml)
                         .hint_text("item-probabilities.xml")
                         .desired_width(360.0),
                 );
-                if ui.button("XML 불러오기").clicked() {
+                if ui
+                    .button(tr!(language, "XML 불러오기", "Load XML", "加载 XML"))
+                    .clicked()
+                {
                     self.load_item_probability_xml_override();
                 }
             });
@@ -2034,12 +2928,12 @@ impl P5136GuiApp {
                     ui.selectable_value(
                         &mut self.server_inputs.show_team_item_probabilities,
                         false,
-                        "아이템 개인전",
+                        tr!(language, "아이템 개인전", "Item solo", "道具个人赛"),
                     );
                     ui.selectable_value(
                         &mut self.server_inputs.show_team_item_probabilities,
                         true,
-                        "아이템 팀전",
+                        tr!(language, "아이템 팀전", "Item team", "道具组队赛"),
                     );
                 });
 
@@ -2048,32 +2942,55 @@ impl P5136GuiApp {
                 } else {
                     &mut self.server_inputs.item_probabilities.individual
                 };
-                edited |= item_probability_grid(ui, entries);
+                edited |= item_probability_grid(ui, entries, language);
             } else {
-                ui.weak(
+                ui.weak(tr!(
+                    language,
                     "자동 모드입니다. 서버 시작 시 클라이언트 확률표를 읽고 적용 여부와 항목 수를 표시합니다. 편집하려면 위의 '불러와 고정'을 누르세요.",
-                );
+                    "Automatic mode is active. At startup the server reads the client table and reports the applied source and entry counts. Use 'Load and pin' above to edit it.",
+                    "当前为自动模式。服务器启动时会读取客户端概率表，并显示应用来源及条目数。如需编辑，请点击上方“加载并固定”。"
+                ));
             }
             if edited {
                 self.server_inputs.item_probability_source = GuiItemProbabilitySource::Edited;
-                "편집한 확률표를 다음 서버 시작에 사용하도록 고정했습니다."
-                    .clone_into(&mut self.item_probability_status);
+                tr!(
+                    language,
+                    "편집한 확률표를 다음 서버 시작에 사용하도록 고정했습니다.",
+                    "Pinned the edited probability table for the next server start.",
+                    "已固定编辑后的概率表，将在下次服务器启动时使用。"
+                )
+                .clone_into(&mut self.item_probability_status);
             }
-            let status_color = if self.item_probability_status.contains("실패") {
+            let status_color = if status_is_error(&self.item_probability_status) {
                 egui::Color32::LIGHT_RED
             } else {
                 egui::Color32::GRAY
             };
             ui.colored_label(status_color, &self.item_probability_status);
-            ui.weak(
+            ui.weak(tr!(
+                language,
                 "ID와 아이템 이름은 읽기 전용입니다. 가중치는 서버 바인드 전에 범위와 합계를 검증합니다.",
-            );
-        });
+                "IDs and item names are read-only. Weight ranges and sums are validated before the server binds.",
+                "ID 和道具名称为只读。服务器绑定端口前会校验权重范围及总和。"
+            ));
+        },
+        );
     }
 
+    // Keeping translated labels beside their controls makes this form intentionally verbose.
+    #[allow(clippy::too_many_lines)]
     fn server_input_panel(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         ui.horizontal(|ui| {
-            if ui.button("내 LAN IPv4로 자동 설정").clicked() {
+            if ui
+                .button(tr!(
+                    language,
+                    "내 LAN IPv4로 자동 설정",
+                    "Auto-configure my LAN IPv4",
+                    "自动设置本机局域网 IPv4"
+                ))
+                .clicked()
+            {
                 self.apply_best_lan_ipv4();
             }
             if !self.lan_candidates.is_empty() {
@@ -2094,8 +3011,12 @@ impl P5136GuiApp {
                             {
                                 self.server_inputs.bind_address = address.to_string();
                                 self.server_inputs.advertised_address = address.to_string();
-                                self.lan_status =
-                                    format!("바인드 주소와 광고 주소를 {address}로 설정했습니다.");
+                                self.lan_status = tr_format!(
+                                    language,
+                                    "바인드 주소와 광고 주소를 {address}로 설정했습니다.",
+                                    "Set both bind and advertised addresses to {address}.",
+                                    "已将绑定地址和公布地址设为 {address}。"
+                                );
                             }
                         }
                     });
@@ -2106,28 +3027,43 @@ impl P5136GuiApp {
             .num_columns(2)
             .spacing([14.0, 10.0])
             .show(ui, |ui| {
-                ui.label("서버 바인드 주소");
+                ui.label(tr!(
+                    language,
+                    "서버 바인드 주소",
+                    "Server bind address",
+                    "服务器绑定地址"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.server_inputs.bind_address)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("클라이언트에 알릴 IPv4");
+                ui.label(tr!(
+                    language,
+                    "클라이언트에 알릴 IPv4",
+                    "Advertised client IPv4",
+                    "向客户端公布的 IPv4"
+                ));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.server_inputs.advertised_address)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("기준 포트");
+                ui.label(tr!(language, "기준 포트", "Base port", "基准端口"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.server_inputs.configured_port)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
 
-                ui.label("프로필 저장 경로");
+                ui.label(tr!(
+                    language,
+                    "프로필 저장 경로",
+                    "Profile storage path",
+                    "配置文件保存路径"
+                ));
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.server_inputs.profile_root)
@@ -2136,12 +3072,22 @@ impl P5136GuiApp {
                     .changed()
                 {
                     self.inventory_additional_karts.clear();
-                    "프로필 저장 경로가 바뀌었습니다. 인벤토리를 새로고침하세요."
-                        .clone_into(&mut self.inventory_status);
+                    tr!(
+                        language,
+                        "프로필 저장 경로가 바뀌었습니다. 인벤토리를 새로고침하세요.",
+                        "The profile storage path changed. Refresh the inventory.",
+                        "配置文件保存路径已更改，请刷新库存。"
+                    )
+                    .clone_into(&mut self.inventory_status);
                 }
                 ui.end_row();
 
-                ui.label("클라이언트 또는 Profile 경로 (필수)");
+                ui.label(tr!(
+                    language,
+                    "클라이언트 또는 Profile 경로 (필수)",
+                    "Client or Profile path (required)",
+                    "客户端或 Profile 路径（必填）"
+                ));
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.server_inputs.client_path)
@@ -2153,10 +3099,20 @@ impl P5136GuiApp {
                 }
                 ui.end_row();
 
-                ui.label("원격 프로필 생성");
+                ui.label(tr!(
+                    language,
+                    "원격 프로필 생성",
+                    "Remote profile creation",
+                    "远程创建配置文件"
+                ));
                 ui.checkbox(
                     &mut self.server_inputs.allow_remote_profile_creation,
-                    "LAN의 새 닉네임 허용",
+                    tr!(
+                        language,
+                        "LAN의 새 닉네임 허용",
+                        "Allow new nicknames on LAN",
+                        "允许局域网中的新昵称"
+                    ),
                 );
                 ui.end_row();
             });
@@ -2164,86 +3120,166 @@ impl P5136GuiApp {
         self.server_advanced_input_panel(ui);
         self.item_probability_editor(ui);
 
-        ui.weak("포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2.");
-        ui.weak(
+        ui.weak(tr!(
+            language,
+            "포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2.",
+            "Ports: game UDP = base, login TCP/P2P UDP = base + 1, messenger TCP = base + 2.",
+            "端口：游戏 UDP = 基准，登录 TCP/P2P UDP = 基准 + 1，聊天 TCP = 基准 + 2。"
+        ));
+        ui.weak(tr!(
+            language,
             "클라이언트 루트, Profile 또는 Data 폴더를 지정하면 RHO 카트·아이템 데이터를 자동으로 읽습니다. KartCatalog.xml은 필요하지 않습니다.",
-        );
-        ui.weak("주소에는 IP 리터럴만 사용할 수 있습니다. P5136 패킷은 광고 주소를 IPv4 4바이트로 기록하므로 도메인을 직접 넣을 수 없습니다.");
-        ui.weak("방 제목에 S0~S8 토큰을 넣으면 다음 경기 시작 패킷의 주행 물리를 해당 등급으로 바꿉니다. 예: '[S2] 친선'.");
-        ui.weak("서버·접속기 입력 설정은 GUI 종료 시 저장되어 다음 실행에 복원됩니다. 실행 상태, 로그, 임시 검색 결과는 저장하지 않습니다.");
+            "Point to the client root, Profile, or Data folder to read RHO kart and item data automatically. KartCatalog.xml is not required.",
+            "指定客户端根目录、Profile 或 Data 文件夹后，会自动读取 RHO 车辆及道具数据，无需 KartCatalog.xml。"
+        ));
+        ui.weak(tr!(
+            language,
+            "주소에는 IP 리터럴만 사용할 수 있습니다. P5136 패킷은 광고 주소를 IPv4 4바이트로 기록하므로 도메인을 직접 넣을 수 없습니다.",
+            "Addresses must be IP literals. P5136 stores the advertised address as four IPv4 bytes, so a domain name cannot be entered directly.",
+            "地址必须是 IP 字面值。P5136 数据包以 4 字节 IPv4 保存公布地址，因此不能直接输入域名。"
+        ));
+        ui.weak(tr!(
+            language,
+            "방 제목에 S0~S8 토큰을 넣으면 다음 경기 시작 패킷의 주행 물리를 해당 등급으로 바꿉니다. 예: '[S2] 친선'.",
+            "Put an S0–S8 token in the room title to use that physics grade from the next race. Example: '[S2] Friendly'.",
+            "在房间标题中加入 S0–S8 标记，可从下一场比赛起使用对应物理等级。例如：“[S2] 友谊赛”。"
+        ));
+        ui.weak(tr!(
+            language,
+            "서버·접속기 입력 설정은 GUI 종료 시 저장되어 다음 실행에 복원됩니다. 실행 상태, 로그, 임시 검색 결과는 저장하지 않습니다.",
+            "Server and connector inputs are saved when the GUI closes and restored next time. Runtime state, logs, and temporary search results are not saved.",
+            "关闭 GUI 时会保存服务器和连接器输入，并在下次启动时恢复。运行状态、日志及临时搜索结果不会保存。"
+        ));
     }
 
     fn server_advanced_input_panel(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("고급 시간 제한 및 접속 수", |ui| {
-            egui::Grid::new("server-advanced-inputs")
-                .num_columns(2)
-                .spacing([14.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("클라이언트 Data 경로 재정의 (선택)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.server_inputs.client_data_dir)
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "고급 시간 제한 및 접속 수",
+                "Advanced timeouts and connection limits",
+                "高级超时与连接限制"
+            ),
+            |ui| {
+                egui::Grid::new("server-advanced-inputs")
+                    .num_columns(2)
+                    .spacing([14.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label(tr!(
+                            language,
+                            "클라이언트 Data 경로 재정의 (선택)",
+                            "Client Data path override (optional)",
+                            "客户端 Data 路径覆盖（可选）"
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.server_inputs.client_data_dir)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+
+                        ui.label(tr!(
+                            language,
+                            "첫 메시지 지연 (ms)",
+                            "First-message delay (ms)",
+                            "首条消息延迟（毫秒）"
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.server_inputs.first_message_delay_ms,
+                            )
                             .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
+                        );
+                        ui.end_row();
 
-                    ui.label("첫 메시지 지연 (ms)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.server_inputs.first_message_delay_ms)
+                        ui.label(tr!(
+                            language,
+                            "로그인 제한 시간 (초)",
+                            "Login timeout (seconds)",
+                            "登录超时（秒）"
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.server_inputs.login_timeout_seconds,
+                            )
                             .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
+                        );
+                        ui.end_row();
 
-                    ui.label("로그인 제한 시간 (초)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.server_inputs.login_timeout_seconds)
+                        ui.label(tr!(
+                            language,
+                            "세션 유휴 제한 시간 (초)",
+                            "Session idle timeout (seconds)",
+                            "会话空闲超时（秒）"
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.server_inputs.session_idle_timeout_seconds,
+                            )
                             .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
+                        );
+                        ui.end_row();
 
-                    ui.label("세션 유휴 제한 시간 (초)");
-                    ui.add(
-                        egui::TextEdit::singleline(
-                            &mut self.server_inputs.session_idle_timeout_seconds,
-                        )
-                        .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
-
-                    ui.label("세션 전송 제한 시간 (초)");
-                    ui.add(
-                        egui::TextEdit::singleline(
-                            &mut self.server_inputs.session_write_timeout_seconds,
-                        )
-                        .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
-
-                    ui.label("최대 로그인 세션 수");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.server_inputs.max_login_sessions)
+                        ui.label(tr!(
+                            language,
+                            "세션 전송 제한 시간 (초)",
+                            "Session write timeout (seconds)",
+                            "会话写入超时（秒）"
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.server_inputs.session_write_timeout_seconds,
+                            )
                             .desired_width(f32::INFINITY),
-                    );
-                    ui.end_row();
-                });
-        });
+                        );
+                        ui.end_row();
+
+                        ui.label(tr!(
+                            language,
+                            "최대 로그인 세션 수",
+                            "Maximum login sessions",
+                            "最大登录会话数"
+                        ));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.server_inputs.max_login_sessions)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    });
+            },
+        );
     }
 
     fn server_status_panel(&self, ui: &mut egui::Ui) {
+        let language = self.language;
         match &self.server_run_state {
             ServerRunState::Stopped => {
-                ui.weak("서버가 정지되어 있습니다.");
+                ui.weak(tr!(
+                    language,
+                    "서버가 정지되어 있습니다.",
+                    "The server is stopped.",
+                    "服务器已停止。"
+                ));
             }
             ServerRunState::Starting => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("네트워크 포트를 열고 클라이언트 데이터를 읽는 중...");
+                    ui.label(tr!(
+                        language,
+                        "네트워크 포트를 열고 클라이언트 데이터를 읽는 중...",
+                        "Opening network ports and reading client data...",
+                        "正在打开网络端口并读取客户端数据……"
+                    ));
                 });
             }
             ServerRunState::Running(endpoints) => {
                 ui.colored_label(
                     egui::Color32::LIGHT_GREEN,
-                    format!(
+                    tr_format!(
+                        language,
                         "실행 중: 게임 UDP {}, 로그인 TCP {}, P2P UDP {}, 메신저 TCP {}.",
+                        "Running: game UDP {}, login TCP {}, P2P UDP {}, messenger TCP {}.",
+                        "运行中：游戏 UDP {}，登录 TCP {}，P2P UDP {}，聊天 TCP {}。",
                         endpoints.game_udp,
                         endpoints.login_tcp,
                         endpoints.p2p_udp,
@@ -2254,13 +3290,23 @@ impl P5136GuiApp {
             ServerRunState::Stopping => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("서버를 안전하게 종료하는 중...");
+                    ui.label(tr!(
+                        language,
+                        "서버를 안전하게 종료하는 중...",
+                        "Stopping the server safely...",
+                        "正在安全停止服务器……"
+                    ));
                 });
             }
             ServerRunState::StopBlocked(error) => {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    format!("안전 종료가 지연되고 있습니다: {error}"),
+                    tr_format!(
+                        language,
+                        "안전 종료가 지연되고 있습니다: {error}",
+                        "Safe shutdown is delayed: {error}",
+                        "安全停止被延迟：{error}"
+                    ),
                 );
             }
             ServerRunState::Failed(error) => {
@@ -2269,15 +3315,36 @@ impl P5136GuiApp {
         }
     }
 
+    // Keeping translated labels beside their controls makes this tab intentionally verbose.
+    #[allow(clippy::too_many_lines)]
     fn server_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         let active = self.server_run_state.is_active();
-        ui.heading("서버");
-        ui.label("P5136 서버를 설정하고 클라이언트가 접속하는 동안 실행합니다.");
+        ui.heading(tr!(language, "서버", "Server", "服务器"));
+        ui.label(tr!(
+            language,
+            "P5136 서버를 설정하고 클라이언트가 접속하는 동안 실행합니다.",
+            "Configure the P5136 server and keep it running while clients connect.",
+            "配置 P5136 服务器，并在客户端连接期间保持运行。"
+        ));
         ui.add_space(10.0);
         let mut file_logging_enabled = self.server_inputs.file_logging.enabled();
         if ui
-            .checkbox(&mut file_logging_enabled, "상세 로그 파일 저장")
-            .on_hover_text("해제하면 이후 파일 기록을 중단하며 화면/터미널 요약은 유지합니다.")
+            .checkbox(
+                &mut file_logging_enabled,
+                tr!(
+                    language,
+                    "상세 로그 파일 저장",
+                    "Save detailed log file",
+                    "保存详细日志文件"
+                ),
+            )
+            .on_hover_text(tr!(
+                language,
+                "해제하면 이후 파일 기록을 중단하며 화면/터미널 요약은 유지합니다.",
+                "Disabling stops future file writes while keeping screen and terminal summaries.",
+                "取消后将停止后续文件写入，但保留界面及终端摘要。"
+            ))
             .changed()
         {
             self.server_inputs.file_logging = if file_logging_enabled {
@@ -2295,7 +3362,8 @@ impl P5136GuiApp {
             if ui
                 .add_enabled(
                     !active,
-                    egui::Button::new("서버 시작").min_size([130.0, 34.0].into()),
+                    egui::Button::new(tr!(language, "서버 시작", "Start server", "启动服务器"))
+                        .min_size([130.0, 34.0].into()),
                 )
                 .clicked()
             {
@@ -2304,8 +3372,18 @@ impl P5136GuiApp {
 
             if matches!(&self.server_run_state, ServerRunState::Running(_))
                 && ui
-                    .button("서버 안전 종료")
-                    .on_hover_text("진행 중인 프로필 저장을 마친 뒤 포트를 닫습니다.")
+                    .button(tr!(
+                        language,
+                        "서버 안전 종료",
+                        "Stop server safely",
+                        "安全停止服务器"
+                    ))
+                    .on_hover_text(tr!(
+                        language,
+                        "진행 중인 프로필 저장을 마친 뒤 포트를 닫습니다.",
+                        "Finishes pending profile saves before closing ports.",
+                        "完成正在进行的配置文件保存后再关闭端口。"
+                    ))
                     .clicked()
             {
                 self.request_server_control(ServerControl::GracefulShutdown);
@@ -2315,14 +3393,27 @@ impl P5136GuiApp {
                 &self.server_run_state,
                 ServerRunState::Stopping | ServerRunState::StopBlocked(_)
             ) && ui
-                .button("강제 종료")
-                .on_hover_text("안전 종료가 오래 걸리거나 막힌 경우에만 사용하세요.")
+                .button(tr!(language, "강제 종료", "Force stop", "强制停止"))
+                .on_hover_text(tr!(
+                    language,
+                    "안전 종료가 오래 걸리거나 막힌 경우에만 사용하세요.",
+                    "Use only when safe shutdown is taking too long or is blocked.",
+                    "仅在安全停止耗时过长或被阻塞时使用。"
+                ))
                 .clicked()
             {
                 self.request_server_control(ServerControl::ForceShutdown);
             }
 
-            if ui.button("서버 주소를 접속기에 복사").clicked() {
+            if ui
+                .button(tr!(
+                    language,
+                    "서버 주소를 접속기에 복사",
+                    "Copy server address to connector",
+                    "将服务器地址复制到连接器"
+                ))
+                .clicked()
+            {
                 self.connector_inputs
                     .server
                     .clone_from(&self.server_inputs.advertised_address);
@@ -2336,9 +3427,15 @@ impl P5136GuiApp {
     }
 
     fn connector_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
         let running = self.connector_run_state.is_running();
-        ui.heading("접속기");
-        ui.label("정식 클라이언트 한 개를 준비하고 메신저 접속을 확인한 뒤 실행합니다.");
+        ui.heading(tr!(language, "접속기", "Connector", "连接器"));
+        ui.label(tr!(
+            language,
+            "정식 클라이언트 한 개를 준비하고 메신저 접속을 확인한 뒤 실행합니다.",
+            "Prepares one stock client, verifies messenger reachability, and launches it.",
+            "准备一个原版客户端，确认聊天服务器可连接后启动。"
+        ));
         ui.add_space(10.0);
         ui.add_enabled_ui(!running, |ui| self.connector_input_panel(ui));
         ui.add_space(12.0);
@@ -2348,7 +3445,13 @@ impl P5136GuiApp {
         if ui
             .add_enabled(
                 !running,
-                egui::Button::new("클라이언트 준비 및 실행").min_size([180.0, 34.0].into()),
+                egui::Button::new(tr!(
+                    language,
+                    "클라이언트 준비 및 실행",
+                    "Prepare and launch client",
+                    "准备并启动客户端"
+                ))
+                .min_size([180.0, 34.0].into()),
             )
             .clicked()
         {
@@ -2387,21 +3490,65 @@ impl eframe::App for P5136GuiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let language = self.language;
         egui::Panel::bottom("build-version-footer").show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.weak(BUILD_VERSION_LABEL);
+                ui.weak(tr_format!(
+                    language,
+                    "빌드 버전: {}",
+                    "Build version: {}",
+                    "构建版本：{}",
+                    BUILD_VERSION
+                ));
             });
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(WINDOW_TITLE);
+            ui.horizontal(|ui| {
+                ui.heading(WINDOW_TITLE);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("gui-language")
+                        .selected_text(self.language.native_label())
+                        .show_ui(ui, |ui| {
+                            for candidate in GuiLanguage::ALL {
+                                ui.selectable_value(
+                                    &mut self.language,
+                                    candidate,
+                                    candidate.native_label(),
+                                );
+                            }
+                        });
+                    ui.label(tr!(language, "언어", "Language", "语言"));
+                });
+            });
+            let language = self.language;
             ui.small(if self.server_inputs.file_logging.enabled() {
-                format!("실행 로그 저장 중: {}", self.log_path.display())
+                tr_format!(
+                    language,
+                    "실행 로그 저장 중: {}",
+                    "Saving runtime log: {}",
+                    "正在保存运行日志：{}",
+                    self.log_path.display()
+                )
             } else {
-                "실행 로그 파일 저장 꺼짐".to_owned()
+                tr!(
+                    language,
+                    "실행 로그 파일 저장 꺼짐",
+                    "Runtime log file saving is disabled",
+                    "运行日志文件保存已关闭"
+                )
+                .to_owned()
             });
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.selected_tab, GuiTab::Server, "서버");
-                ui.selectable_value(&mut self.selected_tab, GuiTab::Connector, "접속기");
+                ui.selectable_value(
+                    &mut self.selected_tab,
+                    GuiTab::Server,
+                    tr!(language, "서버", "Server", "服务器"),
+                );
+                ui.selectable_value(
+                    &mut self.selected_tab,
+                    GuiTab::Connector,
+                    tr!(language, "접속기", "Connector", "连接器"),
+                );
             });
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| match self.selected_tab {
@@ -2432,22 +3579,41 @@ fn run_connector_worker(
     plan: &ConnectorPlan,
     notifier: &GuiNotifier,
     cancellation: &ConnectorCancellation,
+    language: GuiLanguage,
 ) -> Result<GuiSuccess> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("접속기 런타임을 만들지 못했습니다")?;
+        .with_context(|| {
+            tr!(
+                language,
+                "접속기 런타임을 만들지 못했습니다",
+                "Failed to create the connector runtime",
+                "无法创建连接器运行时"
+            )
+        })?;
     runtime.block_on(async {
         let mut execution =
             execute_connector_with_progress_and_cancellation(plan, cancellation, |stage| {
                 notifier.send(GuiEvent::Connector(ConnectorGuiEvent::Stage(stage)));
             })
             .await
-            .context("접속기 실행에 실패했습니다")?;
-        let status = execution
-            .launched_process
-            .try_status()
-            .context("실행한 프로세스 상태를 확인하지 못했습니다")?;
+            .with_context(|| {
+                tr!(
+                    language,
+                    "접속기 실행에 실패했습니다",
+                    "Connector execution failed",
+                    "连接器执行失败"
+                )
+            })?;
+        let status = execution.launched_process.try_status().with_context(|| {
+            tr!(
+                language,
+                "실행한 프로세스 상태를 확인하지 못했습니다",
+                "Failed to query the launched process status",
+                "无法查询已启动进程的状态"
+            )
+        })?;
         Ok(GuiSuccess {
             backend: execution.launched_process.backend(),
             pid: execution.launched_process.pid(),
@@ -2460,6 +3626,7 @@ fn run_server_worker(
     config: ServerConfig,
     mut controls: tokio::sync::mpsc::UnboundedReceiver<ServerControl>,
     notifier: &GuiNotifier,
+    language: GuiLanguage,
 ) -> Result<()> {
     tracing::info!(
         bind_address = %config.bind_address,
@@ -2474,16 +3641,37 @@ fn run_server_worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("서버 런타임을 만들지 못했습니다")?;
+        .with_context(|| {
+            tr!(
+                language,
+                "서버 런타임을 만들지 못했습니다",
+                "Failed to create the server runtime",
+                "无法创建服务器运行时"
+            )
+        })?;
     runtime.block_on(async move {
         let server = BoundServer::bind(config)
             .await
-            .context("P5136 네트워크 포트를 열지 못했습니다")?
+            .with_context(|| {
+                tr!(
+                    language,
+                    "P5136 네트워크 포트를 열지 못했습니다",
+                    "Failed to open the P5136 network ports",
+                    "无法打开 P5136 网络端口"
+                )
+            })?
             .start()
-            .context("P5136 서버 감독 작업을 시작하지 못했습니다")?;
+            .with_context(|| {
+                tr!(
+                    language,
+                    "P5136 서버 감독 작업을 시작하지 못했습니다",
+                    "Failed to start the P5136 server supervisor",
+                    "无法启动 P5136 服务器监督任务"
+                )
+            })?;
         let endpoints = server.endpoints();
         notifier.send(GuiEvent::ServerStarted(endpoints));
-        run_server_control_loop(&server, &mut controls, notifier).await
+        run_server_control_loop(&server, &mut controls, notifier, language).await
     })
 }
 
@@ -2491,21 +3679,22 @@ async fn run_server_control_loop(
     server: &p5136_server::ServerHandle,
     controls: &mut tokio::sync::mpsc::UnboundedReceiver<ServerControl>,
     notifier: &GuiNotifier,
+    language: GuiLanguage,
 ) -> Result<()> {
     loop {
         tokio::select! {
-            result = server.wait() => return result.context("P5136 서버 런타임이 종료되었습니다"),
+            result = server.wait() => return result.with_context(|| tr!(language, "P5136 서버 런타임이 종료되었습니다", "The P5136 server runtime exited", "P5136 服务器运行时已退出")),
             control = controls.recv() => match control {
-                Some(ServerControl::GracefulShutdown) => match await_graceful_shutdown_or_force(server, controls, notifier).await? {
+                Some(ServerControl::GracefulShutdown) => match await_graceful_shutdown_or_force(server, controls, notifier, language).await? {
                     GracefulShutdownOutcome::Stopped => return Ok(()),
                     GracefulShutdownOutcome::Blocked(error) => {
                         if !notifier.send(GuiEvent::ServerStopBlocked(error)) {
-                            return server.force_shutdown().await.context("GUI 종료 후 서버 강제 종료에 실패했습니다");
+                            return server.force_shutdown().await.with_context(|| tr!(language, "GUI 종료 후 서버 강제 종료에 실패했습니다", "Failed to force-stop the server after the GUI closed", "GUI 关闭后强制停止服务器失败"));
                         }
                     }
                 },
                 Some(ServerControl::ForceShutdown) | None => {
-                    return server.force_shutdown().await.context("서버 강제 종료에 실패했습니다");
+                    return server.force_shutdown().await.with_context(|| tr!(language, "서버 강제 종료에 실패했습니다", "Failed to force-stop the server", "强制停止服务器失败"));
                 }
                 Some(ServerControl::UpdateRandomTracks(random_tracks)) => {
                     let result = server
@@ -2516,7 +3705,7 @@ async fn run_server_control_loop(
                         return server
                             .force_shutdown()
                             .await
-                            .context("GUI 종료 후 서버 강제 종료에 실패했습니다");
+                            .with_context(|| tr!(language, "GUI 종료 후 서버 강제 종료에 실패했습니다", "Failed to force-stop the server after the GUI closed", "GUI 关闭后强制停止服务器失败"));
                     }
                 }
                 Some(ServerControl::GrantKart {
@@ -2533,7 +3722,7 @@ async fn run_server_control_loop(
                         return server
                             .force_shutdown()
                             .await
-                            .context("GUI 종료 후 서버 강제 종료에 실패했습니다");
+                            .with_context(|| tr!(language, "GUI 종료 후 서버 강제 종료에 실패했습니다", "Failed to force-stop the server after the GUI closed", "GUI 关闭后强制停止服务器失败"));
                     }
                 }
             }
@@ -2550,6 +3739,7 @@ async fn await_graceful_shutdown_or_force(
     server: &p5136_server::ServerHandle,
     controls: &mut tokio::sync::mpsc::UnboundedReceiver<ServerControl>,
     notifier: &GuiNotifier,
+    language: GuiLanguage,
 ) -> Result<GracefulShutdownOutcome> {
     let mut graceful = Box::pin(server.shutdown());
     loop {
@@ -2562,18 +3752,18 @@ async fn await_graceful_shutdown_or_force(
                 Some(ServerControl::GracefulShutdown) => {}
                 Some(ServerControl::ForceShutdown) | None => {
                     let (forced, graceful_result) = tokio::join!(server.force_shutdown(), &mut graceful);
-                    forced.context("서버 강제 종료에 실패했습니다")?;
-                    graceful_result.context("강제 종료 후에도 안전 종료 작업이 끝나지 않았습니다")?;
+                    forced.with_context(|| tr!(language, "서버 강제 종료에 실패했습니다", "Failed to force-stop the server", "强制停止服务器失败"))?;
+                    graceful_result.with_context(|| tr!(language, "강제 종료 후에도 안전 종료 작업이 끝나지 않았습니다", "Safe shutdown did not finish even after a force-stop", "强制停止后安全停止任务仍未完成"))?;
                     return Ok(GracefulShutdownOutcome::Stopped);
                 }
                 Some(ServerControl::UpdateRandomTracks(_)) => {
                     notifier.send(GuiEvent::RandomTracksUpdated(Err(
-                        "서버가 종료 중이어서 설정을 적용하지 않았습니다".to_owned()
+                        tr!(language, "서버가 종료 중이어서 설정을 적용하지 않았습니다", "Settings were not applied because the server is stopping", "服务器正在停止，未应用设置").to_owned()
                     )));
                 }
                 Some(ServerControl::GrantKart { .. }) => {
                     notifier.send(GuiEvent::KartGranted(Err(
-                        "서버가 종료 중이어서 카트를 지급하지 않았습니다".to_owned()
+                        tr!(language, "서버가 종료 중이어서 카트를 지급하지 않았습니다", "The kart was not granted because the server is stopping", "服务器正在停止，未发放车辆").to_owned()
                     )));
                 }
             }
@@ -2581,11 +3771,26 @@ async fn await_graceful_shutdown_or_force(
     }
 }
 
-const fn stage_label(stage: ConnectorStage) -> &'static str {
+fn stage_label(stage: ConnectorStage, language: GuiLanguage) -> &'static str {
     match stage {
-        ConnectorStage::PreparingInstallation => "PIN과 XML 파일을 준비하는 중…",
-        ConnectorStage::ProbingMessenger => "메신저 TCP 접속을 확인하는 중…",
-        ConnectorStage::LaunchingGame => "카트라이더를 실행하는 중…",
+        ConnectorStage::PreparingInstallation => tr!(
+            language,
+            "PIN과 XML 파일을 준비하는 중…",
+            "Preparing PIN and XML files…",
+            "正在准备 PIN 和 XML 文件……"
+        ),
+        ConnectorStage::ProbingMessenger => tr!(
+            language,
+            "메신저 TCP 접속을 확인하는 중…",
+            "Checking messenger TCP reachability…",
+            "正在检查聊天服务器 TCP 连接……"
+        ),
+        ConnectorStage::LaunchingGame => tr!(
+            language,
+            "카트라이더를 실행하는 중…",
+            "Launching KartRider…",
+            "正在启动跑跑卡丁车……"
+        ),
     }
 }
 
@@ -2606,10 +3811,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BUILD_VERSION_LABEL, ConnectorGuiEvent, GUI_SETTINGS_KEY, GuiInputs,
-        GuiItemProbabilitySource, GuiRunState, GuiRunner, GuiSuccess, MAX_GUI_SETTINGS_BYTES,
-        P5136GuiApp, ServerInputs, lan_address_rank, virtual_adapter_rank,
+        BUILD_VERSION, ConnectorGuiEvent, GUI_SETTINGS_KEY, GuiInputs, GuiItemProbabilitySource,
+        GuiRunState, GuiRunner, GuiSuccess, MAX_GUI_SETTINGS_BYTES, P5136GuiApp, ServerInputs,
+        lan_address_rank, virtual_adapter_rank,
     };
+    use crate::gui_i18n::GuiLanguage;
 
     #[derive(Default)]
     struct MemoryStorage(HashMap<String, String>);
@@ -2635,6 +3841,7 @@ mod tests {
             game_directory: "/games/Kart Rider".to_owned(),
             game_executable: "/games/Kart Rider/KartRider.custom.exe".to_owned(),
             nickname: "fixture-user".to_owned(),
+            observer_mode: true,
             server: "192.0.2.10".to_owned(),
             configured_port: "39311".to_owned(),
             runner: GuiRunner::Wine,
@@ -2648,15 +3855,14 @@ mod tests {
 
     #[test]
     fn build_version_footer_uses_the_compiled_package_version() {
-        assert_eq!(
-            BUILD_VERSION_LABEL,
-            concat!("빌드 버전: ", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
     fn inputs_build_the_same_non_mutating_connector_plan_as_cli() {
-        let plan = fixture_inputs().connector_plan().unwrap();
+        let plan = fixture_inputs()
+            .connector_plan(GuiLanguage::Korean)
+            .unwrap();
 
         assert_eq!(plan.game_directory, Path::new("/games/Kart Rider"));
         assert_eq!(
@@ -2664,6 +3870,10 @@ mod tests {
             Path::new("/games/Kart Rider/KartRider.custom.exe")
         );
         assert_eq!(plan.nickname, "fixture-user");
+        assert_eq!(
+            plan.installation_options.launcher_profile_role,
+            p5136_connector::LauncherProfileRole::ObserverMaster
+        );
         assert_eq!(plan.login_endpoint.to_string(), "192.0.2.10:39312");
         assert_eq!(plan.messenger_endpoint.to_string(), "192.0.2.10:39313");
         assert_eq!(plan.launch_spec.backend(), RunnerBackend::Wine);
@@ -2674,12 +3884,39 @@ mod tests {
     }
 
     #[test]
+    fn observer_checkbox_maps_to_an_explicit_regular_or_observer_profile() {
+        let mut inputs = fixture_inputs();
+        inputs.observer_mode = false;
+        assert_eq!(
+            inputs
+                .connector_plan(GuiLanguage::Korean)
+                .unwrap()
+                .installation_options
+                .launcher_profile_role,
+            p5136_connector::LauncherProfileRole::Regular
+        );
+
+        inputs.observer_mode = true;
+        assert_eq!(
+            inputs
+                .connector_plan(GuiLanguage::Korean)
+                .unwrap()
+                .installation_options
+                .launcher_profile_role,
+            p5136_connector::LauncherProfileRole::ObserverMaster
+        );
+    }
+
+    #[test]
     fn crossover_requires_both_binary_and_bottle() {
         let mut inputs = fixture_inputs();
         inputs.runner = GuiRunner::CrossOver;
         inputs.crossover_bottle.clear();
 
-        let error = inputs.connector_plan().unwrap_err().to_string();
+        let error = inputs
+            .connector_plan(GuiLanguage::Korean)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("CrossOver 보틀"));
     }
 
@@ -2689,7 +3926,10 @@ mod tests {
         inputs.runner = GuiRunner::Sikarugir;
         inputs.sikarugir_app.clear();
 
-        let error = inputs.connector_plan().unwrap_err().to_string();
+        let error = inputs
+            .connector_plan(GuiLanguage::Korean)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("Sikarugir wrapper 앱"));
     }
 
@@ -2713,7 +3953,7 @@ mod tests {
             ..ServerInputs::default()
         };
 
-        let config = inputs.server_config().unwrap();
+        let config = inputs.server_config(GuiLanguage::Korean).unwrap();
 
         assert_eq!(config.bind_address, "::1".parse::<IpAddr>().unwrap());
         assert_eq!(config.advertised_address, Ipv4Addr::new(192, 0, 2, 20));
@@ -2740,7 +3980,7 @@ mod tests {
             trust_client_item_rank: false,
             ..inputs
         }
-        .server_config()
+        .server_config(GuiLanguage::Korean)
         .unwrap();
         assert_eq!(
             safe.item_probability_rank_policy,
@@ -2757,7 +3997,7 @@ mod tests {
 
         assert!(
             inputs
-                .server_config()
+                .server_config(GuiLanguage::Korean)
                 .unwrap_err()
                 .to_string()
                 .contains("최대 로그인 세션 수")
@@ -2781,18 +4021,27 @@ mod tests {
             ..ServerInputs::default()
         };
 
-        assert_eq!(inputs.server_config().unwrap().random_tracks, random_tracks);
+        assert_eq!(
+            inputs
+                .server_config(GuiLanguage::Korean)
+                .unwrap()
+                .random_tracks,
+            random_tracks
+        );
     }
 
     #[test]
     fn server_inputs_require_a_client_location() {
-        let error = ServerInputs::default().server_config().unwrap_err();
+        let error = ServerInputs::default()
+            .server_config(GuiLanguage::Korean)
+            .unwrap_err();
         assert!(error.to_string().contains("클라이언트 또는 Profile 경로"));
     }
 
     #[test]
     fn gui_persists_server_and_connector_inputs_between_runs() {
         let mut app = P5136GuiApp::new(PathBuf::new(), None);
+        app.language = GuiLanguage::SimplifiedChinese;
         app.connector_inputs = fixture_inputs();
         app.server_inputs = ServerInputs {
             bind_address: "0.0.0.0".to_owned(),
@@ -2823,6 +4072,7 @@ mod tests {
         app.server_inputs.item_probabilities.individual[0].top_weight += 17;
         let expected_connector = app.connector_inputs.clone();
         let expected_server = app.server_inputs.clone();
+        let expected_language = app.language;
         let mut storage = MemoryStorage::default();
         eframe::App::save(&mut app, &mut storage);
         assert!(storage.0.contains_key(GUI_SETTINGS_KEY));
@@ -2830,6 +4080,24 @@ mod tests {
         let restored = P5136GuiApp::new(PathBuf::new(), Some(&storage));
         assert_eq!(restored.connector_inputs, expected_connector);
         assert_eq!(restored.server_inputs, expected_server);
+        assert_eq!(restored.language, expected_language);
+    }
+
+    #[test]
+    fn gui_defaults_legacy_settings_without_a_language_to_korean() {
+        let encoded = serde_json::json!({
+            "connector": GuiInputs::default(),
+            "server": ServerInputs::default(),
+        })
+        .to_string();
+        let mut storage = MemoryStorage::default();
+        storage.0.insert(GUI_SETTINGS_KEY.to_owned(), encoded);
+
+        let restored = P5136GuiApp::new(PathBuf::new(), Some(&storage));
+
+        assert_eq!(restored.language, GuiLanguage::Korean);
+        assert_eq!(restored.connector_inputs, GuiInputs::default());
+        assert_eq!(restored.server_inputs, ServerInputs::default());
     }
 
     #[test]
@@ -2858,7 +4126,7 @@ mod tests {
 
         assert!(
             inputs
-                .server_config()
+                .server_config(GuiLanguage::Korean)
                 .unwrap_err()
                 .to_string()
                 .contains("맵이 1개 이상")
@@ -2871,19 +4139,23 @@ mod tests {
             bind_address: "server.lan".to_owned(),
             ..ServerInputs::default()
         };
-        assert!(bind_domain.server_config().is_err());
+        assert!(bind_domain.server_config(GuiLanguage::Korean).is_err());
 
         let advertised_domain = ServerInputs {
             advertised_address: "server.lan".to_owned(),
             ..ServerInputs::default()
         };
-        assert!(advertised_domain.server_config().is_err());
+        assert!(
+            advertised_domain
+                .server_config(GuiLanguage::Korean)
+                .is_err()
+        );
 
         let unspecified = ServerInputs {
             advertised_address: Ipv4Addr::UNSPECIFIED.to_string(),
             ..ServerInputs::default()
         };
-        assert!(unspecified.server_config().is_err());
+        assert!(unspecified.server_config(GuiLanguage::Korean).is_err());
     }
 
     #[test]

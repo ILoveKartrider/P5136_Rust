@@ -66,7 +66,7 @@ been demonstrated.
   room-master-only atomic title/password update and all-room reply; a changed
   S0-S8 token selects that variant in the next `GrCommandStartPacket` while the
   existing channel/session speed byte remains unchanged, matching the C# server
-- [x] channel-consistent no-title physics fallback: S6 for individual/team
+- [x] channel-consistent no-title physics fallback: stock S4 for individual/team
   infinite-booster channels, S7 for speed, and S8 for item game-type rows
 - [ ] verified launch of a stock client on Windows
 - [ ] verified launch of the same client through Wine, CrossOver, or Sikarugir
