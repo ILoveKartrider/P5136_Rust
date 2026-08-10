@@ -8,10 +8,93 @@
 
 use crate::kart_physics::P5136TuneSpecSnapshot;
 
+/// Item-mode meaning recovered from
+/// `zeta_/kr/enchant/desc.xml` in the stock Korean P5136 RHO5 data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P5136ItemFloaterEffect {
+    WaterBombDefense,
+    WaterFlyDefense,
+    LucciOnItemCube,
+    DevilDefense,
+    ShieldToSuperShield,
+    BossRocketDamage,
+    UfoSignalToShield,
+    MagnetUseGrantsBooster,
+    BananaHitGrantsBooster,
+    WaterBombToInfectedBomb,
+    RocketToGoldRocket,
+    WaterBombToIceBomb,
+    BananaDefense,
+    BoosterToSiren,
+    BananaToWaterMine,
+    QuickEscapeFromWater,
+    DoubleRocketFire,
+    BoosterToSuperShield,
+    BattleWaterFlyDefense,
+    BattleWaterBombDefense,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P5136ItemFloaterAbility {
+    pub code: i16,
+    pub effect: P5136ItemFloaterEffect,
+    /// The `+N` value shown by the Korean client. Fixed effects have no
+    /// displayed level even though their encoded option ID is one.
+    pub display_level: Option<u8>,
+    /// Exact percentage in the stock Korean P5136 `enchant.xml` Tune entry.
+    pub probability: u8,
+}
+
+/// Resolves the 20 options in the stock item-mode activation-kit pool.
+#[must_use]
+pub const fn p5136_item_floater_ability(code: i16) -> Option<P5136ItemFloaterAbility> {
+    use P5136ItemFloaterEffect as Effect;
+
+    let (effect, display_level, probability) = match code {
+        10_103 => (Effect::WaterBombDefense, Some(3), 20),
+        10_203 => (Effect::WaterFlyDefense, Some(3), 20),
+        10_303 => (Effect::LucciOnItemCube, Some(3), 40),
+        10_401 => (Effect::DevilDefense, None, 100),
+        10_503 => (Effect::ShieldToSuperShield, Some(3), 15),
+        10_603 => (Effect::BossRocketDamage, Some(3), 40),
+        10_703 => (Effect::UfoSignalToShield, Some(3), 50),
+        10_803 => (Effect::MagnetUseGrantsBooster, Some(3), 30),
+        10_901 => (Effect::BananaHitGrantsBooster, None, 100),
+        11_001 => (Effect::WaterBombToInfectedBomb, None, 100),
+        11_103 => (Effect::RocketToGoldRocket, Some(3), 40),
+        11_201 => (Effect::WaterBombToIceBomb, None, 100),
+        11_301 => (Effect::BananaDefense, None, 100),
+        11_403 => (Effect::BoosterToSiren, Some(3), 25),
+        11_501 => (Effect::BananaToWaterMine, None, 100),
+        11_601 => (Effect::QuickEscapeFromWater, None, 100),
+        11_701 => (Effect::DoubleRocketFire, None, 100),
+        11_803 => (Effect::BoosterToSuperShield, Some(3), 30),
+        11_903 => (Effect::BattleWaterFlyDefense, Some(3), 75),
+        12_003 => (Effect::BattleWaterBombDefense, Some(3), 75),
+        _ => return None,
+    };
+    Some(P5136ItemFloaterAbility {
+        code,
+        effect,
+        display_level,
+        probability,
+    })
+}
+
 pub const SPEED_FLOATER_CODES: &[i16] = &[103, 203, 303, 403, 503, 603, 703, 803, 903];
+pub const ALL_SPEED_FLOATER_CODES: &[i16] = &[
+    101, 102, 103, 201, 202, 203, 301, 302, 303, 401, 402, 403, 501, 502, 503, 601, 602, 603, 701,
+    702, 703, 801, 802, 803, 901, 902, 903,
+];
 pub const ITEM_FLOATER_CODES: &[i16] = &[
     10_103, 10_203, 10_303, 10_401, 10_503, 10_603, 10_703, 10_803, 10_901, 11_001, 11_103, 11_201,
     11_301, 11_403, 11_501, 11_601, 11_701, 11_803, 11_903, 12_003,
+];
+pub const ALL_FLOATER_CODES: &[i16] = &[
+    101, 102, 103, 201, 202, 203, 301, 302, 303, 401, 402, 403, 501, 502, 503, 601, 602, 603, 701,
+    702, 703, 801, 802, 803, 901, 902, 903, 10_103, 10_203, 10_303, 10_401, 10_503, 10_603, 10_703,
+    10_803, 10_901, 11_001, 11_103, 11_201, 11_301, 11_403, 11_501, 11_601, 11_701, 11_803, 11_903,
+    12_003,
 ];
 pub const BLACK_FLOATER_CODES: [i16; 3] = [603, 703, 903];
 
@@ -177,8 +260,10 @@ pub fn p5136_floater_spec(codes: [i16; 3]) -> Option<P5136TuneSpecSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLACK_FLOATER_CODES, INTRINSIC_FLOATER_CODES, ITEM_FLOATER_CODES, SPEED_FLOATER_CODES,
-        floater_code_pool, intrinsic_floater_codes, p5136_floater_spec,
+        ALL_FLOATER_CODES, ALL_SPEED_FLOATER_CODES, BLACK_FLOATER_CODES, INTRINSIC_FLOATER_CODES,
+        ITEM_FLOATER_CODES, P5136ItemFloaterEffect, SPEED_FLOATER_CODES, floater_code_pool,
+        intrinsic_floater_codes, is_known_floater_code, p5136_floater_spec,
+        p5136_item_floater_ability,
     };
     use crate::kart_physics::P5136TuneSpecSnapshot;
 
@@ -253,12 +338,53 @@ mod tests {
     }
 
     #[test]
+    fn korean_rho_item_floater_descriptions_have_explicit_meanings() {
+        let lucci = p5136_item_floater_ability(10_303).unwrap();
+        assert_eq!(lucci.effect, P5136ItemFloaterEffect::LucciOnItemCube);
+        assert_eq!(lucci.display_level, Some(3));
+        assert_eq!(lucci.probability, 40);
+
+        let gold_rocket = p5136_item_floater_ability(11_103).unwrap();
+        assert_eq!(
+            gold_rocket.effect,
+            P5136ItemFloaterEffect::RocketToGoldRocket
+        );
+        assert_eq!(gold_rocket.display_level, Some(3));
+        assert_eq!(gold_rocket.probability, 40);
+
+        let water_mine = p5136_item_floater_ability(11_501).unwrap();
+        assert_eq!(water_mine.effect, P5136ItemFloaterEffect::BananaToWaterMine);
+        assert_eq!(water_mine.display_level, None);
+        assert_eq!(water_mine.probability, 100);
+
+        assert_eq!(
+            ITEM_FLOATER_CODES
+                .iter()
+                .filter(|&&code| p5136_item_floater_ability(code).is_some())
+                .count(),
+            ITEM_FLOATER_CODES.len()
+        );
+    }
+
+    #[test]
     fn activation_kit_pools_and_black_fixed_triple_match_csharp() {
         assert_eq!(floater_code_pool(6).unwrap(), SPEED_FLOATER_CODES);
         assert_eq!(floater_code_pool(4).unwrap(), ITEM_FLOATER_CODES);
         assert!(floater_code_pool(1).unwrap().len() > SPEED_FLOATER_CODES.len());
         assert!(floater_code_pool(0).is_none());
         assert_eq!(BLACK_FLOATER_CODES, [603, 703, 903]);
+    }
+
+    #[test]
+    fn operator_floater_catalog_contains_every_valid_nonzero_code_once() {
+        assert_eq!(ALL_SPEED_FLOATER_CODES.len(), 27);
+        assert_eq!(ALL_FLOATER_CODES.len(), 47);
+        assert!(ALL_FLOATER_CODES.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            ALL_FLOATER_CODES
+                .iter()
+                .all(|code| is_known_floater_code(*code))
+        );
     }
 
     #[test]

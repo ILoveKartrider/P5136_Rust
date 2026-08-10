@@ -38,6 +38,7 @@ const MAX_SOURCE_ELEMENTS: usize = 100_000;
 const MAX_SOURCE_ATTRIBUTES: usize = 256;
 const MAX_SOURCE_STRING_BYTES: usize = 4 * 1024;
 const SHOP_INVENTORY_PATH: &str = "zeta_/kr/shop/data/item.kml";
+const SPECIAL_BOOSTER_TRANSFORM_MODE: &str = "animal_booster";
 
 const VERIFIED_ITEM_SYMBOLS: &[(&str, i16)] = &[
     ("animalBooster", 31),
@@ -82,6 +83,15 @@ const VERIFIED_ITEM_SYMBOLS: &[(&str, i16)] = &[
     ("waterbombFly", 120),
 ];
 
+/// Playable Korean shop bodies whose stock resource layout intentionally
+/// fails the generic one-folder model heuristic.
+///
+/// The three Boxter variants carry their own P5136 `BodyParam` but share the
+/// `boxter7` model folder. Kartneck's historical internal names contain
+/// `dummyBox`, despite both KR parameter files explicitly identifying the
+/// released Kartneck bodies and shipping complete model resources.
+const VERIFIED_PLAYABLE_KART_EXCEPTIONS: &[u16] = &[744, 745, 746, 795, 1_167];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientKartCatalogStats {
     pub names: usize,
@@ -91,6 +101,7 @@ pub struct ClientKartCatalogStats {
     pub inventory_karts: usize,
     pub auto_grant_karts: usize,
     pub quarantined_karts: usize,
+    pub x_parts_karts: usize,
     pub transform_rules: usize,
     pub item_symbols: usize,
 }
@@ -243,6 +254,7 @@ struct InventoryItem {
     id: u16,
     name: String,
     auto_grant: bool,
+    x_parts_compatible: bool,
 }
 type TransformSources = BTreeMap<String, Prioritized<SourceElement>>;
 
@@ -257,7 +269,7 @@ pub fn load_client_kart_catalog(
     let (names, specs, resources, rho5) = load_kart_metadata(&source_directory, &kart_path)?;
     validate_kart_metadata(&names, &specs)?;
     let mut inventory = load_inventory(&rho5, &names)?;
-    classify_kart_auto_grants(&mut inventory, &names, &specs, &resources);
+    classify_karts(&mut inventory, &names, &specs, &resources);
     let (symbols, transforms) = load_item_transforms(&item_path)?;
 
     let xml = build_catalog_xml(&names, &specs, &inventory, &transforms)?;
@@ -280,6 +292,10 @@ pub fn load_client_kart_catalog(
         quarantined_karts: inventory
             .iter()
             .filter(|item| item.category == 3 && !item.auto_grant)
+            .count(),
+        x_parts_karts: inventory
+            .iter()
+            .filter(|item| item.category == 3 && item.x_parts_compatible)
             .count(),
         transform_rules: transforms.len(),
         item_symbols: symbols.len(),
@@ -400,7 +416,7 @@ fn load_inventory(
     parse_inventory(inventory_entry.normalized_path(), &inventory_bytes, names)
 }
 
-fn classify_kart_auto_grants(
+fn classify_karts(
     inventory: &mut [InventoryItem],
     names: &KartNames,
     specs: &KartSpecs,
@@ -408,7 +424,20 @@ fn classify_kart_auto_grants(
 ) {
     for item in inventory.iter_mut().filter(|item| item.category == 3) {
         item.auto_grant = kart_is_safe_for_automatic_grant(item, names, specs, resources);
+        item.x_parts_compatible = kart_uses_x_parts(item, names, specs);
     }
+}
+
+fn kart_uses_x_parts(item: &InventoryItem, names: &KartNames, specs: &KartSpecs) -> bool {
+    let Some(internal_name) = names.get(&item.id).map(|name| name.value.trim()) else {
+        return false;
+    };
+    let Some(spec) = specs.get(&internal_name.to_ascii_lowercase()) else {
+        return false;
+    };
+    spec.value.attribute("TachometerType").is_some_and(|value| {
+        value.eq_ignore_ascii_case("XGenTacho") || value.eq_ignore_ascii_case("V1GenTacho")
+    })
 }
 
 fn kart_is_safe_for_automatic_grant(
@@ -420,12 +449,18 @@ fn kart_is_safe_for_automatic_grant(
     let Some(internal_name) = names.get(&item.id).map(|name| name.value.trim()) else {
         return false;
     };
-    if internal_name.is_empty() || looks_like_non_player_kart(internal_name, &item.name) {
+    let verified_exception = VERIFIED_PLAYABLE_KART_EXCEPTIONS.contains(&item.id);
+    if internal_name.is_empty()
+        || (!verified_exception && looks_like_non_player_kart(internal_name, &item.name))
+    {
         return false;
     }
     let Some(spec) = specs.get(&internal_name.to_ascii_lowercase()) else {
         return false;
     };
+    if verified_exception {
+        return true;
+    }
     let model_folder = spec
         .value
         .attribute("addModelFolder")
@@ -463,6 +498,7 @@ fn load_item_transforms(
     let item_archive = LegacyRhoArchive::open(item_path, LegacyRhoLimits::default())?;
     let mut symbols = HashMap::<String, i16>::new();
     let mut transform_sources = TransformSources::new();
+    let mut special_booster_sources = TransformSources::new();
     for entry in item_archive.entries()? {
         let path = entry.normalized_path();
         let file_name = path.rsplit('/').next().unwrap_or(path);
@@ -481,11 +517,20 @@ fn load_item_transforms(
             let bytes = checked_legacy_extract(&item_archive, &entry)?;
             merge_transform_sources(&mut transform_sources, priority, path, &bytes)?;
         }
+        let priority = catalog_file_priority(file_name, "animalBooster", "kr");
+        if priority > 0 {
+            let bytes = checked_legacy_extract(&item_archive, &entry)?;
+            merge_special_booster_sources(&mut special_booster_sources, priority, path, &bytes)?;
+        }
     }
     for &(name, id) in VERIFIED_ITEM_SYMBOLS {
         add_item_symbol(&mut symbols, name, id)?;
     }
-    let transforms = resolve_transforms(transform_sources, &symbols)?;
+    let mut transforms = resolve_transforms(transform_sources, &symbols)?;
+    transforms.extend(resolve_special_boosters(special_booster_sources)?);
+    transforms.sort_unstable_by(|left, right| {
+        (left.kart_id, &left.source, &left.mode).cmp(&(right.kart_id, &right.source, &right.mode))
+    });
     if transforms.len() < MINIMUM_TRANSFORM_RULES {
         return Err(ClientKartCatalogError::IncompleteTransforms {
             actual: transforms.len(),
@@ -521,6 +566,37 @@ fn validate_p5136_sentinels(catalog: &CatalogInventory) -> Result<(), ClientKart
         if rule.target_item_id != expected_target || rule.probability != 100 {
             return Err(ClientKartCatalogError::Sentinel {
                 check: "chicken_goldV1 transform semantics",
+            });
+        }
+    }
+    // Both Korean Pharaoh HT shop bodies use the same guardian5 ability:
+    // each listed ordinary item, including booster 6, becomes Gold Shield 36
+    // at 20%. Keep this sentinel on the exact reported path so an incomplete
+    // transform overlay fails startup instead of silently dropping the kart
+    // ability.
+    for kart_id in [498, 585] {
+        for source_id in [3, 4, 5, 6, 7, 9, 12, 13] {
+            let Some(rule) = catalog.item_transform(kart_id, source_id, "no_flag") else {
+                return Err(ClientKartCatalogError::Sentinel {
+                    check: "Pharaoh HT Gold Shield transform presence",
+                });
+            };
+            if rule.target_item_id != 36 || rule.probability != 20 {
+                return Err(ClientKartCatalogError::Sentinel {
+                    check: "Pharaoh HT Gold Shield transform semantics",
+                });
+            }
+        }
+    }
+    for kart_id in [186, 197, 366, 412, 498, 585, 1_139] {
+        let Some(rule) = catalog.item_transform(kart_id, 6, SPECIAL_BOOSTER_TRANSFORM_MODE) else {
+            return Err(ClientKartCatalogError::Sentinel {
+                check: "Gold Booster transform presence",
+            });
+        };
+        if rule.target_item_id != 31 || rule.probability != 100 {
+            return Err(ClientKartCatalogError::Sentinel {
+                check: "Gold Booster transform semantics",
             });
         }
     }
@@ -678,6 +754,7 @@ fn parse_inventory(
             id,
             name,
             auto_grant: is_stock_item_safe_for_implicit_grant(category, id),
+            x_parts_compatible: false,
         })
         .collect())
 }
@@ -753,6 +830,32 @@ fn merge_transform_sources(
     Ok(())
 }
 
+fn merge_special_booster_sources(
+    transforms: &mut TransformSources,
+    priority: i32,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), ClientKartCatalogError> {
+    for element in source_elements(path, bytes, "animalBooster")? {
+        let Some(kart_id) = element.attribute("kartId") else {
+            continue;
+        };
+        let replace = transforms
+            .get(kart_id)
+            .is_none_or(|current| priority >= current.priority);
+        if replace {
+            transforms.insert(
+                kart_id.to_owned(),
+                Prioritized {
+                    priority,
+                    value: element,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 fn resolve_transforms(
     sources: BTreeMap<String, Prioritized<SourceElement>>,
     symbols: &HashMap<String, i16>,
@@ -789,6 +892,38 @@ fn resolve_transforms(
     transforms.sort_unstable_by(|left, right| {
         (left.kart_id, &left.source, &left.mode).cmp(&(right.kart_id, &right.source, &right.mode))
     });
+    Ok(transforms)
+}
+
+fn resolve_special_boosters(
+    sources: TransformSources,
+) -> Result<Vec<RawTransform>, ClientKartCatalogError> {
+    let mut transforms = Vec::with_capacity(sources.len());
+    for source in sources.into_values() {
+        let element = source.value;
+        let path = "item.rho animalBooster";
+        let kart_id = parse_required::<u16>(&element, "kartId", path)?;
+        let _: u16 = parse_required(&element, "iconId", path)?;
+        let probability = match element.attribute("prob") {
+            None | Some("-1") => 100,
+            Some(value) => value
+                .parse::<u8>()
+                .ok()
+                .filter(|probability| *probability <= 100)
+                .ok_or_else(|| ClientKartCatalogError::InvalidField {
+                    path: path.to_owned(),
+                    field: "prob",
+                })?,
+        };
+        transforms.push(RawTransform {
+            kart_id,
+            source: "booster".to_owned(),
+            source_id: 6,
+            target_id: 31,
+            probability,
+            mode: SPECIAL_BOOSTER_TRANSFORM_MODE.to_owned(),
+        });
+    }
     Ok(transforms)
 }
 
@@ -891,6 +1026,9 @@ fn write_catalog_inventory(
         }
         if !item.auto_grant {
             element.push_attribute(("autoGrant", "false"));
+        }
+        if item.x_parts_compatible {
+            element.push_attribute(("xPartsCompatible", "true"));
         }
         writer
             .write_event(Event::Empty(element))
@@ -1267,7 +1405,7 @@ mod tests {
 
     use super::{
         InventoryItem, KartNames, KartResources, KartSpecs, Prioritized, SourceElement,
-        catalog_file_priority, classify_kart_auto_grants, decode_xml_text, kart_model_folder,
+        catalog_file_priority, classify_karts, decode_xml_text, kart_model_folder,
         kart_param_candidate, load_client_kart_catalog,
     };
 
@@ -1341,13 +1479,25 @@ mod tests {
             },
         };
         let specs = KartSpecs::from([
-            ("normalkart".to_owned(), body(&[])),
+            (
+                "normalkart".to_owned(),
+                body(&[("TachometerType", "XGenTacho")]),
+            ),
             (
                 "sharedkart".to_owned(),
-                body(&[("addModelFolder", "commonModel")]),
+                body(&[
+                    ("addModelFolder", "commonModel"),
+                    ("TachometerType", "V1GenTacho"),
+                ]),
             ),
-            ("missingmodel".to_owned(), body(&[])),
-            ("development_test_kart".to_owned(), body(&[])),
+            (
+                "missingmodel".to_owned(),
+                body(&[("TachometerType", "XGenTacho")]),
+            ),
+            (
+                "development_test_kart".to_owned(),
+                body(&[("TachometerType", "V1GenTacho")]),
+            ),
         ]);
         let resources = KartResources {
             model_folders: HashSet::from([
@@ -1362,16 +1512,24 @@ mod tests {
                 id,
                 name: format!("Kart {id}"),
                 auto_grant: true,
+                x_parts_compatible: false,
             })
             .collect::<Vec<_>>();
 
-        classify_kart_auto_grants(&mut inventory, &names, &specs, &resources);
+        classify_karts(&mut inventory, &names, &specs, &resources);
         assert_eq!(
             inventory
                 .iter()
                 .map(|item| item.auto_grant)
                 .collect::<Vec<_>>(),
             vec![true, true, false, false, false]
+        );
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|item| item.x_parts_compatible)
+                .collect::<Vec<_>>(),
+            vec![true, true, true, false, true]
         );
     }
 
@@ -1397,12 +1555,48 @@ mod tests {
         assert_eq!(stats.inventory_items, 6_929);
         assert_eq!(stats.inventory_categories, 65);
         assert_eq!(stats.inventory_karts, 1_296);
-        assert_eq!(stats.auto_grant_karts, 1_282);
-        assert_eq!(stats.quarantined_karts, 14);
-        assert_eq!(stats.transform_rules, 493);
+        assert_eq!(stats.auto_grant_karts, 1_287);
+        assert_eq!(stats.quarantined_karts, 9);
+        assert_eq!(stats.x_parts_karts, 251);
+        assert_eq!(stats.transform_rules, 626);
         assert_eq!(stats.item_symbols, 73);
         assert_eq!(loaded.catalog().kart_name(1_410), Some("gigantesV1"));
         assert!(loaded.catalog().grants_item(3, 1_410));
+        assert!(loaded.catalog().supports_x_parts(1_410));
+        assert_eq!(
+            loaded
+                .catalog()
+                .grant_items()
+                .filter(|item| item.category == 3 && item.x_parts_compatible)
+                .count(),
+            251
+        );
+        let mut profile = p5136_profile::Profile::default();
+        profile.granted_karts.push(p5136_profile::GrantedKart {
+            kart_id: 1_167,
+            serial: 2,
+        });
+        let inventory = p5136_profile::build_inventory_snapshot_with_equipment(
+            loaded.catalog(),
+            &profile,
+            p5136_profile::EquipmentExceptions::default(),
+        )
+        .unwrap();
+        assert_eq!(inventory.parts_exceptions.len(), 252);
+        assert!(inventory.parts_exceptions.iter().all(|record| {
+            *record
+                == p5136_core::inventory::PartsExcRecord {
+                    id: record.id,
+                    serial: record.serial,
+                    ..p5136_core::inventory::PartsExcRecord::default()
+                }
+        }));
+        assert!(
+            inventory
+                .parts_exceptions
+                .iter()
+                .any(|record| record.id == 1_167 && record.serial == 2)
+        );
         assert!(loaded.catalog().contains_kart(814));
         assert!(!loaded.catalog().grants_item(3, 814));
         assert!(loaded.catalog().grants_item(28, 49));
@@ -1424,9 +1618,10 @@ mod tests {
                 .filter(|item| !item.auto_grant)
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![
-                199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 795, 814, 886, 1167,
-            ]
+            vec![199, 312, 323, 352, 657, 658, 659, 814, 886]
         );
+        for restored_id in [744, 745, 746, 795, 1_167] {
+            assert!(loaded.catalog().grants_item(3, restored_id));
+        }
     }
 }

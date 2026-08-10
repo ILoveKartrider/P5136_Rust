@@ -39,7 +39,8 @@ pub use inventory_editor::{
     add_kart_with_options, additional_karts, search_karts,
 };
 pub use model::{
-    ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, ServerSettings,
+    ExtraFields, GameOptions, GrantedKart, MyRoom, Profile, Rider, RiderItems, RiderSchoolProgress,
+    ServerSettings,
 };
 pub use myroom_items::{
     MAX_MYROOM_ITEM_RECORDS, MAX_MYROOM_ITEM_STATE_BYTES, MyRoomItemFileType, MyRoomItemStateError,

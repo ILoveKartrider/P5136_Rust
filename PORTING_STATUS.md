@@ -1,9 +1,50 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-08-05
+Last updated: 2026-08-10
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
+
+## 2026-08-10 v0.2.5 RHO abilities, inventory, licenses, and offline profiles
+
+- Added live/offline nickname administration for license progression, manual
+  PRO mission-set selection, and a client-default-or-S0-S8 time-attack physics
+  override under the consolidated Server management GUI tab.
+- Rider lookup and MyRoom visits now resolve persisted offline profiles instead
+  of treating every disconnected rider as nonexistent.
+- Kart grants expose three vertical Floater selectors with the complete
+  RHO-verified speed/item effect names, while X/V1 parts compatibility is
+  derived from each client BodyParam instead of a fixed kart list.
+
+- Replaced the guessed item-Floater labels with all 20 exact group meanings
+  recovered from `zeta_/kr/enchant/desc.xml`. The encoded value is confirmed
+  by `enchant.xml` as `groupId * 100 + tuneId`.
+- The item-box path now uses each Tune's original probability and full source
+  set. This includes timed/rolling water-bomb variants, big banana, and animal
+  booster; the former global “chance per displayed level” setting was removed.
+- Added a stock-catalog startup sentinel for both Pharaoh HT bodies (498/585):
+  booster and the other seven listed sources transform to Gold Shield 36 at
+  the RHO-defined 20%, with pass/miss regression coverage.
+- Gold Booster is a separate client-data path from Gold Shield. The direct
+  loader now merges the base and Korean `slot/animalBooster` tables into 133
+  kart rules and maps an awarded normal booster 6 to animal booster 31 using
+  each row's exact probability. The client then selects the kart-specific
+  visual/effect; the icon-197 sentinels include Pharaoh HT 498/585 and Bastet X
+  1139. Ordinary `TransformByKart` acquisition, equipped Floater acquisition,
+  and special-booster fallback are evaluated in that order and never stack.
+- Corrected the ownership audit for the 78 `firing2Gain` and 150 `fired2Gain`
+  rows. `KartRiderU.exe` loads both tables into its item manager
+  (`sub_79FB30`, offset `+0x1400`; `sub_79F5F0`, offset `+0x1408`) with the
+  source item, target item, probability, game type, and firing-step fields.
+  Confirmed runtime behaviour (including Hongryeon V1 magnet-to-siren) works
+  without any Rust-side reward synthesis. GameSlot type 10 use and type 11
+  reaction reports therefore remain byte-exact client-owned relay paths. The
+  older C# `AddItemSkill`/`AttackedSkill` extra award packets are intentionally
+  not ported because they can double-grant an already client-resolved effect.
+- Audited all 14 quarantined kart rows. Restored Kartneck/Kartneck X, whose
+  released internal names contain `dummyBox`, and the three Boxter HT variants
+  that share the `boxter7` model. Four rows lacking a Korean/default BodyParam
+  and five explicit dummy/test rows remain excluded from implicit grants.
 
 ## 2026-08-05 v0.1.5 room control and customization compatibility
 
@@ -3071,21 +3112,23 @@ These items prevent a "port complete" claim.
   resolves one canonical `Data` directory and reads `kart.rho`, `item.rho`,
   and the KR RHO5 overlays directly.
 - The bounded loader reproduces 1,456 kart names, 1,353 `BodyParam` specs,
-  6,929 shop rows across 65 categories, 73 verified item symbols, and all 493
-  `TransformByKart` rules. It requires the 1450/1453 identity, slot-capacity,
-  and chicken-gold transform sentinels before publication.
+  6,929 shop rows across 65 categories, 73 verified item symbols, all 493
+  `TransformByKart` rules, and 133 merged `animalBooster` rules (626 runtime
+  transforms total). It requires the 1450/1453 identity, slot-capacity,
+  chicken-gold transform, and special-booster sentinels before publication.
 - The opt-in stock-client test now verifies the direct-RHO cardinalities,
-  sentinels, exact 1,282 automatic kart grants, and exact 14-ID quarantine set.
+  sentinels, exact 1,287 automatic kart grants, and exact 9-ID quarantine set.
   The old XML remains a compatibility-only `ServerConfig` input, not a runtime
   prerequisite or generated artifact; blanket C# inventory publication is no
   longer treated as the desired semantic oracle.
 - GUI inventory search retains the immutable direct-RHO `Arc<CatalogInventory>`
   and passes it into the next server start when the canonical `Data` path still
   matches, avoiding a second 112 MiB `kart.rho` parse.
-- Direct catalog reconstruction intentionally publishes only the 493 transform
-  rules consumed by current Rust gameplay. The C#-exported 78 `FiringToGain`
-  and 150 `FiredToGain` audit rows are not current `CatalogInventory` runtime
-  inputs and remain outside this loader until a server consumer is implemented.
+- Direct catalog reconstruction publishes the 493 `TransformByKart` and 133
+  `animalBooster` rules consumed by current Rust gameplay. The C#-exported 78
+  `FiringToGain` and 150 `FiredToGain` audit rows intentionally remain outside
+  `CatalogInventory`: the client owns those decisions, while the server only
+  validates and relays the resulting GameSlot use/reaction reports.
 
 ## Definition of port complete
 

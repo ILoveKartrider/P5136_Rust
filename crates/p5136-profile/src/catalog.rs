@@ -97,6 +97,12 @@ pub struct CatalogInventoryItem {
     /// `false` keeps the catalog entry available for an explicit operator ID
     /// override without exposing it to every client by default.
     pub auto_grant: bool,
+    /// Whether the stock kart body uses the X/V1 parts exception cache.
+    ///
+    /// Direct-RHO catalogs derive this from `BodyParam.TachometerType`; older
+    /// portable catalogs omit the marker and retain the conservative `false`
+    /// default.
+    pub x_parts_compatible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +350,13 @@ impl CatalogInventory {
     #[must_use]
     pub fn contains_kart(&self, kart_id: u16) -> bool {
         self.item(3, kart_id).is_some()
+    }
+
+    /// Returns whether this kart needs an X/V1 `PartsExcRecord` cache entry.
+    #[must_use]
+    pub fn supports_x_parts(&self, kart_id: u16) -> bool {
+        self.item(3, kart_id)
+            .is_some_and(|item| item.x_parts_compatible)
     }
 
     /// Returns whether one catalog item is safe to expose as owned inventory.
@@ -1169,6 +1182,16 @@ impl CatalogParser {
             }
             None => true,
         };
+        let x_parts_compatible = match attribute(reader, element, b"xPartsCompatible")? {
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(_) => {
+                return Err(CatalogInventoryError::InvalidItemAttribute {
+                    attribute: "xPartsCompatible",
+                });
+            }
+            None => false,
+        };
         if name.len() > MAX_ITEM_NAME_BYTES {
             return Err(CatalogInventoryError::ItemNameTooLong {
                 maximum: MAX_ITEM_NAME_BYTES,
@@ -1183,6 +1206,7 @@ impl CatalogParser {
             serial,
             name,
             auto_grant,
+            x_parts_compatible,
         });
         Ok(())
     }
@@ -2086,7 +2110,7 @@ mod tests {
                 <Inventory total="3" categories="2">
                     <Item category="3" id="1453" name="chicken_goldV1" autoGrant="false" />
                     <Item category="1" id="45" name="dummy" />
-                    <Item category="3" id="1450" serial="7" name="shurikenV1" />
+                    <Item category="3" id="1450" serial="7" name="shurikenV1" xPartsCompatible="true" />
                 </Inventory>
             </KartCatalog>"#,
         )
@@ -2104,6 +2128,8 @@ mod tests {
             vec![(1, 45), (3, 1450), (3, 1453)]
         );
         assert_eq!(catalog.items()[1].serial, 7);
+        assert!(catalog.supports_x_parts(1450));
+        assert!(!catalog.supports_x_parts(1453));
         assert!(is_grant_category(3));
         assert!(!is_grant_category(5));
         assert!(!is_grant_item(&CatalogInventoryItem {
@@ -2112,6 +2138,7 @@ mod tests {
             serial: 0,
             name: String::new(),
             auto_grant: true,
+            x_parts_compatible: false,
         }));
         assert!(!catalog.items()[2].auto_grant);
         assert!(catalog.contains_kart(1453));
@@ -2132,6 +2159,7 @@ mod tests {
                 serial: 0,
                 name: String::new(),
                 auto_grant: true,
+                x_parts_compatible: false,
             }));
         }
 
@@ -2141,6 +2169,7 @@ mod tests {
             serial: 0,
             name: "놀이동산 마이룸".to_owned(),
             auto_grant: true,
+            x_parts_compatible: false,
         }));
     }
 
@@ -2164,6 +2193,7 @@ mod tests {
                 serial: 0,
                 name: String::new(),
                 auto_grant: true,
+                x_parts_compatible: false,
             }));
         }
 
@@ -2176,6 +2206,7 @@ mod tests {
                 serial: 0,
                 name: String::new(),
                 auto_grant: true,
+                x_parts_compatible: false,
             }));
         }
     }
@@ -2192,6 +2223,22 @@ mod tests {
             ),
             Err(CatalogInventoryError::InvalidItemAttribute {
                 attribute: "autoGrant"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_x_parts_compatible_attribute() {
+        assert!(matches!(
+            parse_structural(
+                r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                    <Inventory total="1" categories="1">
+                        <Item category="3" id="1450" xPartsCompatible="maybe" />
+                    </Inventory>
+                </KartCatalog>"#,
+            ),
+            Err(CatalogInventoryError::InvalidItemAttribute {
+                attribute: "xPartsCompatible"
             })
         ));
     }
@@ -2267,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_resolves_bounded_kart_item_transforms() {
+    fn parses_and_resolves_bounded_kart_item_abilities() {
         let catalog = parse_structural(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
                 <Inventory total="0" categories="0" />

@@ -149,7 +149,7 @@ pub struct KartLevelExcRecord {
     pub effect: i16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PartsExcRecord {
     pub id: i16,
     pub serial: i16,

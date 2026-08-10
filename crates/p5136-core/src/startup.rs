@@ -26,6 +26,10 @@ pub const P5136_RIDER_SCHOOL_MAX_STEP: u8 = 42;
 pub const P5136_RIDER_SCHOOL_PRO_PAIR_COUNT: usize = 6;
 const P5136_RIDER_SCHOOL_PRO_STEPS: [[u8; 2]; P5136_RIDER_SCHOOL_PRO_PAIR_COUNT] =
     [[31, 32], [33, 34], [35, 36], [37, 38], [39, 40], [41, 42]];
+pub const P5136_RACING_MASTER_EMBLEM_ID: u16 = 8_524;
+/// Zero-seeded Adler-32 hashes of `mine_R01`, `forest_R02`, and
+/// `village_R03`, in the order consumed by the stock PRO reward page.
+pub const P5136_RACING_MASTER_TRACK_IDS: [u32; 3] = [0x1BAE_02BB, 0x2C60_03A6, 0x34CE_03F8];
 const P5136_TRAINING_CENTERS: [[i16; 2]; 3] = [[1, 4], [2, 4], [3, 4]];
 pub const LOCKED_ITEM_LIST_REQUEST_NAME: &str = "PqLockedItemGet";
 pub const LOCKED_ITEM_LIST_REPLY_NAME: &str = "PrLockedItemGet";
@@ -37,6 +41,13 @@ pub const START_RIDER_SCHOOL_REQUEST_NAME: &str = "PqStartRiderSchool";
 pub const START_RIDER_SCHOOL_REPLY_NAME: &str = "PrStartRiderSchool";
 pub const START_RIDER_SCHOOL_REQUEST_HASH: u32 = 0x4327_072D;
 pub const START_RIDER_SCHOOL_REPLY_HASH: u32 = 0x4338_072E;
+pub const UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME: &str = "LoRqUpdateRiderSchoolDataPacket";
+pub const UPDATE_RIDER_SCHOOL_LEVEL_REQUEST_NAME: &str = "PqUpdateRiderSchoolLevelPacket";
+pub const UPDATE_RIDER_SCHOOL_LEVEL_REPLY_NAME: &str = "PrUpdateRiderSchoolLevelPacket";
+pub const REWARD_PRO_EMBLEM_REQUEST_NAME: &str = "PqRewardProEmblemPacket";
+pub const REWARD_PRO_EMBLEM_REPLY_NAME: &str = "PrRewardProEmblemPacket";
+pub const REWARD_PRO_EMBLEM_REQUEST_HASH: u32 = 0x6B0A_0901;
+pub const REWARD_PRO_EMBLEM_REPLY_HASH: u32 = 0x6B20_0902;
 pub const GET_RIDER_TASK_CONTEXT_REQUEST_NAME: &str = "PqGetRiderTaskContext";
 pub const GET_RIDER_TASK_CONTEXT_REPLY_NAME: &str = "PrGetRiderTaskContext";
 pub const GET_RIDER_TASK_CONTEXT_REQUEST_HASH: u32 = 0x5870_084F;
@@ -109,7 +120,6 @@ const STARTUP_NOOP_PACKET_NAMES: &[&str] = &[
     "PqCountdownBoxPeriodPacket",
     "PqServerSideUdpBindCheck",
     "PqVipGradeCheck",
-    "LoRqUpdateRiderSchoolDataPacket",
     "PqNeedTimerGiftEvent",
     "LoRqCheckReplayItemPacket",
     "PqGetRecommandChatServerInfo",
@@ -145,6 +155,9 @@ pub enum StartupRequest {
     RiderSchoolProgress,
     RiderSchoolExpiredCheck,
     StartRiderSchool,
+    UpdateRiderSchoolData,
+    UpdateRiderSchoolLevel,
+    RewardProEmblem,
     RankerInfo,
     GetMaxGiftId,
     KoinBalance,
@@ -189,6 +202,9 @@ pub const STARTUP_REQUESTS: &[StartupRequest] = &[
     StartupRequest::RiderSchoolProgress,
     StartupRequest::RiderSchoolExpiredCheck,
     StartupRequest::StartRiderSchool,
+    StartupRequest::UpdateRiderSchoolData,
+    StartupRequest::UpdateRiderSchoolLevel,
+    StartupRequest::RewardProEmblem,
     StartupRequest::RankerInfo,
     StartupRequest::GetMaxGiftId,
     StartupRequest::KoinBalance,
@@ -236,6 +252,9 @@ impl StartupRequest {
             Self::RiderSchoolProgress => "PqRiderSchoolProPacket",
             Self::RiderSchoolExpiredCheck => RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME,
             Self::StartRiderSchool => START_RIDER_SCHOOL_REQUEST_NAME,
+            Self::UpdateRiderSchoolData => UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME,
+            Self::UpdateRiderSchoolLevel => UPDATE_RIDER_SCHOOL_LEVEL_REQUEST_NAME,
+            Self::RewardProEmblem => REWARD_PRO_EMBLEM_REQUEST_NAME,
             Self::RankerInfo => RANKER_INFO_REQUEST_NAME,
             Self::GetMaxGiftId => GET_MAX_GIFT_ID_REQUEST_NAME,
             Self::KoinBalance => KOIN_BALANCE_REQUEST_NAME,
@@ -274,7 +293,7 @@ impl StartupRequest {
             Self::GetRider => Some("PrGetRider"),
             Self::GetRiderTaskContext => Some(GET_RIDER_TASK_CONTEXT_REPLY_NAME),
             Self::VersusModeRankOne => Some(VERSUS_MODE_RANK_ONE_REPLY_NAME),
-            Self::UpdateGameOption | Self::DecLucci => None,
+            Self::UpdateGameOption | Self::DecLucci | Self::UpdateRiderSchoolData => None,
             Self::GetGameOption => Some("PrGetGameOption"),
             Self::SetPlaytimeEventTick => Some("PrSetPlaytimeEventTick"),
             Self::ChapterInfo => Some("PrChapterInfoPacket"),
@@ -283,6 +302,8 @@ impl StartupRequest {
             Self::RiderSchoolProgress => Some("PrRiderSchoolProPacket"),
             Self::RiderSchoolExpiredCheck => Some(RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME),
             Self::StartRiderSchool => Some(START_RIDER_SCHOOL_REPLY_NAME),
+            Self::UpdateRiderSchoolLevel => Some(UPDATE_RIDER_SCHOOL_LEVEL_REPLY_NAME),
+            Self::RewardProEmblem => Some(REWARD_PRO_EMBLEM_REPLY_NAME),
             Self::RankerInfo => Some(RANKER_INFO_REPLY_NAME),
             Self::GetMaxGiftId => Some(GET_MAX_GIFT_ID_REPLY_NAME),
             Self::KoinBalance => Some(KOIN_BALANCE_REPLY_NAME),
@@ -380,6 +401,34 @@ impl StartRiderSchoolRequest {
     pub const fn value(self) -> u8 {
         self.0
     }
+}
+
+/// One completed license-school test reported by the stock client.
+///
+/// Static analysis of `LoRqUpdateRiderSchoolDataPacket` establishes the common
+/// 18-byte packet context followed by a raw mission/resource dword, a raw
+/// completed-step byte, and a protected-in-memory but raw-on-wire elapsed
+/// millisecond count, in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateRiderSchoolDataRequest {
+    pub mission_id: u32,
+    pub completed_step: u8,
+    pub elapsed_milliseconds: i32,
+}
+
+const RIDER_SCHOOL_COMPLETION_CONTEXT_WIRE_LENGTH: usize = 18;
+
+/// The next license level requested by `PqUpdateRiderSchoolLevelPacket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateRiderSchoolLevelRequest {
+    pub level: u8,
+}
+
+/// The client-selected Racing Master reward item. The P5136 producer writes
+/// the RHO `proCategory.emblemId` as one raw little-endian word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RewardProEmblemRequest {
+    pub emblem_id: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +647,54 @@ pub fn parse_pq_start_rider_school(packet: &[u8]) -> Result<StartRiderSchoolRequ
     Ok(request)
 }
 
+/// Parses the exact stock rider-school completion report.
+pub fn parse_lo_rq_update_rider_school_data(
+    packet: &[u8],
+) -> Result<UpdateRiderSchoolDataRequest, StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME)?;
+    // The packet derives from the client's completion/report base. Its v3
+    // reader calls sub_5C0050 before reading the three derived fields;
+    // sub_5C0050 consumes the exact 18-byte context also observed in the
+    // retained stock-client capture. This is packet metadata, not the mission
+    // id or rider-school progress.
+    let _completion_context = reader.read_bytes(RIDER_SCHOOL_COMPLETION_CONTEXT_WIRE_LENGTH)?;
+    let request = UpdateRiderSchoolDataRequest {
+        mission_id: reader.read_u32()?,
+        completed_step: reader.read_u8()?,
+        elapsed_milliseconds: reader.read_i32()?,
+    };
+    ensure_exhausted(&reader, UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME)?;
+    Ok(request)
+}
+
+/// Parses the stock one-byte license-level promotion request.
+pub fn parse_pq_update_rider_school_level(
+    packet: &[u8],
+) -> Result<UpdateRiderSchoolLevelRequest, StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, UPDATE_RIDER_SCHOOL_LEVEL_REQUEST_NAME)?;
+    let request = UpdateRiderSchoolLevelRequest {
+        level: reader.read_u8()?,
+    };
+    ensure_exhausted(&reader, UPDATE_RIDER_SCHOOL_LEVEL_REQUEST_NAME)?;
+    Ok(request)
+}
+
+/// Parses the reward button request emitted after all three PRO target times
+/// pass. P5136 writes the configured emblem id (`8524` in the Korean RHO),
+/// but the compatibility server uses it only as protocol context and does not
+/// introduce a separate emblem-ownership progression system.
+pub fn parse_pq_reward_pro_emblem(packet: &[u8]) -> Result<RewardProEmblemRequest, StartupError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, REWARD_PRO_EMBLEM_REQUEST_NAME)?;
+    let request = RewardProEmblemRequest {
+        emblem_id: reader.read_u16()?,
+    };
+    ensure_exhausted(&reader, REWARD_PRO_EMBLEM_REQUEST_NAME)?;
+    Ok(request)
+}
+
 fn parse_hash_only_request(packet: &[u8], name: &'static str) -> Result<(), StartupError> {
     let mut reader = PacketReader::new(packet);
     expect_hash(&mut reader, name)?;
@@ -740,10 +837,14 @@ pub fn serialize_pr_get_duel_mission_bulk(time: LegacyTime) -> Vec<u8> {
 }
 
 #[must_use]
-pub fn serialize_pr_rider_school_data(time: LegacyTime) -> Vec<u8> {
+pub fn serialize_pr_rider_school_data(
+    time: LegacyTime,
+    level: u8,
+    max_completed_step: u8,
+) -> Vec<u8> {
     let mut packet = PacketWriter::named("PrRiderSchoolDataPacket");
-    packet.write_u8(P5136_RIDER_SCHOOL_LEVEL);
-    packet.write_u8(P5136_RIDER_SCHOOL_MAX_STEP);
+    packet.write_u8(level);
+    packet.write_u8(max_completed_step);
     write_legacy_time(&mut packet, time);
     packet.write_i32(0);
     packet.write_u8(0);
@@ -757,13 +858,54 @@ pub fn serialize_pr_rider_school_data(time: LegacyTime) -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the success shape consumed by the P5136 promotion handler:
+/// promoted level, legacy result value, and status `1`.
 #[must_use]
-pub fn serialize_pr_rider_school_progress(pro_pair_index: usize) -> Vec<u8> {
+pub fn serialize_pr_update_rider_school_level(level: u8) -> Vec<u8> {
+    let mut packet = PacketWriter::named(UPDATE_RIDER_SCHOOL_LEVEL_REPLY_NAME);
+    packet.write_u8(level);
+    packet.write_i32(0);
+    packet.write_u8(1);
+    packet.into_inner()
+}
+
+/// Returns the two PRO mission steps consumed by the reward handler. Static
+/// analysis shows that the client immediately calls its level-6 mission-page
+/// builder with the first step; the adjacent second step is retained to match
+/// the complete stock packet codec.
+#[must_use]
+pub fn serialize_pr_reward_pro_emblem(pro_pair_index: usize) -> Vec<u8> {
+    let [first_step, second_step] =
+        P5136_RIDER_SCHOOL_PRO_STEPS[pro_pair_index % P5136_RIDER_SCHOOL_PRO_PAIR_COUNT];
+    let mut packet = PacketWriter::named(REWARD_PRO_EMBLEM_REPLY_NAME);
+    packet.write_bytes(&[first_step, second_step]);
+    packet.into_inner()
+}
+
+#[must_use]
+pub fn serialize_pr_rider_school_progress(
+    pro_pair_index: usize,
+    current_level: u8,
+    max_completed_step: u8,
+    racing_master_records_ms: [u32; 3],
+) -> Vec<u8> {
     let [first_step, second_step] =
         P5136_RIDER_SCHOOL_PRO_STEPS[pro_pair_index % P5136_RIDER_SCHOOL_PRO_PAIR_COUNT];
     let mut packet = PacketWriter::named("PrRiderSchoolProPacket");
-    packet.write_bytes(&[1, first_step, P5136_RIDER_SCHOOL_LEVEL, second_step]);
-    packet.write_bytes(&[0; 12]);
+    // Riders who already own the PRO license receive the exact legacy
+    // hardcoded shortcut. The stock client historically permits those riders
+    // to reopen the PRO versus content through this shape. L1 and lower riders
+    // use the recovered detailed codec so their durable completion boundary
+    // and actual per-track records control progression.
+    if current_level >= P5136_RIDER_SCHOOL_LEVEL {
+        packet.write_bytes(&[1, first_step, P5136_RIDER_SCHOOL_LEVEL, second_step]);
+        packet.write_bytes(&[0; 12]);
+    } else {
+        packet.write_bytes(&[0, first_step, current_level, max_completed_step]);
+        for record in racing_master_records_ms {
+            packet.write_u32(record);
+        }
+    }
     packet.into_inner()
 }
 
@@ -1235,23 +1377,26 @@ mod tests {
         REMAIN_CASH_REQUEST_HASH, REMAIN_CASH_REQUEST_NAME, REMAIN_TC_CASH_REPLY_HASH,
         REMAIN_TC_CASH_REPLY_NAME, REMAIN_TC_CASH_REQUEST_HASH, REMAIN_TC_CASH_REQUEST_NAME,
         REQUEST_EXTRADATA_REPLY_NAME, REQUEST_EXTRADATA_REQUEST_NAME,
-        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, RIDER_SCHOOL_EXPIRED_CHECK_REPLY_HASH,
-        RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME, RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_HASH,
-        RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME, START_RIDER_SCHOOL_REPLY_HASH,
-        START_RIDER_SCHOOL_REPLY_NAME, START_RIDER_SCHOOL_REQUEST_HASH,
-        START_RIDER_SCHOOL_REQUEST_NAME, StartupError, StartupRequest,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, RIDER_SCHOOL_COMPLETION_CONTEXT_WIRE_LENGTH,
+        RIDER_SCHOOL_EXPIRED_CHECK_REPLY_HASH, RIDER_SCHOOL_EXPIRED_CHECK_REPLY_NAME,
+        RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_HASH, RIDER_SCHOOL_EXPIRED_CHECK_REQUEST_NAME,
+        START_RIDER_SCHOOL_REPLY_HASH, START_RIDER_SCHOOL_REPLY_NAME,
+        START_RIDER_SCHOOL_REQUEST_HASH, START_RIDER_SCHOOL_REQUEST_NAME, StartupError,
+        StartupRequest, UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME,
+        UPDATE_RIDER_SCHOOL_LEVEL_REPLY_NAME, UPDATE_RIDER_SCHOOL_LEVEL_REQUEST_NAME,
+        UpdateRiderSchoolDataRequest, UpdateRiderSchoolLevelRequest,
         VERSUS_MODE_RANK_ONE_REPLY_HASH, VERSUS_MODE_RANK_ONE_REPLY_NAME,
         VERSUS_MODE_RANK_ONE_REQUEST_HASH, VERSUS_MODE_RANK_ONE_REQUEST_NAME,
         WEB_EVENT_COMPLETE_CHECK_REPLY_NAME, WEB_EVENT_COMPLETE_CHECK_REQUEST_NAME,
         channel_static_reply_body, classify_startup_request, is_startup_noop,
-        parse_lo_rq_dec_lucci, parse_lo_rq_get_track_rank, parse_pq_favorite_track_map_get,
-        parse_pq_get_rider_task_context, parse_pq_locked_item_get, parse_pq_ranker_info,
-        parse_pq_request_exchange_init, parse_pq_request_extradata,
+        parse_lo_rq_dec_lucci, parse_lo_rq_get_track_rank, parse_lo_rq_update_rider_school_data,
+        parse_pq_favorite_track_map_get, parse_pq_get_rider_task_context, parse_pq_locked_item_get,
+        parse_pq_ranker_info, parse_pq_request_exchange_init, parse_pq_request_extradata,
         parse_pq_rider_school_expired_check, parse_pq_start_rider_school,
-        parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
-        parse_pq_web_event_complete_check, parse_sp_rq_get_cash_inventory,
-        parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance, parse_sp_rq_remain_cash,
-        parse_sp_rq_remain_tc_cash, serialize_channel_static_reply,
+        parse_pq_update_game_option, parse_pq_update_rider_school_level,
+        parse_pq_versus_mode_rank_one, parse_pq_web_event_complete_check,
+        parse_sp_rq_get_cash_inventory, parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance,
+        parse_sp_rq_remain_cash, parse_sp_rq_remain_tc_cash, serialize_channel_static_reply,
         serialize_empty_locked_item_list, serialize_empty_pr_favorite_track_map_get,
         serialize_empty_sp_rp_get_cash_inventory, serialize_lo_rp_add_racing_time,
         serialize_lo_rp_event_reward, serialize_lo_rp_get_track_rank,
@@ -1266,9 +1411,10 @@ mod tests {
         serialize_pr_rider_school_data, serialize_pr_rider_school_expired_check,
         serialize_pr_rider_school_progress, serialize_pr_server_time,
         serialize_pr_set_playtime_event_tick, serialize_pr_start_rider_school,
-        serialize_pr_sync_dictionary_info, serialize_pr_versus_mode_rank_one,
-        serialize_pr_web_event_complete_check, serialize_sp_rp_get_max_gift_id,
-        serialize_sp_rp_koin_balance, serialize_sp_rp_remain_cash, serialize_sp_rp_remain_tc_cash,
+        serialize_pr_sync_dictionary_info, serialize_pr_update_rider_school_level,
+        serialize_pr_versus_mode_rank_one, serialize_pr_web_event_complete_check,
+        serialize_sp_rp_get_max_gift_id, serialize_sp_rp_koin_balance, serialize_sp_rp_remain_cash,
+        serialize_sp_rp_remain_tc_cash,
     };
     use crate::{
         adler32, encoded,
@@ -1611,6 +1757,85 @@ mod tests {
     }
 
     #[test]
+    fn rider_school_updates_match_the_statically_recovered_codecs() {
+        let mut completion = PacketWriter::named(UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME);
+        completion.write_bytes(&[0xA5; RIDER_SCHOOL_COMPLETION_CONTEXT_WIRE_LENGTH]);
+        completion.write_u32(0x1234_5678);
+        completion.write_u8(17);
+        completion.write_i32(45_678);
+        assert_eq!(
+            parse_lo_rq_update_rider_school_data(completion.as_slice()).unwrap(),
+            UpdateRiderSchoolDataRequest {
+                mission_id: 0x1234_5678,
+                completed_step: 17,
+                elapsed_milliseconds: 45_678,
+            }
+        );
+
+        // Exact logical packet captured from the stock 5136 client after a
+        // license mission completed. The old parser mistook the first nine
+        // bytes of the common context for the derived fields and rejected the
+        // remaining 18 bytes, which terminated the login TCP session.
+        let captured = vec![
+            0x11, 0x0C, 0x7F, 0xBF, 0x0E, 0x00, 0x00, 0x00, 0x53, 0x02, 0x90, 0x01, 0xF2, 0x04,
+            0x4F, 0x56, 0xE4, 0xBA, 0x2C, 0x19, 0x83, 0x18, 0xB9, 0x08, 0x00, 0x00, 0x01, 0x81,
+            0x59, 0x00, 0x00,
+        ];
+        assert_eq!(
+            parse_lo_rq_update_rider_school_data(&captured).unwrap(),
+            UpdateRiderSchoolDataRequest {
+                mission_id: 2_233,
+                completed_step: 1,
+                elapsed_milliseconds: 22_913,
+            }
+        );
+
+        for truncated_length in 0..captured.len() {
+            assert!(matches!(
+                parse_lo_rq_update_rider_school_data(&captured[..truncated_length]),
+                Err(StartupError::Packet(_) | StartupError::UnexpectedPacketHash { .. })
+            ));
+        }
+
+        let mut trailing = captured;
+        trailing.push(0x51);
+        assert!(matches!(
+            parse_lo_rq_update_rider_school_data(&trailing),
+            Err(StartupError::TrailingBytes {
+                name: UPDATE_RIDER_SCHOOL_DATA_REQUEST_NAME,
+                count: 1,
+            })
+        ));
+
+        let mut promotion = PacketWriter::named(UPDATE_RIDER_SCHOOL_LEVEL_REQUEST_NAME);
+        promotion.write_u8(3);
+        assert_eq!(
+            parse_pq_update_rider_school_level(promotion.as_slice()).unwrap(),
+            UpdateRiderSchoolLevelRequest { level: 3 }
+        );
+
+        assert_packet(
+            &serialize_pr_update_rider_school_level(3),
+            adler32::packet_hash(UPDATE_RIDER_SCHOOL_LEVEL_REPLY_NAME),
+            &[3, 0, 0, 0, 0, 1],
+        );
+
+        let mut reward = PacketWriter::named(super::REWARD_PRO_EMBLEM_REQUEST_NAME);
+        reward.write_u16(super::P5136_RACING_MASTER_EMBLEM_ID);
+        assert_eq!(
+            super::parse_pq_reward_pro_emblem(reward.as_slice()).unwrap(),
+            super::RewardProEmblemRequest {
+                emblem_id: super::P5136_RACING_MASTER_EMBLEM_ID,
+            }
+        );
+        assert_packet(
+            &super::serialize_pr_reward_pro_emblem(1),
+            super::REWARD_PRO_EMBLEM_REPLY_HASH,
+            &[33, 34],
+        );
+    }
+
+    #[test]
     fn rider_school_reply_pins_the_canonical_builder_not_csharp_shortcut_drift() {
         let packet = serialize_pr_start_rider_school().unwrap();
         assert_eq!(
@@ -1801,18 +2026,30 @@ mod tests {
         assert_packet(&serialize_pr_set_playtime_event_tick(), 1_671_366_848, &[0]);
         assert_packet(&serialize_pr_chapter_info(), 1_224_542_061, &[0; 4]);
         assert_packet(
-            &serialize_pr_rider_school_progress(1),
+            &serialize_pr_rider_school_progress(1, 5, 30, [71_234, 130_987, 69_876]),
             1_648_560_297,
-            &[1, 33, 6, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[
+                0, 33, 5, 30, 0x42, 0x16, 0x01, 0x00, 0xAB, 0xFF, 0x01, 0x00, 0xF4, 0x10, 0x01,
+                0x00,
+            ],
         );
         assert_eq!(
-            &serialize_pr_rider_school_progress(5)[4..8],
-            &[1, 41, 6, 42]
+            &serialize_pr_rider_school_progress(5, 6, 42, [0; 3])[4..8],
+            &[1, 41, 6, 42],
+            "a durable PRO profile receives the exact legacy hardcoded shortcut"
         );
         assert_eq!(
-            serialize_pr_rider_school_progress(6),
-            serialize_pr_rider_school_progress(0),
+            serialize_pr_rider_school_progress(6, 5, 30, [0; 3]),
+            serialize_pr_rider_school_progress(0, 5, 30, [0; 3]),
             "the six evidenced Pro pairs rotate without emitting an invalid step"
+        );
+        assert_eq!(
+            super::P5136_RACING_MASTER_TRACK_IDS,
+            [
+                adler32::unicode_hash("mine_R01"),
+                adler32::unicode_hash("forest_R02"),
+                adler32::unicode_hash("village_R03"),
+            ]
         );
         assert_packet(
             &serialize_pr_dynamic_command(),
@@ -1853,7 +2090,7 @@ mod tests {
             quarter_seconds: 0x5678,
         };
 
-        let school = serialize_pr_rider_school_data(time);
+        let school = serialize_pr_rider_school_data(time, 6, 42);
         assert_packet(
             &school,
             1_783_761_138,

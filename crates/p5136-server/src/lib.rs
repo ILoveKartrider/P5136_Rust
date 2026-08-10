@@ -29,7 +29,10 @@ pub use client_catalog::{
     ClientKartCatalogError, ClientKartCatalogStats, LoadedClientKartCatalog,
     load_client_kart_catalog,
 };
-pub use config::{DEFAULT_MAX_LOGIN_SESSIONS, ServerConfig, ServerEndpoints};
+pub use config::{
+    DEFAULT_MAX_LOGIN_SESSIONS, RiderSchoolProMissionSet, ServerConfig, ServerEndpoints,
+    TimeAttackPhysicsPreset,
+};
 pub use favorite_persistence::FavoriteItemPersistError;
 pub use identity::{
     ChannelBinding, DisconnectOutcome, IdentityBinding, IdentityError, IdentityGeneration,
@@ -67,7 +70,8 @@ pub use random_track::{
     load_client_random_track_catalog,
 };
 pub use runtime::{
-    BoundServer, OperatorKartGrantError, RewardPersistenceRuntimeError, ServerError, ServerHandle,
+    BoundServer, OperatorKartGrantError, OperatorRiderSchoolUpdateError,
+    RewardPersistenceRuntimeError, ServerError, ServerHandle,
 };
 pub use session::{LoginSessionError, read_encrypted_frame};
 pub use udp_runtime::{

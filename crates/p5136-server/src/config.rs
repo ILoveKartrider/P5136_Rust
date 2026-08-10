@@ -15,6 +15,147 @@ use crate::{
 
 pub const DEFAULT_MAX_LOGIN_SESSIONS: usize = 256;
 
+/// Server-selected modern physics preset for stock time-attack starts.
+///
+/// The visible S grade is not identical to the P5136 protocol speed byte:
+/// S0 uses byte 3, while S1 through S3 use bytes 0 through 2.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeAttackPhysicsPreset {
+    #[default]
+    ClientDefault,
+    S0,
+    S1,
+    S2,
+    S3,
+    S4,
+    S5,
+    S6,
+    S7,
+    S8,
+}
+
+impl TimeAttackPhysicsPreset {
+    pub const ALL: [Self; 10] = [
+        Self::ClientDefault,
+        Self::S0,
+        Self::S1,
+        Self::S2,
+        Self::S3,
+        Self::S4,
+        Self::S5,
+        Self::S6,
+        Self::S7,
+        Self::S8,
+    ];
+
+    #[must_use]
+    pub const fn speed_type(self) -> Option<u8> {
+        match self {
+            Self::ClientDefault => None,
+            Self::S0 => Some(3),
+            Self::S1 => Some(0),
+            Self::S2 => Some(1),
+            Self::S3 => Some(2),
+            Self::S4 => Some(4),
+            Self::S5 => Some(5),
+            Self::S6 => Some(6),
+            Self::S7 => Some(7),
+            Self::S8 => Some(8),
+        }
+    }
+
+    #[must_use]
+    pub const fn resolve(self, client_speed_type: u8) -> u8 {
+        match self.speed_type() {
+            Some(speed_type) => speed_type,
+            None => client_speed_type,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TimeAttackPhysicsPreset;
+
+    #[test]
+    fn time_attack_presets_preserve_default_and_map_visible_s_grades_to_wire_bytes() {
+        assert_eq!(TimeAttackPhysicsPreset::default().resolve(6), 6);
+        assert_eq!(
+            TimeAttackPhysicsPreset::ALL.map(TimeAttackPhysicsPreset::speed_type),
+            [
+                None,
+                Some(3),
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+            ]
+        );
+    }
+}
+
+/// Selects the stock P5136 PRO license mission pair.
+///
+/// All six pairs already exist in the Korean client RHO. Manual variants only
+/// change the server-projected rider-school reference month and packet steps;
+/// they do not require a client patch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiderSchoolProMissionSet {
+    #[default]
+    Automatic,
+    FairyMabinogi,
+    ChinaSword,
+    GoldAbyss,
+    ForestOlympus,
+    PirateNemo,
+    MineMaple,
+}
+
+impl RiderSchoolProMissionSet {
+    pub const MANUAL: [Self; 6] = [
+        Self::FairyMabinogi,
+        Self::ChinaSword,
+        Self::GoldAbyss,
+        Self::ForestOlympus,
+        Self::PirateNemo,
+        Self::MineMaple,
+    ];
+
+    #[must_use]
+    pub const fn pair_index(self) -> Option<usize> {
+        match self {
+            Self::Automatic => None,
+            Self::FairyMabinogi => Some(0),
+            Self::ChinaSword => Some(1),
+            Self::GoldAbyss => Some(2),
+            Self::ForestOlympus => Some(3),
+            Self::PirateNemo => Some(4),
+            Self::MineMaple => Some(5),
+        }
+    }
+
+    /// January, March, May, July, September, or November for the selected
+    /// pair. The client groups consecutive months into the same pair.
+    #[must_use]
+    pub const fn reference_month(self) -> Option<u32> {
+        match self {
+            Self::Automatic => None,
+            Self::FairyMabinogi => Some(1),
+            Self::ChinaSword => Some(3),
+            Self::GoldAbyss => Some(5),
+            Self::ForestOlympus => Some(7),
+            Self::PirateNemo => Some(9),
+            Self::MineMaple => Some(11),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_address: IpAddr,
@@ -41,6 +182,10 @@ pub struct ServerConfig {
     /// Optional pool overrides for the stock `track_common.rho` random-track
     /// catalog. An empty configuration uses the client defaults.
     pub random_tracks: RandomTrackConfiguration,
+    /// Automatic bi-monthly rotation or one manually selected stock PRO pair.
+    pub rider_school_pro_mission_set: RiderSchoolProMissionSet,
+    /// Physics grade written into every accepted time-attack start reply.
+    pub time_attack_physics_preset: TimeAttackPhysicsPreset,
     /// Pre-resolved client catalog installed transactionally by
     /// [`crate::BoundServer::bind`]. Normal callers should leave this `None`.
     pub resolved_random_tracks: Option<Arc<ResolvedRandomTracks>>,
@@ -71,6 +216,8 @@ impl Default for ServerConfig {
             item_probabilities: None,
             item_probability_rank_policy: ItemProbabilityRankPolicy::default(),
             random_tracks: RandomTrackConfiguration::default(),
+            rider_school_pro_mission_set: RiderSchoolProMissionSet::Automatic,
+            time_attack_physics_preset: TimeAttackPhysicsPreset::default(),
             resolved_random_tracks: None,
             first_message_delay: Duration::from_millis(250),
             login_timeout: Duration::from_secs(12),

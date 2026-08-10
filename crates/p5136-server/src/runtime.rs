@@ -13,7 +13,7 @@ use std::{
 use p5136_profile::{
     AddKartOutcome, CatalogInventory, CatalogInventoryError, EmblemCatalog, EmblemCatalogError,
     KartGrantOptions, KartInventoryEditError, MAX_EMBLEM_XML_BYTES, ProfileStoreError,
-    add_kart_during_race_run_with_options,
+    RiderSchoolProgress, SavedProfile, add_kart_during_race_run_with_options,
 };
 use p5136_rho5::{Rho5Directory, Rho5Error, Rho5Limits};
 use thiserror::Error;
@@ -213,6 +213,23 @@ pub enum OperatorKartGrantError {
 
     #[error(transparent)]
     Inventory(#[from] KartInventoryEditError),
+}
+
+#[derive(Debug, Error)]
+pub enum OperatorRiderSchoolUpdateError {
+    #[error("active profile runtime is unavailable")]
+    ProfileRuntimeUnavailable,
+
+    #[error(
+        "rider-school progress must be a license-grade boundary, received level {level} / step {max_completed_step}"
+    )]
+    InvalidGradeBoundary { level: u8, max_completed_step: u8 },
+
+    #[error(transparent)]
+    ProfileIo(#[from] ProfileIoError),
+
+    #[error(transparent)]
+    ProfileStore(#[from] ProfileStoreError),
 }
 
 #[derive(Debug, Error)]
@@ -482,6 +499,8 @@ impl BoundServer {
             individual_item_probability_count,
             team_item_probability_count,
             random_tracks_loaded = config.resolved_random_tracks.is_some(),
+            rider_school_pro_mission_set = ?config.rider_school_pro_mission_set,
+            time_attack_physics_preset = ?config.time_attack_physics_preset,
             remote_profile_creation = config.allow_remote_profile_creation,
             "P5136 server configuration validated and transports started"
         );
@@ -683,6 +702,40 @@ impl ServerHandle {
         let (result, lane) = completed.into_parts();
         drop(lane);
         result.map_err(OperatorKartGrantError::from)
+    }
+
+    /// Assigns one nickname's license grade through the active profile lane.
+    /// An unknown nickname receives a durable profile before its first login.
+    /// Existing client snapshots remain unchanged until reconnect.
+    pub async fn set_rider_school_progress(
+        &self,
+        nickname: String,
+        progress: RiderSchoolProgress,
+    ) -> Result<SavedProfile, OperatorRiderSchoolUpdateError> {
+        if !progress.is_grade_boundary() {
+            return Err(OperatorRiderSchoolUpdateError::InvalidGradeBoundary {
+                level: progress.level,
+                max_completed_step: progress.max_completed_step,
+            });
+        }
+        let profiles = self
+            .profiles
+            .as_ref()
+            .ok_or(OperatorRiderSchoolUpdateError::ProfileRuntimeUnavailable)?;
+        let admission = profiles
+            .admit(&nickname, "operator rider-school update")
+            .await?;
+        let completed = admission
+            .run("operator rider-school update", move |store, _, subject| {
+                store.update(subject.nickname(), |profile| {
+                    profile.rider_school = progress;
+                })
+            })
+            .await?;
+        let (result, lane) = completed.into_parts();
+        drop(lane);
+        let (saved, _) = result?;
+        Ok(saved)
     }
 
     /// Returns the current actor-owned reward drain and recovery state.
@@ -2761,6 +2814,7 @@ mod tests {
                         observer_master: false,
                         kart_physics: P5136KartPhysicsBlock::from([0; 235]),
                         kart_physics_variants: None,
+                        floater_codes: [0; 3],
                     },
                 },
             )

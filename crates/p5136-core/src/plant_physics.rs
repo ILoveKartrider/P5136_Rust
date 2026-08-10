@@ -41,6 +41,13 @@ const ALL: u8 = 1 | 2 | 4 | 8;
 const SPEED: u8 = 1 | 8;
 const ITEM: u8 = 2 | 4;
 
+// Complete category cardinalities from Korean P5136's
+// zeta_/kr/enchant/enchantMaterials.xml. Keeping the bounds next to the table
+// makes it harder for a later compatibility edit to silently audit only the
+// four popular Tae/Ex/Wild/Golden records.
+#[cfg(test)]
+const RECOVERED_CATEGORY_COUNTS: [(i16, i16); 4] = [(43, 23), (44, 15), (45, 23), (46, 30)];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PlantSpec {
     modes: u8,
@@ -384,6 +391,10 @@ fn plant_spec(category: i16, id: i16) -> Option<PlantSpec> {
             spec.forward_accel = 2.0;
         }
         (46, 3) => spec.animal_booster_time = 200.0,
+        // Known records without a numeric KartSpec contribution. IDs 4, 10,
+        // 19, and 20 describe client item-ability behavior; 13, 14, and 27-30
+        // are lamp-board cosmetics. They must still be recognized so valid
+        // equipment is not reported as an unknown physics fallback.
         (46, 4 | 10 | 13 | 14 | 19 | 20 | 27 | 28 | 29 | 30) => {}
         (46, 5) => {
             spec.normal_booster_time = 90.0;
@@ -443,7 +454,10 @@ fn plant_spec(category: i16, id: i16) -> Option<PlantSpec> {
 
 #[cfg(test)]
 mod tests {
-    use super::{P5136PlantGameMode, apply_p5136_plant_part};
+    use super::{
+        P5136PlantGameMode, PlantSpec, RECOVERED_CATEGORY_COUNTS, apply_p5136_plant_part,
+        plant_spec,
+    };
     use crate::kart_physics::P5136ExcSpecSnapshot;
 
     #[test]
@@ -468,8 +482,9 @@ mod tests {
 
     #[test]
     fn recovered_category_counts_are_complete() {
-        let expected = [(43, 23), (44, 15), (45, 23), (46, 30)];
-        for (category, count) in expected {
+        let mut total = 0;
+        for (category, count) in RECOVERED_CATEGORY_COUNTS {
+            assert!(plant_spec(category, 0).is_none());
             assert_eq!(
                 (1..=count)
                     .filter(|id| {
@@ -484,7 +499,67 @@ mod tests {
                     .count(),
                 usize::try_from(count).unwrap()
             );
+            assert!(plant_spec(category, count + 1).is_none());
+            total += count;
         }
+        assert_eq!(total, 91);
+        assert!(plant_spec(42, 1).is_none());
+        assert!(plant_spec(47, 1).is_none());
+    }
+
+    #[test]
+    fn every_recovered_part_is_routed_only_to_its_own_category_snapshot() {
+        let modes = [
+            P5136PlantGameMode::Speed,
+            P5136PlantGameMode::Item,
+            P5136PlantGameMode::Battle,
+            P5136PlantGameMode::TimeAttack,
+        ];
+        for (category, count) in RECOVERED_CATEGORY_COUNTS {
+            for id in 1..=count {
+                for mode in modes {
+                    let mut target = P5136ExcSpecSnapshot::default();
+                    assert!(apply_p5136_plant_part(&mut target, category, id, mode));
+                    let empty = P5136ExcSpecSnapshot::default();
+                    if category != 43 {
+                        assert_eq!(target.plant43, empty.plant43, "unexpected 43:{id} route");
+                    }
+                    if category != 44 {
+                        assert_eq!(target.plant44, empty.plant44, "unexpected 44:{id} route");
+                    }
+                    if category != 45 {
+                        assert_eq!(target.plant45, empty.plant45, "unexpected 45:{id} route");
+                    }
+                    if category != 46 {
+                        assert_eq!(target.plant46, empty.plant46, "unexpected 46:{id} route");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_ten_recovered_ability_or_cosmetic_parts_have_zero_numeric_physics() {
+        let zero_physics = RECOVERED_CATEGORY_COUNTS
+            .into_iter()
+            .flat_map(|(category, count)| (1..=count).map(move |id| (category, id)))
+            .filter(|&(category, id)| plant_spec(category, id) == Some(PlantSpec::all()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            zero_physics,
+            vec![
+                (46, 4),
+                (46, 10),
+                (46, 13),
+                (46, 14),
+                (46, 19),
+                (46, 20),
+                (46, 27),
+                (46, 28),
+                (46, 29),
+                (46, 30),
+            ]
+        );
     }
 
     #[test]

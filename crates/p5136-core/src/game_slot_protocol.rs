@@ -168,6 +168,9 @@ impl ItemVector {
     }
 }
 
+/// Kart-specific `firing2Gain` probability/reward resolution belongs to the
+/// P5136 client. The server must relay this report byte-exactly and must not
+/// synthesize a second item award for the reporting player.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemUse {
     pub kind: ItemUseKind,
@@ -197,6 +200,8 @@ pub enum ItemUseKind {
     SpawnedWorldObject,
 }
 
+/// Kart-specific `fired2Gain` probability/reward resolution belongs to the
+/// P5136 client. This report is peer state, not a server award request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemReaction {
     pub uni: u8,

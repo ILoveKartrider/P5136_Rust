@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use p5136_core::floater_physics::p5136_floater_spec;
 use thiserror::Error;
 
 use crate::{
@@ -21,22 +22,33 @@ pub const MAX_KART_SEARCH_RESULTS: usize = 50;
 const MAX_CLIENT_SAFE_KART_SERIAL: u16 = 32_767;
 pub const FLOATER_333_CODES: [i16; 3] = [603, 903, 703];
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KartGrantOptions {
-    pub apply_floater_333: bool,
+    pub apply_floater: bool,
+    pub floater_codes: [i16; 3],
     pub apply_grade_five: bool,
+}
+
+impl Default for KartGrantOptions {
+    fn default() -> Self {
+        Self {
+            apply_floater: false,
+            floater_codes: FLOATER_333_CODES,
+            apply_grade_five: false,
+        }
+    }
 }
 
 impl KartGrantOptions {
     #[must_use]
     pub const fn requests_enhancements(self) -> bool {
-        self.apply_floater_333 || self.apply_grade_five
+        self.apply_floater || self.apply_grade_five
     }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AppliedKartGrantEnhancements {
-    pub floater_333: bool,
+    pub floater_codes: Option<[i16; 3]>,
     pub grade_five: bool,
     pub durability_warnings: Vec<String>,
 }
@@ -146,6 +158,9 @@ pub enum KartInventoryEditError {
 
     #[error("kart ID {kart_id} cannot be represented by the signed P5136 enhancement codec")]
     EnhancementTargetOutOfRange { kart_id: u16 },
+
+    #[error("Floater grant codes {codes:?} are not a valid distinct P5136 three-slot combination")]
+    InvalidFloaterGrantCodes { codes: [i16; 3] },
 
     #[error(
         "kart {kart_id}:{serial} was granted, but the requested {stage} enhancement was not fully applied: {source}"
@@ -395,6 +410,11 @@ fn validate_grant_enhancement_options(
     if !catalog.supports_legacy_kart_enhancements(kart_id) {
         return Err(KartInventoryEditError::LegacyEnhancementUnsupported { kart_id });
     }
+    if options.apply_floater && p5136_floater_spec(options.floater_codes).is_none() {
+        return Err(KartInventoryEditError::InvalidFloaterGrantCodes {
+            codes: options.floater_codes,
+        });
+    }
     i16::try_from(kart_id)
         .map(|_| ())
         .map_err(|_| KartInventoryEditError::EnhancementTargetOutOfRange { kart_id })
@@ -411,7 +431,7 @@ fn apply_offline_grant_enhancements(
         kart,
         options,
         |kart_id, serial| {
-            store.set_floater_codes_offline(lease, nickname, kart_id, serial, FLOATER_333_CODES)
+            store.set_floater_codes_offline(lease, nickname, kart_id, serial, options.floater_codes)
         },
         |kart_id, serial| store.upgrade_kart_level_offline(lease, nickname, kart_id, serial),
     )
@@ -428,7 +448,7 @@ fn apply_live_grant_enhancements(
         kart,
         options,
         |kart_id, serial| {
-            store.set_floater_codes(lease, nickname, kart_id, serial, FLOATER_333_CODES)
+            store.set_floater_codes(lease, nickname, kart_id, serial, options.floater_codes)
         },
         |kart_id, serial| store.upgrade_kart_level(lease, nickname, kart_id, serial),
     )
@@ -463,16 +483,16 @@ where
     })?;
     let serial = i16::try_from(kart.serial).expect("allocated kart serial is client-safe");
     let mut applied = AppliedKartGrantEnhancements::default();
-    if options.apply_floater_333 {
+    if options.apply_floater {
         let outcome = apply_tune(kart_id, serial).map_err(|source| {
             KartInventoryEditError::EnhancementAfterGrant {
                 kart_id: kart.kart_id,
                 serial: kart.serial,
-                stage: "333 Floater",
+                stage: "operator-selected Floater",
                 source,
             }
         })?;
-        applied.floater_333 = true;
+        applied.floater_codes = Some(options.floater_codes);
         if let Some(warning) = outcome.durability_warning {
             applied.durability_warnings.push(warning.to_string());
         }
@@ -750,14 +770,18 @@ mod tests {
             "EnhancedRider",
             764,
             KartGrantOptions {
-                apply_floater_333: true,
+                apply_floater: true,
+                floater_codes: FLOATER_333_CODES,
                 apply_grade_five: true,
             },
         )
         .unwrap();
 
         assert_eq!(outcome.kart().serial, 2);
-        assert!(outcome.enhancements().floater_333);
+        assert_eq!(
+            outcome.enhancements().floater_codes,
+            Some(FLOATER_333_CODES)
+        );
         assert!(outcome.enhancements().grade_five);
         assert!(outcome.enhancements().durability_warnings.is_empty());
         let loaded = store.reload("enhancedrider").unwrap();
@@ -783,6 +807,54 @@ mod tests {
     }
 
     #[test]
+    fn offline_grant_accepts_custom_distinct_floater_slots_and_rejects_conflicts() {
+        let root = tempdir().unwrap();
+        let store = ProfileStore::new(root.path());
+        let catalog = catalog();
+        let codes = [103, 202, 10_901];
+        let outcome = add_kart_with_options(
+            &store,
+            &catalog,
+            "CustomFloater",
+            764,
+            KartGrantOptions {
+                apply_floater: true,
+                floater_codes: codes,
+                apply_grade_five: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.enhancements().floater_codes, Some(codes));
+
+        let loaded = store.reload("customfloater").unwrap();
+        let equipment =
+            EquipmentExceptions::load(root.path(), loaded.source_path.parent().unwrap()).unwrap();
+        assert!(equipment.tune.iter().any(|record| {
+            record.id == 764
+                && record.serial == 2
+                && [record.tune1, record.tune2, record.tune3] == codes
+        }));
+
+        assert!(matches!(
+            add_kart_with_options(
+                &store,
+                &catalog,
+                "InvalidFloater",
+                764,
+                KartGrantOptions {
+                    apply_floater: true,
+                    floater_codes: [601, 603, 0],
+                    apply_grade_five: false,
+                },
+            ),
+            Err(KartInventoryEditError::InvalidFloaterGrantCodes {
+                codes: [601, 603, 0]
+            })
+        ));
+        assert!(!store.profile_exists("InvalidFloater").unwrap());
+    }
+
+    #[test]
     fn live_grant_applies_enhancements_through_the_run_lease() {
         let root = tempdir().unwrap();
         let store = ProfileStore::new(root.path());
@@ -795,7 +867,8 @@ mod tests {
             "LiveEnhanced",
             764,
             KartGrantOptions {
-                apply_floater_333: true,
+                apply_floater: true,
+                floater_codes: FLOATER_333_CODES,
                 apply_grade_five: true,
             },
         )
@@ -826,7 +899,8 @@ mod tests {
                 "V1Rider",
                 1_410,
                 KartGrantOptions {
-                    apply_floater_333: true,
+                    apply_floater: true,
+                    floater_codes: FLOATER_333_CODES,
                     apply_grade_five: false,
                 },
             ),

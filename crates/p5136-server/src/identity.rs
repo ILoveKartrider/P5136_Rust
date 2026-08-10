@@ -44,9 +44,18 @@ impl UserNo {
 pub struct IdentityGeneration(u64);
 
 impl IdentityGeneration {
+    /// Reserved generation for a profile-backed `MyRoom` owner with no live
+    /// login session. Runtime login generations always start at one.
+    pub(crate) const OFFLINE_MYROOM: Self = Self(0);
+
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    #[must_use]
+    pub(crate) const fn is_offline_myroom(self) -> bool {
+        self.0 == Self::OFFLINE_MYROOM.0
     }
 }
 
@@ -892,18 +901,13 @@ impl IdentityRegistry {
             });
         }
 
-        let known = if let Some(known) = self.known_by_name.get(&key) {
-            known.clone()
-        } else {
-            let user_no = self.allocate_user_no()?;
-            let known = KnownIdentity {
-                nickname: nickname.clone(),
-                user_no,
-            };
-            self.known_by_name.insert(key.clone(), known.clone());
-            self.name_by_user_no.insert(user_no, key.clone());
-            known
-        };
+        let user_no = self.ensure_known_user_no(&nickname)?;
+        let known = self
+            .known_by_name
+            .get(&key)
+            .expect("ensuring a known user number installs its nickname mapping")
+            .clone();
+        debug_assert_eq!(known.user_no, user_no);
         let generation = self.allocate_generation()?;
         let operation_gate = IdentityOperationGate::shared(activated_udp_epoch);
         let binding = IdentityBinding {
@@ -1540,6 +1544,55 @@ impl IdentityRegistry {
         self.known_by_name
             .get(&canonical_nickname_key(nickname))
             .map(|known| known.user_no)
+    }
+
+    /// Returns the stable process-local user number for a validated profile
+    /// nickname, allocating it without creating an active login generation.
+    ///
+    /// Rider-info lookup uses this only after profile storage proved that the
+    /// nickname exists. A later login reuses the same number through `claim`.
+    pub fn ensure_known_user_no(
+        &mut self,
+        requested_nickname: &str,
+    ) -> Result<UserNo, IdentityError> {
+        let nickname = normalize_nickname(requested_nickname)?;
+        let key = canonical_nickname_key(&nickname);
+        if let Some(known) = self.known_by_name.get(&key) {
+            return Ok(known.user_no);
+        }
+        let user_no = self.allocate_user_no()?;
+        let known = KnownIdentity { nickname, user_no };
+        self.known_by_name.insert(key.clone(), known);
+        self.name_by_user_no.insert(user_no, key);
+        Ok(user_no)
+    }
+
+    /// Mints a deterministic, non-routable binding for an existing offline
+    /// profile projected as an absent `MyRoom` owner.
+    ///
+    /// The binding is never installed as an active identity. Session zero and
+    /// generation zero are reserved sentinels, so repeated visitors construct
+    /// the same canonical owner while normal login can later advance it.
+    pub(crate) fn offline_myroom_binding(
+        &mut self,
+        requested_nickname: &str,
+    ) -> Result<IdentityBinding, IdentityError> {
+        let nickname = normalize_nickname(requested_nickname)?;
+        let key = canonical_nickname_key(&nickname);
+        let user_no = self.ensure_known_user_no(&nickname)?;
+        let known = self
+            .known_by_name
+            .get(&key)
+            .expect("ensuring a known user number installs its nickname mapping");
+        debug_assert_eq!(known.user_no, user_no);
+        Ok(IdentityBinding {
+            nickname: known.nickname.clone(),
+            user_no,
+            generation: IdentityGeneration::OFFLINE_MYROOM,
+            owner: SessionId::new(0),
+            source_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            channel: None,
+        })
     }
 
     #[must_use]

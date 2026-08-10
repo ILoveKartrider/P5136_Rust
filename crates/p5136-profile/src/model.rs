@@ -15,6 +15,14 @@ pub struct Profile {
     pub granted_karts: Vec<GrantedKart>,
     pub my_room: MyRoom,
     pub game_option: GameOptions,
+    #[serde(rename = "P5136RustRiderSchool")]
+    pub rider_school: RiderSchoolProgress,
+    #[serde(
+        default,
+        rename = "P5136RustTimeAttackRecords",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub time_attack_records: BTreeMap<u32, u32>,
     #[serde(
         default,
         rename = "P5136RustFavoriteItems",
@@ -35,6 +43,90 @@ pub struct Profile {
     pub race_reward_receipt: Option<crate::progression::PersistedRaceRewardReceipt>,
     #[serde(flatten)]
     pub extra: ExtraFields,
+}
+
+/// Durable P5136 license-school progress.
+///
+/// The stock client exposes these as two independent fields in
+/// `PrRiderSchoolDataPacket`: the current/unlocked license level and the
+/// greatest completed school step. Legacy profiles predate this Rust field,
+/// so their serde default deliberately preserves the historical all-clear
+/// behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct RiderSchoolProgress {
+    pub level: u8,
+    pub max_completed_step: u8,
+}
+
+impl RiderSchoolProgress {
+    /// Untouched stock progression: no license level and no completed test.
+    pub const NONE_CLEARED: Self = Self {
+        level: 0,
+        max_completed_step: 0,
+    };
+
+    /// Compatibility progression used by all profiles before this field was
+    /// persisted.
+    pub const ALL_CLEAR: Self = Self {
+        level: p5136_core::startup::P5136_RIDER_SCHOOL_LEVEL,
+        max_completed_step: p5136_core::startup::P5136_RIDER_SCHOOL_MAX_STEP,
+    };
+
+    /// Completed the six Beginner tests.
+    pub const BEGINNER: Self = Self {
+        level: 1,
+        max_completed_step: 6,
+    };
+
+    /// Completed the six Rookie tests.
+    pub const ROOKIE: Self = Self {
+        level: 2,
+        max_completed_step: 12,
+    };
+
+    /// Completed the six L3 tests.
+    pub const L3: Self = Self {
+        level: 3,
+        max_completed_step: 18,
+    };
+
+    /// Completed the six L2 tests.
+    pub const L2: Self = Self {
+        level: 4,
+        max_completed_step: 24,
+    };
+
+    /// Completed the six L1 tests and unlocked the PRO challenge set.
+    pub const L1: Self = Self {
+        level: 5,
+        max_completed_step: 30,
+    };
+
+    /// Grade-boundary values exposed by the operator account editor.
+    pub const GRADE_BOUNDARIES: [Self; 7] = [
+        Self::NONE_CLEARED,
+        Self::BEGINNER,
+        Self::ROOKIE,
+        Self::L3,
+        Self::L2,
+        Self::L1,
+        Self::ALL_CLEAR,
+    ];
+
+    #[must_use]
+    pub const fn is_grade_boundary(self) -> bool {
+        matches!(
+            (self.level, self.max_completed_step),
+            (0, 0) | (1, 6) | (2, 12) | (3, 18) | (4, 24) | (5, 30) | (6, 42)
+        )
+    }
+}
+
+impl Default for RiderSchoolProgress {
+    fn default() -> Self {
+        Self::ALL_CLEAR
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,7 +581,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{MyRoom, Profile, Rider};
+    use super::{MyRoom, Profile, Rider, RiderSchoolProgress};
 
     #[test]
     fn defaults_match_the_p5136_csharp_profile() {
@@ -503,8 +595,59 @@ mod tests {
         assert_eq!(profile.rider_item.dye, 1);
         assert_eq!(profile.game_option.video_quality, 14);
         assert_eq!(profile.game_option.speed_type, 7);
+        assert_eq!(profile.rider_school, RiderSchoolProgress::ALL_CLEAR);
+        assert!(profile.time_attack_records.is_empty());
         assert!(profile.favorite_items.is_none());
         assert_eq!(profile.race_reward_receipt, None);
+    }
+
+    #[test]
+    fn legacy_profiles_default_to_all_clear_but_none_cleared_roundtrips() {
+        let legacy: Profile = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy.rider_school, RiderSchoolProgress::ALL_CLEAR);
+        assert!(legacy.time_attack_records.is_empty());
+
+        let fresh = Profile {
+            rider_school: RiderSchoolProgress::NONE_CLEARED,
+            ..Profile::default()
+        };
+        let encoded = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(encoded["P5136RustRiderSchool"]["Level"], 0);
+        assert_eq!(encoded["P5136RustRiderSchool"]["MaxCompletedStep"], 0);
+        assert_eq!(
+            serde_json::from_value::<Profile>(encoded)
+                .unwrap()
+                .rider_school,
+            RiderSchoolProgress::NONE_CLEARED
+        );
+    }
+
+    #[test]
+    fn time_attack_records_roundtrip_as_track_specific_personal_bests() {
+        let mut profile = Profile::default();
+        profile.time_attack_records.insert(0x1BAE_02BB, 71_234);
+        profile.time_attack_records.insert(0x2C60_03A6, 130_987);
+
+        let encoded = serde_json::to_value(&profile).unwrap();
+        let decoded: Profile = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.time_attack_records, profile.time_attack_records);
+    }
+
+    #[test]
+    fn rider_school_grade_boundaries_match_the_kr_client_catalog() {
+        assert_eq!(RiderSchoolProgress::GRADE_BOUNDARIES.len(), 7);
+        assert!(
+            RiderSchoolProgress::GRADE_BOUNDARIES
+                .into_iter()
+                .all(RiderSchoolProgress::is_grade_boundary)
+        );
+        assert!(
+            !RiderSchoolProgress {
+                level: 5,
+                max_completed_step: 29,
+            }
+            .is_grade_boundary()
+        );
     }
 
     #[test]

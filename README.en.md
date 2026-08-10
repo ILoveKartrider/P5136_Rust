@@ -46,7 +46,7 @@ You may select the client root, `Profile`, or `Data` directory. The server locat
 
 The default item-probability mode is **Apply automatically at server start**. Starting the server first reads the actual `item.rho`, reports the solo/team entry counts and source in the GUI, and passes that exact immutable snapshot to the server run. A load failure prevents startup. Values become path-independent only after **Load and pin** or an XML override is used.
 
-Kart item transforms such as Sebec V1 are also read from `item.rho` `transformByKart`; the server determines the final acquired item. For example, Sebec V1's gold shield is a server transform rather than an automatic client transform. The catalog is immutable in memory and never modifies RHO archives or the client directory.
+Kart item transforms such as Sebec V1 are also read from `item.rho` `transformByKart`; the server determines the final acquired item. For example, Sebec V1's gold shield is a server transform rather than an automatic client transform. The base and Korean `animalBooster` tables are merged separately, so special-booster karts such as Pharaoh HT and Bastet X receive item 31 and let the client display their kart-specific Gold Booster. Gold Shield and Gold Booster remain independent effects. The catalog is immutable in memory and never modifies RHO archives or the client directory.
 
 ## Per-nickname kart inventory
 
@@ -58,13 +58,17 @@ Expand **Inventory editor by nickname** to grant multiple copies of one kart wit
 4. Search with a name, a whitespace-normalized name, or a numeric ID such as `1410`, then select a result.
 5. Select **Add selected kart**. Repeating the action allocates another unique serial.
 
-Only karts with a resolved name, `BodyParam`, actual `model.1s`, and no test/dummy/NPC indicators are granted automatically as serial 1. In the stock P5136 data, 1,282 of 1,296 karts pass. Fourteen IDs (`199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 795, 814, 886, 1167`) remain quarantined to avoid inventory-scroll crashes. If a quarantined kart is confirmed to work in the client, enter its exact numeric ID and select the **manual review** result. This adds only a serial-2-or-higher copy for that nickname; it does not re-enable the default serial-1 grant.
+Only karts with a resolved name, `BodyParam`, actual `model.1s`, and no test/dummy/NPC indicators are granted automatically as serial 1. In the stock P5136 data, 1,287 of 1,296 karts pass. Nine IDs (`199, 312, 323, 352, 657, 658, 659, 814, 886`) remain quarantined to avoid inventory-scroll crashes. If a quarantined kart is confirmed to work in the client, enter its exact numeric ID and select the **manual review** result. This adds only a serial-2-or-higher copy for that nickname; it does not re-enable the default serial-1 grant.
 
 Additional copies are stored atomically in the nickname profile's `GrantedKarts`. They use the same `(kart_id, serial)` key as tune, plant, level, and parts data, so each copy can keep different upgrades. The allocator also reserves serials still referenced by `TuneData.json`, `PlantData.json`, `LevelData.json`, and `PartsData.json`. Missing profiles are created on the first grant. Reconnect a client that was already online.
 
 Legacy-engine upgrades use a simplified friends-server policy. The target and material karts must be owned, but materials and currency are not consumed and success is always 100%. Level, remaining points, four-slot distribution, and special effects are saved per nickname in `LevelData.json` and restored into inventory and race physics. Each slot is limited to 0–10 and the total distribution to 35 points.
 
-The stock floater UI is supported for socket creation, activation kits, protection spanners, and reset. Consumables are not deducted, but ownership, kart type, and socket state are validated and saved atomically in `TuneData.json`. Black-kit values `603/703/903` contribute start-booster time `+800`, transform acceleration `+0.018`, and drift escape force `+210`. Normal speed values `103`–`903` follow the C# values. Item floaters `10103`–`12003` do not invent speed effects because the reference server did not apply them to speed physics.
+The stock floater UI is supported for socket creation, activation kits, protection spanners, and reset. Consumables are not deducted, but ownership, kart type, and socket state are validated and saved atomically in `TuneData.json`. Black-kit values `603/703/903` contribute start-booster time `+800`, transform acceleration `+0.018`, and drift escape force `+210`. Normal speed values `103`–`903` follow the C# values. All 20 item Floater meanings are derived from the Korean P5136 RHO5 `zeta_/kr/enchant/desc.xml`. Item-box transforms—shield to super shield, water bomb to toxic/ice water bomb, rocket to gold rocket, booster to siren/super shield, and banana to water mine—run in the server award path. Every chance comes from its exact `enchant.xml` Tune entry (for example, `10503` 15%, `11103` 40%, `11403` 25%, and `11803` 30%); RHO replacement effects are 100%. In contrast, the client resolves and awards all 78 `firing2Gain` use-trigger rewards and 150 `fired2Gain` hit-trigger rewards itself. The server relays the corresponding GameSlot types 10 and 11 byte-exactly and does not synthesize duplicate rewards.
+
+When granting a kart in the GUI, use the existing **333 preset** or select each of the three vertically arranged Floater slots. The editor exposes 27 validated speed codes and all 20 RHO-verified item effects by their actual translated meanings. It rejects duplicate speed-effect families and duplicate item codes before creating the kart. **Apply grade 5** remains independent and can be combined with either Floater choice.
+
+The default kart inventory now includes the verified shared-model Boxter HT-S/HT-B/HT LE bodies and Kartneck/Kartneck X, whose historical internal names contain `dummyBox`. The nine remaining quarantined rows are four bodies without a Korean/default BodyParam and five explicit dummy/test bodies.
 
 The editor briefly acquires the same profile-root lease used by the server and revalidates the store identity. A server in another process therefore blocks offline edits. Live grants use the running server's serialized profile queue. If the client path changes after a catalog is loaded, the catalog and selection are invalidated and the canonical `Data` path is checked again immediately before a grant.
 
@@ -79,6 +83,8 @@ Track and pool proper names come from the Korean client data and are therefore s
 ## S0–S8 room-title physics
 
 An independent `S0`–`S8` token in the room title selects that modern C# physics preset for the next race:
+
+**Time-attack physics preset** under Server management offers **Default (client selection)** plus S0–S8. Default preserves the existing client-requested grade. Selecting an S grade overrides the 235-byte physics block in every accepted time-attack start reply after the server is restarted.
 
 ```text
 [S0] Beginner

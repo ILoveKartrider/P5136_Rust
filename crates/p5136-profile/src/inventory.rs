@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use p5136_core::{
     equipment_protocol::{RiderItemSelection, XPartEquipRequest},
-    inventory::{InventorySnapshot, RiderItemGroup, RiderItemRecord},
+    inventory::{InventorySnapshot, PartsExcRecord, RiderItemGroup, RiderItemRecord},
 };
 use thiserror::Error;
 
@@ -170,6 +170,8 @@ pub fn build_inventory_snapshot_with_equipment(
         });
     }
 
+    add_missing_x_parts_exception_records(catalog, &records, &mut equipment.parts);
+
     let mut by_category = BTreeMap::<u16, Vec<RiderItemRecord>>::new();
     for record in records {
         by_category.entry(record.category).or_default().push(record);
@@ -194,6 +196,33 @@ pub fn build_inventory_snapshot_with_equipment(
         parts_exceptions: equipment.parts,
         item_groups,
     })
+}
+
+fn add_missing_x_parts_exception_records(
+    catalog: &CatalogInventory,
+    inventory: &[RiderItemRecord],
+    parts: &mut Vec<PartsExcRecord>,
+) {
+    let mut known = parts
+        .iter()
+        .map(|record| (record.id, record.serial))
+        .collect::<HashSet<_>>();
+    for kart in inventory
+        .iter()
+        .filter(|record| record.category == 3 && catalog.supports_x_parts(record.id))
+    {
+        let serial = normalize_kart_serial(kart.id, kart.serial);
+        let (Ok(id), Ok(serial)) = (i16::try_from(kart.id), i16::try_from(serial)) else {
+            continue;
+        };
+        if known.insert((id, serial)) {
+            parts.push(PartsExcRecord {
+                id,
+                serial,
+                ..PartsExcRecord::default()
+            });
+        }
+    }
 }
 
 fn exception_kart_is_owned(
@@ -478,7 +507,12 @@ mod tests {
             items.len()
         );
         for (category, id) in items {
-            write!(xml, r#"<Item category="{category}" id="{id}" />"#).unwrap();
+            let x_parts = if category == 3 && id == 1_450 {
+                r#" xPartsCompatible="true""#
+            } else {
+                ""
+            };
+            write!(xml, r#"<Item category="{category}" id="{id}"{x_parts} />"#).unwrap();
         }
         xml.push_str("</Inventory></KartCatalog>");
         xml
@@ -563,9 +597,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.plant_exceptions.len(), 1);
-        assert_eq!(snapshot.parts_exceptions.len(), 1);
+        assert_eq!(snapshot.parts_exceptions.len(), 2);
         assert_eq!(snapshot.plant_exceptions[0].id, 1_450);
         assert_eq!(snapshot.parts_exceptions[0].id, 1_450);
+        assert_eq!(snapshot.parts_exceptions[0].serial, 2);
+        assert_eq!(snapshot.parts_exceptions[0].engine, 1);
+        assert_eq!(
+            snapshot.parts_exceptions[1],
+            PartsExcRecord {
+                id: 1_450,
+                serial: 1,
+                ..PartsExcRecord::default()
+            }
+        );
         assert_eq!(snapshot.item_groups.len(), 49);
         assert_eq!(snapshot.item_groups[0].records[0].category, 21);
         assert_eq!(snapshot.item_groups[35].records[0].category, 39);
@@ -616,7 +660,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manual_snapshot.plant_exceptions.len(), 2);
-        assert_eq!(manual_snapshot.parts_exceptions.len(), 2);
+        assert_eq!(manual_snapshot.parts_exceptions.len(), 3);
         assert!(
             manual_snapshot.item_groups[48]
                 .records

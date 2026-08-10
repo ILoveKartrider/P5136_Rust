@@ -16,17 +16,20 @@ use p5136_connector::{
     ConnectorCancellation, ConnectorPlan, ConnectorRequest, ConnectorStage, InstallationOptions,
     Runner, RunnerBackend, execute_connector_with_progress_and_cancellation,
 };
-use p5136_core::ports::{DEFAULT_CONFIGURED_PORT, PortTopology};
+use p5136_core::{
+    floater_physics::{ALL_FLOATER_CODES, p5136_floater_spec},
+    ports::{DEFAULT_CONFIGURED_PORT, PortTopology},
+};
 use p5136_profile::{
     AddKartOutcome, AdditionalKart, CatalogInventory, KartCatalogSearchResult, KartGrantOptions,
-    ProfileStore, add_kart_with_options, additional_karts, search_karts,
+    ProfileStore, RiderSchoolProgress, add_kart_with_options, additional_karts, search_karts,
 };
 use p5136_server::{
     BoundServer, ItemProbabilityConfiguration, ItemProbabilityEntry, ItemProbabilityRankBand,
     ItemProbabilityRankPolicy, RandomTrackCatalog, RandomTrackConfiguration, RandomTrackDefinition,
-    RandomTrackPool, RandomTrackPoolOverride, ResolvedRandomTracks, ServerConfig, ServerEndpoints,
-    load_client_item_probabilities, load_client_kart_catalog, load_client_random_track_catalog,
-    load_item_probability_xml,
+    RandomTrackPool, RandomTrackPoolOverride, ResolvedRandomTracks, RiderSchoolProMissionSet,
+    ServerConfig, ServerEndpoints, TimeAttackPhysicsPreset, load_client_item_probabilities,
+    load_client_kart_catalog, load_client_random_track_catalog, load_item_probability_xml,
 };
 use serde::{Deserialize, Serialize};
 
@@ -376,6 +379,8 @@ struct ServerInputs {
     item_probability_xml: String,
     show_team_item_probabilities: bool,
     random_tracks: RandomTrackConfiguration,
+    rider_school_pro_mission_set: RiderSchoolProMissionSet,
+    time_attack_physics_preset: TimeAttackPhysicsPreset,
     file_logging: GuiFileLogging,
 }
 
@@ -469,6 +474,8 @@ impl Default for ServerInputs {
             item_probability_xml: String::new(),
             show_team_item_probabilities: false,
             random_tracks: RandomTrackConfiguration::default(),
+            rider_school_pro_mission_set: RiderSchoolProMissionSet::Automatic,
+            time_attack_physics_preset: TimeAttackPhysicsPreset::default(),
             file_logging: GuiFileLogging::Enabled,
         }
     }
@@ -610,6 +617,8 @@ impl ServerInputs {
                 }
             },
             random_tracks: self.random_tracks.clone(),
+            rider_school_pro_mission_set: self.rider_school_pro_mission_set,
+            time_attack_physics_preset: self.time_attack_physics_preset,
             first_message_delay: Duration::from_millis(parse_u64(
                 &self.first_message_delay_ms,
                 tr!(
@@ -675,6 +684,309 @@ fn optional_path_ref(value: &str) -> Option<&Path> {
 
 fn optional_path(value: &str) -> Option<PathBuf> {
     optional_path_ref(value).map(Path::to_owned)
+}
+
+fn rider_school_grade_label(language: GuiLanguage, progress: RiderSchoolProgress) -> &'static str {
+    match progress {
+        RiderSchoolProgress::NONE_CLEARED => {
+            tr!(
+                language,
+                "미취득 (처음부터)",
+                "Unlicensed (start)",
+                "未取得（从头开始）"
+            )
+        }
+        RiderSchoolProgress::BEGINNER => tr!(language, "초보", "Beginner", "初级"),
+        RiderSchoolProgress::ROOKIE => tr!(language, "루키", "Rookie", "新手"),
+        RiderSchoolProgress::L3 => "L3",
+        RiderSchoolProgress::L2 => "L2",
+        RiderSchoolProgress::L1 => "L1",
+        RiderSchoolProgress::ALL_CLEAR => tr!(language, "PRO", "PRO", "PRO"),
+        _ => tr!(language, "사용자 지정", "Custom", "自定义"),
+    }
+}
+
+fn rider_school_pro_mission_set_label(
+    language: GuiLanguage,
+    selection: RiderSchoolProMissionSet,
+) -> &'static str {
+    match selection {
+        RiderSchoolProMissionSet::Automatic => tr!(
+            language,
+            "자동 (현재 2개월 주기)",
+            "Automatic (current two-month rotation)",
+            "自动（当前双月轮换）"
+        ),
+        RiderSchoolProMissionSet::FairyMabinogi => tr!(
+            language,
+            "동화 이상한 나라의 문 → 마비노기 이멘 마하",
+            "Fairy Door to Wonderland → Mabinogi Emain Macha",
+            "童话 奇境之门 → 洛奇 伊文玛哈"
+        ),
+        RiderSchoolProMissionSet::ChinaSword => tr!(
+            language,
+            "차이나 골목길 대질주 → 도검 구름의 협곡",
+            "China Alley Rush → Sword Cloud Canyon",
+            "中国 胡同疾驰 → 刀剑 云之峡谷"
+        ),
+        RiderSchoolProMissionSet::GoldAbyss => tr!(
+            language,
+            "황금문명 비밀장치의 위협 → 어비스 스카이라인",
+            "Golden Civilization Secret Device → Abyss Skyline",
+            "黄金文明 秘密装置的威胁 → 深渊 天际线"
+        ),
+        RiderSchoolProMissionSet::ForestOlympus => tr!(
+            language,
+            "포레스트 아찔한 다운힐 → 올림포스 하늘의 신전",
+            "Forest Dizzying Downhill → Olympus Sky Temple",
+            "森林 惊险下坡 → 奥林匹斯 天空神殿"
+        ),
+        RiderSchoolProMissionSet::PirateNemo => tr!(
+            language,
+            "해적 숨겨진 보물 → 네모 산타의 비밀공간",
+            "Pirate Hidden Treasure → Cube Santa's Secret Space",
+            "海盗 隐藏宝藏 → 方块 圣诞老人的秘密空间"
+        ),
+        RiderSchoolProMissionSet::MineMaple => tr!(
+            language,
+            "광산 위험한 제련소 → 메이플 레헬른 악몽의 시계탑",
+            "Mine Dangerous Refinery → MapleStory Lachelein Clocktower",
+            "矿山 危险冶炼厂 → 冒险岛 梦都噩梦钟楼"
+        ),
+    }
+}
+
+fn time_attack_physics_preset_label(
+    language: GuiLanguage,
+    preset: TimeAttackPhysicsPreset,
+) -> &'static str {
+    match preset {
+        TimeAttackPhysicsPreset::ClientDefault => tr!(
+            language,
+            "기본 설정 (클라이언트 선택)",
+            "Default (client selection)",
+            "默认设置（客户端选择）"
+        ),
+        TimeAttackPhysicsPreset::S0 => tr!(language, "S0 보통", "S0 Normal", "S0 普通"),
+        TimeAttackPhysicsPreset::S1 => tr!(language, "S1 빠름", "S1 Fast", "S1 快速"),
+        TimeAttackPhysicsPreset::S2 => {
+            tr!(language, "S2 매우 빠름", "S2 Very fast", "S2 非常快")
+        }
+        TimeAttackPhysicsPreset::S3 => tr!(language, "S3 가장 빠름", "S3 Fastest", "S3 极速"),
+        TimeAttackPhysicsPreset::S4 => tr!(
+            language,
+            "S4 무한부스터",
+            "S4 Infinite Booster",
+            "S4 无限加速"
+        ),
+        TimeAttackPhysicsPreset::S5 => tr!(
+            language,
+            "S5 특수 프리셋",
+            "S5 special preset",
+            "S5 特殊预设"
+        ),
+        TimeAttackPhysicsPreset::S6 => tr!(
+            language,
+            "S6 이벤트 무한부스터",
+            "S6 event Infinite Booster",
+            "S6 活动无限加速"
+        ),
+        TimeAttackPhysicsPreset::S7 => tr!(
+            language,
+            "S7 통합 스피드",
+            "S7 integrated speed",
+            "S7 统一竞速"
+        ),
+        TimeAttackPhysicsPreset::S8 => tr!(
+            language,
+            "S8 통합 아이템",
+            "S8 integrated item",
+            "S8 统一道具"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn floater_code_label(language: GuiLanguage, code: i16) -> String {
+    if code == 0 {
+        return tr!(language, "없음 (0)", "None (0)", "无（0）").to_owned();
+    }
+    if code < 10_000 {
+        let effect = match code / 100 {
+            1 => tr!(language, "항력 감소", "Drag reduction", "阻力降低"),
+            2 => tr!(language, "전진 가속", "Forward acceleration", "前进加速"),
+            3 => tr!(language, "코너링", "Cornering", "弯道性能"),
+            4 => tr!(
+                language,
+                "팀 부스터 지속",
+                "Team-booster duration",
+                "组队加速持续时间"
+            ),
+            5 => tr!(
+                language,
+                "개인 부스터 지속",
+                "Normal-booster duration",
+                "普通加速持续时间"
+            ),
+            6 => tr!(
+                language,
+                "출발 부스터 지속",
+                "Start-booster duration",
+                "起步加速持续时间"
+            ),
+            7 => tr!(language, "변신 가속", "Transform acceleration", "变形加速"),
+            8 => tr!(language, "드리프트 게이지", "Drift gauge", "漂移集气"),
+            9 => tr!(
+                language,
+                "드리프트 탈출력",
+                "Drift escape force",
+                "漂移脱离力"
+            ),
+            _ => return code.to_string(),
+        };
+        let grade = code % 100;
+        return tr_format!(
+            language,
+            "{effect} {grade}단계 ({code})",
+            "{effect} grade {grade} ({code})",
+            "{effect} {grade}级（{code}）"
+        );
+    }
+    // Exact group/id names from the stock Korean P5136
+    // `zeta_/kr/enchant/desc.xml` RHO5 entry. The code is group * 100 + id.
+    let (ko, en, zh, level) = match code {
+        10_103 => ("물폭탄 방어", "Water-bomb defense", "防御水炸弹", Some(3)),
+        10_203 => ("물파리 방어", "Water-fly defense", "防御水苍蝇", Some(3)),
+        10_303 => (
+            "아이템 큐브 획득 시 루찌 획득",
+            "Gain Lucci from an item cube",
+            "获得道具箱时获得金币",
+            Some(3),
+        ),
+        10_401 => (
+            "대마왕 류 방어 (100%)",
+            "Devil-family defense (100%)",
+            "防御大魔王类道具（100%）",
+            None,
+        ),
+        10_503 => (
+            "실드 획득 시 슈퍼 실드로 변경",
+            "Chance to convert an acquired shield to a super shield",
+            "获得盾牌时一定概率变为超级盾牌",
+            Some(3),
+        ),
+        10_603 => (
+            "보스전 미사일 데미지 증가",
+            "Increased rocket damage in Boss mode",
+            "Boss 模式导弹伤害增加",
+            Some(3),
+        ),
+        10_703 => (
+            "우주선 전파를 실드로 획득",
+            "Chance to gain a shield from a UFO signal",
+            "一定概率将宇宙船电波变为盾牌",
+            Some(3),
+        ),
+        10_803 => (
+            "자석 사용 시 부스터 획득",
+            "Chance to gain a booster after using a magnet",
+            "使用磁铁时一定概率获得加速器",
+            Some(3),
+        ),
+        10_901 => (
+            "바나나를 밟았을 때 부스터 획득 (100%)",
+            "Gain a booster after hitting a banana (100%)",
+            "踩到香蕉时获得加速器（100%）",
+            None,
+        ),
+        11_001 => (
+            "물폭탄 대신 독성 물폭탄 사용",
+            "Use a toxic water bomb instead of a water bomb",
+            "用毒性水炸弹替代水炸弹",
+            None,
+        ),
+        11_103 => (
+            "미사일을 황금 미사일로 변경",
+            "Chance to convert a rocket to a gold rocket",
+            "一定概率将导弹变为黄金导弹",
+            Some(3),
+        ),
+        11_201 => (
+            "물폭탄 대신 얼음 물폭탄 사용",
+            "Use an ice water bomb instead of a water bomb",
+            "用冰冻水炸弹替代水炸弹",
+            None,
+        ),
+        11_301 => (
+            "바나나 방어 (100%)",
+            "Banana defense (100%)",
+            "防御香蕉（100%）",
+            None,
+        ),
+        11_403 => (
+            "부스터 획득 시 사이렌으로 변경",
+            "Chance to convert an acquired booster to a siren",
+            "获得加速器时一定概率变为警笛",
+            Some(3),
+        ),
+        11_501 => (
+            "바나나 대신 물지뢰 사용",
+            "Use a water mine instead of a banana",
+            "用水雷替代香蕉",
+            None,
+        ),
+        11_601 => (
+            "물폭탄·물파리에서 재빨리 탈출",
+            "Quick escape from a water-bomb or water-fly hit",
+            "被水炸弹或水苍蝇命中时快速脱离",
+            None,
+        ),
+        11_701 => (
+            "미사일 2발 동시 발사",
+            "Fire two rockets simultaneously",
+            "同时发射两枚导弹",
+            None,
+        ),
+        11_803 => (
+            "부스터 획득 시 슈퍼 실드로 변경",
+            "Chance to convert an acquired booster to a super shield",
+            "获得加速器时一定概率变为超级盾牌",
+            Some(3),
+        ),
+        11_903 => (
+            "배틀·챔피언스 모드 물파리 방어",
+            "Water-fly defense in Battle/Champions mode",
+            "战斗／冠军模式水苍蝇防御",
+            Some(3),
+        ),
+        12_003 => (
+            "배틀·챔피언스 모드 물폭탄 방어",
+            "Water-bomb defense in Battle/Champions mode",
+            "战斗／冠军模式水炸弹防御",
+            Some(3),
+        ),
+        _ => return code.to_string(),
+    };
+    let effect = match language {
+        GuiLanguage::Korean => ko,
+        GuiLanguage::English => en,
+        GuiLanguage::SimplifiedChinese => zh,
+    };
+    if let Some(level) = level {
+        tr_format!(
+            language,
+            "{effect} +{level} ({code})",
+            "{effect} +{level} ({code})",
+            "{effect} +{level}（{code}）"
+        )
+    } else {
+        tr_format!(
+            language,
+            "{effect} ({code})",
+            "{effect} ({code})",
+            "{effect}（{code}）"
+        )
+    }
 }
 
 fn parse_u64(value: &str, label: &str, language: GuiLanguage) -> Result<u64> {
@@ -936,6 +1248,10 @@ enum ServerControl {
         kart_id: u16,
         options: KartGrantOptions,
     },
+    SetRiderSchoolProgress {
+        nickname: String,
+        progress: RiderSchoolProgress,
+    },
 }
 
 enum GuiEvent {
@@ -944,6 +1260,11 @@ enum GuiEvent {
     ServerStopBlocked(String),
     RandomTracksUpdated(Result<(), String>),
     KartGranted(Result<AddKartOutcome, String>),
+    RiderSchoolProgressSet {
+        nickname: String,
+        progress: RiderSchoolProgress,
+        result: Result<u64, String>,
+    },
     ServerFinished(Result<(), String>),
 }
 
@@ -980,6 +1301,8 @@ struct P5136GuiApp {
     inventory_kart_grant_options: KartGrantOptions,
     inventory_additional_karts: Vec<AdditionalKart>,
     inventory_status: String,
+    rider_school_selection: RiderSchoolProgress,
+    rider_school_status: String,
 }
 
 impl P5136GuiApp {
@@ -1062,6 +1385,14 @@ impl P5136GuiApp {
                 "加载车辆列表后，可按昵称管理额外拥有的车辆。"
             )
             .to_owned(),
+            rider_school_selection: RiderSchoolProgress::ALL_CLEAR,
+            rider_school_status: tr!(
+                language,
+                "닉네임과 라이선스 등급을 선택해 적용하세요.",
+                "Select a nickname and license grade, then apply it.",
+                "请选择昵称和驾照等级，然后应用。"
+            )
+            .to_owned(),
         }
     }
 
@@ -1105,6 +1436,11 @@ impl P5136GuiApp {
                     }
                 },
                 GuiEvent::KartGranted(result) => self.apply_inventory_grant_result(result),
+                GuiEvent::RiderSchoolProgressSet {
+                    nickname,
+                    progress,
+                    result,
+                } => self.apply_rider_school_result(&nickname, progress, result),
                 GuiEvent::ServerFinished(result) => self.finish_server_worker(result),
             }
         }
@@ -1417,6 +1753,7 @@ impl P5136GuiApp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuiTab {
     Server,
+    ServerManagement,
     Connector,
 }
 
@@ -1870,6 +2207,116 @@ impl P5136GuiApp {
         }
     }
 
+    fn apply_selected_rider_school_progress(&mut self) {
+        let language = self.language;
+        let request = (|| -> Result<(String, RiderSchoolProgress)> {
+            let nickname = required_text(
+                &self.inventory_nickname,
+                tr!(language, "계정 닉네임", "Account nickname", "账号昵称"),
+                language,
+            )?
+            .to_owned();
+            let progress = self.rider_school_selection;
+            if !progress.is_grade_boundary() {
+                return Err(anyhow!(tr!(
+                    language,
+                    "지원하지 않는 라이선스 경계값입니다.",
+                    "The selected license boundary is unsupported.",
+                    "所选驾照边界值不受支持。"
+                )));
+            }
+            Ok((nickname, progress))
+        })();
+        let (nickname, progress) = match request {
+            Ok(request) => request,
+            Err(error) => {
+                self.rider_school_status = tr_format!(
+                    language,
+                    "라이선스 적용 실패: {error:#}",
+                    "Failed to apply the license: {error:#}",
+                    "应用驾照失败：{error:#}"
+                );
+                return;
+            }
+        };
+
+        if matches!(self.server_run_state, ServerRunState::Running(_)) {
+            self.request_server_control(ServerControl::SetRiderSchoolProgress {
+                nickname,
+                progress,
+            });
+            tr!(
+                language,
+                "실행 중 서버의 프로필 큐에 라이선스 변경을 요청했습니다.",
+                "Requested the license change through the running server's profile queue.",
+                "已通过运行中服务器的资料队列请求修改驾照。"
+            )
+            .clone_into(&mut self.rider_school_status);
+            return;
+        }
+        if self.server_run_state.is_active() {
+            tr!(
+                language,
+                "서버가 시작 또는 종료 중입니다. 완료 후 다시 적용하세요.",
+                "The server is starting or stopping. Apply again after it finishes.",
+                "服务器正在启动或停止，请完成后再次应用。"
+            )
+            .clone_into(&mut self.rider_school_status);
+            return;
+        }
+
+        let outcome = (|| -> Result<u64> {
+            let store = ProfileStore::new(required_path(
+                &self.server_inputs.profile_root,
+                tr!(
+                    language,
+                    "프로필 저장 경로",
+                    "Profile storage path",
+                    "资料存储路径"
+                ),
+                language,
+            )?);
+            let (saved, _) = store.update(&nickname, |profile| {
+                profile.rider_school = progress;
+            })?;
+            Ok(saved.revision)
+        })();
+        self.apply_rider_school_result(
+            &nickname,
+            progress,
+            outcome.map_err(|error| format!("{error:#}")),
+        );
+    }
+
+    fn apply_rider_school_result(
+        &mut self,
+        nickname: &str,
+        progress: RiderSchoolProgress,
+        result: Result<u64, String>,
+    ) {
+        let language = self.language;
+        match result {
+            Ok(revision) => {
+                let grade = rider_school_grade_label(language, progress);
+                self.rider_school_status = tr_format!(
+                    language,
+                    "{} 계정의 라이선스를 {grade}(으)로 저장했습니다. 프로필 revision {revision}. 접속 중이었다면 재접속 후 반영됩니다.",
+                    "Saved the license for {} as {grade}. Profile revision {revision}. Reconnect if the client was online.",
+                    "已将 {} 的驾照保存为 {grade}。资料 revision {revision}。若客户端在线，请重新连接。",
+                    nickname
+                );
+            }
+            Err(error) => {
+                self.rider_school_status = tr_format!(
+                    language,
+                    "라이선스 적용 실패: {error}",
+                    "Failed to apply the license: {error}",
+                    "应用驾照失败：{error}"
+                );
+            }
+        }
+    }
+
     fn add_selected_inventory_kart(&mut self) {
         let language = self.language;
         let request = (|| -> Result<(Arc<CatalogInventory>, String, u16, KartGrantOptions)> {
@@ -1907,8 +2354,9 @@ impl P5136GuiApp {
                 nickname,
                 selected.kart_id,
                 KartGrantOptions {
-                    apply_floater_333: supports_enhancements
-                        && self.inventory_kart_grant_options.apply_floater_333,
+                    apply_floater: supports_enhancements
+                        && self.inventory_kart_grant_options.apply_floater,
+                    floater_codes: self.inventory_kart_grant_options.floater_codes,
                     apply_grade_five: supports_enhancements
                         && self.inventory_kart_grant_options.apply_grade_five,
                 },
@@ -1980,12 +2428,12 @@ impl P5136GuiApp {
                 let kart = added.kart();
                 let revision = added.saved().revision;
                 let enhancements = added.enhancements();
-                let mut applied = Vec::new();
-                if enhancements.floater_333 {
-                    applied.push("333 (603/903/703)");
+                let mut applied = Vec::<String>::new();
+                if let Some([first, second, third]) = enhancements.floater_codes {
+                    applied.push(format!("Floater {first}/{second}/{third}"));
                 }
                 if enhancements.grade_five {
-                    applied.push(tr!(language, "5강", "grade 5", "强化 5"));
+                    applied.push(tr!(language, "5강", "grade 5", "强化 5").to_owned());
                 }
                 let enhancement_suffix = if applied.is_empty() {
                     String::new()
@@ -2153,9 +2601,9 @@ impl P5136GuiApp {
         ui.collapsing(
             tr!(
                 language,
-                "닉네임별 인벤토리 편집",
-                "Inventory editor by nickname",
-                "按昵称编辑库存"
+                "닉네임별 계정/인벤토리 편집",
+                "Account and inventory editor by nickname",
+                "按昵称编辑账号与仓库"
             ),
             |ui| {
             self.inventory_catalog_controls(ui);
@@ -2257,6 +2705,45 @@ impl P5136GuiApp {
                 self.refresh_inventory_profile();
             }
         });
+
+        ui.horizontal(|ui| {
+            ui.label(tr!(language, "라이선스 등급", "License grade", "驾照等级"));
+            egui::ComboBox::from_id_salt("account-rider-school-grade")
+                .selected_text(rider_school_grade_label(
+                    language,
+                    self.rider_school_selection,
+                ))
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for progress in RiderSchoolProgress::GRADE_BOUNDARIES {
+                        ui.selectable_value(
+                            &mut self.rider_school_selection,
+                            progress,
+                            rider_school_grade_label(language, progress),
+                        );
+                    }
+                });
+            if ui
+                .button(tr!(language, "라이선스 적용", "Apply license", "应用驾照"))
+                .clicked()
+            {
+                self.apply_selected_rider_school_progress();
+            }
+        });
+        ui.colored_label(
+            if status_is_error(&self.rider_school_status) {
+                egui::Color32::LIGHT_RED
+            } else {
+                egui::Color32::GRAY
+            },
+            &self.rider_school_status,
+        );
+        ui.weak(tr!(
+            language,
+            "미취득을 선택하면 라이선스 테스트를 처음부터 진행할 수 있습니다. PRO 선택 시 레이싱 마스터 엠블럼은 지급하지 않습니다.",
+            "Unlicensed starts the license tests from the beginning. Selecting PRO does not grant the Racing Master emblem.",
+            "选择未取得可从头开始驾照考试。选择 PRO 不会发放 Racing Master 徽章。"
+        ));
     }
 
     fn inventory_kart_search_controls(&mut self, ui: &mut egui::Ui) {
@@ -2356,6 +2843,7 @@ impl P5136GuiApp {
         self.inventory_kart_enhancement_controls(ui);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn inventory_kart_enhancement_controls(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         let enhancements_supported = self
@@ -2376,13 +2864,8 @@ impl P5136GuiApp {
             ui.add_enabled(
                 enhancements_supported,
                 egui::Checkbox::new(
-                    &mut self.inventory_kart_grant_options.apply_floater_333,
-                    tr!(
-                        language,
-                        "333 적용 (603/903/703)",
-                        "Apply 333 (603/903/703)",
-                        "应用 333（603/903/703）"
-                    ),
+                    &mut self.inventory_kart_grant_options.apply_floater,
+                    tr!(language, "플로터 적용", "Apply Floater", "应用强化属性"),
                 ),
             );
             ui.add_enabled(
@@ -2392,7 +2875,74 @@ impl P5136GuiApp {
                     tr!(language, "5강 적용", "Apply grade 5", "应用强化 5"),
                 ),
             );
+            if ui
+                .add_enabled(
+                    enhancements_supported,
+                    egui::Button::new(tr!(language, "333 프리셋", "333 preset", "333 预设")),
+                )
+                .clicked()
+            {
+                self.inventory_kart_grant_options.apply_floater = true;
+                self.inventory_kart_grant_options.floater_codes = [603, 903, 703];
+            }
         });
+        ui.add_enabled_ui(
+            enhancements_supported && self.inventory_kart_grant_options.apply_floater,
+            |ui| {
+                let mut codes = self.inventory_kart_grant_options.floater_codes;
+                ui.label(tr!(
+                    language,
+                    "플로터 슬롯",
+                    "Floater slots",
+                    "强化属性槽"
+                ));
+                for slot in 0..3 {
+                    ui.horizontal(|ui| {
+                        ui.label(tr_format!(
+                            language,
+                            "슬롯 {}",
+                            "Slot {}",
+                            "槽位 {}",
+                            slot + 1
+                        ));
+                        let mut selected = codes[slot];
+                        egui::ComboBox::from_id_salt(("grant-floater-slot", slot))
+                            .selected_text(floater_code_label(language, selected))
+                            .width(360.0)
+                            .show_ui(ui, |ui| {
+                                let mut none_candidate = codes;
+                                none_candidate[slot] = 0;
+                                if p5136_floater_spec(none_candidate).is_some() {
+                                    ui.selectable_value(
+                                        &mut selected,
+                                        0,
+                                        floater_code_label(language, 0),
+                                    );
+                                }
+                                for &code in ALL_FLOATER_CODES {
+                                    let mut candidate = codes;
+                                    candidate[slot] = code;
+                                    if p5136_floater_spec(candidate).is_some() {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            code,
+                                            floater_code_label(language, code),
+                                        );
+                                    }
+                                }
+                            });
+                        codes[slot] = selected;
+                    });
+                }
+                self.inventory_kart_grant_options.floater_codes = codes;
+                ui.weak(tr!(
+                    language,
+                    "동일한 스피드 효과 종류나 같은 아이템 효과는 두 슬롯에 중복 지정할 수 없습니다.",
+                    "The same speed-effect family or item effect cannot be selected in more than one slot.",
+                    "同一种竞速效果类别或相同道具效果不能重复选择到多个槽位。"
+                ));
+            },
+        );
         if let Some(selected) = &self.inventory_selected_kart {
             ui.weak(tr_format!(
                 language,
@@ -2814,6 +3364,12 @@ impl P5136GuiApp {
             |ui| {
             let mut edited = false;
             self.item_probability_rank_policy_editor(ui);
+            ui.weak(tr!(
+                language,
+                "아이템 플로터 확률은 한국 P5136 enchant.xml의 코드별 원본 값을 사용합니다.",
+                "Item Floater chances use the per-code stock Korean P5136 enchant.xml values.",
+                "道具强化属性概率使用韩服 P5136 enchant.xml 中各代码的原始数值。"
+            ));
             let pinned =
                 self.server_inputs.item_probability_source == GuiItemProbabilitySource::Edited;
             ui.add_enabled_ui(pinned, |ui| {
@@ -3118,8 +3674,6 @@ impl P5136GuiApp {
             });
 
         self.server_advanced_input_panel(ui);
-        self.item_probability_editor(ui);
-
         ui.weak(tr!(
             language,
             "포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2.",
@@ -3355,8 +3909,6 @@ impl P5136GuiApp {
             self.logging_control.set_enabled(file_logging_enabled);
         }
         ui.add_enabled_ui(!active, |ui| self.server_input_panel(ui));
-        self.random_track_editor(ui);
-        self.inventory_editor(ui);
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui
@@ -3424,6 +3976,118 @@ impl P5136GuiApp {
         });
         ui.add_space(8.0);
         self.server_status_panel(ui);
+    }
+
+    fn time_attack_physics_editor(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "타임어택 물리 프리셋",
+                "Time-attack physics preset",
+                "计时赛物理预设"
+            ),
+            |ui| {
+                egui::ComboBox::from_id_salt("time-attack-physics-preset")
+                    .selected_text(time_attack_physics_preset_label(
+                        language,
+                        self.server_inputs.time_attack_physics_preset,
+                    ))
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for preset in TimeAttackPhysicsPreset::ALL {
+                            ui.selectable_value(
+                                &mut self.server_inputs.time_attack_physics_preset,
+                                preset,
+                                time_attack_physics_preset_label(language, preset),
+                            );
+                        }
+                    });
+                ui.weak(tr!(
+                    language,
+                    "기본 설정은 클라이언트가 요청한 등급을 유지합니다. S0~S8을 선택하면 타임어택 시작 물리를 서버가 덮어쓰며, 다음 서버 시작부터 적용됩니다.",
+                    "Default preserves the client-requested grade. Selecting S0–S8 overrides time-attack start physics from the next server start.",
+                    "默认设置会保留客户端请求的等级。选择 S0–S8 后，服务器会从下次启动起覆盖计时赛开始物理。"
+                ));
+            },
+        );
+    }
+
+    fn rider_school_pro_mission_editor(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "PRO 미션 조합",
+                "PRO mission pair",
+                "PRO 任务组合"
+            ),
+            |ui| {
+                egui::ComboBox::from_id_salt("rider-school-pro-mission-set")
+                    .selected_text(rider_school_pro_mission_set_label(
+                        language,
+                        self.server_inputs.rider_school_pro_mission_set,
+                    ))
+                    .width(420.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.server_inputs.rider_school_pro_mission_set,
+                            RiderSchoolProMissionSet::Automatic,
+                            rider_school_pro_mission_set_label(
+                                language,
+                                RiderSchoolProMissionSet::Automatic,
+                            ),
+                        );
+                        for selection in RiderSchoolProMissionSet::MANUAL {
+                            ui.selectable_value(
+                                &mut self.server_inputs.rider_school_pro_mission_set,
+                                selection,
+                                rider_school_pro_mission_set_label(language, selection),
+                            );
+                        }
+                    });
+                ui.weak(tr!(
+                    language,
+                    "왼쪽 타임어택 트랙 → 오른쪽 대결 트랙 순서입니다. 수동 선택은 서버가 클라이언트에 알리는 기준 시각도 같은 2개월 구간으로 맞추며, 다음 서버 시작부터 적용됩니다.",
+                    "Pairs are shown as time-attack track → versus track. A manual selection also projects the client-facing server clock into the same two-month window and applies from the next server start.",
+                    "组合按计时赛地图 → 对决地图显示。手动选择还会把客户端所见的服务器时间调整到相同的双月周期，并从下次启动服务器时生效。"
+                ));
+            },
+        );
+    }
+
+    fn server_management_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        let active = self.server_run_state.is_active();
+        ui.heading(tr!(
+            language,
+            "서버 관리",
+            "Server management",
+            "服务器管理"
+        ));
+        ui.label(tr!(
+            language,
+            "게임 규칙과 닉네임별 계정·인벤토리를 한곳에서 관리합니다.",
+            "Manage gameplay rules and nickname-specific accounts and inventories in one place.",
+            "在此集中管理游戏规则以及按昵称区分的账号和仓库。"
+        ));
+        ui.add_space(10.0);
+
+        ui.add_enabled_ui(!active, |ui| {
+            self.time_attack_physics_editor(ui);
+            self.rider_school_pro_mission_editor(ui);
+            self.item_probability_editor(ui);
+        });
+        if active {
+            ui.weak(tr!(
+                language,
+                "타임어택 물리, PRO 미션 조합과 아이템 확률표는 현재 실행 설정에 포함되어 있으므로 서버를 정지한 뒤 변경할 수 있습니다.",
+                "The time-attack physics preset, PRO mission pair, and item-probability table are part of the current runtime configuration; stop the server before changing them.",
+                "计时赛物理预设、PRO 任务组合和道具概率表属于当前运行配置，请停止服务器后再更改。"
+            ));
+        }
+        self.inventory_editor(ui);
+        self.random_track_editor(ui);
     }
 
     fn connector_tab(&mut self, ui: &mut egui::Ui) {
@@ -3546,6 +4210,11 @@ impl eframe::App for P5136GuiApp {
                 );
                 ui.selectable_value(
                     &mut self.selected_tab,
+                    GuiTab::ServerManagement,
+                    tr!(language, "서버 관리", "Server management", "服务器管理"),
+                );
+                ui.selectable_value(
+                    &mut self.selected_tab,
                     GuiTab::Connector,
                     tr!(language, "접속기", "Connector", "连接器"),
                 );
@@ -3553,6 +4222,7 @@ impl eframe::App for P5136GuiApp {
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| match self.selected_tab {
                 GuiTab::Server => self.server_tab(ui),
+                GuiTab::ServerManagement => self.server_management_tab(ui),
                 GuiTab::Connector => self.connector_tab(ui),
             });
         });
@@ -3725,6 +4395,24 @@ async fn run_server_control_loop(
                             .with_context(|| tr!(language, "GUI 종료 후 서버 강제 종료에 실패했습니다", "Failed to force-stop the server after the GUI closed", "GUI 关闭后强制停止服务器失败"));
                     }
                 }
+                Some(ServerControl::SetRiderSchoolProgress { nickname, progress }) => {
+                    let request_nickname = nickname.clone();
+                    let result = server
+                        .set_rider_school_progress(nickname, progress)
+                        .await
+                        .map(|saved| saved.revision)
+                        .map_err(|error| format!("{error:#}"));
+                    if !notifier.send(GuiEvent::RiderSchoolProgressSet {
+                        nickname: request_nickname,
+                        progress,
+                        result,
+                    }) {
+                        return server
+                            .force_shutdown()
+                            .await
+                            .with_context(|| tr!(language, "GUI 종료 후 서버 강제 종료에 실패했습니다", "Failed to force-stop the server after the GUI closed", "GUI 关闭后强制停止服务器失败"));
+                    }
+                }
             }
         }
     }
@@ -3765,6 +4453,13 @@ async fn await_graceful_shutdown_or_force(
                     notifier.send(GuiEvent::KartGranted(Err(
                         tr!(language, "서버가 종료 중이어서 카트를 지급하지 않았습니다", "The kart was not granted because the server is stopping", "服务器正在停止，未发放车辆").to_owned()
                     )));
+                }
+                Some(ServerControl::SetRiderSchoolProgress { nickname, progress }) => {
+                    notifier.send(GuiEvent::RiderSchoolProgressSet {
+                        nickname,
+                        progress,
+                        result: Err(tr!(language, "서버가 종료 중이어서 라이선스를 변경하지 않았습니다", "The license was not changed because the server is stopping", "服务器正在停止，未修改驾照").to_owned()),
+                    });
                 }
             }
         }
@@ -3807,6 +4502,7 @@ mod tests {
     use p5136_connector::{ConnectorCancellation, ConnectorStage, RunnerBackend};
     use p5136_server::{
         ItemProbabilityRankPolicy, RandomTrackConfiguration, RandomTrackPoolOverride,
+        RiderSchoolProMissionSet, TimeAttackPhysicsPreset,
     };
     use tempfile::tempdir;
 
@@ -3950,6 +4646,8 @@ mod tests {
             session_idle_timeout_seconds: "240".to_owned(),
             session_write_timeout_seconds: "20".to_owned(),
             max_login_sessions: "32".to_owned(),
+            rider_school_pro_mission_set: RiderSchoolProMissionSet::MineMaple,
+            time_attack_physics_preset: TimeAttackPhysicsPreset::S4,
             ..ServerInputs::default()
         };
 
@@ -3975,6 +4673,14 @@ mod tests {
         assert_eq!(config.session_idle_timeout, Duration::from_secs(240));
         assert_eq!(config.session_write_timeout, Duration::from_secs(20));
         assert_eq!(config.max_login_sessions, 32);
+        assert_eq!(
+            config.rider_school_pro_mission_set,
+            RiderSchoolProMissionSet::MineMaple
+        );
+        assert_eq!(
+            config.time_attack_physics_preset,
+            TimeAttackPhysicsPreset::S4
+        );
 
         let safe = ServerInputs {
             trust_client_item_rank: false,
@@ -4067,6 +4773,7 @@ mod tests {
                     track_ids: vec!["village_R01".to_owned(), "desert_R01".to_owned()],
                 }],
             },
+            rider_school_pro_mission_set: RiderSchoolProMissionSet::GoldAbyss,
             ..ServerInputs::default()
         };
         app.server_inputs.item_probabilities.individual[0].top_weight += 17;

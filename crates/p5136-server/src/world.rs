@@ -12,6 +12,7 @@ use std::{
 
 use p5136_core::{
     equipment_protocol::{EquipmentProtocolError, serialize_room_slot_items},
+    floater_physics::{P5136ItemFloaterEffect, p5136_item_floater_ability},
     game_slot_item_semantics::ItemLifecycleMeaning,
     game_slot_protocol::{
         BarricadeOperation, GameSlotAction, GameSlotBody, GameSlotEvidencePending,
@@ -255,6 +256,7 @@ impl ItemProbabilityService {
         client_reported_rank: i16,
         racer_count: usize,
         kart_id: u16,
+        floater_codes: [i16; 3],
         item_rolls: &mut impl ItemRollSource,
     ) -> Result<ItemAwardSelection, ItemProbabilityError> {
         let (rank_band, total) = self.roll_total(team_mode, client_reported_rank, racer_count)?;
@@ -267,7 +269,7 @@ impl ItemProbabilityService {
             .as_deref()
             .and_then(|catalog| catalog.item_transform(kart_id, base_item_id, "no_flag"))
             .map(|rule| (rule.target_item_id, rule.probability));
-        let (item_id, transform_probability, transform_applied) = match transform {
+        let (mut item_id, transform_probability, transform_applied) = match transform {
             Some((target_item_id, probability))
                 if probability >= 100
                     || item_rolls.draw_item(NonZeroU64::new(100).expect("100 is nonzero"))
@@ -278,12 +280,53 @@ impl ItemProbabilityService {
             Some((_, probability)) => (base_item_id, Some(probability), false),
             None => (base_item_id, None, false),
         };
+        let floater_transform = (!transform_applied)
+            .then(|| item_floater_pickup_rule(floater_codes, base_item_id))
+            .flatten();
+        let (floater_code, floater_probability, floater_applied) = match floater_transform {
+            Some(rule)
+                if rule.probability >= 100
+                    || item_rolls.draw_item(NonZeroU64::new(100).expect("100 is nonzero"))
+                        < u64::from(rule.probability) =>
+            {
+                item_id = rule.target_item_id;
+                (Some(rule.code), Some(rule.probability), true)
+            }
+            Some(rule) => (Some(rule.code), Some(rule.probability), false),
+            None => (None, None, false),
+        };
+        let special_booster_transform = (!transform_applied && !floater_applied)
+            .then(|| {
+                self.catalog.as_deref().and_then(|catalog| {
+                    catalog.item_transform(kart_id, base_item_id, "animal_booster")
+                })
+            })
+            .flatten()
+            .map(|rule| (rule.target_item_id, rule.probability));
+        let (special_booster_probability, special_booster_applied) = match special_booster_transform
+        {
+            Some((target_item_id, probability))
+                if probability >= 100
+                    || item_rolls.draw_item(NonZeroU64::new(100).expect("100 is nonzero"))
+                        < u64::from(probability) =>
+            {
+                item_id = target_item_id;
+                (Some(probability), true)
+            }
+            Some((_, probability)) => (Some(probability), false),
+            None => (None, false),
+        };
         Ok(ItemAwardSelection {
             rank_band,
             base_item_id,
             item_id,
             transform_probability,
             transform_applied,
+            floater_code,
+            floater_probability,
+            floater_applied,
+            special_booster_probability,
+            special_booster_applied,
         })
     }
 }
@@ -301,6 +344,43 @@ struct ItemAwardSelection {
     item_id: i16,
     transform_probability: Option<u8>,
     transform_applied: bool,
+    floater_code: Option<i16>,
+    floater_probability: Option<u8>,
+    floater_applied: bool,
+    special_booster_probability: Option<u8>,
+    special_booster_applied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ItemFloaterPickupRule {
+    code: i16,
+    target_item_id: i16,
+    probability: u8,
+}
+
+fn item_floater_pickup_rule(codes: [i16; 3], source_item_id: i16) -> Option<ItemFloaterPickupRule> {
+    use P5136ItemFloaterEffect as Effect;
+
+    codes.into_iter().find_map(|code| {
+        let ability = p5136_item_floater_ability(code)?;
+        let target_item_id = match (ability.effect, source_item_id) {
+            (Effect::RocketToGoldRocket, 7) => 32,
+            (Effect::BoosterToSuperShield, 6 | 31) | (Effect::ShieldToSuperShield, 10) => 18,
+            (Effect::BoosterToSiren, 6 | 31) => 24,
+            (Effect::BananaToWaterMine, 8 | 85) => 37,
+            (Effect::WaterBombToInfectedBomb, 9) => 27,
+            (Effect::WaterBombToInfectedBomb, 13) => 28,
+            (Effect::WaterBombToInfectedBomb, 19) => 29,
+            (Effect::WaterBombToIceBomb, 9) => 34,
+            (Effect::WaterBombToIceBomb, 13) => 35,
+            _ => return None,
+        };
+        Some(ItemFloaterPickupRule {
+            code,
+            target_item_id,
+            probability: ability.probability,
+        })
+    })
 }
 
 /// One ordered write unit for a login session. A batch consumes one bounded
@@ -748,6 +828,7 @@ pub(crate) struct RoomParticipant {
     pub(crate) observer_master: bool,
     pub(crate) kart_physics: P5136KartPhysicsBlock,
     pub(crate) kart_physics_variants: Option<RoomKartPhysicsVariants>,
+    pub(crate) floater_codes: [i16; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1378,6 +1459,7 @@ enum MyRoomEntryIntent {
         requested_owner: String,
         password: MyRoomPassword,
         self_info: Option<MyRoomInfo>,
+        profiled_owner: Option<Box<ProfiledMyRoomOwnerLoad>>,
     },
     Reenter {
         self_info: Result<MyRoomInfo, MyRoomProtocolError>,
@@ -1390,6 +1472,20 @@ enum MyRoomEntryOwnerResolution {
     PasswordRequired { owner_nickname: String },
     Tracked(MyRoomOwner),
     Bootstrap(MyRoomInfo),
+}
+
+/// Fresh durable profile data that may bootstrap a direct `MyRoom` owner when
+/// no live, actor-tracked owner room exists.
+#[derive(Debug)]
+pub(crate) struct ProfiledMyRoomOwnerLoad {
+    info: MyRoomInfo,
+    profile: MyRoomProfileLease,
+}
+
+impl ProfiledMyRoomOwnerLoad {
+    pub(crate) fn new(info: MyRoomInfo, profile: MyRoomProfileLease) -> Self {
+        Self { info, profile }
+    }
 }
 
 impl MyRoomEntryInput {
@@ -1420,6 +1516,26 @@ impl MyRoomEntryInput {
                 requested_owner,
                 password,
                 self_info,
+                profiled_owner: None,
+            },
+        )
+    }
+
+    pub(crate) fn direct_with_profiled_owner(
+        expected: IdentityBinding,
+        requested_owner: String,
+        password: MyRoomPassword,
+        presentation: &MyRoomProfilePresentation,
+        profiled_owner: ProfiledMyRoomOwnerLoad,
+    ) -> Result<Self, MyRoomHubError> {
+        Self::bind(
+            expected,
+            presentation,
+            MyRoomEntryIntent::Direct {
+                requested_owner,
+                password,
+                self_info: None,
+                profiled_owner: Some(Box::new(profiled_owner)),
             },
         )
     }
@@ -2242,6 +2358,10 @@ enum WorldCommand {
         nickname: String,
         reply: oneshot::Sender<Result<IdentityBinding, WorldError>>,
     },
+    EnsureKnownUserNo {
+        nickname: String,
+        reply: oneshot::Sender<Result<UserNo, WorldError>>,
+    },
     AuthorizeIdentity {
         session: SessionId,
         reply: oneshot::Sender<Result<IdentityBinding, WorldError>>,
@@ -2296,6 +2416,7 @@ enum WorldCommand {
     RefreshRoomKartPhysics {
         session: SessionId,
         kart_physics: Box<RoomKartPhysicsVariants>,
+        floater_codes: [i16; 3],
         reply: oneshot::Sender<Result<bool, WorldError>>,
     },
     RefreshMyRoomPresentation {
@@ -3381,6 +3502,18 @@ impl AdmittedWorldHandle<'_> {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    /// Allocates the stable process-local number for an already validated,
+    /// existing profile without activating another login generation.
+    pub(crate) async fn ensure_known_user_no(
+        &self,
+        nickname: String,
+    ) -> Result<UserNo, WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::EnsureKnownUserNo { nickname, reply })
+            .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     pub(crate) async fn authorize_udp_rebind(&self) -> Result<(), WorldError> {
         let (reply, response) = oneshot::channel();
         self.send(WorldCommand::AuthorizeUdpRebind {
@@ -3429,11 +3562,13 @@ impl AdmittedWorldHandle<'_> {
     pub(crate) async fn refresh_room_kart_physics(
         &self,
         kart_physics: RoomKartPhysicsVariants,
+        floater_codes: [i16; 3],
     ) -> Result<bool, WorldError> {
         let (reply, response) = oneshot::channel();
         self.send(WorldCommand::RefreshRoomKartPhysics {
             session: self.session_id(),
             kart_physics: Box::new(kart_physics),
+            floater_codes,
             reply,
         })
         .await?;
@@ -3915,6 +4050,7 @@ struct ProtocolRoomMember {
     player: RoomPlayer,
     kart_physics: P5136KartPhysicsBlock,
     kart_physics_variants: Option<RoomKartPhysicsVariants>,
+    floater_codes: [i16; 3],
 }
 
 impl ProtocolRoomMember {
@@ -3940,6 +4076,7 @@ struct FrozenRaceParticipant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FrozenHumanResultSnapshot {
     kart_id: u16,
+    floater_codes: [i16; 3],
     character_id: u16,
     club_mark_logo: i32,
     economy: FrozenResultEconomy,
@@ -4392,6 +4529,7 @@ impl ProtocolRoomState {
                 player: participant.player,
                 kart_physics: participant.kart_physics,
                 kart_physics_variants: participant.kart_physics_variants,
+                floater_codes: participant.floater_codes,
             });
             if observer_master {
                 self.room_master = i32::try_from(ROOM_SLOT_COUNT + observer_id)
@@ -4417,6 +4555,7 @@ impl ProtocolRoomState {
             player: participant.player,
             kart_physics: participant.kart_physics,
             kart_physics_variants: participant.kart_physics_variants,
+            floater_codes: participant.floater_codes,
         });
         self.slot_positions[slot_id] = Some(member_id);
         if self.member_by_player_id(self.room_master).is_none() {
@@ -5349,10 +5488,12 @@ fn prepare_item_pickup_admission(
     Ok(next)
 }
 
-fn frozen_item_pickup_kart_id(sender: &FrozenRaceParticipant) -> Result<u16, RaceError> {
+fn frozen_item_pickup_loadout(
+    sender: &FrozenRaceParticipant,
+) -> Result<(u16, [i16; 3]), RaceError> {
     sender
         .result
-        .map(|result| result.kart_id)
+        .map(|result| (result.kart_id, result.floater_codes))
         .ok_or(RaceError::GameSlotInvariant {
             detail: "item-pickup sender has no frozen human result snapshot",
         })
@@ -6045,7 +6186,7 @@ impl World {
     }
 
     fn resolve_myroom_entry_owner(
-        &self,
+        &mut self,
         session: SessionId,
         requester: &IdentityBinding,
         intent: MyRoomEntryIntent,
@@ -6056,12 +6197,14 @@ impl World {
                 requested_owner,
                 password,
                 self_info,
+                profiled_owner,
             } => self.resolve_direct_myroom_entry_owner(
                 session,
                 requester,
                 &requested_owner,
                 &password,
                 self_info,
+                profiled_owner,
             ),
             MyRoomEntryIntent::Reenter { self_info } => {
                 self.resolve_reenter_myroom_entry_owner(session, requester, self_info)
@@ -6073,12 +6216,13 @@ impl World {
     }
 
     fn resolve_direct_myroom_entry_owner(
-        &self,
+        &mut self,
         session: SessionId,
         requester: &IdentityBinding,
         requested_owner: &str,
         password: &MyRoomPassword,
         self_info: Option<MyRoomInfo>,
+        profiled_owner: Option<Box<ProfiledMyRoomOwnerLoad>>,
     ) -> Result<MyRoomEntryOwnerResolution, WorldOperationError> {
         let requested_self =
             canonical_nickname_key(requested_owner) == canonical_nickname_key(&requester.nickname);
@@ -6113,33 +6257,66 @@ impl World {
                     .myroom
                     .present_owner_entry_input(&target)
                     .map_err(|source| myroom_hub_error("direct-entry owner query", source))?;
-                Ok(match present {
-                    Some(owner) if owner.info().use_room_password == 0 => {
-                        MyRoomEntryOwnerResolution::Tracked(owner)
-                    }
-                    Some(owner)
-                        if !password.is_empty()
-                            && password.expose_secret() == owner.info().room_password =>
-                    {
-                        MyRoomEntryOwnerResolution::Tracked(owner)
-                    }
-                    Some(owner) if password.is_empty() => {
-                        MyRoomEntryOwnerResolution::PasswordRequired {
-                            owner_nickname: owner.identity().nickname.clone(),
-                        }
-                    }
-                    Some(_) => {
-                        MyRoomEntryOwnerResolution::Rejected(EnterMyRoomStatus::PasswordMismatch)
-                    }
-                    None => {
-                        MyRoomEntryOwnerResolution::Rejected(EnterMyRoomStatus::OwnerUnavailable)
-                    }
-                })
+                let owner = match present {
+                    Some(owner) => Some(owner),
+                    None => self.bind_profiled_myroom_owner(
+                        requested_owner,
+                        Some(target),
+                        profiled_owner,
+                    )?,
+                };
+                Ok(owner.map_or(
+                    MyRoomEntryOwnerResolution::Rejected(EnterMyRoomStatus::OwnerUnavailable),
+                    |owner| classify_direct_myroom_owner(owner, password),
+                ))
             }
-            None => Ok(MyRoomEntryOwnerResolution::Rejected(
-                EnterMyRoomStatus::OwnerUnavailable,
-            )),
+            None => {
+                let owner =
+                    self.bind_profiled_myroom_owner(requested_owner, None, profiled_owner)?;
+                Ok(owner.map_or(
+                    MyRoomEntryOwnerResolution::Rejected(EnterMyRoomStatus::OwnerUnavailable),
+                    |owner| classify_direct_myroom_owner(owner, password),
+                ))
+            }
         }
+    }
+
+    fn bind_profiled_myroom_owner(
+        &mut self,
+        requested_owner: &str,
+        active: Option<IdentityBinding>,
+        profiled: Option<Box<ProfiledMyRoomOwnerLoad>>,
+    ) -> Result<Option<MyRoomOwner>, WorldOperationError> {
+        let Some(profiled) = profiled else {
+            return Ok(None);
+        };
+        let profiled = *profiled;
+        if !profiled
+            .profile
+            .subject()
+            .matches_nickname(requested_owner)
+            .map_err(IdentityError::from)?
+        {
+            return Err(WorldError::MyRoomProfileSubjectMismatch {
+                expected: requested_owner.to_owned(),
+                actual: profiled.profile.subject().nickname().to_owned(),
+            }
+            .into());
+        }
+        let identity = match active {
+            Some(identity) => identity,
+            None => self.identities.offline_myroom_binding(requested_owner)?,
+        };
+        let participant = profiled
+            .profile
+            .presentation()
+            .clone()
+            .with_p2p_port(0)
+            .bind(identity)
+            .map_err(|source| myroom_hub_error("profiled direct-entry owner binding", source))?;
+        let owner = MyRoomOwner::new(participant, profiled.info)
+            .map_err(|source| myroom_hub_error("profiled direct-entry owner info", source))?;
+        Ok(Some(owner))
     }
 
     fn resolve_reenter_myroom_entry_owner(
@@ -9575,6 +9752,7 @@ impl World {
         &mut self,
         session: SessionId,
         kart_physics: RoomKartPhysicsVariants,
+        floater_codes: [i16; 3],
     ) -> Result<bool, WorldOperationError> {
         let identity = self.authorize_session_operation(session)?;
         let Some(room_id) = self.protocol_room_by_user.get(&identity.user_no).copied() else {
@@ -9597,6 +9775,7 @@ impl World {
         };
         member.kart_physics.clone_from(&kart_physics.default);
         member.kart_physics_variants = Some(kart_physics);
+        member.floater_codes = floater_codes;
         self.debug_assert_invariants();
         Ok(true)
     }
@@ -9668,6 +9847,42 @@ impl World {
                 actual: profile.subject().nickname().to_owned(),
             }
             .into());
+        }
+        if let Some(previous) = self
+            .myroom
+            .canonical_identity_if_tracked(identity.user_no)
+            .map_err(|source| myroom_hub_error("profile presentation owner query", source))?
+            && previous != identity
+            && previous.generation.is_offline_myroom()
+        {
+            let transition = match self.myroom.advance_profiled_identity_if_tracked(
+                &previous,
+                &identity,
+                profile.presentation(),
+            ) {
+                Ok(transition) => transition,
+                Err(MyRoomHubError::Wire(source)) => {
+                    tracing::warn!(
+                        nickname = %identity.nickname,
+                        %source,
+                        "retained the offline MyRoom presentation while activating its owner"
+                    );
+                    self.myroom
+                        .advance_migrated_identity_if_tracked(&previous, &identity)
+                        .map_err(|error| {
+                            myroom_hub_error("offline MyRoom owner activation fallback", error)
+                        })?
+                }
+                Err(source) => {
+                    return Err(myroom_hub_error("offline MyRoom owner activation", source).into());
+                }
+            };
+            let Some(transition) = transition else {
+                return Ok(false);
+            };
+            self.commit_silent_myroom_transition(transition)?;
+            self.debug_assert_invariants();
+            return Ok(true);
         }
         let transition = match self
             .myroom
@@ -10305,6 +10520,7 @@ impl World {
         Ok(recipients)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn synthesize_item_pickup(
         &mut self,
         room_id: RoomId,
@@ -10345,7 +10561,7 @@ impl World {
                 detail: "item-pickup sender changed during actor dispatch",
             });
         }
-        let kart_id = frozen_item_pickup_kart_id(sender)?;
+        let (kart_id, floater_codes) = frozen_item_pickup_loadout(sender)?;
         let pickup_admission = prepare_item_pickup_admission(
             room.race_progress.item_pickups.get(&sender_player_id),
             now,
@@ -10361,6 +10577,7 @@ impl World {
             client_reported_rank,
             racer_count,
             kart_id,
+            floater_codes,
             item_rolls,
         )?;
         let raw = packet.into_item_pickup_award(award.item_id)?;
@@ -10391,6 +10608,12 @@ impl World {
             transform_mode = "no_flag",
             transform_probability = ?award.transform_probability,
             transform_applied = award.transform_applied,
+            floater_codes = ?floater_codes,
+            floater_code = ?award.floater_code,
+            floater_probability = ?award.floater_probability,
+            floater_applied = award.floater_applied,
+            special_booster_probability = ?award.special_booster_probability,
+            special_booster_applied = award.special_booster_applied,
             rank_band = ?award.rank_band,
             rank_policy = ?self.item_probability.rank_policy,
             client_reported_rank,
@@ -11143,6 +11366,7 @@ impl World {
                             .try_into()
                             .expect("the kart field is a fixed two-byte slice"),
                     ),
+                    floater_codes: member.floater_codes,
                     character_id: u16::from_le_bytes(
                         member.player.rider_item_snapshot[..2]
                             .try_into()
@@ -12474,6 +12698,24 @@ fn myroom_hub_error(operation: &'static str, source: MyRoomHubError) -> MyRoomLi
     MyRoomLifecycleError::Hub { operation, source }
 }
 
+fn classify_direct_myroom_owner(
+    owner: MyRoomOwner,
+    password: &MyRoomPassword,
+) -> MyRoomEntryOwnerResolution {
+    if owner.info().use_room_password == 0 {
+        return MyRoomEntryOwnerResolution::Tracked(owner);
+    }
+    if !password.is_empty() && password.expose_secret() == owner.info().room_password {
+        return MyRoomEntryOwnerResolution::Tracked(owner);
+    }
+    if password.is_empty() {
+        return MyRoomEntryOwnerResolution::PasswordRequired {
+            owner_nickname: owner.identity().nickname.clone(),
+        };
+    }
+    MyRoomEntryOwnerResolution::Rejected(EnterMyRoomStatus::PasswordMismatch)
+}
+
 fn redact_myroom_secrets(mut info: MyRoomInfo) -> MyRoomInfo {
     info.room_password.clear();
     info.item_password.clear();
@@ -12931,6 +13173,13 @@ async fn dispatch_unwrapped_command(
             let result = world.claim_identity_at_udp_epoch(session, &nickname, activated_udp_epoch);
             reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
         }
+        WorldCommand::EnsureKnownUserNo { nickname, reply } => {
+            let result = world
+                .identities
+                .ensure_known_user_no(&nickname)
+                .map_err(WorldError::from);
+            reply_after_identity_lifecycle(world, sidecars, reply, result).await?;
+        }
         WorldCommand::AuthorizeIdentity { session, reply } => {
             dispatch_authorize_identity(world, sidecars, session, reply).await?;
         }
@@ -12998,9 +13247,10 @@ async fn dispatch_unwrapped_command(
         WorldCommand::RefreshRoomKartPhysics {
             session,
             kart_physics,
+            floater_codes,
             reply,
         } => {
-            let result = world.refresh_room_kart_physics(session, *kart_physics);
+            let result = world.refresh_room_kart_physics(session, *kart_physics, floater_codes);
             reply_after_world_operation(world, sidecars, reply, result).await?;
         }
         WorldCommand::RefreshMyRoomPresentation {
@@ -13095,6 +13345,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
         }
+        WorldCommand::EnsureKnownUserNo { reply, .. } => reject_quiesced_reply(reply),
         WorldCommand::BeginMigration { reply, .. } => {
             let _ = reply.send(Err(WorldError::OutboundProductionClosed));
             None
@@ -13557,6 +13808,7 @@ async fn dispatch_utility_command(
         | WorldCommand::RegisterSession { .. }
         | WorldCommand::SessionClosed { .. }
         | WorldCommand::ClaimIdentity { .. }
+        | WorldCommand::EnsureKnownUserNo { .. }
         | WorldCommand::AuthorizeIdentity { .. }
         | WorldCommand::AuthorizeUdpRebind { .. }
         | WorldCommand::BeginMigration { .. }
@@ -13684,6 +13936,7 @@ pub(crate) mod test_support {
             observer_master: false,
             kart_physics: P5136KartPhysicsBlock::from([0; 235]),
             kart_physics_variants: None,
+            floater_codes: [0; 3],
         }
     }
 
@@ -14787,6 +15040,7 @@ mod tests {
             observer_master: false,
             kart_physics: P5136KartPhysicsBlock::from([0; 235]),
             kart_physics_variants: None,
+            floater_codes: [0; 3],
         }
     }
 
@@ -17864,6 +18118,10 @@ mod tests {
             ("SebekGoldShieldEmp", 1_395, 12, 36, vec![0, 24]),
             ("SebekGoldShieldTimeBomb", 1_395, 13, 36, vec![0, 24]),
             ("SebekGoldShieldMiss", 1_395, 5, 5, vec![0, 25]),
+            ("PharaohHtBoosterPass", 498, 6, 36, vec![0, 19]),
+            ("PharaohHtBoosterMiss", 498, 6, 31, vec![0, 20]),
+            ("BastetXBoosterPass", 1_139, 6, 36, vec![0, 24]),
+            ("BastetXBoosterMiss", 1_139, 6, 31, vec![0, 25]),
         ] {
             let (mut world, mut sessions, room_id) =
                 prepare_game_slot_race(case, 42_000 + kart_id, &[(false, 8)]);
@@ -17911,6 +18169,133 @@ mod tests {
                     recipients: 1,
                     ..
                 } if item_id == expected_item_id
+            ));
+            let awarded = take_single_packet(&mut sessions[0].outbound);
+            assert_eq!(
+                i16::from_le_bytes(awarded[38..40].try_into().unwrap()),
+                expected_item_id,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn item_pickup_prefers_floater_transform_before_special_booster_fallback() {
+        for (case, rolls, expected_item_id) in [
+            ("FloaterPass", vec![0, 20, 29], 18),
+            ("FloaterMiss", vec![0, 20, 30], 31),
+        ] {
+            let (mut world, mut sessions, room_id) =
+                prepare_game_slot_race(case, 42_498, &[(false, 8)]);
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            room.settings.game_type = 2;
+            let result = room.frozen_race.as_mut().unwrap().participants[0]
+                .result
+                .as_mut()
+                .unwrap();
+            result.kart_id = 498;
+            result.floater_codes = [11_803, 0, 0];
+            world.item_probability.catalog = Some(Arc::new(test_equipment_catalog()));
+            world.item_probability.configuration = Arc::new(ItemProbabilityConfiguration {
+                rank_band: ItemProbabilityRankBand::Live,
+                individual: vec![ItemProbabilityEntry {
+                    item_id: 6,
+                    name: "booster".to_owned(),
+                    top_weight: 1,
+                    high_weight: 1,
+                    middle_weight: 1,
+                    low_weight: 1,
+                }],
+                team: Vec::new(),
+            });
+            world.item_probability.rank_policy = ItemProbabilityRankPolicy::TrustClientReported;
+
+            let mut item_rolls = SequenceItemRolls::new(rolls);
+            let outcome = world
+                .race_command_with_clock_and_item_source(
+                    sessions[0].session,
+                    tcp_game_slot_request(&item_pickup_game_slot(0)),
+                    Instant::now(),
+                    &ServerClock::new(),
+                    &mut item_rolls,
+                )
+                .unwrap();
+            assert!(
+                item_rolls.0.is_empty(),
+                "{case} consumed the wrong roll count"
+            );
+            assert!(matches!(
+                outcome,
+                RaceCommandOutcome::GameSlotItemAwarded { item_id, .. }
+                    if item_id == expected_item_id
+            ));
+            let awarded = take_single_packet(&mut sessions[0].outbound);
+            assert_eq!(
+                i16::from_le_bytes(awarded[38..40].try_into().unwrap()),
+                expected_item_id,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn item_pickup_applies_frozen_item_floater_transform_policy() {
+        for (case, codes, base_item_id, expected_item_id, rolls) in [
+            ("GoldRocketPass", [11_103, 0, 0], 7, 32, vec![0, 39]),
+            ("GoldRocketMiss", [11_103, 0, 0], 7, 7, vec![0, 40]),
+            ("BoosterToSuperShield", [11_803, 0, 0], 6, 18, vec![0, 29]),
+            ("BananaToWaterMine", [11_501, 0, 0], 8, 37, vec![0]),
+            ("BigBananaToWaterMine", [11_501, 0, 0], 85, 37, vec![0]),
+            ("WaterBombToToxic", [11_001, 0, 0], 9, 27, vec![0]),
+            ("TimeBombToToxic", [11_001, 0, 0], 13, 28, vec![0]),
+            ("RollingBombToToxic", [11_001, 0, 0], 19, 29, vec![0]),
+            ("WaterBombToIce", [11_201, 0, 0], 9, 34, vec![0]),
+            ("TimeBombToIce", [11_201, 0, 0], 13, 35, vec![0]),
+            ("AnimalBoosterToSiren", [11_403, 0, 0], 31, 24, vec![0, 24]),
+        ] {
+            let (mut world, mut sessions, room_id) =
+                prepare_game_slot_race(case, 43_000, &[(false, 8)]);
+            let room = world.protocol_rooms.get_mut(&room_id).unwrap();
+            room.settings.game_type = 2;
+            room.frozen_race.as_mut().unwrap().participants[0]
+                .result
+                .as_mut()
+                .unwrap()
+                .floater_codes = codes;
+            world.item_probability.catalog = None;
+            world.item_probability.configuration = Arc::new(ItemProbabilityConfiguration {
+                rank_band: ItemProbabilityRankBand::Live,
+                individual: vec![ItemProbabilityEntry {
+                    item_id: base_item_id,
+                    name: "fixture".to_owned(),
+                    top_weight: 1,
+                    high_weight: 1,
+                    middle_weight: 1,
+                    low_weight: 1,
+                }],
+                team: Vec::new(),
+            });
+            world.item_probability.rank_policy = ItemProbabilityRankPolicy::TrustClientReported;
+
+            let request = item_pickup_game_slot(0);
+            let mut item_rolls = SequenceItemRolls::new(rolls);
+            let outcome = world
+                .race_command_with_clock_and_item_source(
+                    sessions[0].session,
+                    tcp_game_slot_request(&request),
+                    Instant::now(),
+                    &ServerClock::new(),
+                    &mut item_rolls,
+                )
+                .unwrap();
+            assert!(
+                item_rolls.0.is_empty(),
+                "{case} consumed the wrong roll count"
+            );
+            assert!(matches!(
+                outcome,
+                RaceCommandOutcome::GameSlotItemAwarded { item_id, .. }
+                    if item_id == expected_item_id
             ));
             let awarded = take_single_packet(&mut sessions[0].outbound);
             assert_eq!(

@@ -1,16 +1,18 @@
-//! Fail-closed P5136 rider-info packet primitives.
+//! P5136 rider-info packet primitives.
 //!
 //! Stock producer evidence establishes one exact `PqGetRiderInfo` form: a
 //! zero scalar, an empty reserved UTF-16 string, a bounded target nickname,
-//! and one raw mode byte. This module accepts only that producer-minted form
-//! and intentionally exposes no successful `PrGetRiderInfo` DTO until the
-//! cross-profile authorization and data-projection policy is defined.
+//! and one raw mode byte. This module accepts only that producer-minted form.
+//! The successful reply layout is corroborated by the Korean C# compatibility
+//! handler and the 199-byte `PrGetRiderInfo` capture from 2026-07-15.
 
 use thiserror::Error;
 
 use crate::{
+    login::LegacyTime,
     packet::{PacketError, PacketReader, PacketWriter},
     room_protocol::MAX_RIDER_NICKNAME_UTF16_UNITS,
+    startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
 };
 
 pub const GET_RIDER_INFO_REQUEST_NAME: &str = "PqGetRiderInfo";
@@ -18,6 +20,29 @@ pub const GET_RIDER_INFO_REPLY_NAME: &str = "PrGetRiderInfo";
 
 pub const GET_RIDER_INFO_REQUEST_HASH: u32 = 0x2777_0563;
 pub const GET_RIDER_INFO_REPLY_HASH: u32 = 0x2784_0564;
+
+/// Profile-backed fields in a successful Korean P5136 rider-info reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiderInfoFields {
+    pub user_no: u32,
+    pub account_name: String,
+    pub nickname: String,
+    pub profile_time: LegacyTime,
+    pub rider_item_snapshot: [u8; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+    pub card: String,
+    pub rp: u32,
+    pub license_level: u8,
+    pub emblem_1: i16,
+    pub emblem_2: i16,
+    pub rider_intro: String,
+    pub premium: i32,
+    pub premium_points: i32,
+    pub club_code: i32,
+    pub club_mark_logo: i32,
+    pub club_mark_line: i32,
+    pub club_name: String,
+    pub ranker: u8,
+}
 
 /// A fully validated, exactly consumed stock `PqGetRiderInfo` request.
 ///
@@ -114,6 +139,54 @@ pub fn serialize_get_rider_info_failure() -> Vec<u8> {
     packet.into_inner()
 }
 
+/// Serializes the exact successful `PrGetRiderInfo` projection consumed by
+/// the Korean P5136 client.
+pub fn serialize_get_rider_info_success(fields: &RiderInfoFields) -> Result<Vec<u8>, PacketError> {
+    let mut packet = PacketWriter::named(GET_RIDER_INFO_REPLY_NAME);
+    packet.write_u8(1);
+    packet.write_u32(fields.user_no);
+    packet.write_utf16(&fields.account_name)?;
+    packet.write_utf16(&fields.nickname)?;
+    write_legacy_time(&mut packet, fields.profile_time);
+    packet.write_bytes(&fields.rider_item_snapshot);
+    packet.write_utf16(&fields.card)?;
+    packet.write_u32(fields.rp);
+    packet.write_i32(0);
+    packet.write_u8(fields.license_level);
+    write_legacy_time(&mut packet, fields.profile_time);
+    packet.write_bytes(&[0; 17]);
+    packet.write_i16(fields.emblem_1);
+    packet.write_i16(fields.emblem_2);
+    packet.write_i16(0);
+    packet.write_utf16(&fields.rider_intro)?;
+    packet.write_i32(fields.premium);
+    packet.write_u8(1);
+    packet.write_i32(fields.premium_points);
+    if fields.club_mark_logo == 0 {
+        packet.write_i32(0);
+        packet.write_i32(0);
+        packet.write_i32(0);
+        packet.write_utf16("")?;
+    } else {
+        packet.write_i32(fields.club_code);
+        packet.write_i32(fields.club_mark_logo);
+        packet.write_i32(fields.club_mark_line);
+        packet.write_utf16(&fields.club_name)?;
+    }
+    packet.write_i32(0);
+    packet.write_u8(fields.ranker);
+    for _ in 0..5 {
+        packet.write_i32(0);
+    }
+    packet.write_bytes(&[0; 3]);
+    Ok(packet.into_inner())
+}
+
+fn write_legacy_time(packet: &mut PacketWriter, time: LegacyTime) {
+    packet.write_u16(time.days_since_1900);
+    packet.write_u16(time.quarter_seconds);
+}
+
 fn expect_hash(reader: &mut PacketReader<'_>) -> Result<(), RiderInfoProtocolError> {
     let actual = reader.read_u32()?;
     if actual == GET_RIDER_INFO_REQUEST_HASH {
@@ -142,13 +215,16 @@ fn ensure_exhausted(reader: &PacketReader<'_>) -> Result<(), RiderInfoProtocolEr
 mod tests {
     use super::{
         GET_RIDER_INFO_REPLY_HASH, GET_RIDER_INFO_REPLY_NAME, GET_RIDER_INFO_REQUEST_HASH,
-        GET_RIDER_INFO_REQUEST_NAME, RiderInfoProtocolError, parse_get_rider_info_request,
-        serialize_get_rider_info_failure,
+        GET_RIDER_INFO_REQUEST_NAME, RiderInfoFields, RiderInfoProtocolError,
+        parse_get_rider_info_request, serialize_get_rider_info_failure,
+        serialize_get_rider_info_success,
     };
     use crate::{
         adler32,
+        login::LegacyTime,
         packet::{PacketError, PacketWriter},
         room_protocol::MAX_RIDER_NICKNAME_UTF16_UNITS,
+        startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
     };
 
     fn request_fixture(target_nickname: &str, mode: u8) -> Vec<u8> {
@@ -304,5 +380,56 @@ mod tests {
         let response = serialize_get_rider_info_failure();
         assert_eq!(response, [0x64, 0x05, 0x84, 0x27, 0x00]);
         assert_eq!(response.len(), 5);
+    }
+
+    #[test]
+    fn successful_response_matches_the_csharp_layout_and_199_byte_capture_shape() {
+        let response = serialize_get_rider_info_success(&RiderInfoFields {
+            user_no: 5,
+            account_name: "Yany".to_owned(),
+            nickname: "Yany".to_owned(),
+            profile_time: LegacyTime {
+                days_since_1900: 0xB488,
+                quarter_seconds: 0x503D,
+            },
+            rider_item_snapshot: [0; RIDER_ITEM_SNAPSHOT_WIRE_LENGTH],
+            card: String::new(),
+            rp: 0x7735_9417,
+            license_level: 6,
+            emblem_1: 0,
+            emblem_2: 0,
+            rider_intro: String::new(),
+            premium: 5,
+            premium_points: 200_000,
+            club_code: 10_000,
+            club_mark_logo: 0,
+            club_mark_line: 0,
+            club_name: "must be hidden without a logo".to_owned(),
+            ranker: 0,
+        })
+        .unwrap();
+
+        assert_eq!(response.len(), 199);
+        assert_eq!(&response[..5], &[0x64, 0x05, 0x84, 0x27, 1]);
+        assert_eq!(&response[5..9], &5_u32.to_le_bytes());
+        assert_eq!(
+            &response[9..21],
+            &[4, 0, 0, 0, 0x59, 0, 0x61, 0, 0x6E, 0, 0x79, 0]
+        );
+        assert_eq!(&response[21..33], &response[9..21]);
+        assert_eq!(&response[33..37], &[0x88, 0xB4, 0x3D, 0x50]);
+        assert!(
+            response[37..37 + RIDER_ITEM_SNAPSHOT_WIRE_LENGTH]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(&response[102..106], &[0; 4]);
+        assert_eq!(&response[106..110], &0x7735_9417_u32.to_le_bytes());
+        assert_eq!(response[114], 6);
+        assert_eq!(&response[115..119], &[0x88, 0xB4, 0x3D, 0x50]);
+        assert_eq!(&response[146..150], &5_i32.to_le_bytes());
+        assert_eq!(response[150], 1);
+        assert_eq!(&response[151..155], &200_000_i32.to_le_bytes());
+        assert!(response[155..].iter().all(|byte| *byte == 0));
     }
 }

@@ -104,8 +104,9 @@ use p5136_core::{
     },
     race_start_protocol::P5136KartPhysicsBlock,
     rider_info_protocol::{
-        GET_RIDER_INFO_REQUEST_HASH, RiderInfoProtocolError, parse_get_rider_info_request,
-        serialize_get_rider_info_failure,
+        GET_RIDER_INFO_REQUEST_HASH, RiderInfoFields, RiderInfoProtocolError,
+        parse_get_rider_info_request, serialize_get_rider_info_failure,
+        serialize_get_rider_info_success,
     },
     room_protocol::{
         RoomAi, RoomPlayer, RoomProtocolError, RoomProtocolRequest, classify_room_protocol_request,
@@ -132,12 +133,14 @@ use p5136_core::{
     },
     startup::{
         self, LoRqDecLucci, LoRqGetTrackRank, PqUpdateGameOption, PrGetRiderFields,
-        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest, classify_startup_request,
-        is_startup_noop, parse_lo_rq_dec_lucci, parse_lo_rq_get_track_rank,
+        RIDER_ITEM_SNAPSHOT_WIRE_LENGTH, StartupError, StartupRequest,
+        UpdateRiderSchoolDataRequest, classify_startup_request, is_startup_noop,
+        parse_lo_rq_dec_lucci, parse_lo_rq_get_track_rank, parse_lo_rq_update_rider_school_data,
         parse_pq_favorite_track_map_get, parse_pq_get_rider_task_context, parse_pq_locked_item_get,
         parse_pq_ranker_info, parse_pq_request_exchange_init, parse_pq_request_extradata,
-        parse_pq_rider_school_expired_check, parse_pq_start_rider_school,
-        parse_pq_update_game_option, parse_pq_versus_mode_rank_one,
+        parse_pq_reward_pro_emblem, parse_pq_rider_school_expired_check,
+        parse_pq_start_rider_school, parse_pq_update_game_option,
+        parse_pq_update_rider_school_level, parse_pq_versus_mode_rank_one,
         parse_pq_web_event_complete_check, parse_sp_rq_get_cash_inventory,
         parse_sp_rq_get_max_gift_id, parse_sp_rq_koin_balance, parse_sp_rq_remain_cash,
         parse_sp_rq_remain_tc_cash,
@@ -166,7 +169,7 @@ use tokio::{
 
 use crate::{
     ChannelBinding, IdentityBinding, IdentityGeneration, MigrationToken, ResolvedRandomTracks,
-    ServerConfig, SessionId, UserNo, WorldError, WorldHandle,
+    RiderSchoolProMissionSet, ServerConfig, SessionId, UserNo, WorldError, WorldHandle,
     equipment_persistence::{
         PreparedRiderEquipmentWrite, RiderEquipmentPersistError, RiderEquipmentValidationError,
         RiderEquipmentWriteError, kart_is_owned,
@@ -203,8 +206,8 @@ use crate::{
     world::{
         AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
         MyRoomEntryInput, MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole,
-        OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload,
-        RoomKartPhysicsVariants, RoomParticipant, StartRoomPlan,
+        OutboundBatch, ProfiledMyRoomOwnerLoad, RaceCommandOutcome, RaceCommandPayload,
+        RoomCommandPayload, RoomKartPhysicsVariants, RoomParticipant, StartRoomPlan,
     },
 };
 
@@ -484,6 +487,18 @@ pub enum LoginSessionError {
 
     #[error("profile {nickname:?} does not exist and remote profile creation is disabled")]
     ProfileCreationDenied { nickname: String },
+
+    #[error("rider-school completion step must be 1..=42, received {step}")]
+    InvalidRiderSchoolStep { step: u8 },
+
+    #[error(
+        "rider-school level transition from {current} must request {expected}, received {requested}"
+    )]
+    InvalidRiderSchoolLevelTransition {
+        current: u8,
+        expected: u8,
+        requested: u8,
+    },
 
     #[error(
         "profile admission for {admitted:?} cannot authorize operation on profile {requested:?}"
@@ -963,6 +978,71 @@ impl ProfileCoordinator {
         ))
     }
 
+    async fn complete_rider_school_step(
+        &self,
+        nickname: String,
+        request: UpdateRiderSchoolDataRequest,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run(
+                "persist rider-school completion",
+                move |store, _, subject| {
+                    store.update(subject.nickname(), |profile| {
+                        profile.rider_school.max_completed_step = profile
+                            .rider_school
+                            .max_completed_step
+                            .max(request.completed_step);
+                    })
+                },
+            )
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
+        tracing::debug!(
+            nickname,
+            mission_id = request.mission_id,
+            completed_step = request.completed_step,
+            elapsed_milliseconds = request.elapsed_milliseconds,
+            "persisted P5136 rider-school test completion"
+        );
+        Ok((
+            ProfileSnapshot {
+                profile,
+                revision: Some(saved.revision),
+                source_path: saved.path,
+            },
+            lane,
+        ))
+    }
+
+    async fn promote_rider_school_level(
+        &self,
+        nickname: String,
+        level: u8,
+        admission: ProfileJobAdmission,
+    ) -> Result<(ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
+        Self::ensure_admitted_subject(&admission, &nickname)?;
+        let completed = admission
+            .run("persist rider-school level", move |store, _, subject| {
+                store.update(subject.nickname(), |profile| {
+                    profile.rider_school.level = level;
+                })
+            })
+            .await?;
+        let (updated, lane) = completed.into_parts();
+        let (saved, profile) = updated?;
+        Ok((
+            ProfileSnapshot {
+                profile,
+                revision: Some(saved.revision),
+                source_path: saved.path,
+            },
+            lane,
+        ))
+    }
+
     async fn decrement_lucci(
         &self,
         nickname: String,
@@ -1087,6 +1167,7 @@ impl ProfileCoordinator {
         &self,
         nickname: String,
         request: FinishTimeAttackRequest,
+        track: u32,
         admission: ProfileJobAdmission,
     ) -> Result<(AppliedTimeReward, ProfileSnapshot, ProfileLanePermit), LoginSessionError> {
         Self::ensure_admitted_subject(&admission, &nickname)?;
@@ -1105,6 +1186,12 @@ impl ProfileCoordinator {
                     next.rider.time = request.race_time;
                     next.rider.rp = DEFAULT_RP;
                     next.rider.lucci = current_lucci;
+                    if request.race_time != 0 {
+                        next.time_attack_records
+                            .entry(track)
+                            .and_modify(|best| *best = (*best).min(request.race_time))
+                            .or_insert(request.race_time);
+                    }
                     let applied = AppliedTimeReward {
                         current_rp: DEFAULT_RP,
                         earned_rp: reward.earned_rp(),
@@ -2703,6 +2790,7 @@ where
     .map_err(|_| LoginSessionError::WriteTimeout)?
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_packet_admitted(
     services: &SessionServices<'_>,
     packet: &[u8],
@@ -2754,7 +2842,16 @@ async fn dispatch_packet_admitted(
     };
     let world = services.world.admitted(operation);
 
-    if let Some(result) = dispatch_fail_closed_request(&world, hash, packet, context).await {
+    if let Some(result) = dispatch_fail_closed_request(
+        services.config,
+        &world,
+        services.profiles,
+        hash,
+        packet,
+        context,
+    )
+    .await
+    {
         return result;
     }
 
@@ -2889,6 +2986,7 @@ async fn handle_client_event(
 }
 
 async fn handle_single_player_request(
+    config: &ServerConfig,
     world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     kind: SinglePlayerRequestKind,
@@ -2939,7 +3037,7 @@ async fn handle_single_player_request(
             Ok(vec![serialize_kart_spec_reply(&physics.block)])
         }
         SinglePlayerRequest::StartTimeAttack(request) => {
-            handle_start_time_attack(world, profiles, request, context).await
+            handle_start_time_attack(config, world, profiles, request, context).await
         }
         SinglePlayerRequest::FinishTimeAttack(request) => {
             handle_finish_time_attack(world, profiles, request, context).await
@@ -3022,6 +3120,7 @@ async fn handle_complete_challenger(
 }
 
 async fn handle_start_time_attack(
+    config: &ServerConfig,
     world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     request: StartTimeAttackRequest,
@@ -3042,6 +3141,9 @@ async fn handle_start_time_attack(
         .await?;
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
+    let selected_speed_type = config
+        .time_attack_physics_preset
+        .resolve(request.speed_type);
     let physics = selected_physics_metadata(
         &profile.profile,
         Some(&equipment),
@@ -3049,12 +3151,19 @@ async fn handle_start_time_attack(
         PhysicsSelection {
             kart_id: request.kart_id,
             flying_pet_id: request.flying_pet_id,
-            requested_speed_type: request.speed_type,
+            requested_speed_type: selected_speed_type,
             plant_game_mode: P5136PlantGameMode::TimeAttack,
             apply_profile_equipment: request.start_type == 0,
         },
     )?;
     trace_single_player_physics_fallback(&after, &physics, "PqStartTimeAttack");
+    tracing::trace!(
+        nickname = %after.nickname,
+        requested_speed_type = request.speed_type,
+        configured_preset = ?config.time_attack_physics_preset,
+        selected_speed_type,
+        "applied the server-selected time-attack physics preset"
+    );
     let response = serialize_start_time_attack_reply(
         request.start_token,
         &physics.block,
@@ -3090,7 +3199,7 @@ async fn handle_finish_time_attack(
         .admit_for_operation(world.operation(), &before.nickname, "finish time attack")
         .await?;
     let (applied, profile, lane) = profiles
-        .finish_time_attack(before.nickname.clone(), request, admission)
+        .finish_time_attack(before.nickname.clone(), request, active.track, admission)
         .await?;
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
@@ -3335,6 +3444,7 @@ async fn dispatch_profile_bound_request(
     if let Some(request) = classify_startup_request(hash) {
         return Some(
             handle_startup_request(
+                services.config,
                 world,
                 services.profiles,
                 services.session_id,
@@ -3352,7 +3462,15 @@ async fn dispatch_profile_bound_request(
     }
     if let Some(request) = classify_single_player_request(hash) {
         return Some(
-            handle_single_player_request(world, services.profiles, request, packet, context).await,
+            handle_single_player_request(
+                services.config,
+                world,
+                services.profiles,
+                request,
+                packet,
+                context,
+            )
+            .await,
         );
     }
     if let Some(request) = classify_telemetry_request(hash) {
@@ -3362,13 +3480,15 @@ async fn dispatch_profile_bound_request(
 }
 
 async fn dispatch_fail_closed_request(
+    config: &ServerConfig,
     world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
     hash: u32,
     packet: &[u8],
     context: &SessionContext,
 ) -> Option<Result<Vec<Vec<u8>>, LoginSessionError>> {
     if hash == GET_RIDER_INFO_REQUEST_HASH {
-        return Some(handle_get_rider_info_failure(world, packet, context).await);
+        return Some(handle_get_rider_info(config, world, profiles, packet, context).await);
     }
     if hash == CLUB_CHANNEL_SWITCH_REQUEST_HASH {
         return Some(handle_club_channel_switch(world, packet, context).await);
@@ -3382,22 +3502,99 @@ async fn dispatch_fail_closed_request(
     None
 }
 
-async fn handle_get_rider_info_failure(
+async fn handle_get_rider_info(
+    config: &ServerConfig,
     world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
     packet: &[u8],
     context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     // Parse the entire stock request before packet-specific authorization so
     // malformed live traffic cannot be mistaken for a valid lookup. Global
     // generation and quiesce admission still precede this handler.
-    let _request = parse_get_rider_info_request(packet)?;
-    let identity = world.authorize_identity().await?;
-    let _ = context.bound_profile_for(&identity)?;
+    let request = parse_get_rider_info_request(packet)?;
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let target = request.target_nickname().to_owned();
 
-    // Cross-profile visibility and offline lookup policy are not yet defined.
-    // Fail closed without logging the target, touching profile storage, or
-    // publishing a request-specific World command.
-    Ok(vec![serialize_get_rider_info_failure()])
+    let admission = match profiles
+        .admit_for_operation(world.operation(), &target, "lookup rider info")
+        .await
+    {
+        Ok(admission) => admission,
+        Err(LoginSessionError::ProfileIo(ProfileIoError::InvalidNickname(_))) => {
+            ensure_profile_lookup_caller_fence(world, context, &before).await?;
+            return Ok(vec![serialize_get_rider_info_failure()]);
+        }
+        Err(error) => return Err(error),
+    };
+    let (snapshot, lane) = match profiles.load(target.clone(), false, admission).await {
+        Ok(loaded) => loaded,
+        Err(LoginSessionError::ProfileCreationDenied { .. }) => {
+            ensure_profile_lookup_caller_fence(world, context, &before).await?;
+            return Ok(vec![serialize_get_rider_info_failure()]);
+        }
+        Err(error) => return Err(error),
+    };
+
+    // P5136 Rust stores profile directories under a canonical key and does
+    // not persist a second display-name field. The lookup spelling therefore
+    // becomes the process-local presentation used by a later login too.
+    let nickname = target;
+    let profile = snapshot.profile;
+    drop(lane);
+
+    // Profile I/O is an await boundary. The original caller generation must
+    // still own this request before it can allocate a public UserNo or emit a
+    // result derived from another rider's durable profile.
+    ensure_profile_lookup_caller_fence(world, context, &before).await?;
+    let user_no = world.ensure_known_user_no(nickname.clone()).await?;
+    ensure_profile_lookup_caller_fence(world, context, &before).await?;
+
+    let rider = &profile.rider;
+    let response = serialize_get_rider_info_success(&RiderInfoFields {
+        user_no: user_no.get(),
+        account_name: nickname.clone(),
+        nickname,
+        profile_time: rider_school_reference_time(config.rider_school_pro_mission_set),
+        rider_item_snapshot: rider_item_snapshot(&profile.rider_item),
+        card: rider.card.clone(),
+        rp: rider.rp,
+        license_level: profile.rider_school.level,
+        emblem_1: rider.emblem1,
+        emblem_2: rider.emblem2,
+        rider_intro: rider.rider_intro.clone(),
+        premium: rider.premium,
+        premium_points: rider_info_premium_points(rider.premium),
+        club_code: rider.club_code,
+        club_mark_logo: rider.club_mark_logo,
+        club_mark_line: rider.club_mark_line,
+        club_name: rider.club_name.clone(),
+        ranker: rider.ranker,
+    })?;
+    Ok(vec![response])
+}
+
+async fn ensure_profile_lookup_caller_fence(
+    world: &AdmittedWorldHandle<'_>,
+    context: &SessionContext,
+    expected: &IdentityBinding,
+) -> Result<(), LoginSessionError> {
+    let actual = world.authorize_identity().await?;
+    ensure_identity_fence(expected, &actual)?;
+    let _ = context.bound_profile_for(&actual)?;
+    Ok(())
+}
+
+const fn rider_info_premium_points(premium: i32) -> i32 {
+    match premium {
+        1 => 10_000,
+        2 => 30_000,
+        3 => 60_000,
+        4 => 120_000,
+        5 => 200_000,
+        _ => 0,
+    }
 }
 
 async fn handle_club_query(
@@ -4287,6 +4484,7 @@ async fn handle_myroom_request(
         MyRoomRequest::Enter => {
             execute_myroom_entry(
                 world,
+                profiles,
                 SessionMyRoomEntryIntent::Direct(parse_enter_request(packet)?),
                 context,
             )
@@ -4295,12 +4493,14 @@ async fn handle_myroom_request(
         }
         MyRoomRequest::Reenter => {
             parse_reenter_request(packet)?;
-            execute_myroom_entry(world, SessionMyRoomEntryIntent::Reenter, context).await?;
+            execute_myroom_entry(world, profiles, SessionMyRoomEntryIntent::Reenter, context)
+                .await?;
             Ok(Vec::new())
         }
         MyRoomRequest::EnterRandom => {
             parse_enter_random_request(packet)?;
-            execute_myroom_entry(world, SessionMyRoomEntryIntent::Random, context).await?;
+            execute_myroom_entry(world, profiles, SessionMyRoomEntryIntent::Random, context)
+                .await?;
             Ok(Vec::new())
         }
         MyRoomRequest::FirstState => {
@@ -4547,6 +4747,7 @@ enum SessionMyRoomEntryIntent {
 
 async fn execute_myroom_entry(
     world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
     intent: SessionMyRoomEntryIntent,
     context: &SessionContext,
 ) -> Result<(), LoginSessionError> {
@@ -4555,20 +4756,42 @@ async fn execute_myroom_entry(
     let presentation = context.myroom_presentation_for(&identity)?;
     let input = match intent {
         SessionMyRoomEntryIntent::Direct(request) => {
-            let self_info = if canonical_nickname_key(&request.owner_nickname)
-                == canonical_nickname_key(&identity.nickname)
-            {
+            let requested_self = canonical_nickname_key(&request.owner_nickname)
+                == canonical_nickname_key(&identity.nickname);
+            let self_info = if requested_self {
                 Some(profile.my_room.try_to_protocol_info()?)
             } else {
                 None
             };
-            MyRoomEntryInput::direct(
-                identity,
-                request.owner_nickname,
-                request.password,
-                &presentation,
-                self_info,
-            )
+            if requested_self {
+                MyRoomEntryInput::direct(
+                    identity,
+                    request.owner_nickname,
+                    request.password,
+                    &presentation,
+                    self_info,
+                )
+            } else {
+                let target = request.owner_nickname.clone();
+                match load_profiled_myroom_owner(world, profiles, context, &identity, target)
+                    .await?
+                {
+                    Some(owner) => MyRoomEntryInput::direct_with_profiled_owner(
+                        identity,
+                        request.owner_nickname,
+                        request.password,
+                        &presentation,
+                        owner,
+                    ),
+                    None => MyRoomEntryInput::direct(
+                        identity,
+                        request.owner_nickname,
+                        request.password,
+                        &presentation,
+                        None,
+                    ),
+                }
+            }
         }
         SessionMyRoomEntryIntent::Reenter => MyRoomEntryInput::reenter(
             identity,
@@ -4582,6 +4805,48 @@ async fn execute_myroom_entry(
     })?;
     world.myroom_enter(input).await?;
     Ok(())
+}
+
+async fn load_profiled_myroom_owner(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    context: &SessionContext,
+    expected: &IdentityBinding,
+    target: String,
+) -> Result<Option<ProfiledMyRoomOwnerLoad>, LoginSessionError> {
+    let admission = match profiles
+        .admit_for_operation(world.operation(), &target, "load direct MyRoom owner")
+        .await
+    {
+        Ok(admission) => admission,
+        Err(LoginSessionError::ProfileIo(ProfileIoError::InvalidNickname(_))) => {
+            ensure_profile_lookup_caller_fence(world, context, expected).await?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let (profile, lane) = match profiles.load(target, false, admission).await {
+        Ok(loaded) => loaded,
+        Err(LoginSessionError::ProfileCreationDenied { .. }) => {
+            ensure_profile_lookup_caller_fence(world, context, expected).await?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    ensure_profile_lookup_caller_fence(world, context, expected).await?;
+    let info = match profile.profile.my_room.try_to_protocol_info() {
+        Ok(info) => info,
+        Err(source) => {
+            tracing::warn!(%source, "ignored an invalid offline MyRoom profile during direct entry");
+            drop(lane);
+            return Ok(None);
+        }
+    };
+    let presentation = myroom_profile_presentation(&profile.profile).with_p2p_port(0);
+    Ok(Some(ProfiledMyRoomOwnerLoad::new(
+        info,
+        MyRoomProfileLease::new(presentation, lane),
+    )))
 }
 
 async fn execute_myroom_owner_items(
@@ -4834,7 +5099,7 @@ async fn update_rider_equipment(
     ensure_identity_fence(&before, &after)?;
     let physics = room_physics_metadata(&profile.profile, &equipment, profiles.catalog.as_deref())?;
     let refreshed_room_physics = world
-        .refresh_room_kart_physics(physics.variants.clone())
+        .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
         .await?;
     tracing::info!(
         nickname = %after.nickname,
@@ -4877,7 +5142,7 @@ async fn equip_plant_part(
     context.replace_equipment(&after_write, equipment.clone())?;
     let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
     let refreshed_room_physics = world
-        .refresh_room_kart_physics(physics.variants.clone())
+        .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
         .await?;
     tracing::info!(
         nickname = %after_write.nickname,
@@ -4918,7 +5183,7 @@ async fn equip_x_part(
     context.replace_equipment(&after, equipment.clone())?;
     let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
     let refreshed_room_physics = world
-        .refresh_room_kart_physics(physics.variants.clone())
+        .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
         .await?;
     tracing::info!(
         nickname = %after.nickname,
@@ -4959,7 +5224,7 @@ async fn handle_floater_request(
     let refreshed_room_physics = if accepted && changes_physics {
         let physics = room_physics_metadata(&profile, &result.equipment, profiles.catalog())?;
         world
-            .refresh_room_kart_physics(physics.variants.clone())
+            .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
             .await?
     } else {
         false
@@ -5021,7 +5286,7 @@ async fn handle_kart_level_request(
     if result.accepted && !matches!(request, KartLevelRequest::LevelUpProbability(_)) {
         let physics = room_physics_metadata(&profile, &result.equipment, profiles.catalog())?;
         refreshed_room_physics = world
-            .refresh_room_kart_physics(physics.variants.clone())
+            .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
             .await?;
     }
     tracing::info!(
@@ -5107,6 +5372,7 @@ enum RoomPhysicsFallbackReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoomPhysicsMetadata {
     kart_id: u16,
+    floater_codes: [i16; 3],
     base_resolution: RoomKartBaseResolution,
     fallback_reasons: Vec<RoomPhysicsFallbackReason>,
     block: P5136KartPhysicsBlock,
@@ -5209,7 +5475,9 @@ fn selected_physics_metadata(
         RoomKartBaseResolution::MissingCatalogFallback
     };
 
-    if let Some(codes) = intrinsic_floater_codes(kart_id) {
+    let mut floater_codes = intrinsic_floater_codes(kart_id).unwrap_or([0; 3]);
+    if floater_codes != [0; 3] {
+        let codes = floater_codes;
         snapshot.exc.tune = p5136_floater_spec(codes)
             .expect("the compiled intrinsic Floater table contains only validated triples");
     }
@@ -5230,6 +5498,9 @@ fn selected_physics_metadata(
         }
     }
     if apply_profile_equipment && kart_id == items.kart {
+        if let Some(codes) = selected_profile_floater_codes(equipment, kart_id, items.kart_serial) {
+            floater_codes = codes;
+        }
         apply_profile_exception_physics(
             &mut snapshot,
             equipment,
@@ -5260,11 +5531,33 @@ fn selected_physics_metadata(
         .expect("the fixed 0 through 8 speed range produces nine blocks");
     Ok(RoomPhysicsMetadata {
         kart_id,
+        floater_codes,
         base_resolution,
         fallback_reasons,
         variants: RoomKartPhysicsVariants::new(block.clone(), variants),
         block,
     })
+}
+
+fn selected_profile_floater_codes(
+    equipment: Option<&EquipmentExceptions>,
+    kart_id: u16,
+    kart_serial: u16,
+) -> Option<[i16; 3]> {
+    let equipment = equipment?;
+    let (Ok(kart_id), Ok(mut kart_serial)) = (i16::try_from(kart_id), i16::try_from(kart_serial))
+    else {
+        return None;
+    };
+    if kart_id != 0 && kart_serial == 0 {
+        kart_serial = 1;
+    }
+    let tune = equipment
+        .tune
+        .iter()
+        .find(|record| record.id == kart_id && record.serial == kart_serial)?;
+    let codes = [tune.tune1, tune.tune2, tune.tune3];
+    p5136_floater_spec(codes).map(|_| codes)
 }
 
 fn apply_profile_exception_physics(
@@ -5380,7 +5673,7 @@ fn room_participant_from_profile_with_p2p_port(
             rp: profile.rider.rp,
             team: 0,
             ranking: 0,
-            rider_school_level: startup::P5136_RIDER_SCHOOL_LEVEL,
+            rider_school_level: profile.rider_school.level,
             club_name,
             club_mark_logo: profile.rider.club_mark_logo,
         },
@@ -5388,6 +5681,7 @@ fn room_participant_from_profile_with_p2p_port(
         observer_master,
         kart_physics: physics.block,
         kart_physics_variants: Some(physics.variants),
+        floater_codes: physics.floater_codes,
     })
 }
 
@@ -5421,6 +5715,7 @@ fn myroom_player_slot_from_profile(
 }
 
 async fn handle_startup_request(
+    config: &ServerConfig,
     world: &AdmittedWorldHandle<'_>,
     profiles: &ProfileCoordinator,
     session_id: SessionId,
@@ -5434,6 +5729,15 @@ async fn handle_startup_request(
     if request == StartupRequest::UpdateGameOption {
         update_game_options_admitted(world, profiles, session_id, packet, context).await?;
         return Ok(Vec::new());
+    }
+    if request == StartupRequest::UpdateRiderSchoolData {
+        let request = parse_lo_rq_update_rider_school_data(packet)?;
+        update_rider_school_data_admitted(world, profiles, request, context).await?;
+        return Ok(Vec::new());
+    }
+    if request == StartupRequest::UpdateRiderSchoolLevel {
+        let request = parse_pq_update_rider_school_level(packet)?;
+        return update_rider_school_level_admitted(world, profiles, request.level, context).await;
     }
     if request == StartupRequest::DecLucci {
         let request = parse_lo_rq_dec_lucci(packet)?;
@@ -5462,13 +5766,18 @@ async fn handle_startup_request(
         StartupRequest::StartRiderSchool => {
             let _ = parse_pq_start_rider_school(packet)?;
         }
+        StartupRequest::RewardProEmblem => {
+            let _ = parse_pq_reward_pro_emblem(packet)?;
+        }
         StartupRequest::RequestExchangeInit => parse_pq_request_exchange_init(packet)?,
         _ => {}
     }
 
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
-    Ok(startup_response(request, profile)?.into_iter().collect())
+    Ok(startup_response(config, request, profile)?
+        .into_iter()
+        .collect())
 }
 
 async fn handle_get_rider_admitted(
@@ -5521,6 +5830,75 @@ async fn update_game_options_admitted(
     context.bind_profile(after, profile);
     drop(lane);
     Ok(())
+}
+
+async fn update_rider_school_data_admitted(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    request: UpdateRiderSchoolDataRequest,
+    context: &mut SessionContext,
+) -> Result<(), LoginSessionError> {
+    if !(1..=startup::P5136_RIDER_SCHOOL_MAX_STEP).contains(&request.completed_step) {
+        return Err(LoginSessionError::InvalidRiderSchoolStep {
+            step: request.completed_step,
+        });
+    }
+    let before = world.authorize_identity().await?;
+    let _ = context.bound_profile_for(&before)?;
+    let admission = profiles
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            "persist rider-school completion",
+        )
+        .await?;
+    let (profile, lane) = profiles
+        .complete_rider_school_step(before.nickname.clone(), request, admission)
+        .await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let _ = context.profile_for(&after)?;
+    context.bind_profile(after, profile);
+    drop(lane);
+    Ok(())
+}
+
+async fn update_rider_school_level_admitted(
+    world: &AdmittedWorldHandle<'_>,
+    profiles: &ProfileCoordinator,
+    requested: u8,
+    context: &mut SessionContext,
+) -> Result<Vec<Vec<u8>>, LoginSessionError> {
+    let before = world.authorize_identity().await?;
+    let current = context.profile_for(&before)?.rider_school.level;
+    let expected = current
+        .saturating_add(1)
+        .min(startup::P5136_RIDER_SCHOOL_LEVEL);
+    if requested != expected {
+        return Err(LoginSessionError::InvalidRiderSchoolLevelTransition {
+            current,
+            expected,
+            requested,
+        });
+    }
+    let admission = profiles
+        .admit_for_operation(
+            world.operation(),
+            &before.nickname,
+            "persist rider-school level",
+        )
+        .await?;
+    let (profile, lane) = profiles
+        .promote_rider_school_level(before.nickname.clone(), requested, admission)
+        .await?;
+    let after = world.authorize_identity().await?;
+    ensure_identity_fence(&before, &after)?;
+    let _ = context.profile_for(&after)?;
+    context.bind_profile(after, profile);
+    drop(lane);
+    Ok(vec![startup::serialize_pr_update_rider_school_level(
+        requested,
+    )])
 }
 
 async fn decrement_lucci_admitted(
@@ -5580,10 +5958,18 @@ fn profile_rider_fields(nickname: String, profile: &Profile) -> PrGetRiderFields
 }
 
 fn startup_response(
+    config: &ServerConfig,
     request: StartupRequest,
     profile: &Profile,
 ) -> Result<Option<Vec<u8>>, LoginSessionError> {
-    let time = current_legacy_time();
+    // P5136 does not gate the active PRO pair from the date embedded in
+    // PrRiderSchoolDataPacket.  PrServerTime seeds the client's advancing
+    // server clock (sub_D13B10 -> sub_841B40), and the PRO UI derives its
+    // two-month window from that clock (sub_7BCFB0 -> sub_841B70 ->
+    // sub_7BCE20).  Project all startup timestamps together so a manual pair
+    // remains internally consistent without patching the client binary.
+    let time = rider_school_reference_time(config.rider_school_pro_mission_set);
+    let pro_pair_index = current_rider_school_pro_pair_index(config.rider_school_pro_mission_set);
     let response = match request {
         StartupRequest::LoginVipInfo => startup::serialize_pr_login_vip_info(profile.rider.premium),
         StartupRequest::EventReward => startup::serialize_lo_rp_event_reward(),
@@ -5603,9 +5989,25 @@ fn startup_response(
         StartupRequest::SetPlaytimeEventTick => startup::serialize_pr_set_playtime_event_tick(),
         StartupRequest::ChapterInfo => startup::serialize_pr_chapter_info(),
         StartupRequest::GetDuelMissionBulk => startup::serialize_pr_get_duel_mission_bulk(time),
-        StartupRequest::RiderSchoolData => startup::serialize_pr_rider_school_data(time),
+        StartupRequest::RiderSchoolData => startup::serialize_pr_rider_school_data(
+            time,
+            profile.rider_school.level,
+            profile.rider_school.max_completed_step,
+        ),
         StartupRequest::RiderSchoolProgress => {
-            startup::serialize_pr_rider_school_progress(current_rider_school_pro_pair_index())
+            let records = startup::P5136_RACING_MASTER_TRACK_IDS.map(|track| {
+                profile
+                    .time_attack_records
+                    .get(&track)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            startup::serialize_pr_rider_school_progress(
+                pro_pair_index,
+                profile.rider_school.level,
+                profile.rider_school.max_completed_step,
+                records,
+            )
         }
         StartupRequest::RiderSchoolExpiredCheck => {
             startup::serialize_pr_rider_school_expired_check()
@@ -5636,9 +6038,12 @@ fn startup_response(
         StartupRequest::RequestExtradata => startup::serialize_pr_request_extradata(),
         StartupRequest::WebEventCompleteCheck => startup::serialize_pr_web_event_complete_check(),
         StartupRequest::StartRiderSchool => startup::serialize_pr_start_rider_school()?,
+        StartupRequest::RewardProEmblem => startup::serialize_pr_reward_pro_emblem(pro_pair_index),
         StartupRequest::RequestExchangeInit => startup::serialize_pr_request_exchange_init(),
         StartupRequest::GetRider
         | StartupRequest::UpdateGameOption
+        | StartupRequest::UpdateRiderSchoolData
+        | StartupRequest::UpdateRiderSchoolLevel
         | StartupRequest::DecLucci
         | StartupRequest::GetTrackRank => return Ok(None),
     };
@@ -5775,9 +6180,13 @@ fn random_migration_token() -> MigrationToken {
 
 fn current_legacy_time() -> LegacyTime {
     let now = Local::now();
+    legacy_time_for_date_and_seconds(now.date_naive(), now.num_seconds_from_midnight())
+}
+
+fn legacy_time_for_date_and_seconds(date: NaiveDate, seconds_from_midnight: u32) -> LegacyTime {
     let epoch = NaiveDate::from_ymd_opt(1900, 1, 1).expect("1900-01-01 is a valid date");
-    let days = (now.date_naive() - epoch).num_days().rem_euclid(65_536);
-    let quarter_seconds = now.num_seconds_from_midnight() / 4;
+    let days = (date - epoch).num_days().rem_euclid(65_536);
+    let quarter_seconds = seconds_from_midnight / 4;
     LegacyTime {
         days_since_1900: u16::try_from(days).expect("modulo 65536 fits in u16"),
         quarter_seconds: u16::try_from(quarter_seconds)
@@ -5785,10 +6194,10 @@ fn current_legacy_time() -> LegacyTime {
     }
 }
 
-fn current_rider_school_pro_pair_index() -> usize {
-    let now = Local::now();
+fn rider_school_pro_pair_index_for_year_month(year: i32, month: u32) -> usize {
+    debug_assert!((1..=12).contains(&month));
     let month_count =
-        (now.year() - 1900) * 12 + i32::try_from(now.month()).expect("calendar month fits in i32");
+        (year - 1900) * 12 + i32::try_from(month).expect("calendar month fits in i32");
     let odd_month_count = (month_count + 1) / 2;
     usize::try_from(
         (odd_month_count - 1).rem_euclid(
@@ -5797,6 +6206,34 @@ fn current_rider_school_pro_pair_index() -> usize {
         ),
     )
     .expect("non-negative Pro pair index fits usize")
+}
+
+fn current_rider_school_pro_pair_index(selection: RiderSchoolProMissionSet) -> usize {
+    if let Some(index) = selection.pair_index() {
+        return index;
+    }
+    let now = Local::now();
+    rider_school_pro_pair_index_for_year_month(now.year(), now.month())
+}
+
+fn rider_school_reference_time(selection: RiderSchoolProMissionSet) -> LegacyTime {
+    let now = Local::now();
+    let date = rider_school_reference_date(selection, now.date_naive());
+    legacy_time_for_date_and_seconds(date, now.num_seconds_from_midnight())
+}
+
+fn rider_school_reference_date(
+    selection: RiderSchoolProMissionSet,
+    current_date: NaiveDate,
+) -> NaiveDate {
+    let Some(month) = selection.reference_month() else {
+        return current_date;
+    };
+    // The client selects A-F from consecutive month pairs. A stable mid-month
+    // reference avoids month-length and daylight-saving edge cases while the
+    // expired-check reply keeps the manually selected stock set active.
+    NaiveDate::from_ymd_opt(current_date.year(), month, 15)
+        .expect("manual PRO reference months always contain day 15")
 }
 
 fn peer_label(stream: &TcpStream) -> Option<SocketAddr> {
@@ -5961,6 +6398,7 @@ async fn update_game_options(
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
     use std::{
         array,
         collections::{BTreeMap, BTreeSet},
@@ -6073,6 +6511,7 @@ mod tests {
         handle_lobby_request, handle_race_request, handle_room_request,
         myroom_player_slot_from_profile, myroom_profile_presentation, p5136_kart_level_spec,
         read_encrypted_frame, read_encrypted_frame_with_diagnostics, read_session_frame,
+        rider_school_pro_pair_index_for_year_month, rider_school_reference_date,
         room_participant_from_profile, room_physics_metadata, select_session_read_event,
         selected_physics_metadata, update_game_options, write_outbound_batch, write_session_bytes,
     };
@@ -6081,7 +6520,8 @@ mod tests {
     use crate::profile_io::MyRoomProfileLease;
     use crate::{
         ChannelBinding, FavoriteItemPersistError, IdentityBinding, IdentityError, MigrationToken,
-        ServerConfig, SessionId, WorldError, WorldHandle,
+        RiderSchoolProMissionSet, ServerConfig, SessionId, TimeAttackPhysicsPreset, WorldError,
+        WorldHandle,
         world::test_support::{spawn_myroom_world, spawn_myroom_world_with_outbound_capacity},
         world::{OutboundBatch, RaceCommandOutcome, RaceCommandPayload, RoomCommandPayload},
     };
@@ -6620,6 +7060,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn none_cleared_profile_advances_and_survives_reload() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create("LicenseStarter").unwrap();
+        store
+            .update("LicenseStarter", |profile| {
+                profile.rider_school = p5136_profile::RiderSchoolProgress::NONE_CLEARED;
+            })
+            .unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig::default();
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_700))
+            .await
+            .unwrap();
+        let identity = world
+            .claim_identity(session_id, "LicenseStarter")
+            .await
+            .unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let school_request = PacketWriter::named("PqRiderSchoolDataPacket").into_inner();
+        let initial = dispatch_packet(&services, &school_request, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(&initial[4..6], &[0, 0]);
+
+        let mut completion = PacketWriter::named("LoRqUpdateRiderSchoolDataPacket");
+        completion.write_bytes(&[0xA5; 18]);
+        completion.write_u32(0x1020_3040);
+        completion.write_u8(1);
+        completion.write_i32(12_345);
+        assert!(
+            dispatch_packet(&services, completion.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut promotion = PacketWriter::named("PqUpdateRiderSchoolLevelPacket");
+        promotion.write_u8(1);
+        let reply = dispatch_packet(&services, promotion.as_slice(), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            vec![p5136_core::startup::serialize_pr_update_rider_school_level(
+                1
+            )]
+        );
+
+        let persisted = ProfileStore::new(profile_root.path())
+            .load_or_create(&identity.nickname)
+            .unwrap();
+        assert_eq!(
+            persisted.profile.rider_school,
+            p5136_profile::RiderSchoolProgress {
+                level: 1,
+                max_completed_step: 1,
+            }
+        );
+
+        let reloaded = dispatch_packet(&services, &school_request, &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(&reloaded[4..6], &[1, 1]);
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn l1_profile_exposes_test_records_and_unlocks_pro_missions_without_emblem_state() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create("L1NotPro").unwrap();
+        store
+            .update("L1NotPro", |profile| {
+                profile.rider_school = p5136_profile::RiderSchoolProgress::L1;
+                for (track, record) in p5136_core::startup::P5136_RACING_MASTER_TRACK_IDS
+                    .into_iter()
+                    .zip([71_234, 130_987, 69_876])
+                {
+                    profile.time_attack_records.insert(track, record);
+                }
+            })
+            .unwrap();
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let config = ServerConfig {
+            rider_school_pro_mission_set: RiderSchoolProMissionSet::MineMaple,
+            ..ServerConfig::default()
+        };
+        let (world, world_task) = WorldHandle::spawn(8).expect("nonzero World mailbox capacity");
+        let session_id = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_701))
+            .await
+            .unwrap();
+        let identity = world.claim_identity(session_id, "L1NotPro").await.unwrap();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id,
+        };
+        let mut context = bind_test_profile(&profiles, &identity).await;
+
+        let school_data = dispatch_packet(
+            &services,
+            PacketWriter::named("PqRiderSchoolDataPacket").as_slice(),
+            &mut context,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert_eq!(&school_data[4..6], &[5, 30]);
+        let reference_days = u16::from_le_bytes(school_data[6..8].try_into().unwrap());
+        let reference_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()
+            + ChronoDuration::days(i64::from(reference_days));
+        assert_eq!(reference_date.month(), 11);
+        assert_eq!(reference_date.day(), 15);
+
+        let server_time = dispatch_packet(
+            &services,
+            PacketWriter::named("PqServerTime").as_slice(),
+            &mut context,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            u32::from_le_bytes(server_time[..4].try_into().unwrap()),
+            adler32::packet_hash("PrServerTime")
+        );
+        let server_days = u16::from_le_bytes(server_time[4..6].try_into().unwrap());
+        let server_date = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()
+            + ChronoDuration::days(i64::from(server_days));
+        assert_eq!(server_date.month(), 11);
+        assert_eq!(server_date.day(), 15);
+
+        let pro = dispatch_packet(
+            &services,
+            PacketWriter::named("PqRiderSchoolProPacket").as_slice(),
+            &mut context,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            pro[4], 0,
+            "an incomplete profile must not take the already-cleared shortcut"
+        );
+        assert_eq!(pro[6], 5, "L1 must not be projected as cleared PRO level 6");
+        assert_eq!(
+            pro[7], 30,
+            "the maximum completed step must not alias the selected pair's second step"
+        );
+        assert_eq!(
+            pro[5], 41,
+            "the manual Mine/Maple set must select steps 41/42"
+        );
+        assert_eq!(u32::from_le_bytes(pro[8..12].try_into().unwrap()), 71_234);
+        assert_eq!(u32::from_le_bytes(pro[12..16].try_into().unwrap()), 130_987);
+        assert_eq!(u32::from_le_bytes(pro[16..20].try_into().unwrap()), 69_876);
+
+        let mut reward = PacketWriter::named(p5136_core::startup::REWARD_PRO_EMBLEM_REQUEST_NAME);
+        reward.write_u16(p5136_core::startup::P5136_RACING_MASTER_EMBLEM_ID);
+        let reward_reply = dispatch_packet(&services, reward.as_slice(), &mut context)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            &reward_reply[..4],
+            &p5136_core::startup::REWARD_PRO_EMBLEM_REPLY_HASH.to_le_bytes()
+        );
+        assert_eq!(reward_reply.len(), 6);
+        assert_eq!(&reward_reply[4..], &[41, 42]);
+
+        let persisted = ProfileStore::new(profile_root.path())
+            .load_or_create(&identity.nickname)
+            .unwrap();
+        assert_eq!(
+            persisted.profile.rider_school,
+            p5136_profile::RiderSchoolProgress::L1,
+            "rewarding the client must not invent a separate emblem or PRO-clear state"
+        );
+
+        profile_runtime.shutdown().await.unwrap();
+        world.shutdown().await.unwrap();
+        world_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn connector_role_override_is_durable_across_channel_profile_reload() {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
@@ -6990,6 +7635,25 @@ mod tests {
         );
         let start_packets = rider.outbound.recv().await.unwrap().into_packets();
         assert_eq!(start_packets.len(), 2);
+    }
+
+    #[test]
+    fn manual_pro_mission_sets_project_matching_client_reference_months() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        assert_eq!(
+            rider_school_reference_date(RiderSchoolProMissionSet::Automatic, today),
+            today
+        );
+
+        for (index, selection) in RiderSchoolProMissionSet::MANUAL.into_iter().enumerate() {
+            let projected = rider_school_reference_date(selection, today);
+            assert_eq!(projected.day(), 15);
+            assert_eq!(projected.month(), 1 + 2 * u32::try_from(index).unwrap());
+            assert_eq!(
+                rider_school_pro_pair_index_for_year_month(projected.year(), projected.month()),
+                index
+            );
+        }
     }
 
     #[test]
@@ -8090,7 +8754,10 @@ mod tests {
         let profile_root = tempfile::tempdir().unwrap();
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
-        let config = ServerConfig::default();
+        let config = ServerConfig {
+            time_attack_physics_preset: TimeAttackPhysicsPreset::S2,
+            ..ServerConfig::default()
+        };
         let (world, world_task) = WorldHandle::spawn(4).expect("nonzero World mailbox capacity");
         let session_id = world
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_712))
@@ -8122,6 +8789,20 @@ mod tests {
 
         let track = 0x2B1E_038E;
         let start = time_attack_start_request(track, 1);
+        let expected_physics = selected_physics_metadata(
+            context.profile_for(&identity).unwrap(),
+            Some(context.equipment_for(&identity).unwrap()),
+            profiles.catalog(),
+            PhysicsSelection {
+                kart_id: 1_401,
+                flying_pet_id: 32,
+                requested_speed_type: TimeAttackPhysicsPreset::S2.speed_type().unwrap(),
+                plant_game_mode: p5136_core::plant_physics::P5136PlantGameMode::TimeAttack,
+                apply_profile_equipment: true,
+            },
+        )
+        .unwrap()
+        .block;
         let start_reply = dispatch_packet(&services, &start, &mut context)
             .await
             .unwrap();
@@ -8130,6 +8811,7 @@ mod tests {
             start_reply[0].len(),
             p5136_core::single_player_protocol::START_TIME_ATTACK_REPLY_LENGTH
         );
+        assert_eq!(&start_reply[0][12..247], expected_physics.as_bytes());
 
         let charged = store.load_or_create(&identity.nickname).unwrap();
         assert_eq!(
@@ -8193,6 +8875,10 @@ mod tests {
         assert_eq!(loaded.profile.rider.game_type, 0);
         assert_eq!(loaded.profile.rider.attack_type, 0);
         assert_eq!(loaded.profile.rider.time, 101_731);
+        assert_eq!(
+            loaded.profile.time_attack_records.get(&replacement_track),
+            Some(&101_731)
+        );
         assert_eq!(loaded.profile.rider.rp, p5136_profile::DEFAULT_RP);
         assert_eq!(
             loaded.profile.rider.lucci,
@@ -8203,6 +8889,26 @@ mod tests {
             dispatch_packet(&services, &finish, &mut context).await,
             Err(LoginSessionError::TimeAttackFinishWithoutStart)
         ));
+
+        dispatch_packet(&services, &replacement, &mut context)
+            .await
+            .unwrap();
+        let mut slower_finish = finish;
+        let slower_offset = slower_finish.len() - 4;
+        slower_finish[slower_offset..].copy_from_slice(&110_000_u32.to_le_bytes());
+        dispatch_packet(&services, &slower_finish, &mut context)
+            .await
+            .unwrap();
+        let after_slower_attempt = store.load_or_create(&identity.nickname).unwrap();
+        assert_eq!(after_slower_attempt.profile.rider.time, 110_000);
+        assert_eq!(
+            after_slower_attempt
+                .profile
+                .time_attack_records
+                .get(&replacement_track),
+            Some(&101_731),
+            "the latest time remains available separately, while the per-track best never regresses"
+        );
 
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
@@ -9568,8 +10274,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rider_info_lookup_fails_closed_without_reading_or_creating_remote_profiles() {
+    #[allow(clippy::too_many_lines)]
+    async fn rider_info_lookup_returns_existing_profile_without_creating_missing_riders() {
         let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create("ExistingTarget").unwrap();
+        store
+            .update("ExistingTarget", |profile| {
+                profile.rider_item.character = 77;
+                profile.rider_item.paint = 6;
+                profile.rider_item.kart = 1_234;
+                profile.rider.card = "profile card".to_owned();
+                profile.rider.rp = 7_654_321;
+                profile.rider.emblem1 = 11;
+                profile.rider.emblem2 = -7;
+                profile.rider.rider_intro = "profile intro".to_owned();
+                profile.rider.premium = 4;
+                profile.rider.club_code = 12_345;
+                profile.rider.club_mark_logo = 23;
+                profile.rider.club_mark_line = 45;
+                profile.rider.club_name = "Profile Club".to_owned();
+                profile.rider.ranker = 1;
+                profile.rider_school = p5136_profile::RiderSchoolProgress::L2;
+            })
+            .unwrap();
+        let target_before = store.reload("ExistingTarget").unwrap();
+        let expected_item_snapshot = rider_item_snapshot(&target_before.profile.rider_item);
         let (profiles, profile_runtime) =
             ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
         let config = ServerConfig::default();
@@ -9616,7 +10346,6 @@ mod tests {
 
         let mut context = bind_test_profile(&profiles, &identity).await;
         let in_memory_before = context.profile_for(&identity).unwrap().clone();
-        let store = ProfileStore::new(profile_root.path());
         let durable_before = store.reload(&identity.nickname).unwrap();
 
         assert_eq!(
@@ -9630,6 +10359,80 @@ mod tests {
             identity
         );
         assert_eq!(context.profile_for(&identity).unwrap(), &in_memory_before);
+        assert!(!store.profile_exists("OfflineTarget").unwrap());
+
+        // Lookup is case-insensitive and returns the requested rider spelling
+        // in the exact profile-backed C# wire layout.
+        let success_request = exact_get_rider_info_request("ExistingTarget", 1);
+        let success = dispatch_packet(&services, &success_request, &mut context)
+            .await
+            .unwrap();
+        assert_eq!(success.len(), 1);
+        let mut reader = PacketReader::new(&success[0]);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrGetRiderInfo")
+        );
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        let looked_up_user_no = reader.read_u32().unwrap();
+        assert_ne!(looked_up_user_no, 0);
+        assert_eq!(reader.read_utf16().unwrap(), "ExistingTarget");
+        assert_eq!(reader.read_utf16().unwrap(), "ExistingTarget");
+        let first_time = (reader.read_u16().unwrap(), reader.read_u16().unwrap());
+        assert_eq!(
+            reader.read_bytes(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH).unwrap(),
+            expected_item_snapshot
+        );
+        assert_eq!(reader.read_utf16().unwrap(), "profile card");
+        assert_eq!(reader.read_u32().unwrap(), 7_654_321);
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_u8().unwrap(), 4);
+        assert_eq!(
+            (reader.read_u16().unwrap(), reader.read_u16().unwrap()),
+            first_time
+        );
+        assert_eq!(reader.read_bytes(17).unwrap(), &[0; 17]);
+        assert_eq!(reader.read_i16().unwrap(), 11);
+        assert_eq!(reader.read_i16().unwrap(), -7);
+        assert_eq!(reader.read_i16().unwrap(), 0);
+        assert_eq!(reader.read_utf16().unwrap(), "profile intro");
+        assert_eq!(reader.read_i32().unwrap(), 4);
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 120_000);
+        assert_eq!(reader.read_i32().unwrap(), 12_345);
+        assert_eq!(reader.read_i32().unwrap(), 23);
+        assert_eq!(reader.read_i32().unwrap(), 45);
+        assert_eq!(reader.read_utf16().unwrap(), "Profile Club");
+        assert_eq!(reader.read_i32().unwrap(), 0);
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        for _ in 0..5 {
+            assert_eq!(reader.read_i32().unwrap(), 0);
+        }
+        assert_eq!(reader.read_bytes(3).unwrap(), &[0; 3]);
+        assert!(reader.remaining().is_empty());
+
+        // Repeated lookup and a later actual login share one process-local
+        // UserNo, rather than exposing a lookup-only phantom identity.
+        let repeated = dispatch_packet(&services, &success_request, &mut context)
+            .await
+            .unwrap();
+        let mut repeated_reader = PacketReader::new(&repeated[0]);
+        assert_eq!(
+            repeated_reader.read_u32().unwrap(),
+            adler32::packet_hash("PrGetRiderInfo")
+        );
+        assert_eq!(repeated_reader.read_u8().unwrap(), 1);
+        assert_eq!(repeated_reader.read_u32().unwrap(), looked_up_user_no);
+        let target_session = world
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_716))
+            .await
+            .unwrap();
+        let target_identity = world
+            .claim_identity(target_session, "EXISTINGTARGET")
+            .await
+            .unwrap();
+        assert_eq!(target_identity.nickname, "ExistingTarget");
+        assert_eq!(target_identity.user_no.get(), looked_up_user_no);
 
         let server_time = PacketWriter::named("PqServerTime");
         let follow_up = dispatch_packet(&services, server_time.as_slice(), &mut context)
@@ -9644,6 +10447,9 @@ mod tests {
         let durable_after = store.reload(&identity.nickname).unwrap();
         assert_eq!(durable_after.revision, durable_before.revision);
         assert_eq!(durable_after.profile, durable_before.profile);
+        let target_after = store.reload("ExistingTarget").unwrap();
+        assert_eq!(target_after.revision, target_before.revision);
+        assert_eq!(target_after.profile, target_before.profile);
 
         profile_runtime.shutdown().await.unwrap();
         world.shutdown().await.unwrap();
@@ -10173,11 +10979,38 @@ mod tests {
         };
 
         assert!(resolved.fallback_reasons.is_empty());
+        assert_eq!(resolved.floater_codes, [603, 903, 702]);
         assert_ne!(resolved.block, baseline);
         assert_eq!(
             resolved.block,
             build_p5136_kart_physics_block(&expected_snapshot).unwrap()
         );
+    }
+
+    #[test]
+    fn item_floater_codes_survive_physics_resolution_for_race_gameplay() {
+        let catalog = test_catalog();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_450;
+        profile.rider_item.kart_serial = 1;
+        let equipment = EquipmentExceptions {
+            tune: vec![p5136_core::inventory::TuneExcRecord {
+                id: 1_450,
+                serial: 1,
+                tune1: 10_303,
+                tune2: 10_901,
+                tune3: 11_001,
+                slot1: -1,
+                count1: 0,
+                slot2: -1,
+                count2: 0,
+            }],
+            ..EquipmentExceptions::default()
+        };
+
+        let resolved = room_physics_metadata(&profile, &equipment, Some(catalog.as_ref())).unwrap();
+        assert_eq!(resolved.floater_codes, [10_303, 10_901, 11_001]);
+        assert!(resolved.fallback_reasons.is_empty());
     }
 
     #[test]
@@ -10651,6 +11484,253 @@ mod tests {
         assert!(visitor.outbound.try_recv().is_err());
 
         shutdown_myroom_test(&world, profile_runtime, actor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    async fn myroom_direct_entry_loads_an_offline_owner_without_creating_unknown_profiles() {
+        let profile_root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(profile_root.path());
+        store.load_or_create("OfflineOwner").unwrap();
+        store
+            .update("OfflineOwner", |profile| {
+                profile.rider_item.character = 77;
+                profile.rider_item.kart = 1_234;
+                profile.rider.rp = 7_654_321;
+                profile.rider.club_name = "Offline Club".to_owned();
+                profile.my_room.my_room = 36;
+                profile.my_room.my_room_bgm = 8;
+                profile.my_room.use_room_pwd = 0;
+                profile.my_room.use_item_pwd = 0;
+                profile.my_room.room_pwd = "must be redacted".to_owned();
+                profile.my_room.item_pwd = "must also be redacted".to_owned();
+            })
+            .unwrap();
+        let offline_profile = store.reload("OfflineOwner").unwrap().profile;
+
+        let (profiles, profile_runtime) =
+            ProfileCoordinator::new_test(profile_root.path().to_owned(), None);
+        let (world, actor) = WorldHandle::spawn(32).expect("nonzero World mailbox capacity");
+        let (session, _cancelled, mut outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_732),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let visitor = world
+            .claim_identity(session, "OfflineRoomVisitor")
+            .await
+            .unwrap();
+        let mut context = bind_test_profile(&profiles, &visitor).await;
+        let config = ServerConfig::default();
+        let services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: session,
+        };
+
+        let mut missing = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        missing.write_utf16("NeverCreatedOwner").unwrap();
+        missing.write_utf16("").unwrap();
+        assert!(
+            dispatch_packet(&services, missing.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outbound.try_recv().unwrap().into_packets(),
+            vec![serialize_enter_error(EnterMyRoomStatus::OwnerUnavailable).unwrap()]
+        );
+        assert!(!store.profile_exists("NeverCreatedOwner").unwrap());
+
+        let mut enter = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        enter.write_utf16("OfflineOwner").unwrap();
+        enter.write_utf16("").unwrap();
+        assert!(
+            dispatch_packet(&services, enter.as_slice(), &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let packets = outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 2);
+        let mut redacted = offline_profile.my_room.try_to_protocol_info().unwrap();
+        redacted.room_password.clear();
+        redacted.item_password.clear();
+        assert_eq!(
+            packets[0],
+            serialize_enter_reply("OfflineOwner", EnterMyRoomStatus::Success, &redacted).unwrap()
+        );
+
+        let mut slots = PacketReader::new(&packets[1]);
+        assert_eq!(
+            slots.read_u32().unwrap(),
+            adler32::packet_hash("RmSlotDataPacket")
+        );
+        let offline_user_no = slots.read_u32().unwrap();
+        assert_ne!(offline_user_no, 0);
+        assert_ne!(offline_user_no, visitor.user_no.get());
+        assert_eq!(slots.read_bytes(4).unwrap(), &[0; 4]);
+        assert_eq!(slots.read_u16().unwrap(), 0);
+        assert_eq!(slots.read_bytes(4).unwrap(), &[0; 4]);
+        assert_eq!(slots.read_u16().unwrap(), 0);
+        assert_eq!(slots.read_utf16().unwrap(), "OfflineOwner");
+        assert_eq!(
+            slots.read_bytes(RIDER_ITEM_SNAPSHOT_WIRE_LENGTH).unwrap(),
+            rider_item_snapshot(&offline_profile.rider_item)
+        );
+        assert_eq!(slots.read_u32().unwrap(), 7_654_321);
+        assert_eq!(slots.read_bytes(29).unwrap(), &[0; 29]);
+        assert_eq!(slots.read_utf16().unwrap(), "Offline Club");
+        assert_eq!(slots.read_u8().unwrap(), 0);
+        assert_eq!(slots.read_u32().unwrap(), visitor.user_no.get());
+
+        let first = PacketWriter::named(FIRST_MYROOM_REQUEST_NAME).into_inner();
+        assert!(
+            dispatch_packet(&services, &first, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            outbound.try_recv().unwrap().into_packets(),
+            vec![packets[1].clone()]
+        );
+
+        let items = PacketWriter::named(REQUEST_MYROOM_ITEMS_NAME).into_inner();
+        assert!(
+            dispatch_packet(&services, &items, &mut context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let item_packets = outbound.try_recv().unwrap().into_packets();
+        assert!(!item_packets.is_empty());
+        assert_eq!(
+            u32::from_le_bytes(item_packets[0][..4].try_into().unwrap()),
+            adler32::packet_hash(OWNER_ITEM_NAME)
+        );
+
+        // A second visitor must resolve the same deterministic absent-owner
+        // binding and join the existing offline room rather than colliding on
+        // a requester-specific synthetic generation.
+        let (second_session, _second_cancelled, mut second_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_733),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let second_visitor = world
+            .claim_identity(second_session, "SecondOfflineVisitor")
+            .await
+            .unwrap();
+        let mut second_context = bind_test_profile(&profiles, &second_visitor).await;
+        let second_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: second_session,
+        };
+        assert!(
+            dispatch_packet(&second_services, enter.as_slice(), &mut second_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let second_entry = second_outbound.try_recv().unwrap().into_packets();
+        assert_eq!(second_entry.len(), 2);
+        assert_eq!(
+            second_entry[0],
+            serialize_enter_reply("OfflineOwner", EnterMyRoomStatus::Success, &redacted).unwrap()
+        );
+        assert_eq!(
+            outbound.try_recv().unwrap().into_packets(),
+            vec![second_entry[1].clone()]
+        );
+
+        // If the offline owner subsequently logs in, the normal startup
+        // profile refresh advances generation zero to the live generation.
+        // The owner can then enter slot zero without invalidating visitors.
+        let (owner_session, _owner_cancelled, mut owner_outbound) = world
+            .register_login_session(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_734),
+                WireOperationGate::new(),
+            )
+            .await
+            .unwrap();
+        let owner_identity = world
+            .claim_identity(owner_session, "OfflineOwner")
+            .await
+            .unwrap();
+        assert_eq!(owner_identity.user_no.get(), offline_user_no);
+        let mut owner_context = bind_test_profile(&profiles, &owner_identity).await;
+        let operation = world.admit_identity_operation(owner_session).await.unwrap();
+        let admission = profiles
+            .admit_for_operation(
+                &operation,
+                &owner_identity.nickname,
+                "activate offline owner",
+            )
+            .await
+            .unwrap();
+        let (owner_snapshot, lane) = profiles
+            .load(owner_identity.nickname.clone(), false, admission)
+            .await
+            .unwrap();
+        assert!(
+            world
+                .admitted(&operation)
+                .refresh_myroom_presentation(
+                    owner_identity.clone(),
+                    MyRoomProfileLease::new(
+                        myroom_profile_presentation(&owner_snapshot.profile).with_p2p_port(0),
+                        lane,
+                    ),
+                )
+                .await
+                .unwrap()
+        );
+        drop(operation);
+        let owner_services = SessionServices {
+            config: &config,
+            world: &world,
+            profiles: &profiles,
+            session_id: owner_session,
+        };
+        let mut self_enter = PacketWriter::named(ENTER_MYROOM_REQUEST_NAME);
+        self_enter.write_utf16("OfflineOwner").unwrap();
+        self_enter.write_utf16("").unwrap();
+        assert!(
+            dispatch_packet(&owner_services, self_enter.as_slice(), &mut owner_context)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let owner_entry = owner_outbound.try_recv().unwrap().into_packets();
+        assert_eq!(owner_entry.len(), 2);
+        assert_eq!(
+            owner_entry[0],
+            serialize_enter_reply(
+                "OfflineOwner",
+                EnterMyRoomStatus::Success,
+                &offline_profile.my_room.try_to_protocol_info().unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            outbound.try_recv().unwrap().into_packets(),
+            vec![owner_entry[1].clone()]
+        );
+        assert_eq!(
+            second_outbound.try_recv().unwrap().into_packets(),
+            vec![owner_entry[1].clone()]
+        );
+
+        shutdown_spawned_myroom_test(&world, profile_runtime, actor).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13347,7 +14427,7 @@ mod tests {
         );
         let refreshed = world
             .admitted(&operation)
-            .refresh_room_kart_physics(variants)
+            .refresh_room_kart_physics(variants, [0; 3])
             .await
             .unwrap();
         assert!(
