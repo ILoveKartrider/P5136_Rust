@@ -20,13 +20,14 @@ use p5136_core::{
     },
     kart_physics::{P5136_MODERN_SPEED_TYPE_COUNT, csharp_room_title_speed_type},
     lobby_protocol::{
-        BasicAiRequest, ChangeRoomInfoRequest, ChangeTrackRequest, CloseSlotRequest,
+        BasicAiRequest, ChangeRoomInfoRequest, ChangeTrackRequest, CloseSlotRequest, KickRequest,
         LobbyProtocolError, MacroChatRequest, PlayerSlotState,
         RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, StartRoomStatus,
         serialize_basic_ai_added, serialize_basic_ai_removed, serialize_basic_ai_reply,
         serialize_change_room_info_reply, serialize_change_team_reply, serialize_close_slot_reply,
-        serialize_macro_chat_relay, serialize_rider_echo as serialize_lobby_rider_echo,
-        serialize_set_slot_state_reply, serialize_slot_state, serialize_start_room_reply,
+        serialize_kick_broadcast, serialize_kick_reply, serialize_macro_chat_relay,
+        serialize_rider_echo as serialize_lobby_rider_echo, serialize_set_slot_state_reply,
+        serialize_slot_state, serialize_start_room_reply,
     },
     myroom_protocol::{
         CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus, EnterMyRoomStatus,
@@ -896,6 +897,7 @@ pub(crate) enum LobbyCommandPayload {
         resolved_message: String,
     },
     ChangeRoomInfo(ChangeRoomInfoRequest),
+    Kick(KickRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -943,6 +945,11 @@ pub(crate) enum LobbyCommandOutcome {
     },
     RoomInfoChanged {
         room_id: RoomId,
+    },
+    PlayerKicked {
+        room_id: RoomId,
+        player_id: i32,
+        nickname: String,
     },
 }
 
@@ -1068,6 +1075,9 @@ pub enum LobbyError {
 
     #[error("room-master target {nickname:?} is not a human racer in this room")]
     InvalidMasterTarget { nickname: String },
+
+    #[error("kick target player ID {player_id} is not a human racer in this room")]
+    InvalidKickTarget { player_id: i32 },
 
     #[error("team changes are valid only in game types 3 and 4")]
     TeamModeRequired,
@@ -9737,6 +9747,9 @@ impl World {
             LobbyCommandPayload::ChangeRoomInfo(request) => self
                 .change_room_info(&identity, &request)
                 .map_err(Into::into),
+            LobbyCommandPayload::Kick(request) => {
+                self.kick_player(&identity, request).map_err(Into::into)
+            }
         }
     }
 
@@ -10795,6 +10808,87 @@ impl World {
         Self::publish_reserved(reserved);
         self.debug_assert_invariants();
         Ok(LobbyCommandOutcome::RoomInfoChanged { room_id })
+    }
+
+    fn kick_player(
+        &mut self,
+        identity: &IdentityBinding,
+        request: KickRequest,
+    ) -> Result<LobbyCommandOutcome, LobbyError> {
+        let room_id = self.protocol_room_id(identity)?;
+        let room = self
+            .protocol_rooms
+            .get(&room_id)
+            .expect("protocol membership always references an existing room");
+        Self::require_lobby_master(room, identity.user_no)?;
+
+        let target_index = usize::try_from(request.target_player_id)
+            .ok()
+            .filter(|index| *index < ROOM_SLOT_COUNT)
+            .ok_or(LobbyError::InvalidKickTarget {
+                player_id: request.target_player_id,
+            })?;
+        let target =
+            room.members_by_id[target_index]
+                .as_ref()
+                .ok_or(LobbyError::InvalidKickTarget {
+                    player_id: request.target_player_id,
+                })?;
+        let target_user_no = target.user_no;
+        let target_nickname = target.player.nickname.clone();
+        let target_session = self
+            .identities
+            .active_identity_by_user_no(target_user_no)
+            .map(|binding| binding.owner)
+            .ok_or(LobbyError::InactiveRosterMember {
+                user_no: target_user_no.get(),
+            })?;
+
+        let mut next = room.clone();
+        let removed = next.remove_user(target_user_no);
+        debug_assert!(
+            removed,
+            "the selected kick target remains in the cloned room"
+        );
+
+        let leave = serialize_ch_leave_room_reply(true);
+        let broadcast = serialize_kick_broadcast(&target_nickname)?;
+        let reply = serialize_kick_reply();
+        let slot_data = serialize_gr_slot_data(&next.slot_data())?;
+        let mut deliveries = Vec::with_capacity(next.user_nos().len() + 1);
+        for (user_no, session) in self.active_room_sessions(&next)? {
+            let batch = if user_no == identity.user_no {
+                OutboundBatch::ordered(vec![broadcast.clone(), reply.clone(), slot_data.clone()])
+            } else {
+                OutboundBatch::ordered(vec![broadcast.clone(), slot_data.clone()])
+            };
+            deliveries.push((session, batch));
+        }
+        let target_batch = if target_user_no == identity.user_no {
+            OutboundBatch::ordered(vec![leave, reply])
+        } else {
+            OutboundBatch::single(leave)
+        };
+        deliveries.push((target_session, target_batch));
+        let reserved = self.reserve_outbound(deliveries)?;
+
+        let removed_membership = self.protocol_room_by_user.remove(&target_user_no);
+        debug_assert_eq!(removed_membership, Some(room_id));
+        if next.is_empty() {
+            let removed_room = self.protocol_rooms.remove(&room_id);
+            debug_assert!(removed_room.is_some());
+            self.free_protocol_room_ids
+                .insert(u16::try_from(room_id.0).expect("protocol room ID fits in u16"));
+        } else {
+            self.protocol_rooms.insert(room_id, next);
+        }
+        Self::publish_reserved(reserved);
+        self.debug_assert_invariants();
+        Ok(LobbyCommandOutcome::PlayerKicked {
+            room_id,
+            player_id: request.target_player_id,
+            nickname: target_nickname,
+        })
     }
 
     fn relay_rider_talk(
@@ -13954,9 +14048,11 @@ mod tests {
             BASIC_AI_REPLY_NAME, BASIC_AI_SLOT_DATA_NAME, BasicAiRequest,
             CHANGE_ROOM_INFO_REPLY_NAME, CHANGE_TEAM_REPLY_NAME, CLOSE_SLOT_REPLY_NAME,
             ChangeRoomInfoRequest, ChangeTrackRequest, CloseSlotOperation, CloseSlotRequest,
-            MACRO_CHAT_RELAY_NAME, MacroChatRequest, PlayerSlotState, RIDER_ECHO_NAME,
+            KICK_BROADCAST_NAME, KICK_REPLY_NAME, KickRequest, MACRO_CHAT_RELAY_NAME,
+            MacroChatRequest, PlayerSlotState, RIDER_ECHO_NAME,
             RiderTalkRequest as LobbyRiderTalkRequest, RoomTeam, SET_SLOT_STATE_REPLY_NAME,
-            SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME,
+            SLOT_STATE_PACKET_NAME, START_ROOM_REPLY_NAME, serialize_kick_broadcast,
+            serialize_kick_reply,
         },
         myroom_protocol::{
             CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus, EnterMyRoomStatus,
@@ -13980,7 +14076,8 @@ mod tests {
         room_protocol::{
             ChCreateRoomRequest, ChGetRoomListRequest, ChJoinRoomRequest,
             MAX_CLUB_NAME_UTF16_UNITS, ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomAi,
-            RoomPlayer, RoomProtocolError, serialize_initial_room_state,
+            RoomPlayer, RoomProtocolError, serialize_ch_leave_room_reply, serialize_gr_slot_data,
+            serialize_initial_room_state,
         },
         startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
     };
@@ -21126,6 +21223,139 @@ mod tests {
             adler32::packet_hash(MACRO_CHAT_RELAY_NAME)
         );
         assert!(guest.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end kick test keeps authorization, atomic rollback, packet order, and reconnectable session state on one room lifetime"
+    )]
+    fn kick_is_master_authorized_atomic_and_leaves_the_target_session_connected() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "KickOwner", 67, 41_931, 8);
+        let mut guest = register_channel_session(&mut world, "KickGuest", 67, 41_941, 1);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        join_protocol_room(&mut world, &guest, room_id, false);
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut guest.outbound);
+
+        let before = world.protocol_rooms[&room_id].clone();
+        assert!(matches!(
+            world.lobby_command(
+                guest.session,
+                LobbyCommandPayload::Kick(KickRequest {
+                    target_player_id: 0,
+                }),
+            ),
+            Err(WorldError::Lobby(LobbyError::NotRoomMaster))
+        ));
+        assert!(matches!(
+            world.lobby_command(
+                owner.session,
+                LobbyCommandPayload::Kick(KickRequest {
+                    target_player_id: 7,
+                }),
+            ),
+            Err(WorldError::Lobby(LobbyError::InvalidKickTarget {
+                player_id: 7
+            }))
+        ));
+        assert_eq!(world.protocol_rooms[&room_id], before);
+
+        let track = ChangeTrackRequest {
+            track: 0x22E6_0323,
+            room_data_header: 0,
+            room_data: [0; ROOM_DATA_LENGTH],
+        };
+        world
+            .lobby_command(owner.session, LobbyCommandPayload::ChangeTrack(track))
+            .unwrap();
+        let _owner_track = take_single_packet(&mut owner.outbound);
+        assert!(matches!(
+            world.lobby_command(
+                owner.session,
+                LobbyCommandPayload::Kick(KickRequest {
+                    target_player_id: 1,
+                }),
+            ),
+            Err(WorldError::Lobby(LobbyError::OutboundUnavailable { session }))
+                if session == guest.session
+        ));
+        assert_eq!(
+            world.protocol_rooms[&room_id].members_by_id[1]
+                .as_ref()
+                .unwrap()
+                .user_no,
+            guest.identity.user_no
+        );
+        assert_eq!(
+            world.protocol_room_by_user.get(&guest.identity.user_no),
+            Some(&room_id)
+        );
+        let _guest_track = take_single_packet(&mut guest.outbound);
+        assert!(owner.outbound.try_recv().is_err());
+
+        assert!(matches!(
+            world
+                .lobby_command(
+                    owner.session,
+                    LobbyCommandPayload::Kick(KickRequest {
+                        target_player_id: 1,
+                    }),
+                )
+                .unwrap(),
+            LobbyCommandOutcome::PlayerKicked {
+                room_id: kicked_room,
+                player_id: 1,
+                ref nickname,
+            } if kicked_room == room_id && nickname == "KickGuest"
+        ));
+
+        let owner_packets = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(
+            owner_packets,
+            vec![
+                serialize_kick_broadcast("KickGuest").unwrap(),
+                serialize_kick_reply(),
+                serialize_gr_slot_data(&world.protocol_rooms[&room_id].slot_data()).unwrap(),
+            ]
+        );
+        assert_eq!(
+            logical_packet_hash(&owner_packets[0]),
+            adler32::packet_hash(KICK_BROADCAST_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&owner_packets[1]),
+            adler32::packet_hash(KICK_REPLY_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&owner_packets[2]),
+            adler32::packet_hash("GrSlotDataPacket")
+        );
+        assert_eq!(
+            take_single_packet(&mut guest.outbound),
+            serialize_ch_leave_room_reply(true)
+        );
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&guest.identity.user_no)
+        );
+        assert!(world.protocol_rooms[&room_id].members_by_id[1].is_none());
+        assert_eq!(world.protocol_rooms[&room_id].room_master, 0);
+        assert_eq!(
+            world
+                .authorize_session_operation(guest.session)
+                .unwrap()
+                .user_no,
+            guest.identity.user_no
+        );
+
+        join_protocol_room(&mut world, &guest, room_id, false);
+        assert_eq!(
+            world.protocol_room_by_user.get(&guest.identity.user_no),
+            Some(&room_id)
+        );
     }
 
     #[test]

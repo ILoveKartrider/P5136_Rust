@@ -70,8 +70,9 @@ use p5136_core::{
     lobby_protocol::{
         LobbyProtocolError, LobbyRequest, classify_lobby_request, parse_basic_ai_request,
         parse_change_master_request, parse_change_room_info_request, parse_change_team_request,
-        parse_change_track_request, parse_close_slot_request, parse_macro_chat_request,
-        parse_rider_talk_request, parse_set_slot_state_request, parse_start_room_request,
+        parse_change_track_request, parse_close_slot_request, parse_kick_request,
+        parse_macro_chat_request, parse_rider_talk_request, parse_set_slot_state_request,
+        parse_start_room_request,
     },
     login::{
         LegacyTime, LoginError, P5136_OBSERVER_MASTER_PMAP, P5136_OBSERVER_PMAP, PrLoginFields,
@@ -3952,6 +3953,7 @@ async fn handle_lobby_request_admitted(
         LobbyRequest::ChangeRoomInfo => {
             LobbyCommandPayload::ChangeRoomInfo(parse_change_room_info_request(packet)?)
         }
+        LobbyRequest::Kick => LobbyCommandPayload::Kick(parse_kick_request(packet)?),
     };
     match world.lobby_command(payload).await {
         Ok(_) => {}
@@ -3963,6 +3965,7 @@ async fn handle_lobby_request_admitted(
             | LobbyError::PreparingStateServerOwned
             | LobbyError::NotRoomMaster
             | LobbyError::InvalidMasterTarget { .. }
+            | LobbyError::InvalidKickTarget { .. }
             | LobbyError::TeamModeRequired
             | LobbyError::TeamFull { .. }
             | LobbyError::NoRacers
@@ -6562,6 +6565,9 @@ mod tests {
                 super::parse_change_room_info_request(packet)
                     .expect("captured room-info change must parse");
             }
+            Some(LobbyRequest::Kick) => {
+                super::parse_kick_request(packet).expect("captured room-kick request must parse");
+            }
             _ => return false,
         }
         true
@@ -7332,6 +7338,7 @@ mod tests {
         oversized_macro.write_i32(0);
         oversized_macro.write_u8(0);
         oversized_macro.write_i32(257);
+        let truncated_kick = PacketWriter::named("GrRequestKickPacket");
 
         for packet in [
             invalid_state.into_inner(),
@@ -7343,6 +7350,7 @@ mod tests {
             invalid_close.into_inner(),
             oversized_talk.into_inner(),
             oversized_macro.into_inner(),
+            truncated_kick.into_inner(),
         ] {
             assert!(matches!(
                 dispatch_packet(&services, &packet, &mut context).await,

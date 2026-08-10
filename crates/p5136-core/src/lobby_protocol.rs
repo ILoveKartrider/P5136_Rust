@@ -36,6 +36,9 @@ pub const MACRO_CHAT_REQUEST_NAME: &str = "PqSendMacroChat";
 pub const MACRO_CHAT_RELAY_NAME: &str = "PcSendMacroChat";
 pub const CHANGE_ROOM_INFO_REQUEST_NAME: &str = "PqChangeRoomInfoPacket";
 pub const CHANGE_ROOM_INFO_REPLY_NAME: &str = "PrChangeRoomInfoPacket";
+pub const KICK_REQUEST_NAME: &str = "GrRequestKickPacket";
+pub const KICK_BROADCAST_NAME: &str = "GrKickBroadcastPacket";
+pub const KICK_REPLY_NAME: &str = "GrReplyKickPacket";
 
 pub const ROOM_OBSERVER_ID_END: i32 = 15;
 pub const MAX_ROOM_CHAT_UTF16_UNITS: usize = 256;
@@ -52,6 +55,7 @@ pub enum LobbyRequest {
     RiderTalk,
     MacroChat,
     ChangeRoomInfo,
+    Kick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +183,11 @@ pub struct ChangeRoomInfoRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KickRequest {
+    pub target_player_id: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartRoomStatus {
     Success = 0,
     NotAllReady = 2,
@@ -246,6 +255,7 @@ pub fn classify_lobby_request(hash: u32) -> Option<LobbyRequest> {
         (RIDER_TALK_REQUEST_NAME, LobbyRequest::RiderTalk),
         (MACRO_CHAT_REQUEST_NAME, LobbyRequest::MacroChat),
         (CHANGE_ROOM_INFO_REQUEST_NAME, LobbyRequest::ChangeRoomInfo),
+        (KICK_REQUEST_NAME, LobbyRequest::Kick),
     ]
     .into_iter()
     .find_map(|(name, request)| (adler32::packet_hash(name) == hash).then_some(request))
@@ -376,6 +386,16 @@ pub fn parse_change_room_info_request(
         r_key_allowed: reader.read_u8()?,
     };
     ensure_exhausted(&reader, CHANGE_ROOM_INFO_REQUEST_NAME)?;
+    Ok(request)
+}
+
+pub fn parse_kick_request(packet: &[u8]) -> Result<KickRequest, LobbyProtocolError> {
+    let mut reader = PacketReader::new(packet);
+    expect_hash(&mut reader, KICK_REQUEST_NAME)?;
+    let request = KickRequest {
+        target_player_id: reader.read_i32()?,
+    };
+    ensure_exhausted(&reader, KICK_REQUEST_NAME)?;
     Ok(request)
 }
 
@@ -545,6 +565,27 @@ pub fn serialize_change_room_info_reply(
     Ok(packet.into_inner())
 }
 
+pub fn serialize_kick_broadcast(nickname: &str) -> Result<Vec<u8>, LobbyProtocolError> {
+    let nickname_units = nickname.encode_utf16().count();
+    if nickname_units > MAX_RIDER_NICKNAME_UTF16_UNITS {
+        return Err(LobbyProtocolError::NicknameTooLong {
+            actual: nickname_units,
+            maximum: MAX_RIDER_NICKNAME_UTF16_UNITS,
+        });
+    }
+    let mut packet = PacketWriter::named(KICK_BROADCAST_NAME);
+    packet.write_utf16(nickname)?;
+    Ok(packet.into_inner())
+}
+
+#[must_use]
+pub fn serialize_kick_reply() -> Vec<u8> {
+    let mut packet = PacketWriter::named(KICK_REPLY_NAME);
+    // The stock P5136/C# success path uses zero here.
+    packet.write_u8(0);
+    packet.into_inner()
+}
+
 #[must_use]
 pub fn serialize_start_room_reply(status: StartRoomStatus) -> Vec<u8> {
     let mut packet = PacketWriter::named(START_ROOM_REPLY_NAME);
@@ -658,17 +699,18 @@ mod tests {
     use super::{
         BASIC_AI_REQUEST_NAME, CHANGE_MASTER_REQUEST_NAME, CHANGE_ROOM_INFO_REPLY_NAME,
         CHANGE_ROOM_INFO_REQUEST_NAME, CHANGE_TEAM_REQUEST_NAME, CHANGE_TRACK_REQUEST_NAME,
-        CLOSE_SLOT_REQUEST_NAME, CloseSlotOperation, LobbyProtocolError, LobbyRequest,
-        MACRO_CHAT_REQUEST_NAME, PlayerSlotState, RIDER_TALK_REQUEST_NAME, RoomTeam,
-        SET_SLOT_STATE_REQUEST_NAME, START_ROOM_REQUEST_NAME, StartRoomStatus,
-        classify_lobby_request, parse_basic_ai_request, parse_change_master_request,
-        parse_change_room_info_request, parse_change_team_request, parse_change_track_request,
-        parse_close_slot_request, parse_macro_chat_request, parse_rider_talk_request,
-        parse_set_slot_state_request, parse_start_room_request, serialize_basic_ai_added,
-        serialize_basic_ai_removed, serialize_basic_ai_reply, serialize_change_room_info_reply,
-        serialize_change_team_reply, serialize_close_slot_reply, serialize_macro_chat_relay,
-        serialize_rider_echo, serialize_set_slot_state_reply, serialize_slot_state,
-        serialize_start_room_reply,
+        CLOSE_SLOT_REQUEST_NAME, CloseSlotOperation, KICK_BROADCAST_NAME, KICK_REPLY_NAME,
+        KICK_REQUEST_NAME, LobbyProtocolError, LobbyRequest, MACRO_CHAT_REQUEST_NAME,
+        PlayerSlotState, RIDER_TALK_REQUEST_NAME, RoomTeam, SET_SLOT_STATE_REQUEST_NAME,
+        START_ROOM_REQUEST_NAME, StartRoomStatus, classify_lobby_request, parse_basic_ai_request,
+        parse_change_master_request, parse_change_room_info_request, parse_change_team_request,
+        parse_change_track_request, parse_close_slot_request, parse_kick_request,
+        parse_macro_chat_request, parse_rider_talk_request, parse_set_slot_state_request,
+        parse_start_room_request, serialize_basic_ai_added, serialize_basic_ai_removed,
+        serialize_basic_ai_reply, serialize_change_room_info_reply, serialize_change_team_reply,
+        serialize_close_slot_reply, serialize_kick_broadcast, serialize_kick_reply,
+        serialize_macro_chat_relay, serialize_rider_echo, serialize_set_slot_state_reply,
+        serialize_slot_state, serialize_start_room_reply,
     };
     use crate::{adler32, packet::PacketWriter, room_protocol::RoomAi};
 
@@ -721,6 +763,7 @@ mod tests {
                 0x6057_0888,
                 LobbyRequest::ChangeRoomInfo,
             ),
+            (KICK_REQUEST_NAME, 0x4A05_077C, LobbyRequest::Kick),
         ];
         for (name, expected_hash, request) in fixtures {
             assert_eq!(adler32::packet_hash(name), expected_hash);
@@ -754,6 +797,12 @@ mod tests {
                 .unwrap()
                 .reserved,
             0
+        );
+        assert_eq!(
+            parse_kick_request(&decode_hex("7C07054A01000000"))
+                .unwrap()
+                .target_player_id,
+            1
         );
     }
 
@@ -916,6 +965,13 @@ mod tests {
             serialize_macro_chat_relay(10, 0, 1, "").unwrap(),
             decode_hex("AF05722C0A000000000000000100000000")
         );
+        assert_eq!(adler32::packet_hash(KICK_BROADCAST_NAME), 0x5761_0826);
+        assert_eq!(adler32::packet_hash(KICK_REPLY_NAME), 0x3A92_069F);
+        assert_eq!(
+            serialize_kick_broadcast("Yany").unwrap(),
+            decode_hex("2608615704000000590061006E007900")
+        );
+        assert_eq!(serialize_kick_reply(), decode_hex("9F06923A00"));
     }
 
     #[test]
@@ -939,6 +995,14 @@ mod tests {
         trailing.write_u8(0);
         assert!(matches!(
             parse_start_room_request(trailing.as_slice()),
+            Err(LobbyProtocolError::TrailingBytes { count: 1, .. })
+        ));
+
+        let mut trailing_kick = PacketWriter::named(KICK_REQUEST_NAME);
+        trailing_kick.write_i32(1);
+        trailing_kick.write_u8(0);
+        assert!(matches!(
+            parse_kick_request(trailing_kick.as_slice()),
             Err(LobbyProtocolError::TrailingBytes { count: 1, .. })
         ));
 
