@@ -4033,7 +4033,12 @@ mod tests {
         );
         assert_eq!(
             request_named(&mut client, "PqGetGameOption", maximum).await,
-            serialize_pr_get_game_option(&initial_options)
+            serialize_pr_get_game_option(
+                &initial_options,
+                &initial_quick_messages,
+                &initial_team_quick_messages,
+            )
+            .unwrap()
         );
 
         let mut decrement = PacketWriter::named("LoRqDecLucciPacket");
@@ -4088,7 +4093,12 @@ mod tests {
         .await;
         assert_eq!(
             request_named(&mut client, "PqGetGameOption", maximum).await,
-            serialize_pr_get_game_option(&updated_options)
+            serialize_pr_get_game_option(
+                &updated_options,
+                &updated_quick_messages,
+                &updated_team_quick_messages,
+            )
+            .unwrap()
         );
 
         let get_rider = PacketWriter::named("PqGetRider").into_inner();
@@ -4122,6 +4132,26 @@ mod tests {
         }
         assert_eq!(persisted.profile.rider.lucci, 999_000);
         assert_eq!(persisted.profile.rider.track, rank_request.track);
+
+        let (restarted, restarted_maximum) = start_test_server(profile_root.path(), None).await;
+        let mut restarted_client = authenticate_and_login(
+            restarted.endpoints().login_tcp,
+            restarted_maximum,
+            "ProfileRider",
+        )
+        .await;
+        assert_eq!(
+            request_named(&mut restarted_client, "PqGetGameOption", restarted_maximum,).await,
+            serialize_pr_get_game_option(
+                &updated_options,
+                &updated_quick_messages,
+                &updated_team_quick_messages,
+            )
+            .unwrap()
+        );
+        drop(restarted_client);
+        wait_for_session_count(&restarted.world(), 0).await;
+        restarted.shutdown().await.unwrap();
     }
 
     #[tokio::test]

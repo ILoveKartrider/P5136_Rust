@@ -21,8 +21,6 @@ use crate::{
 pub const RIDER_ITEM_SNAPSHOT_WIRE_LENGTH: usize = 65;
 pub const GAME_OPTION_MACRO_COUNT: usize = 10;
 pub const MAX_GAME_OPTION_MACRO_UTF16_UNITS: usize = 256;
-const GAME_OPTION_REPLY_SLOT_BYTES: usize = size_of::<u32>();
-const GAME_OPTION_REPLY_SLOT_COUNT: usize = 2 * GAME_OPTION_MACRO_COUNT;
 pub const P5136_RIDER_SCHOOL_LEVEL: u8 = 6;
 pub const P5136_RIDER_SCHOOL_MAX_STEP: u8 = 42;
 pub const P5136_RIDER_SCHOOL_PRO_PAIR_COUNT: usize = 6;
@@ -657,19 +655,23 @@ pub fn serialize_pr_equip_tuning_failure() -> Vec<u8> {
     packet.into_inner()
 }
 
-/// Serializes the asymmetric P5136 game-option reply.
+/// Serializes the P5136 game-option reply, including the persisted macro text.
 ///
-/// `PqUpdateGameOption` uploads twenty variable-length UTF-16 macro strings,
-/// but `PrGetGameOption` does not return those strings. Its tail is twenty
-/// fixed four-byte slots. Treating the slots as strings happens to work while
-/// every message is empty, then shifts the packet boundary and crashes the
-/// client as soon as a non-empty macro is persisted.
-#[must_use]
-pub fn serialize_pr_get_game_option(options: &GameOptions) -> Vec<u8> {
+/// The client stores the ten global and ten team messages as two arrays of
+/// UTF-16 strings. Twenty empty strings occupy 80 bytes on the wire, which is
+/// why the old fixed-zero reply appeared correct until a saved message had to
+/// be restored. Unlike `PqUpdateGameOption`, this reply omits the final
+/// `hide_competitive_rank` byte before those strings.
+pub fn serialize_pr_get_game_option(
+    options: &GameOptions,
+    quick_messages: &[String; GAME_OPTION_MACRO_COUNT],
+    team_quick_messages: &[String; GAME_OPTION_MACRO_COUNT],
+) -> Result<Vec<u8>, PacketError> {
     let mut packet = PacketWriter::named("PrGetGameOption");
-    write_game_options(&mut packet, options);
-    packet.write_bytes(&[0; GAME_OPTION_REPLY_SLOT_BYTES * GAME_OPTION_REPLY_SLOT_COUNT]);
-    packet.into_inner()
+    write_pr_get_game_options(&mut packet, options);
+    write_game_option_macros(&mut packet, quick_messages)?;
+    write_game_option_macros(&mut packet, team_quick_messages)?;
+    Ok(packet.into_inner())
 }
 
 #[must_use]
@@ -1080,6 +1082,7 @@ fn read_game_options(reader: &mut PacketReader<'_>) -> Result<GameOptions, Packe
     })
 }
 
+#[cfg(test)]
 fn write_game_options(packet: &mut PacketWriter, options: &GameOptions) {
     packet.write_u32(options.bgm_volume.to_bits());
     packet.write_u32(options.sound_volume.to_bits());
@@ -1114,6 +1117,39 @@ fn write_game_options(packet: &mut PacketWriter, options: &GameOptions) {
     ]);
 }
 
+fn write_pr_get_game_options(packet: &mut PacketWriter, options: &GameOptions) {
+    packet.write_u32(options.bgm_volume.to_bits());
+    packet.write_u32(options.sound_volume.to_bits());
+    packet.write_bytes(&[
+        options.main_bgm,
+        options.sound_effect,
+        options.full_screen,
+        options.show_mirror,
+        options.show_other_player_names,
+        options.show_outlines,
+        options.show_shadows,
+        options.high_level_effect,
+        options.motion_blur_effect,
+        options.motion_distortion_effect,
+        options.high_end_optimization,
+        options.auto_ready,
+        options.prop_description,
+        options.video_quality,
+        options.bgm_check,
+        options.sound_check,
+        options.show_hit_info,
+        options.auto_boost,
+        options.game_type,
+        options.set_ghost,
+        options.speed_type,
+        options.room_chat,
+        options.driving_chat,
+        options.show_all_player_hit_info,
+        options.show_team_color,
+        options.set_screen,
+    ]);
+}
+
 fn read_game_option_macros(
     reader: &mut PacketReader<'_>,
 ) -> Result<[String; GAME_OPTION_MACRO_COUNT], PacketError> {
@@ -1124,7 +1160,6 @@ fn read_game_option_macros(
     Ok(messages)
 }
 
-#[cfg(test)]
 fn write_game_option_macros(
     packet: &mut PacketWriter,
     messages: &[String; GAME_OPTION_MACRO_COUNT],
@@ -1893,12 +1928,15 @@ mod tests {
 
     #[test]
     fn game_option_reply_and_rider_snapshot_match_golden_layouts() {
-        let options_packet = serialize_pr_get_game_option(&fixture_options());
-        assert_eq!(options_packet.len(), 119);
-        assert_eq!(&options_packet[39..], &[0; 80]);
+        let empty_messages = std::array::from_fn(|_| String::new());
+        let options_packet =
+            serialize_pr_get_game_option(&fixture_options(), &empty_messages, &empty_messages)
+                .unwrap();
+        assert_eq!(options_packet.len(), 118);
+        assert_eq!(&options_packet[38..], &[0; 80]);
         assert_eq!(
             format!("{:X}", Sha256::digest(&options_packet)),
-            "27CD829FED00597AE4B0ECA9378D860FEA195FA7F608E0486133E66BE50D3B96"
+            "A9742257B1CD9FF16CEF7A086810C492B8EF5C3F74A2A7E2362EE0C400606677"
         );
 
         let rider = serialize_pr_get_rider(&PrGetRiderFields {
@@ -1923,6 +1961,28 @@ mod tests {
         assert_eq!(reader.read_u8().unwrap(), 0);
         assert_eq!(reader.read_utf16().unwrap(), "Rider");
         assert_eq!(reader.remaining().len(), 180);
+    }
+
+    #[test]
+    fn game_option_reply_restores_all_global_and_team_macros() {
+        let quick_messages = std::array::from_fn(|index| format!("일반 매크로 {index}"));
+        let team_quick_messages = std::array::from_fn(|index| format!("팀 매크로 {index}"));
+        let packet =
+            serialize_pr_get_game_option(&fixture_options(), &quick_messages, &team_quick_messages)
+                .unwrap();
+
+        let mut reader = PacketReader::new(&packet);
+        assert_eq!(
+            reader.read_u32().unwrap(),
+            adler32::packet_hash("PrGetGameOption")
+        );
+        reader
+            .read_bytes(34)
+            .expect("two floats and twenty-six reply option bytes are present");
+        for expected in quick_messages.iter().chain(&team_quick_messages) {
+            assert_eq!(reader.read_utf16().unwrap(), *expected);
+        }
+        assert!(reader.remaining().is_empty());
     }
 
     #[test]

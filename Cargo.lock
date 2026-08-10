@@ -2286,7 +2286,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-client-oracle"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "p5136-core",
  "p5136-server",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-connector"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "flate2",
@@ -2329,7 +2329,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "sha2",
  "thiserror 2.0.19",
@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-profile"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-rho5"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "flate2",
@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "p5136-core",

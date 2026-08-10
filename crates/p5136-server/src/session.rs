@@ -5591,7 +5591,14 @@ fn startup_response(
         StartupRequest::EquipTuning => startup::serialize_pr_equip_tuning_failure(),
         StartupRequest::VersusModeRankOne => startup::serialize_pr_versus_mode_rank_one(),
         StartupRequest::GetGameOption => {
-            startup::serialize_pr_get_game_option(&profile_game_options(&profile.game_option))
+            let quick_messages = profile_macro_messages(&profile.game_option.quick_messages);
+            let team_quick_messages =
+                profile_macro_messages(&profile.game_option.team_quick_messages);
+            startup::serialize_pr_get_game_option(
+                &profile_game_options(&profile.game_option),
+                &quick_messages,
+                &team_quick_messages,
+            )?
         }
         StartupRequest::SetPlaytimeEventTick => startup::serialize_pr_set_playtime_event_tick(),
         StartupRequest::ChapterInfo => startup::serialize_pr_chapter_info(),
@@ -5670,6 +5677,17 @@ fn profile_game_options(options: &p5136_profile::GameOptions) -> startup::GameOp
         set_screen: options.screen,
         hide_competitive_rank: options.hide_competitive_rank,
     }
+}
+
+fn profile_macro_messages(
+    messages: &std::collections::BTreeMap<i32, String>,
+) -> [String; startup::GAME_OPTION_MACRO_COUNT] {
+    std::array::from_fn(|index| {
+        messages
+            .get(&i32::try_from(index).expect("ten macro indexes fit in i32"))
+            .cloned()
+            .unwrap_or_default()
+    })
 }
 
 fn resolve_macro_chat_message(profile: &Profile, chat_type: i32, message_id: u8) -> String {
