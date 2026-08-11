@@ -1,6 +1,6 @@
 # P5136 client server-packet consumer audit
 
-Last updated: 2026-08-04
+Last updated: 2026-08-11
 
 ## Purpose and scope
 
@@ -108,6 +108,18 @@ name is insufficient:
 Consequently, exact byte consumption must be paired with branch fixtures for
 the supported speed/item individual/team stages.  A successful decode in one
 mode does not prove every consumer branch.
+
+The ordinary basic-AI path now has an exact codec boundary but remains short
+of a complete semantic oracle. `GrRequestBasicAiPacket` carries no difficulty;
+`GrSlotDataBasicAi` carries only six `i16` loadout fields plus team; and native
+`GrCommandStartPacket` reader/writer pairs at `0x0072D970`/`0x00730400` own a
+counted vector at object offset `0x120`. Element codecs
+`0x0071E720`/`0x0071F880` consume and emit six consecutive encoded floats.
+This proves server ownership and 24-byte element size, but not the original
+meaning names of all six fields or every `GoBasicAiKart` behavior branch. It
+is therefore documented separately in
+[AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md) and is not added to the 12
+independent outer-class count below.
 
 ## Current independent-oracle coverage
 

@@ -197,6 +197,7 @@ struct GuiInputs {
     game_executable: String,
     nickname: String,
     observer_mode: bool,
+    anonymous_league_mode: bool,
     server: String,
     configured_port: String,
     runner: GuiRunner,
@@ -214,6 +215,7 @@ impl Default for GuiInputs {
             game_executable: String::new(),
             nickname: "player".to_owned(),
             observer_mode: false,
+            anonymous_league_mode: false,
             server: Ipv4Addr::LOCALHOST.to_string(),
             configured_port: DEFAULT_CONFIGURED_PORT.to_string(),
             runner: GuiRunner::Auto,
@@ -272,12 +274,21 @@ impl GuiInputs {
         })?;
         let runner = self.runner(language)?;
 
+        let launcher_profile_role = match (self.observer_mode, self.anonymous_league_mode) {
+            (false, false) => p5136_connector::LauncherProfileRole::Regular,
+            (true, false) => p5136_connector::LauncherProfileRole::ObserverMaster,
+            (false, true) => p5136_connector::LauncherProfileRole::AnonymousLeague,
+            (true, true) => {
+                return Err(anyhow!(tr!(
+                    language,
+                    "옵저버 모드와 익명 리그 모드는 동시에 사용할 수 없습니다",
+                    "Observer mode and anonymous league mode cannot be enabled together",
+                    "观察者模式和匿名联赛模式不能同时启用"
+                )));
+            }
+        };
         let installation_options = InstallationOptions {
-            launcher_profile_role: if self.observer_mode {
-                p5136_connector::LauncherProfileRole::ObserverMaster
-            } else {
-                p5136_connector::LauncherProfileRole::Regular
-            },
+            launcher_profile_role,
             ..InstallationOptions::default()
         };
 
@@ -1557,21 +1568,45 @@ impl P5136GuiApp {
                 ui.end_row();
 
                 ui.label(tr!(language, "계정 역할", "Account role", "账号角色"));
-                ui.checkbox(
-                    &mut self.connector_inputs.observer_mode,
-                    tr!(
+                let observer_response = ui
+                    .checkbox(
+                        &mut self.connector_inputs.observer_mode,
+                        tr!(
+                            language,
+                            "옵저버 모드 (pmap 718)",
+                            "Observer mode (pmap 718)",
+                            "观察者模式（pmap 718）"
+                        ),
+                    )
+                    .on_hover_text(tr!(
                         language,
-                        "옵저버 모드 (pmap 718)",
-                        "Observer mode (pmap 718)",
-                        "观察者模式（pmap 718）"
-                    ),
-                )
-                .on_hover_text(tr!(
-                    language,
-                    "옵저버 방장 역할로 로그인합니다. 현재는 역할/슬롯 진입만 지원하며, 옵저버 채팅과 개인전 맵 교체는 패킷 캡처 후 보강할 예정입니다.",
-                    "Logs in as an observer room master. Role and slot entry are supported; observer chat and solo map replacement still need packet captures.",
-                    "以观察者房主身份登录。目前支持角色和槽位进入；观察者聊天及个人赛换图仍需抓包完善。"
-                ));
+                        "옵저버 방장 역할로 로그인합니다. 현재는 역할/슬롯 진입만 지원하며, 옵저버 채팅과 개인전 맵 교체는 패킷 캡처 후 보강할 예정입니다.",
+                        "Logs in as an observer room master. Role and slot entry are supported; observer chat and solo map replacement still need packet captures.",
+                        "以观察者房主身份登录。目前支持角色和槽位进入；观察者聊天及个人赛换图仍需抓包完善。"
+                    ));
+                if observer_response.changed() && self.connector_inputs.observer_mode {
+                    self.connector_inputs.anonymous_league_mode = false;
+                }
+
+                let league_response = ui
+                    .checkbox(
+                        &mut self.connector_inputs.anonymous_league_mode,
+                        tr!(
+                            language,
+                            "익명 리그 모드 (pmap 1798)",
+                            "Anonymous league mode (pmap 1798)",
+                            "匿名联赛模式（pmap 1798）"
+                        ),
+                    )
+                    .on_hover_text(tr!(
+                        language,
+                        "클라이언트의 익명 리그 계정 프리셋으로 로그인합니다. 확인된 경로에서는 상대 캐릭터·색상·장비를 공통 프리셋으로 바꾸지만 닉네임 익명화는 아직 서버가 수행하지 않습니다.",
+                        "Logs in with the client anonymous-league account preset. The recovered path replaces opponent character, color, and equipment with shared values; nickname anonymization is not yet server-projected.",
+                        "使用客户端匿名联赛账号预设登录。已确认的路径会将对手角色、颜色和装备替换为统一值；昵称匿名化目前尚未由服务器投影。"
+                    ));
+                if league_response.changed() && self.connector_inputs.anonymous_league_mode {
+                    self.connector_inputs.observer_mode = false;
+                }
                 ui.end_row();
 
                 ui.label(tr!(language, "서버 IPv4", "Server IPv4", "服务器 IPv4"));
@@ -4538,6 +4573,7 @@ mod tests {
             game_executable: "/games/Kart Rider/KartRider.custom.exe".to_owned(),
             nickname: "fixture-user".to_owned(),
             observer_mode: true,
+            anonymous_league_mode: false,
             server: "192.0.2.10".to_owned(),
             configured_port: "39311".to_owned(),
             runner: GuiRunner::Wine,
@@ -4580,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn observer_checkbox_maps_to_an_explicit_regular_or_observer_profile() {
+    fn account_role_checkboxes_map_to_explicit_profiles() {
         let mut inputs = fixture_inputs();
         inputs.observer_mode = false;
         assert_eq!(
@@ -4601,6 +4637,20 @@ mod tests {
                 .launcher_profile_role,
             p5136_connector::LauncherProfileRole::ObserverMaster
         );
+
+        inputs.observer_mode = false;
+        inputs.anonymous_league_mode = true;
+        assert_eq!(
+            inputs
+                .connector_plan(GuiLanguage::Korean)
+                .unwrap()
+                .installation_options
+                .launcher_profile_role,
+            p5136_connector::LauncherProfileRole::AnonymousLeague
+        );
+
+        inputs.observer_mode = true;
+        assert!(inputs.connector_plan(GuiLanguage::Korean).is_err());
     }
 
     #[test]

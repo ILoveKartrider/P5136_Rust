@@ -14,6 +14,7 @@ pub const ACCOUNT_DATA_PROFILE_NAME: &str = "AccountDataProfile";
 pub const P5136_REGULAR_PMAP: u32 = 0;
 pub const P5136_OBSERVER_PMAP: u32 = 590;
 pub const P5136_OBSERVER_MASTER_PMAP: u32 = 718;
+pub const P5136_ANONYMOUS_LEAGUE_PMAP: u32 = 1_798;
 pub const LEGACY_LOGIN_TOKEN: &str = "lppicekedkgjdqmncddpddecdogjppqhrghqifqjmjhcfiorecpmockdlngloorhqmekhrpdpejlgnclklrmddhoprcqknrfjolidjhndejiokfjoogqrgldgigqlhpp";
 pub const AGREEMENT_URL: &str = "https://www.tiancity.com/agreement";
 
@@ -26,8 +27,9 @@ pub struct PqLogin {
     /// Optional role selector supplied by the local connector profile.
     ///
     /// Stock launchers omit this node. The server accepts only the known
-    /// regular/observer presets and otherwise rejects the login rather than
-    /// exposing arbitrary permission-map bits to a client.
+    /// regular, observer, and recovered anonymous-league presets and otherwise
+    /// rejects the login rather than exposing arbitrary permission-map bits to
+    /// a client.
     pub requested_pmap: Option<u32>,
     pub trailing: Vec<u8>,
 }
@@ -128,7 +130,10 @@ pub fn parse_pq_login(packet: &[u8]) -> Result<PqLogin, LoginError> {
                     value: value.to_owned(),
                 })?;
             match pmap {
-                P5136_REGULAR_PMAP | P5136_OBSERVER_PMAP | P5136_OBSERVER_MASTER_PMAP => Ok(pmap),
+                P5136_REGULAR_PMAP
+                | P5136_OBSERVER_PMAP
+                | P5136_OBSERVER_MASTER_PMAP
+                | P5136_ANONYMOUS_LEAGUE_PMAP => Ok(pmap),
                 _ => Err(LoginError::UnsupportedRequestedPmap(pmap)),
             }
         })
@@ -217,8 +222,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        AGREEMENT_URL, LEGACY_LOGIN_TOKEN, LegacyTime, P5136_OBSERVER_MASTER_PMAP, PrLoginFields,
-        parse_pq_login, serialize_pr_cn_authen_login, serialize_pr_login,
+        AGREEMENT_URL, LEGACY_LOGIN_TOKEN, LegacyTime, P5136_ANONYMOUS_LEAGUE_PMAP,
+        P5136_OBSERVER_MASTER_PMAP, PrLoginFields, parse_pq_login, serialize_pr_cn_authen_login,
+        serialize_pr_login,
     };
     use crate::{
         adler32,
@@ -249,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_pmap_accepts_only_known_regular_and_observer_presets() {
+    fn connector_pmap_accepts_only_known_account_role_presets() {
         let observer = login_packet_with_pmap("718");
         assert_eq!(
             parse_pq_login(&observer).unwrap().requested_pmap,
@@ -258,6 +264,12 @@ mod tests {
 
         let regular = login_packet_with_pmap("0");
         assert_eq!(parse_pq_login(&regular).unwrap().requested_pmap, Some(0));
+
+        let anonymous_league = login_packet_with_pmap("1798");
+        assert_eq!(
+            parse_pq_login(&anonymous_league).unwrap().requested_pmap,
+            Some(P5136_ANONYMOUS_LEAGUE_PMAP)
+        );
 
         assert!(matches!(
             parse_pq_login(&login_packet_with_pmap("3130")),

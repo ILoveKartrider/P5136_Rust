@@ -136,8 +136,12 @@ struct ConnectArgs {
     username: String,
 
     /// Request the P5136 observer-master login role (pmap 718).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "anonymous_league")]
     observer: bool,
+
+    /// Request the recovered P5136 anonymous-league profile (pmap 1798).
+    #[arg(long, conflicts_with = "observer")]
+    anonymous_league: bool,
 
     #[arg(long, default_value = "127.0.0.1")]
     server: Ipv4Addr,
@@ -517,10 +521,11 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
         Duration::from_millis(args.timeout_ms)
     };
     let installation_options = InstallationOptions {
-        launcher_profile_role: if args.observer {
-            LauncherProfileRole::ObserverMaster
-        } else {
-            LauncherProfileRole::Regular
+        launcher_profile_role: match (args.observer, args.anonymous_league) {
+            (false, false) => LauncherProfileRole::Regular,
+            (true, false) => LauncherProfileRole::ObserverMaster,
+            (false, true) => LauncherProfileRole::AnonymousLeague,
+            (true, true) => unreachable!("clap rejects conflicting account-role flags"),
         },
         ..InstallationOptions::default()
     };
@@ -730,6 +735,7 @@ mod tests {
             game_exe: None,
             username: "dry-run-user".to_owned(),
             observer: false,
+            anonymous_league: false,
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
             runner: RunnerKind::Native,
@@ -754,6 +760,7 @@ mod tests {
             game_exe: None,
             username: "user".to_owned(),
             observer: false,
+            anonymous_league: false,
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
             runner: RunnerKind::Native,

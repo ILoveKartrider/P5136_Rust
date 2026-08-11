@@ -8,6 +8,8 @@ This is an independent Rust server and connector for the Korean KartRider P5136 
 
 This project is not yet a complete recreation of every commercial service feature. Its current goal is a stable multiplayer cycle for friends on the same LAN: create or join a room, start a race, drive, view results and the ceremony, and return to the room. Lucci, bonus items, team flags, and some event, social, and shop features are out of scope or receive limited responses.
 
+See the [documentation map](DOCUMENTATION.md) for the current roles of every user guide, porting ledger, client FSM, and packet, item, or AI audit.
+
 ## Quick start
 
 Build a release with Rust 1.94 or newer:
@@ -50,7 +52,7 @@ Kart item transforms such as Sebec V1 are also read from `item.rho` `transformBy
 
 ## Per-nickname kart inventory
 
-Expand **Inventory editor by nickname** to grant multiple copies of one kart with separate enhancement state.
+Expand **Inventory editor by nickname** to grant multiple copies of one kart with separate enhancement state. The operation is serialized through the same profile queue while the server is running; reconnect clients that were already online.
 
 1. Set the server's client path and profile storage path.
 2. Select **Load kart list** to read real names and IDs from client RHO data.
@@ -58,7 +60,7 @@ Expand **Inventory editor by nickname** to grant multiple copies of one kart wit
 4. Search with a name, a whitespace-normalized name, or a numeric ID such as `1410`, then select a result.
 5. Select **Add selected kart**. Repeating the action allocates another unique serial.
 
-Only karts with a resolved name, `BodyParam`, actual `model.1s`, and no test/dummy/NPC indicators are granted automatically as serial 1. In the stock P5136 data, 1,287 of 1,296 karts pass. Nine IDs (`199, 312, 323, 352, 657, 658, 659, 814, 886`) remain quarantined to avoid inventory-scroll crashes. If a quarantined kart is confirmed to work in the client, enter its exact numeric ID and select the **manual review** result. This adds only a serial-2-or-higher copy for that nickname; it does not re-enable the default serial-1 grant.
+Only karts with a resolved name, `BodyParam`, actual `model.1s`, and no test/dummy/NPC indicators are granted automatically as serial 1. In the stock P5136 data, 1,284 of 1,296 karts pass. Twelve IDs (`199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 814, 886`) remain quarantined to avoid inventory-scroll crashes. If a quarantined kart is confirmed to work in the client, enter its exact numeric ID and select the **manual review** result. This adds only a serial-2-or-higher copy for that nickname; it does not re-enable the default serial-1 grant.
 
 Additional copies are stored atomically in the nickname profile's `GrantedKarts`. They use the same `(kart_id, serial)` key as tune, plant, level, and parts data, so each copy can keep different upgrades. The allocator also reserves serials still referenced by `TuneData.json`, `PlantData.json`, `LevelData.json`, and `PartsData.json`. Missing profiles are created on the first grant. Reconnect a client that was already online.
 
@@ -68,7 +70,7 @@ The stock floater UI is supported for socket creation, activation kits, protecti
 
 When granting a kart in the GUI, use the existing **333 preset** or select each of the three vertically arranged Floater slots. The editor exposes 27 validated speed codes and all 20 RHO-verified item effects by their actual translated meanings. It rejects duplicate speed-effect families and duplicate item codes before creating the kart. **Apply grade 5** remains independent and can be combined with either Floater choice.
 
-The default kart inventory now includes the verified shared-model Boxter HT-S/HT-B/HT LE bodies and Kartneck/Kartneck X, whose historical internal names contain `dummyBox`. The nine remaining quarantined rows are four bodies without a Korean/default BodyParam and five explicit dummy/test bodies.
+The default inventory keeps Kartneck/Kartneck X as verified P5136 exceptions even though their historical internal names contain `dummyBox`. Boxter HT-S/HT-B/HT LE are quarantined again because their shared, incomplete model layout behaves like dummy data in the stock client. Four bodies without a Korean/default BodyParam and five explicit dummy/test bodies also remain excluded.
 
 The editor briefly acquires the same profile-root lease used by the server and revalidates the store identity. A server in another process therefore blocks offline edits. Live grants use the running server's serialized profile queue. If the client path changes after a catalog is loaded, the catalog and selection are invalidated and the canonical `Data` path is checked again immediately before a grant.
 
@@ -79,6 +81,12 @@ The server parses the client's RHO 1.0 `track_common.rho` read-only. It selects 
 Load the catalog in **Random-track settings** to edit each pool with checkboxes. **Select all**, **Clear all**, and **Client defaults** are available. **Apply to running server** replaces all pools atomically for the next race while leaving loading or active races unchanged. Empty custom pools are rejected before application or startup. Manual overrides require the configured client `Data` directory so IDs can be validated.
 
 Track and pool proper names come from the Korean client data and are therefore shown in the client's original language even when the GUI chrome is English or Simplified Chinese.
+
+## Static audit of AI difficulty
+
+The ordinary room add/remove-AI request contains no difficulty value. Actual AI behaviour parameters arrive in `GrCommandStartPacket` as six encoded floats per AI racer. The Rust server currently uses `[0.7, 2400, 2950, 1.5, 1000, 1500]` for every AI. The former C# launcher's Easy, Hard, and Hell labels were server presets that generated those six values from different ranges, not a native client enum.
+
+Different server-side presets can therefore be added without patching the client, but the original individual names of the six fields are not yet proven. v0.2.6 documents the static boundary in [the AI difficulty audit](AI_DIFFICULTY_AUDIT.md) instead of exposing speculative controls. Duel-mission difficulty and battle-mode AI are separate paths.
 
 ## S0–S8 room-title physics
 
@@ -94,11 +102,13 @@ S4 Infinite Booster
 
 Tokens are case-insensitive and use ASCII alphanumeric boundaries, so `TESTS1ROOM` and `S10` do not match. Updating the room title broadcasts the title and password immediately; the physics token applies at the next race start. Without a token, normal speed uses S7, item mode uses S8, and solo/team Infinite Booster uses the stock regular Infinite Booster preset S4. S6 remains a special event preset and is used only when explicitly written in the title. Each player receives a 235-byte race-start physics block composed from the room default and that player's kart, pet, and equipment.
 
-## Observer accounts
+## Account roles: observer and anonymous league
 
 Enable **Observer mode (pmap 718)** in the Connector tab to request the observer-master launcher profile. The server saves that nickname's `pmap` atomically; disabling the option and reconnecting restores the regular value `0`. As in C#, pmap 718 enters observer slots 8–15 while retaining the real `RoomMaster` role, so it can change maps and start races after regular riders join. This authority is not automatically given to the regular observer pmap 590.
 
 Observer chat uses `GrRiderEchoPacket` with observer IDs 8–15 and is sent to every other room member. Rust regression tests verify frame delivery to regular riders; a simultaneous observer/regular live capture is still useful for checking exact stock-client presentation.
+
+**Anonymous league mode (pmap 1798)** is a mutually exclusive connector checkbox. Static analysis resolves 1798 as `0x400|0x200|0x100|0x4|0x2`; in the recovered league-ready path it projects opponents to shared character, color, and equipment values. No client branch was found that rewrites the nickname string itself, so the server does not currently anonymize names. The extra bits may affect other UI paths, and 1798 is not treated as a simple alias for 1068. Disabling the option and reconnecting persists pmap 0 again.
 
 ## Teams and the next starting grid
 
@@ -149,6 +159,8 @@ p5136.exe connect `
   --username player1 `
   --server 192.168.1.10
 ```
+
+Add `--observer` for the observer-master profile or `--anonymous-league` for pmap 1798. The two flags conflict.
 
 macOS Sikarugir example:
 

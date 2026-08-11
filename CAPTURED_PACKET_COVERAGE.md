@@ -1,6 +1,6 @@
 # Retained P5136 packet-trace coverage
 
-Last updated: 2026-08-05
+Last updated: 2026-08-11
 
 This ledger records the read-only audit of
 `C:\Users\drash\Documents\kartrider\KartRider_5136\logs`. The capture files
@@ -94,6 +94,15 @@ race paths, but they are now covered as well.
   that disconnected the client at race completion.
 
 ## Additional static-audit handlers
+
+- The retained corpus covers `GrRequestBasicAiPacket` add/remove requests but
+  does not contain a controlled Easy/Hard/Hell comparison. Static client
+  codecs close the ownership boundary instead: the request is only
+  `player_id:u32 + option:u8`, the 13-byte AI slot body is loadout/team, and
+  `GrCommandStartPacket` owns one counted 24-byte/six-float spec per AI. The
+  current fixed Rust values are therefore compatible but do not constitute a
+  capture-verified difficulty preset. See
+  [AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md).
 
 - `PcStartMatching` now validates its exact 32-byte seven-word session/auth
   envelope and returns the complete seven-byte `PcMatchingFound` empty/create

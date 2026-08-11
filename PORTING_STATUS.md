@@ -1,9 +1,51 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
+
+## 2026-08-11 v0.2.6 stage ownership, account presets, and documentation
+
+- Fixed the C#-era ghost-room path where a room owner entered MyRoom or another
+  client page without first sending `ChLeaveRoomPacket`. Successful MyRoom
+  entry now atomically removes the authenticated generation from its protocol
+  room, deletes an empty Lobby/Loading room, and refreshes remaining peers with
+  the authoritative `GrSlotDataPacket`.
+- Shop, Magic Hat, Club, Rider School, Time Attack, Challenger, Scenario,
+  Single Player, and Matching entry now share one generation-authorized World
+  transition. It removes stale protocol-room and MyRoom memberships together;
+  all peer publications reserve bounded queue capacity before mutation, so a
+  failed fan-out cannot commit only half of the scene change. Passive startup
+  and inventory queries remain non-transitional.
+- Added regressions for a sole owner, owner reassignment/slot refresh, peer
+  backpressure rollback, and repair of a legacy dual-membership state.
+- Re-quarantined Boxter HT-S/HT-B/HT LE (IDs 744/745/746). Their shared,
+  incomplete `boxter7` presentation behaves as dummy data in the stock client.
+  Kartneck/Kartneck X (795/1167) remain the only verified `dummyBox`-named
+  exceptions.
+- Static P5136 inspection confirms both Shop and Magic Hat entry requests are
+  base-only 16-byte packet objects and therefore hash-only four-byte logical
+  packets. The separate account audit also corrects pmap 1798: `0x706`
+  contains the anonymous-loadout bit `0x400` and not the suppressor `0x40`,
+  although its additional bits have other client effects.
+- Added a mutually exclusive connector checkbox and CLI `--anonymous-league`
+  flag for pmap 1798. Login parsing remains fail-closed: only regular 0,
+  observer 590, observer-master 718, and anonymous-league 1798 are accepted.
+  Explicit role selection is saved through the nickname profile lane and
+  survives channel reload. The recovered client projection changes shared
+  character/color/equipment values; nickname anonymization is not claimed.
+- Audited ordinary room-AI difficulty independently of the old C# GUI labels.
+  `GrRequestBasicAiPacket` contains only `player_id:u32 + option:u8`, and the
+  13-byte slot body contains loadout/team only. Native
+  `GrCommandStartPacket` codecs at `0x0072D970`/`0x00730400` carry a counted
+  vector of six-float, 24-byte AI specs. Rust currently freezes the same
+  `[0.7, 2400, 2950, 1.5, 1000, 1500]` spec for every AI; no speculative GUI
+  selector was added. See [AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md).
+- Synchronized all three user READMEs and added [DOCUMENTATION.md](DOCUMENTATION.md)
+  as the complete guide/ledger index. The translated inventory documentation
+  now matches the real 1,284/1,296 catalog admission and the re-quarantined
+  Boxter IDs 744/745/746.
 
 ## 2026-08-10 v0.2.5 RHO abilities, inventory, licenses, and offline profiles
 
@@ -41,10 +83,11 @@ short feature ledger is in [PORTING.md](PORTING.md).
   reaction reports therefore remain byte-exact client-owned relay paths. The
   older C# `AddItemSkill`/`AttackedSkill` extra award packets are intentionally
   not ported because they can double-grant an already client-resolved effect.
-- Audited all 14 quarantined kart rows. Restored Kartneck/Kartneck X, whose
-  released internal names contain `dummyBox`, and the three Boxter HT variants
-  that share the `boxter7` model. Four rows lacking a Korean/default BodyParam
-  and five explicit dummy/test rows remain excluded from implicit grants.
+- Audited all 14 originally quarantined kart rows. Kartneck/Kartneck X remain
+  restored because their released internal names contain `dummyBox`; the
+  three Boxter HT variants that share the incomplete `boxter7` presentation
+  are quarantined again. Four rows lacking a Korean/default BodyParam and five
+  explicit dummy/test rows also remain excluded from implicit grants.
 
 ## 2026-08-05 v0.1.5 room control and customization compatibility
 
@@ -3117,7 +3160,8 @@ These items prevent a "port complete" claim.
   transforms total). It requires the 1450/1453 identity, slot-capacity,
   chicken-gold transform, and special-booster sentinels before publication.
 - The opt-in stock-client test now verifies the direct-RHO cardinalities,
-  sentinels, exact 1,287 automatic kart grants, and exact 9-ID quarantine set.
+  sentinels, exact 1,284 automatic kart grants, and exact 12-ID quarantine set
+  after retaining Kartneck/Kartneck X and re-quarantining Boxter 744/745/746.
   The old XML remains a compatibility-only `ServerConfig` input, not a runtime
   prerequisite or generated artifact; blanket C# inventory publication is no
   longer treated as the desired semantic oracle.

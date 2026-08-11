@@ -1,5 +1,8 @@
 # P5136 item gameplay-reference coverage
 
+Last reviewed: 2026-08-11. This item ledger is indexed with the other protocol
+and implementation documents in [DOCUMENTATION.md](DOCUMENTATION.md).
+
 ## Boundary
 
 This ledger covers every one of the 54 item headings in the supplied Korean

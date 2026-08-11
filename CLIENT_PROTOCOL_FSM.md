@@ -115,8 +115,37 @@ Scene
                                               -> AwaitingResult
                                               -> Podium
                                               -> local final-stage scheduler
-                                           -> RoomLobby (`GameReadyStage`)
+                                              -> RoomLobby (`GameReadyStage`)
 ```
+
+### Server-owned UI-stage exclusivity
+
+The executable oracle above intentionally does not model every UI-only page.
+The production World actor nevertheless has to prevent one authenticated
+generation from retaining two server-owned memberships while the client moves
+between pages. Its authoritative membership projection is:
+
+```text
+ProtocolRoom  -- MyRoom entry ------------> MyRoom
+ProtocolRoom  -- validated UI/solo entry --> No room membership
+MyRoom        -- validated UI/solo entry --> No MyRoom membership
+```
+
+Validated UI/solo entry currently covers Shop, Magic Hat, Club, Rider School,
+Time Attack, Challenger, Scenario, Single Player, and Matching. The first two
+use their exact hash-only entry codecs; Club uses its parsed init request; the
+remaining scenes use their parsed data/start envelopes. Passive inventory,
+cash, event-timer, and cosmetic queries are deliberately not transition
+markers.
+
+MyRoom admission first plans removal from a stale protocol room. Every
+remaining room peer receives the post-removal `GrSlotDataPacket`; a sole-owner
+Lobby/Loading room is deleted and its ID becomes reusable. Stateless UI/solo
+entry plans both a MyRoom leave and protocol-room leave. All relevant peer
+publications reserve bounded outbound capacity before either membership is
+mutated, so backpressure cannot leave half of a cross-stage transition
+committed. The generation-authorized World command also prevents an old TCP
+owner from clearing a replacement session's room state.
 
 ### Login and migration
 
@@ -125,6 +154,11 @@ Scene
 - Successful ordinary login enters rider bootstrap. The complete inventory
   preload precedes `PrGetRider`; `PrGetRider` is the FSM milestone used to
   enter the menu.
+- Connector account presets are login attributes, not separate scenes. The
+  fail-closed set is regular pmap 0, observer 590, observer-master 718, and
+  anonymous-league 1798. pmap 1798 activates a recovered shared
+  character/color/equipment projection in the league-ready path but does not
+  prove nickname rewriting or create a different server FSM.
 - A normal `PrChannelSwitch` creates a migration epoch. The client reconnects,
   consumes another first message, sends `PqChannelMovein`, and becomes
   authenticated again on `PrChannelMoveIn`.
@@ -146,6 +180,11 @@ deserve a scene state.
   88, copies the track at packet offset 300, and applies the remaining start
   structures. Therefore a prior standalone snapshot is useful evidence but
   is not a valid native start guard.
+- Ordinary basic-AI difficulty is frozen inside that command-start snapshot,
+  not selected by `GrRequestBasicAiPacket`. Each AI contributes one 24-byte,
+  six-float spec in the counted vector at packet-object offset `0x120`; the
+  add/remove request contains only `player_id:u32 + option:u8`. Difficulty
+  selection therefore cannot be modeled as a separate lobby transition.
 - Standalone lobby snapshots are rejected by the oracle after Loading begins.
   This captures the stale cross-scene `GrSlotDataPacket` failure already fixed
   in the server.
@@ -370,6 +409,8 @@ Recovered with strong static evidence:
   special final/start stage;
 - `GrCommandStartPacket` as the room-to-loading trigger and its embedded
   snapshot application;
+- the exact six-float basic-AI spec element codec and absence of a difficulty
+  field in the room add/remove request; individual float meanings remain open;
 - ordinary-mode `GameControl` dispatch for states 1, 3, and 4;
 - the exact hash-only `PqStartCollectRecord` request, five-byte
   `PrStartCollectRecord` reply, raw nonzero truthiness, and guarded

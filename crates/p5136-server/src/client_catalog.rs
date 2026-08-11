@@ -86,11 +86,12 @@ const VERIFIED_ITEM_SYMBOLS: &[(&str, i16)] = &[
 /// Playable Korean shop bodies whose stock resource layout intentionally
 /// fails the generic one-folder model heuristic.
 ///
-/// The three Boxter variants carry their own P5136 `BodyParam` but share the
-/// `boxter7` model folder. Kartneck's historical internal names contain
-/// `dummyBox`, despite both KR parameter files explicitly identifying the
-/// released Kartneck bodies and shipping complete model resources.
-const VERIFIED_PLAYABLE_KART_EXCEPTIONS: &[u16] = &[744, 745, 746, 795, 1_167];
+/// Kartneck's historical internal names contain `dummyBox`, despite both KR
+/// parameter files explicitly identifying the released Kartneck bodies and
+/// shipping complete model resources. The Boxter HT variants are deliberately
+/// not exceptions: their shared/incomplete model layout behaves like dummy
+/// data in the stock Korean client and remains quarantined.
+const VERIFIED_PLAYABLE_KART_EXCEPTIONS: &[u16] = &[795, 1_167];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientKartCatalogStats {
@@ -1555,8 +1556,8 @@ mod tests {
         assert_eq!(stats.inventory_items, 6_929);
         assert_eq!(stats.inventory_categories, 65);
         assert_eq!(stats.inventory_karts, 1_296);
-        assert_eq!(stats.auto_grant_karts, 1_287);
-        assert_eq!(stats.quarantined_karts, 9);
+        assert_eq!(stats.auto_grant_karts, 1_284);
+        assert_eq!(stats.quarantined_karts, 12);
         assert_eq!(stats.x_parts_karts, 251);
         assert_eq!(stats.transform_rules, 626);
         assert_eq!(stats.item_symbols, 73);
@@ -1618,10 +1619,13 @@ mod tests {
                 .filter(|item| !item.auto_grant)
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![199, 312, 323, 352, 657, 658, 659, 814, 886]
+            vec![199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 814, 886]
         );
-        for restored_id in [744, 745, 746, 795, 1_167] {
+        for restored_id in [795, 1_167] {
             assert!(loaded.catalog().grants_item(3, restored_id));
+        }
+        for quarantined_boxter_id in [744, 745, 746] {
+            assert!(!loaded.catalog().grants_item(3, quarantined_boxter_id));
         }
     }
 }

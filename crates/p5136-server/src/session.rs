@@ -204,7 +204,7 @@ use crate::{
         ProfilePresentationWriteReceipt,
     },
     world::{
-        AdmittedWorldHandle, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
+        AdmittedWorldHandle, ClientStage, LobbyCommandPayload, LobbyError, MyRoomCommandPayload,
         MyRoomEntryInput, MyRoomOwnerItemLoad, MyRoomPeerCommandPayload, MyRoomSessionRole,
         OutboundBatch, ProfiledMyRoomOwnerLoad, RaceCommandOutcome, RaceCommandPayload,
         RoomCommandPayload, RoomKartPhysicsVariants, RoomParticipant, StartRoomPlan,
@@ -481,6 +481,13 @@ pub enum LoginSessionError {
 
     #[error("PqFinishTimeAttack arrived without an active, unfinished time-attack start")]
     TimeAttackFinishWithoutStart,
+
+    #[error("client-stage marker {name} has logical length {actual}; expected {expected}")]
+    InvalidStageMarkerLength {
+        name: &'static str,
+        actual: usize,
+        expected: usize,
+    },
 
     #[error("time-attack Lucci reward overflowed the profile balance")]
     TimeAttackLucciOverflow,
@@ -2919,7 +2926,7 @@ async fn dispatch_packet_admitted(
     }
 
     if is_startup_noop(hash) {
-        return handle_startup_noop(&world, context).await;
+        return handle_startup_noop(&world, hash, packet, context).await;
     }
 
     consume_unknown_identity_packet(&world, hash, packet, context).await
@@ -2946,10 +2953,31 @@ async fn consume_unknown_identity_packet(
 
 async fn handle_startup_noop(
     world: &AdmittedWorldHandle<'_>,
+    hash: u32,
+    packet: &[u8],
     context: &SessionContext,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let identity = world.authorize_identity().await?;
     let _ = context.profile_for(&identity)?;
+    let stage = match hash {
+        hash if hash == adler32::packet_hash("PqEnterShopPacket") => {
+            Some((ClientStage::Shop, "PqEnterShopPacket"))
+        }
+        hash if hash == adler32::packet_hash("PqEnterMagicHatPacket") => {
+            Some((ClientStage::MagicHat, "PqEnterMagicHatPacket"))
+        }
+        _ => None,
+    };
+    if let Some((stage, name)) = stage {
+        if packet.len() != size_of::<u32>() {
+            return Err(LoginSessionError::InvalidStageMarkerLength {
+                name,
+                actual: packet.len(),
+                expected: size_of::<u32>(),
+            });
+        }
+        world.enter_client_stage(stage).await?;
+    }
     Ok(Vec::new())
 }
 
@@ -2998,6 +3026,7 @@ async fn handle_single_player_request(
         SinglePlayerRequest::StartSingle(request) => {
             let identity = world.authorize_identity().await?;
             let _ = context.bound_profile_for(&identity)?;
+            world.enter_client_stage(ClientStage::SinglePlayer).await?;
             tracing::trace!(
                 nickname = %identity.nickname,
                 start_ticks = request.start_ticks,
@@ -3061,6 +3090,7 @@ async fn handle_start_challenger(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let identity = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&identity)?;
+    world.enter_client_stage(ClientStage::Challenger).await?;
     if let Some(previous) = context.begin_challenger(request) {
         tracing::debug!(
             nickname = %identity.nickname,
@@ -3128,6 +3158,7 @@ async fn handle_start_time_attack(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let before = world.authorize_identity().await?;
     let equipment = context.equipment_for(&before)?.clone();
+    world.enter_client_stage(ClientStage::TimeAttack).await?;
     let track = if request.requested_track == 0 {
         P5136_FALLBACK_TRACK_ID
     } else {
@@ -3353,6 +3384,7 @@ async fn handle_matching_request(
     let _ = context.bound_profile_for(&identity)?;
     match request {
         MatchingRequest::Start(_) => {
+            world.enter_client_stage(ClientStage::Matching).await?;
             tracing::debug!(
                 nickname = %identity.nickname,
                 "accepted P5136 matching envelope; returning complete empty-match create state"
@@ -3400,6 +3432,7 @@ async fn handle_scenario_request(
     let start = parse_start_scenario_request(packet)?;
     let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
+    world.enter_client_stage(ClientStage::Scenario).await?;
     let admission = profiles
         .admit_for_operation(world.operation(), &before.nickname, "update scenario type")
         .await?;
@@ -3608,6 +3641,9 @@ async fn handle_club_query(
     let request = parse_club_query_request(packet)?;
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
+    if request.kind() == ClubQueryRequest::InitClub {
+        world.enter_client_stage(ClientStage::Club).await?;
+    }
 
     // There is no authoritative club repository yet. Membership identity can
     // still be projected from the authenticated profile without mutation or
@@ -5773,8 +5809,33 @@ async fn handle_startup_request(
         _ => {}
     }
 
+    let client_stage = match request {
+        StartupRequest::GetDuelMissionBulk => Some(ClientStage::Challenger),
+        StartupRequest::RiderSchoolData
+        | StartupRequest::RiderSchoolProgress
+        | StartupRequest::RiderSchoolExpiredCheck
+        | StartupRequest::StartRiderSchool => Some(ClientStage::RiderSchool),
+        _ => None,
+    };
+    if matches!(
+        request,
+        StartupRequest::GetDuelMissionBulk
+            | StartupRequest::RiderSchoolData
+            | StartupRequest::RiderSchoolProgress
+    ) && packet.len() != size_of::<u32>()
+    {
+        return Err(LoginSessionError::InvalidStageMarkerLength {
+            name: request.request_name(),
+            actual: packet.len(),
+            expected: size_of::<u32>(),
+        });
+    }
+
     let identity = world.authorize_identity().await?;
     let profile = context.profile_for(&identity)?;
+    if let Some(stage) = client_stage {
+        world.enter_client_stage(stage).await?;
+    }
     Ok(startup_response(config, request, profile)?
         .into_iter()
         .collect())
@@ -5931,6 +5992,7 @@ async fn get_track_rank_admitted(
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let before = world.authorize_identity().await?;
     let _ = context.bound_profile_for(&before)?;
+    world.enter_client_stage(ClientStage::TimeAttack).await?;
     let admission = profiles
         .admit_for_operation(world.operation(), &before.nickname, "select track rank")
         .await?;
@@ -7318,6 +7380,39 @@ mod tests {
             .unwrap();
         assert_eq!(regular.profile.rider.pmap, 0);
         drop(regular_lane);
+
+        let league_admission = profiles
+            .admit("Caster", "test anonymous league connector role")
+            .await
+            .unwrap();
+        let (league, _equipment, league_lane) = profiles
+            .load_with_equipment_and_pmap(
+                "Caster".to_owned(),
+                true,
+                Some(p5136_core::login::P5136_ANONYMOUS_LEAGUE_PMAP),
+                league_admission,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            league.profile.rider.pmap,
+            p5136_core::login::P5136_ANONYMOUS_LEAGUE_PMAP
+        );
+        drop(league_lane);
+
+        let league_reload_admission = profiles
+            .admit("Caster", "test anonymous league channel reload")
+            .await
+            .unwrap();
+        let (league_reloaded, _equipment, league_reload_lane) = profiles
+            .load_with_equipment("Caster".to_owned(), true, league_reload_admission)
+            .await
+            .unwrap();
+        assert_eq!(
+            league_reloaded.profile.rider.pmap,
+            p5136_core::login::P5136_ANONYMOUS_LEAGUE_PMAP
+        );
+        drop(league_reload_lane);
 
         profile_runtime.shutdown().await.unwrap();
     }

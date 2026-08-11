@@ -13,3 +13,7 @@ contain no captured account or authentication data.
 Serializer-produced packets remain as differential tests, but these fixtures
 are the primary evidence that the independent reader is not merely agreeing
 with the production writer.
+
+The current outer-consumer count, evidence grades, and remaining fixture order
+are maintained in the repository-level
+[client consumer audit](../../../../CLIENT_CONSUMER_AUDIT.md).

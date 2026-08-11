@@ -1,12 +1,15 @@
 use std::net::SocketAddrV4;
 
-use p5136_core::login::{P5136_OBSERVER_MASTER_PMAP, P5136_REGULAR_PMAP};
+use p5136_core::login::{
+    P5136_ANONYMOUS_LEAGUE_PMAP, P5136_OBSERVER_MASTER_PMAP, P5136_REGULAR_PMAP,
+};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherProfileRole {
     #[default]
     Regular,
     ObserverMaster,
+    AnonymousLeague,
 }
 
 impl LauncherProfileRole {
@@ -15,6 +18,7 @@ impl LauncherProfileRole {
         match self {
             Self::Regular => P5136_REGULAR_PMAP,
             Self::ObserverMaster => P5136_OBSERVER_MASTER_PMAP,
+            Self::AnonymousLeague => P5136_ANONYMOUS_LEAGUE_PMAP,
         }
     }
 }
@@ -103,6 +107,18 @@ mod tests {
               <profile>\r\n\
               <username>Caster</username>\r\n\
               <pmap>718</pmap>\r\n\
+              </profile>"
+        );
+    }
+
+    #[test]
+    fn anonymous_league_profile_requests_only_the_recovered_pmap() {
+        assert_eq!(
+            launcher_profile_xml_for_role("League", LauncherProfileRole::AnonymousLeague),
+            b"<?xml version='1.0' encoding='UTF-16'?>\r\n\
+              <profile>\r\n\
+              <username>League</username>\r\n\
+              <pmap>1798</pmap>\r\n\
               </profile>"
         );
     }

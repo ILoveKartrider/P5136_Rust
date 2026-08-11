@@ -45,6 +45,10 @@ been demonstrated.
 - [x] native Windows UAC launch specification
 - [x] Wine, CrossOver, and preconfigured macOS Sikarugir wrapper launch specifications
 - [x] no-argument Server/Connector GUI and equivalent CLI
+- [x] mutually exclusive connector account presets for regular pmap 0,
+  observer-master pmap 718, and recovered anonymous-league pmap 1798; the
+  server accepts only those presets plus legacy observer pmap 590 and persists
+  explicit connector overrides atomically
 - [x] GUI-configurable server lifecycle with explicit graceful/forced shutdown
 - [x] GUI item-probability rank/table editor with client archive, portable XML,
   automatic-client, and bounded-fallback sources; automatic rows require an
@@ -77,6 +81,9 @@ been demonstrated.
 - [x] BML-backed `PqLogin` parser and startup response pairing
 - [x] duplicate nickname rejection and stable user number
 - [x] exact session generation and stale-owner rejection
+- [x] generation-authorized, atomic cross-stage membership cleanup for MyRoom,
+  Shop, Magic Hat, Club, Rider School, Time Attack, Challenger, Scenario,
+  Single Player, and Matching, including remaining-room slot refreshes
 - [x] channel-switch permit and `PqChannelMovein` transfer
 - [x] C#-compatible local `PqClubChannelSwitch` UI hand-off (`mode=1`,
   channel 13, zero endpoint) without invalidating the authenticated session
@@ -109,6 +116,11 @@ been demonstrated.
 - [x] team-room admission balances active human/AI counts and assigns matching
   blue/red physical slot ranges, choosing blue only when counts are tied
 - [x] bounded AI slot/wire primitives
+- [x] exact ordinary-room AI difficulty boundary: add/remove requests carry no
+  difficulty, while `GrCommandStartPacket` carries one counted six-float spec
+  per frozen AI racer; the current Rust policy is a single fixed spec and the
+  six original field names remain explicitly unresolved (see
+  [AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md))
 - [x] C#-compatible frozen-roster loading handshake: `GameControl(state=0)`
   arms, successful UDP time-sync marks ready, then timeout and ordered start
 - [x] generation-bound Game/P2P endpoint registration, authenticated runtime
@@ -398,6 +410,10 @@ been demonstrated.
   race control, settlement, podium ordering, leave, and disconnect; native
   state effects and deployed-order assumptions are recorded separately in
   [CLIENT_PROTOCOL_FSM.md](CLIENT_PROTOCOL_FSM.md)
+- [x] repository-wide documentation map and synchronized Korean/English/
+  Simplified-Chinese user guides, including the pmap 1798 limitation, current
+  1,284/1,296 kart quarantine count, stage-exit ownership, and AI difficulty
+  audit; see [DOCUMENTATION.md](DOCUMENTATION.md)
 - [x] executable independent `ItemClientFsm` for the fixed 149-branch item
   consumer corpus (74 local, 70 deferred, zero immediate, 5 unknown), plus
   the 15 later boss/controller/Course branches; lifecycle observation,

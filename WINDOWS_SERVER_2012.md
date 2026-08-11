@@ -1,5 +1,8 @@
 # Windows Server 2012 x64 Compatibility Build Guide
 
+Last reviewed: 2026-08-11. See [the documentation map](DOCUMENTATION.md) for
+the rest of the user and engineering guides.
+
 If any translation sounds unnatural or is incorrect, please [open an issue](https://github.com/ILoveKartrider/P5136_Rust/issues) or submit a pull request.
 
 ## Summary
@@ -12,8 +15,8 @@ This procedure is intended to improve compatibility; it does not guarantee that 
 
 The current official baseline for the default `x86_64-pc-windows-msvc` target is Windows 10 and Windows Server 2016 or newer. The current MSVC dynamic runtime officially supports the same range, so the regular release may fail during loader or CRT initialization on Windows Server 2012.
 
-- Rust Windows MSVC requirements: <https://doc.rust-lang.org/rustc/platform-support/windows-msvc.html>
-- Microsoft Visual C++ Redistributable requirements: <https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170>
+- [Rust Windows MSVC requirements](https://doc.rust-lang.org/rustc/platform-support/windows-msvc.html)
+- [Microsoft Visual C++ Redistributable requirements](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
 
 If only the GUI fails, also investigate Server Core versus Desktop Experience, the graphics driver, OpenGL support, and `winit` window initialization.
 
@@ -25,7 +28,10 @@ If only the GUI fails, also investigate Server Core versus Desktop Experience, t
 - Do not replace the regular release with the compatibility build. Publish it as a separately named release asset.
 - Do not add a global `.cargo` target configuration or compatibility-specific `cfg` branches to the source.
 
-`x86_64-win7-windows-msvc` is recognized as a Tier 3 target by Rust 1.94, but a precompiled standard library cannot be installed with `rustup target add`. It therefore requires nightly Rust, `build-std`, and the `rust-src` component.
+`x86_64-win7-windows-msvc` is a Tier 3 target, and Rust does not ship its
+precompiled standard library. It therefore requires a locally built standard
+library, such as nightly Rust with `build-std` and the `rust-src` component.
+The target is not covered by normal Rust release guarantees.
 
 ## Build commands
 

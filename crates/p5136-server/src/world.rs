@@ -98,11 +98,12 @@ use crate::main_emblem_persistence::{
 use crate::messenger_hub::MessengerIdentity;
 use crate::messenger_runtime::{MessengerServiceError, MessengerServiceHandle};
 use crate::myroom_hub::{
-    EnterOutcome as MyRoomEnterOutcome, MyRoomCommitError, MyRoomDisconnectOutcome, MyRoomHub,
-    MyRoomHubError, MyRoomOwner, MyRoomOwnerItemPlan, MyRoomOwnerResourcePlan, MyRoomParticipant,
-    MyRoomPresentOwnerPlan, MyRoomProfilePresentation, MyRoomRevision, MyRoomTransition,
-    MyRoomVisitorEntryAvailability, MyRoomWirePlan, MyRoomWireProjection,
-    MyRoomWireProjectionError, RoomEffect as MyRoomEffect, RoomPublication as MyRoomPublication,
+    EnterOutcome as MyRoomEnterOutcome, LeaveEffects as MyRoomLeaveEffects, MyRoomCommitError,
+    MyRoomDisconnectOutcome, MyRoomHub, MyRoomHubError, MyRoomOwner, MyRoomOwnerItemPlan,
+    MyRoomOwnerResourcePlan, MyRoomParticipant, MyRoomPresentOwnerPlan, MyRoomProfilePresentation,
+    MyRoomRevision, MyRoomTransition, MyRoomVisitorEntryAvailability, MyRoomWirePlan,
+    MyRoomWireProjection, MyRoomWireProjectionError, RoomEffect as MyRoomEffect,
+    RoomPublication as MyRoomPublication,
 };
 use crate::myroom_persistence::{
     MigrationAcknowledgement, MigrationProfileCompletion, MyRoomCompletionBridge,
@@ -1116,6 +1117,25 @@ pub(crate) enum RoomCommandPayload {
     FirstState,
 }
 
+/// A client scene which cannot simultaneously own a multiplayer-room or
+/// `MyRoom` membership.
+///
+/// Only scenes with an evidence-backed entry request are represented here.
+/// Cosmetic tabs and passive startup queries remain in the channel scene and
+/// must not evict a room member merely because they share inventory packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientStage {
+    Shop,
+    MagicHat,
+    Club,
+    RiderSchool,
+    TimeAttack,
+    Challenger,
+    Scenario,
+    SinglePlayer,
+    Matching,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RoomError {
     #[error("room {0} does not exist")]
@@ -1869,6 +1889,9 @@ pub enum WorldError {
     #[error("MyRoom command could not reserve the outbound queue for session {session:?}")]
     MyRoomCommandOutboundUnavailable { session: SessionId },
 
+    #[error("client-stage transition could not reserve the outbound queue for session {session:?}")]
+    ClientStageOutboundUnavailable { session: SessionId },
+
     #[error("MyRoom entry input no longer belongs to session {session:?}")]
     MyRoomEntryIdentityStale { session: SessionId },
 
@@ -1897,8 +1920,8 @@ pub enum WorldError {
     #[error("channel migration peer publication queue is unavailable for session {session:?}")]
     MigrationPublicationUnavailable { session: SessionId },
 
-    #[error("channel migration protocol-room state is inconsistent for user {user_no}")]
-    MigrationProtocolRoomInconsistent { user_no: u32 },
+    #[error("protocol-room transition state is inconsistent for user {user_no}")]
+    ProtocolRoomTransitionInconsistent { user_no: u32 },
 
     #[error("channel migration lifecycle queue could not reserve commit capacity")]
     MigrationCommitCapacityUnavailable,
@@ -2399,6 +2422,11 @@ enum WorldCommand {
     RoomProtocol {
         session: SessionId,
         payload: Box<RoomCommandPayload>,
+        reply: oneshot::Sender<Result<(), WorldError>>,
+    },
+    EnterClientStage {
+        session: SessionId,
+        stage: ClientStage,
         reply: oneshot::Sender<Result<(), WorldError>>,
     },
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3556,6 +3584,17 @@ impl AdmittedWorldHandle<'_> {
         response.await.map_err(|_| WorldError::Stopped)?
     }
 
+    pub(crate) async fn enter_client_stage(&self, stage: ClientStage) -> Result<(), WorldError> {
+        let (reply, response) = oneshot::channel();
+        self.send(WorldCommand::EnterClientStage {
+            session: self.session_id(),
+            stage,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| WorldError::Stopped)?
+    }
+
     /// Updates the caller's cached race-start physics only while it is still
     /// safe to affect the next race.  `false` means the caller is not in a
     /// lobby room (or its room has already moved past the lobby phase).
@@ -4405,7 +4444,7 @@ impl ProtocolMigrationDelta {
         if protocol_room_by_user.get(&self.user_no) != Some(&self.room_id)
             || protocol_rooms.get(&self.room_id) != Some(&self.expected_room)
         {
-            return Err(WorldError::MigrationProtocolRoomInconsistent {
+            return Err(WorldError::ProtocolRoomTransitionInconsistent {
                 user_no: self.user_no.get(),
             });
         }
@@ -6177,11 +6216,16 @@ impl World {
         )
         .map_err(MyRoomLifecycleError::from)?;
         let requester = identity.clone();
-        self.commit_myroom_command_transition(transition, move |world, outcome| {
-            world.myroom_entry_deliveries(&requester, enter_reply, outcome)
-        })?;
+        let (protocol_delta, mut deliveries) = self.plan_protocol_room_exit(identity.user_no)?;
+        deliveries.extend(self.myroom_entry_deliveries(
+            &requester,
+            enter_reply,
+            transition.outcome(),
+        )?);
+        self.commit_myroom_entry_stage_transition(transition, protocol_delta, deliveries)?;
         self.pending_myroom_password_grants
             .remove(&identity.user_no);
+        self.debug_assert_invariants();
         Ok(())
     }
 
@@ -9729,6 +9773,50 @@ impl World {
         }
     }
 
+    fn enter_client_stage(
+        &mut self,
+        session: SessionId,
+        stage: ClientStage,
+    ) -> Result<(), WorldOperationError> {
+        let identity = self.authorize_session_operation(session)?;
+        let myroom_transition = if self
+            .myroom
+            .membership_if_member(&identity)
+            .map_err(|source| myroom_hub_error("client-stage membership lookup", source))?
+            .is_some()
+        {
+            Some(
+                self.myroom
+                    .leave(&identity)
+                    .map_err(|source| myroom_hub_error("client-stage MyRoom exit", source))?,
+            )
+        } else {
+            None
+        };
+        let (protocol_delta, mut deliveries) = self.plan_protocol_room_exit(identity.user_no)?;
+        if let Some(transition) = &myroom_transition
+            && let MyRoomEffect::Updated(publication) = &transition.outcome().room
+        {
+            deliveries
+                .extend(self.myroom_publication_deliveries(std::slice::from_ref(publication))?);
+        }
+
+        let left_protocol_room = protocol_delta.is_some();
+        let left_myroom = myroom_transition.is_some();
+        self.commit_client_stage_transition(myroom_transition, protocol_delta, deliveries)?;
+        self.pending_myroom_password_grants
+            .remove(&identity.user_no);
+        tracing::debug!(
+            nickname = %identity.nickname,
+            ?stage,
+            left_protocol_room,
+            left_myroom,
+            "committed exclusive client-stage transition"
+        );
+        self.debug_assert_invariants();
+        Ok(())
+    }
+
     fn publish_room_equipment(
         &mut self,
         session: SessionId,
@@ -11707,7 +11795,7 @@ impl World {
             return Ok((None, Vec::new()));
         };
         let expected_room = self.protocol_rooms.get(&room_id).cloned().ok_or(
-            WorldError::MigrationProtocolRoomInconsistent {
+            WorldError::ProtocolRoomTransitionInconsistent {
                 user_no: replacement.user_no.get(),
             },
         )?;
@@ -11716,7 +11804,7 @@ impl World {
             let endpoint = legacy_p2p_endpoint(replacement.source_ip, 0);
             if !next_room.set_p2p_endpoint(replacement.user_no, endpoint.address(), endpoint.port())
             {
-                return Err(WorldError::MigrationProtocolRoomInconsistent {
+                return Err(WorldError::ProtocolRoomTransitionInconsistent {
                     user_no: replacement.user_no.get(),
                 }
                 .into());
@@ -11738,10 +11826,34 @@ impl World {
             ));
         }
 
+        self.plan_protocol_room_exit_from_snapshot(replacement.user_no, room_id, expected_room)
+    }
+
+    fn plan_protocol_room_exit(
+        &self,
+        user_no: UserNo,
+    ) -> Result<(Option<ProtocolMigrationDelta>, Vec<OutboundDelivery>), WorldOperationError> {
+        let Some(room_id) = self.protocol_room_by_user.get(&user_no).copied() else {
+            return Ok((None, Vec::new()));
+        };
+        let expected_room = self.protocol_rooms.get(&room_id).cloned().ok_or(
+            WorldError::ProtocolRoomTransitionInconsistent {
+                user_no: user_no.get(),
+            },
+        )?;
+        self.plan_protocol_room_exit_from_snapshot(user_no, room_id, expected_room)
+    }
+
+    fn plan_protocol_room_exit_from_snapshot(
+        &self,
+        user_no: UserNo,
+        room_id: RoomId,
+        expected_room: ProtocolRoomState,
+    ) -> Result<(Option<ProtocolMigrationDelta>, Vec<OutboundDelivery>), WorldOperationError> {
         let mut next_room = expected_room.clone();
-        if !next_room.remove_user(replacement.user_no) {
-            return Err(WorldError::MigrationProtocolRoomInconsistent {
-                user_no: replacement.user_no.get(),
+        if !next_room.remove_user(user_no) {
+            return Err(WorldError::ProtocolRoomTransitionInconsistent {
+                user_no: user_no.get(),
             }
             .into());
         }
@@ -11759,7 +11871,7 @@ impl World {
         };
         Ok((
             Some(ProtocolMigrationDelta {
-                user_no: replacement.user_no,
+                user_no,
                 room_id,
                 expected_room,
                 next_room: (!remove_room).then_some(next_room),
@@ -11937,6 +12049,93 @@ impl World {
             .commit(&mut self.myroom)
             .map_err(MyRoomLifecycleError::from)?;
         debug_assert_eq!(self.myroom.audit_invariants(), Ok(()));
+        Self::publish_reserved(reserved);
+        Ok(outcome)
+    }
+
+    fn commit_client_stage_transition(
+        &mut self,
+        myroom_transition: Option<MyRoomTransition<MyRoomLeaveEffects>>,
+        protocol_delta: Option<ProtocolMigrationDelta>,
+        deliveries: Vec<OutboundDelivery>,
+    ) -> Result<(), WorldOperationError> {
+        let reserved = self
+            .try_reserve_myroom_outbound(deliveries)
+            .map_err(|error| WorldError::ClientStageOutboundUnavailable {
+                session: error.session,
+            })?;
+        let World {
+            myroom,
+            protocol_room_by_user,
+            protocol_rooms,
+            free_protocol_room_ids,
+            reward_lanes,
+            ..
+        } = self;
+        let myroom_commit = myroom_transition
+            .map(|transition| transition.lock(myroom))
+            .transpose()
+            .map_err(MyRoomLifecycleError::from)?;
+        let protocol_commit = protocol_delta
+            .map(|delta| {
+                delta.lock(
+                    protocol_room_by_user,
+                    protocol_rooms,
+                    free_protocol_room_ids,
+                    reward_lanes,
+                )
+            })
+            .transpose()?;
+
+        if let Some(commit) = myroom_commit {
+            drop(commit.commit());
+        }
+        if let Some(commit) = protocol_commit {
+            commit.commit();
+        }
+        debug_assert_eq!(myroom.audit_invariants(), Ok(()));
+        Self::publish_reserved(reserved);
+        Ok(())
+    }
+
+    fn commit_myroom_entry_stage_transition<T>(
+        &mut self,
+        myroom_transition: MyRoomTransition<T>,
+        protocol_delta: Option<ProtocolMigrationDelta>,
+        deliveries: Vec<OutboundDelivery>,
+    ) -> Result<T, WorldOperationError> {
+        let reserved = self
+            .try_reserve_myroom_outbound(deliveries)
+            .map_err(|error| WorldError::MyRoomCommandOutboundUnavailable {
+                session: error.session,
+            })?;
+        let World {
+            myroom,
+            protocol_room_by_user,
+            protocol_rooms,
+            free_protocol_room_ids,
+            reward_lanes,
+            ..
+        } = self;
+        let myroom_commit = myroom_transition
+            .lock(myroom)
+            .map_err(MyRoomLifecycleError::from)?;
+        let protocol_commit = protocol_delta
+            .map(|delta| {
+                delta.lock(
+                    protocol_room_by_user,
+                    protocol_rooms,
+                    free_protocol_room_ids,
+                    reward_lanes,
+                )
+            })
+            .transpose()?;
+
+        let outcome = myroom_commit.commit();
+        if let Some(commit) = protocol_commit {
+            commit.commit();
+        }
+        debug_assert_eq!(myroom.audit_invariants(), Ok(()));
         Self::publish_reserved(reserved);
         Ok(outcome)
     }
@@ -13236,6 +13435,14 @@ async fn dispatch_unwrapped_command(
             let result = world.room_protocol(session, *payload);
             reply_after_world_operation(world, sidecars, reply, result).await?;
         }
+        WorldCommand::EnterClientStage {
+            session,
+            stage,
+            reply,
+        } => {
+            let result = world.enter_client_stage(session, stage);
+            reply_after_world_operation(world, sidecars, reply, result).await?;
+        }
         WorldCommand::PublishRoomEquipment {
             session,
             snapshot,
@@ -13388,6 +13595,7 @@ fn admit_command_during_quiesce(command: WorldCommand) -> Option<WorldCommand> {
             None
         }
         WorldCommand::RoomProtocol { reply, .. }
+        | WorldCommand::EnterClientStage { reply, .. }
         | WorldCommand::PublishRoomEquipment { reply, .. }
         | WorldCommand::LeaveRoom { reply, .. }
         | WorldCommand::MyRoomEntry { reply, .. }
@@ -13813,6 +14021,7 @@ async fn dispatch_utility_command(
         | WorldCommand::AuthorizeUdpRebind { .. }
         | WorldCommand::BeginMigration { .. }
         | WorldCommand::RoomProtocol { .. }
+        | WorldCommand::EnterClientStage { .. }
         | WorldCommand::PublishRoomEquipment { .. }
         | WorldCommand::RefreshRoomKartPhysics { .. }
         | WorldCommand::RefreshMyRoomPresentation { .. }
@@ -14308,9 +14517,10 @@ mod tests {
             serialize_kick_reply,
         },
         myroom_protocol::{
-            CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus, EnterMyRoomStatus,
-            MYROOM_SLOT_COUNT, MyRoomInfo, MyRoomPassword, MyRoomPlayerSlot, MyRoomSlot,
-            RiderTalkRequest, UpdateMainEmblemRequest, serialize_character_position,
+            CharacterPositionRequest, CheckPasswordRequest, CheckPasswordStatus,
+            ENTER_MYROOM_REPLY_NAME, EnterMyRoomStatus, MYROOM_SLOT_COUNT, MyRoomInfo,
+            MyRoomPassword, MyRoomPlayerSlot, MyRoomSlot, RiderTalkRequest, SLOT_DATA_NAME,
+            UpdateMainEmblemRequest, serialize_character_position,
             serialize_empty_owner_career_list, serialize_enter_error, serialize_enter_reply,
             serialize_missing_owner_items, serialize_myroom_info,
             serialize_password_enter_myroom_command, serialize_rider_echo, serialize_secede_reply,
@@ -14342,10 +14552,10 @@ mod tests {
     };
 
     use super::{
-        GlobalRaceEpoch, ITEM_PICKUP_BUCKET_CAPACITY, ITEM_PICKUP_REFILL_INTERVAL, ItemPickupKind,
-        LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome, LobbyCommandPayload,
-        LobbyError, MigrationAcknowledgement, MyRoomCommandPayload, MyRoomEntryInput,
-        MyRoomLifecycleError, MyRoomOwnerChoiceSource, MyRoomPeerCommandPayload,
+        ClientStage, GlobalRaceEpoch, ITEM_PICKUP_BUCKET_CAPACITY, ITEM_PICKUP_REFILL_INTERVAL,
+        ItemPickupKind, LOADING_HEARTBEAT_INTERVAL, LoadingHandshake, LobbyCommandOutcome,
+        LobbyCommandPayload, LobbyError, MigrationAcknowledgement, MyRoomCommandPayload,
+        MyRoomEntryInput, MyRoomLifecycleError, MyRoomOwnerChoiceSource, MyRoomPeerCommandPayload,
         MyRoomPreparedCommand, MyRoomProtectedResource, MyRoomWireProjection, OutboundBatch,
         ROOM_CAPACITY, RaceCommandOutcome, RaceCommandPayload, RaceError,
         RegisteredMigrationPreflight, RoomCommandPayload, RoomError, RoomId,
@@ -23306,6 +23516,253 @@ mod tests {
             .room_protocol(destination.session, RoomCommandPayload::FirstState)
             .unwrap();
         assert!(destination.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn myroom_entry_removes_a_stale_solo_room_before_publishing_entry() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "StageOwner", 67, 47_210, 16);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+
+        world
+            .myroom_entry(
+                owner.session,
+                test_myroom_entry_input(
+                    &owner.identity,
+                    &owner.identity.nickname,
+                    Some(MyRoomInfo::default()),
+                ),
+            )
+            .unwrap();
+
+        assert!(!world.protocol_rooms.contains_key(&room_id));
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&owner.identity.user_no)
+        );
+        assert!(
+            world
+                .myroom
+                .membership_if_member(&owner.identity)
+                .unwrap()
+                .is_some()
+        );
+        let entry_packets = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(entry_packets.len(), 2);
+        assert_eq!(
+            logical_packet_hash(&entry_packets[0]),
+            adler32::packet_hash(ENTER_MYROOM_REPLY_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&entry_packets[1]),
+            adler32::packet_hash(SLOT_DATA_NAME)
+        );
+    }
+
+    #[test]
+    fn myroom_entry_removes_room_owner_and_refreshes_remaining_slots() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "StageOwnerPeer", 67, 47_220, 16);
+        let mut peer = register_channel_session(&mut world, "StageRemaining", 67, 47_230, 16);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .room_protocol(
+                peer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut peer.outbound);
+
+        world
+            .myroom_entry(
+                owner.session,
+                test_myroom_entry_input(
+                    &owner.identity,
+                    &owner.identity.nickname,
+                    Some(MyRoomInfo::default()),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(world.protocol_rooms[&room_id].room_master, 1);
+        assert_eq!(
+            world.protocol_room_by_user.get(&peer.identity.user_no),
+            Some(&room_id)
+        );
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&owner.identity.user_no)
+        );
+        let peer_update = take_single_packet(&mut peer.outbound);
+        assert_eq!(
+            logical_packet_hash(&peer_update),
+            adler32::packet_hash("GrSlotDataPacket")
+        );
+        let entry_packets = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(entry_packets.len(), 2);
+        assert_eq!(
+            logical_packet_hash(&entry_packets[0]),
+            adler32::packet_hash(ENTER_MYROOM_REPLY_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&entry_packets[1]),
+            adler32::packet_hash(SLOT_DATA_NAME)
+        );
+    }
+
+    #[test]
+    fn myroom_entry_backpressure_keeps_room_and_myroom_state_atomic() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "StageAtomic", 67, 47_240, 16);
+        let mut peer = register_channel_session(&mut world, "StageBlocked", 67, 47_250, 1);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .room_protocol(
+                peer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut peer.outbound);
+        let peer_sender = world.sessions[&peer.session].outbound.clone().unwrap();
+        peer_sender
+            .try_send(OutboundBatch::single(vec![0xFE]))
+            .unwrap();
+
+        assert!(matches!(
+            world.myroom_entry(
+                owner.session,
+                test_myroom_entry_input(
+                    &owner.identity,
+                    &owner.identity.nickname,
+                    Some(MyRoomInfo::default()),
+                ),
+            ),
+            Err(WorldOperationError::Command(
+                WorldError::MyRoomCommandOutboundUnavailable { session }
+            )) if session == peer.session
+        ));
+        assert_eq!(
+            world.protocol_room_by_user.get(&owner.identity.user_no),
+            Some(&room_id)
+        );
+        assert!(
+            world.protocol_rooms[&room_id]
+                .member_by_user_no(owner.identity.user_no)
+                .is_some()
+        );
+        assert!(
+            world
+                .myroom
+                .membership_if_member(&owner.identity)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            peer.outbound.try_recv().unwrap().into_packets(),
+            vec![vec![0xFE]]
+        );
+
+        world
+            .myroom_entry(
+                owner.session,
+                test_myroom_entry_input(
+                    &owner.identity,
+                    &owner.identity.nickname,
+                    Some(MyRoomInfo::default()),
+                ),
+            )
+            .unwrap();
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&owner.identity.user_no)
+        );
+        assert!(
+            world
+                .myroom
+                .membership_if_member(&owner.identity)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stateless_stage_entry_repairs_both_legacy_memberships_atomically() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "StageRepair", 67, 47_260, 16);
+        let mut peer = register_channel_session(&mut world, "StageRepairPeer", 67, 47_270, 16);
+        let room_id = create_protocol_room(&mut world, &owner, 1);
+        drain_batches(&mut owner.outbound);
+        world
+            .room_protocol(
+                peer.session,
+                RoomCommandPayload::Join {
+                    request: join_request(room_id),
+                    participant: room_participant(),
+                },
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+        drain_batches(&mut peer.outbound);
+        enter_myroom(
+            &mut world,
+            &owner.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+        enter_myroom(
+            &mut world,
+            &peer.identity,
+            &owner.identity,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+        );
+
+        world
+            .enter_client_stage(owner.session, ClientStage::Shop)
+            .unwrap();
+
+        assert!(
+            !world
+                .protocol_room_by_user
+                .contains_key(&owner.identity.user_no)
+        );
+        assert!(
+            world
+                .myroom
+                .membership_if_member(&owner.identity)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(world.protocol_rooms[&room_id].room_master, 1);
+        let mut peer_packets = Vec::new();
+        while let Ok(batch) = peer.outbound.try_recv() {
+            peer_packets.extend(batch.into_packets());
+        }
+        assert_eq!(peer_packets.len(), 2);
+        assert!(peer_packets.iter().any(|packet| {
+            logical_packet_hash(packet) == adler32::packet_hash("GrSlotDataPacket")
+        }));
+        assert!(
+            peer_packets.iter().any(|packet| {
+                logical_packet_hash(packet) == adler32::packet_hash(SLOT_DATA_NAME)
+            })
+        );
+        assert!(owner.outbound.try_recv().is_err());
     }
 
     #[test]

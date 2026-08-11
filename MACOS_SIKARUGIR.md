@@ -1,5 +1,8 @@
 # P5136 + Sikarugir 수동 설정 walkthrough (macOS)
 
+최종 검토: 2026-08-11. 다른 사용자·프로토콜 문서는
+[전체 문서 안내](DOCUMENTATION.md)를 참고하세요.
+
 이 문서는 Sikarugir가 만든 wrapper의 Wine prefix를 P5136 클라이언트에
 맞게 설정하는 절차입니다. 게임 EXE, Sikarugir 앱 또는 별도 wrapper를
 만들거나 배포하지 않습니다.
@@ -134,6 +137,10 @@ p5136 connect \
 `--game-exe`에 게임 폴더 기준 상대 경로나 절대 경로를 지정할 수
 있습니다. Sikarugir가 실제로 실행하는 파일은 wrapper의 `exec*.bat`가
 결정하므로 그 배치 파일도 같은 EXE를 가리켜야 합니다.
+
+옵저버 방장으로 접속하려면 `--observer`, 정적으로 복원한 익명 리그
+pmap 1798을 사용하려면 `--anonymous-league`를 추가합니다. 두 역할은
+동시에 선택할 수 없습니다.
 
 ## 확인 순서
 
