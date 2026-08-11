@@ -931,6 +931,7 @@ pub(crate) struct StartRoomPlan {
     random_track_candidates: Vec<u32>,
     random_tracks: Option<Arc<ResolvedRandomTracks>>,
     ai_specs: Vec<AiRaceSpec>,
+    basic_ai_parameters: crate::BasicAiModeParameters,
     maximum_payload_length: usize,
 }
 
@@ -941,8 +942,18 @@ impl StartRoomPlan {
             random_track_candidates,
             random_tracks: None,
             ai_specs,
+            basic_ai_parameters: crate::BasicAiModeParameters::default(),
             maximum_payload_length: MAX_GR_COMMAND_START_PAYLOAD_LENGTH,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_basic_ai_parameters(
+        mut self,
+        basic_ai_parameters: crate::BasicAiModeParameters,
+    ) -> Self {
+        self.basic_ai_parameters = basic_ai_parameters;
+        self
     }
 
     #[must_use]
@@ -5216,12 +5227,12 @@ const fn expected_room_game_type(channel_game_type: u8) -> Option<u8> {
     }
 }
 
-/// P5136 stock infinite-booster channels use wire speed type S4, item channels use
-/// the integrated-item S8 preset, and the remaining stock channels use S7.
+/// P5136 stock infinite-booster channels use wire speed type S4. The stock
+/// `channel.xml` assigns S7 to both integrated speed and item channels; their
+/// gameplay distinction is carried by the room game type, not the speed byte.
 const fn channel_default_speed_type(channel_game_type: u8) -> u8 {
     match channel_game_type {
         23 | 24 => 4,
-        65 | 66 | 8 | 7 => 8,
         _ => 7,
     }
 }
@@ -11315,9 +11326,10 @@ impl World {
         let session_data = room.session_data();
         let mut slot_data = room.slot_data();
         slot_data.track = concrete_track;
-        let ai_specs = (0..room.ai_count())
-            .map(|_| AiRaceSpec::try_from([0.7, 2_400.0, 2_950.0, 1.5, 1_000.0, 1_500.0]))
-            .collect::<Result<Vec<_>, _>>()?;
+        let ai_spec = plan
+            .basic_ai_parameters
+            .race_spec_for_game_type(room.settings.game_type);
+        let ai_specs = vec![ai_spec; room.ai_count()];
         let success_reply = serialize_start_room_reply(StartRoomStatus::Success);
 
         let mut deliveries = Vec::with_capacity(frozen.participants.len());
@@ -14169,7 +14181,7 @@ pub(crate) mod test_support {
             &P5136KartPhysicsBlock::from([6; 235])
         );
         assert_eq!(
-            variants.for_room_title("S8 아이템"),
+            variants.for_room_title("S8 통합속도"),
             &P5136KartPhysicsBlock::from([8; 235])
         );
         assert_eq!(variants.for_room_title("TESTS1ROOM"), &default);
@@ -14210,14 +14222,14 @@ pub(crate) mod test_support {
             variants.for_room("무한부스터", 3, 4),
             &P5136KartPhysicsBlock::from([36; 235])
         );
-        // Item channels use S8 while selecting their own game-type rows.
+        // Stock item channels also use S7 while selecting their own game-type rows.
         assert_eq!(
-            variants.for_room("개인 아이템", 2, 8),
-            &P5136KartPhysicsBlock::from([24; 235])
+            variants.for_room("개인 아이템", 2, 7),
+            &P5136KartPhysicsBlock::from([23; 235])
         );
         assert_eq!(
-            variants.for_room("팀 아이템", 4, 8),
-            &P5136KartPhysicsBlock::from([56; 235])
+            variants.for_room("팀 아이템", 4, 7),
+            &P5136KartPhysicsBlock::from([55; 235])
         );
         // An explicit title token always overrides the channel fallback.
         assert_eq!(
@@ -14233,13 +14245,10 @@ pub(crate) mod test_support {
     }
 
     #[test]
-    fn channel_fallback_speed_matches_infinite_and_item_channel_semantics() {
+    fn channel_fallback_speed_matches_the_stock_p5136_channel_catalog() {
         assert_eq!(super::channel_default_speed_type(23), 4);
         assert_eq!(super::channel_default_speed_type(24), 4);
-        for channel_game_type in [65, 66, 8, 7] {
-            assert_eq!(super::channel_default_speed_type(channel_game_type), 8);
-        }
-        for channel_game_type in [67, 68, 14, 13] {
+        for channel_game_type in [65, 66, 8, 7, 67, 68, 14, 13] {
             assert_eq!(super::channel_default_speed_type(channel_game_type), 7);
         }
     }
@@ -14489,6 +14498,7 @@ mod tests {
     use std::{
         array,
         collections::{HashMap, HashSet, VecDeque},
+        mem::size_of,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         num::{NonZeroU64, NonZeroUsize},
         sync::{Arc, Barrier},
@@ -14527,6 +14537,7 @@ mod tests {
             serialize_slot_data, serialize_update_main_emblem_reply,
         },
         nickname::canonical_nickname_key,
+        packet::PacketReader,
         race_protocol::{
             AiGoalInRequest, GAME_AI_MASTER_NOTICE_NAME, GAME_CONTROL_PACKET_NAME,
             GAME_NEXT_STAGE_PACKET_NAME, GAME_RACE_TIME_PACKET_NAME, GameControlRequest, RaceTeam,
@@ -14534,13 +14545,14 @@ mod tests {
         },
         race_result_protocol::{GAME_RESULT_PACKET_NAME, HUMAN_RESULT_RECORD_LENGTH, ResultTeam},
         race_start_protocol::{
-            AiRaceSpec, GR_COMMAND_START_PACKET_NAME, P5136KartPhysicsBlock, RaceStartProtocolError,
+            AiRaceSpec, GR_COMMAND_START_PACKET_NAME, P5136_KART_PHYSICS_BLOCK_LENGTH,
+            P5136KartPhysicsBlock, RaceStartProtocolError,
         },
         room_protocol::{
             ChCreateRoomRequest, ChGetRoomListRequest, ChJoinRoomRequest,
             MAX_CLUB_NAME_UTF16_UNITS, ROOM_CONNECTION_CONTEXT_LENGTH, ROOM_DATA_LENGTH, RoomAi,
-            RoomPlayer, RoomProtocolError, serialize_ch_leave_room_reply, serialize_gr_slot_data,
-            serialize_initial_room_state,
+            RoomPlayer, RoomProtocolError, serialize_ch_leave_room_reply,
+            serialize_gr_session_data, serialize_gr_slot_data, serialize_initial_room_state,
         },
         startup::RIDER_ITEM_SNAPSHOT_WIRE_LENGTH,
     };
@@ -14586,6 +14598,7 @@ mod tests {
         RaceObjectActor, RaceObjectAdmission, RaceObjectClass, RaceObjectDuplicateKind,
         RaceObjectOperation, RaceObjectPhase,
     };
+    use crate::{BasicAiModeParameters, BasicAiParameters};
     use crate::{
         ChannelBinding, IdentityBinding, IdentityError, ItemProbabilityConfiguration,
         ItemProbabilityEntry, ItemProbabilityRankBand, ItemProbabilityRankPolicy,
@@ -14651,7 +14664,7 @@ mod tests {
     }
 
     #[test]
-    fn p5136_item_channels_accept_matching_room_creation_requests_and_advertise_s8() {
+    fn p5136_item_channels_accept_matching_room_creation_requests_and_advertise_s7() {
         let mut world = World::default();
         for (nickname, channel_game_type, room_game_type, port) in [
             ("ItemIndividual", 65, 2, 40_065),
@@ -14675,7 +14688,7 @@ mod tests {
                 world.protocol_rooms[&room_id].settings.game_type,
                 room_game_type
             );
-            assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 8);
+            assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 7);
         }
     }
 
@@ -22004,6 +22017,79 @@ mod tests {
             logical_packet_hash(&packets[1]),
             adler32::packet_hash(GR_COMMAND_START_PACKET_NAME)
         );
+    }
+
+    #[test]
+    fn item_basic_ai_start_preserves_the_stock_s7_channel_speed() {
+        let mut world = World::default();
+        let mut owner = register_channel_session(&mut world, "ItemAiStartOwner", 65, 41_931, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 2);
+        drain_batches(&mut owner.outbound);
+        assert_eq!(world.protocol_rooms[&room_id].settings.speed_type, 7);
+
+        let candidate = RoomAi {
+            character: 1,
+            rider: 0,
+            kart: 10,
+            balloon: 0,
+            head_band: 0,
+            goggle: 0,
+            team: 0,
+        };
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::BasicAi {
+                    request: BasicAiRequest {
+                        player_id: 1,
+                        option: 0,
+                    },
+                    candidates: [candidate; 2],
+                },
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+
+        let speed_spec =
+            BasicAiParameters::try_from([0.8, 2_500.0, 3_100.0, 1.7, 900.0, 1_400.0]).unwrap();
+        let item_values = [0.45, 2_300.0, 2_800.0, 1.3, 800.0, 1_300.0];
+        let item_spec = BasicAiParameters::try_from(item_values).unwrap();
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(
+                    StartRoomPlan::new(vec![0x1111_2222], Vec::new()).with_basic_ai_parameters(
+                        BasicAiModeParameters::new(speed_spec, item_spec),
+                    ),
+                ),
+            )
+            .unwrap();
+        let packets = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 2);
+        let command = &packets[1];
+        assert_eq!(
+            logical_packet_hash(command),
+            adler32::packet_hash(GR_COMMAND_START_PACKET_NAME)
+        );
+
+        let room = &world.protocol_rooms[&room_id];
+        assert_eq!(room.settings.speed_type, 7);
+        let expected_start_session = serialize_gr_session_data(&room.session_data()).unwrap();
+        assert_eq!(
+            &command[4..4 + expected_start_session.len()],
+            expected_start_session.as_slice()
+        );
+        let slot_packet_length = serialize_gr_slot_data(&room.slot_data()).unwrap().len();
+        let ai_offset = 4
+            + expected_start_session.len()
+            + slot_packet_length
+            + size_of::<i32>()
+            + P5136_KART_PHYSICS_BLOCK_LENGTH;
+        let mut ai = PacketReader::new(&command[ai_offset..]);
+        assert_eq!(ai.read_i32().unwrap(), 1);
+        for expected in item_values {
+            assert_eq!(ai.read_encoded_f32().unwrap().to_bits(), expected.to_bits());
+        }
     }
 
     #[test]

@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(csharp_room_title_speed_type("[S4] 무한"), Some(4));
         assert_eq!(csharp_room_title_speed_type("S6-연습"), Some(6));
         assert_eq!(csharp_room_title_speed_type("S7"), Some(7));
-        assert_eq!(csharp_room_title_speed_type("S8 아이템"), Some(8));
+        assert_eq!(csharp_room_title_speed_type("S8 통합속도"), Some(8));
         assert_eq!(csharp_room_title_speed_type("TESTS1ROOM"), None);
         assert_eq!(csharp_room_title_speed_type("S10"), None);
         assert_eq!(csharp_room_title_speed_type("S9"), None);

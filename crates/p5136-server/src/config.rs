@@ -5,7 +5,11 @@ use std::{
     time::Duration,
 };
 
-use p5136_core::{frame::DEFAULT_MAX_PAYLOAD, ports::PortTopology};
+use p5136_core::{
+    frame::DEFAULT_MAX_PAYLOAD,
+    ports::PortTopology,
+    race_start_protocol::{AiRaceSpec, RaceStartProtocolError},
+};
 use p5136_profile::CatalogInventory;
 
 use crate::{
@@ -14,6 +18,98 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_LOGIN_SESSIONS: usize = 256;
+pub const DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES: [f32; 6] =
+    [0.7, 2_400.0, 2_950.0, 1.5, 1_000.0, 1_500.0];
+pub const DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES: [f32; 6] =
+    [0.6, 2_400.0, 2_950.0, 1.5, 1_000.0, 1_500.0];
+
+/// Validated parameters serialized once for each basic-AI racer at race start.
+///
+/// P5136 consumes the first four values as target-speed factor, base-speed
+/// scalar, boost duration in milliseconds, and boost-acceleration multiplier.
+/// The final two values remain codec-visible compatibility fields but are not
+/// read by this client's `GoBasicAiKart` consumer path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BasicAiParameters {
+    race_spec: AiRaceSpec,
+}
+
+impl BasicAiParameters {
+    #[must_use]
+    pub const fn values(self) -> [f32; 6] {
+        *self.race_spec.values()
+    }
+
+    #[must_use]
+    pub(crate) const fn race_spec(self) -> AiRaceSpec {
+        self.race_spec
+    }
+}
+
+impl Default for BasicAiParameters {
+    fn default() -> Self {
+        Self::try_from(DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES)
+            .expect("the stock P5136 basic-AI parameter vector is valid")
+    }
+}
+
+impl TryFrom<[f32; 6]> for BasicAiParameters {
+    type Error = RaceStartProtocolError;
+
+    fn try_from(values: [f32; 6]) -> Result<Self, Self::Error> {
+        Ok(Self {
+            race_spec: AiRaceSpec::try_from(values)?,
+        })
+    }
+}
+
+/// Separate server vectors for speed and item races.
+///
+/// The original C# implementation chose a lower field-0 range for item mode,
+/// in addition to the client's own `speedVal`/`itemVal` multiplier. Team and
+/// individual races share the vector for their game mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BasicAiModeParameters {
+    speed: BasicAiParameters,
+    item: BasicAiParameters,
+}
+
+impl BasicAiModeParameters {
+    #[must_use]
+    pub const fn new(speed: BasicAiParameters, item: BasicAiParameters) -> Self {
+        Self { speed, item }
+    }
+
+    #[must_use]
+    pub const fn speed(self) -> BasicAiParameters {
+        self.speed
+    }
+
+    #[must_use]
+    pub const fn item(self) -> BasicAiParameters {
+        self.item
+    }
+
+    #[must_use]
+    pub(crate) const fn race_spec_for_game_type(self, game_type: u8) -> AiRaceSpec {
+        if matches!(game_type, 2 | 4) {
+            self.item.race_spec()
+        } else {
+            self.speed.race_spec()
+        }
+    }
+}
+
+impl Default for BasicAiModeParameters {
+    fn default() -> Self {
+        Self {
+            speed: BasicAiParameters::try_from(DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES)
+                .expect("the stock P5136 speed-AI vector is valid"),
+            item: BasicAiParameters::try_from(DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES)
+                .expect("the stock P5136 item-AI vector is valid"),
+        }
+    }
+}
 
 /// Server-selected modern physics preset for stock time-attack starts.
 ///
@@ -76,7 +172,14 @@ impl TimeAttackPhysicsPreset {
 
 #[cfg(test)]
 mod tests {
-    use super::TimeAttackPhysicsPreset;
+    use super::{
+        BasicAiModeParameters, BasicAiParameters, DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES,
+        DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES, TimeAttackPhysicsPreset,
+    };
+
+    fn float_bits(values: [f32; 6]) -> [u32; 6] {
+        values.map(f32::to_bits)
+    }
 
     #[test]
     fn time_attack_presets_preserve_default_and_map_visible_s_grades_to_wire_bytes() {
@@ -95,6 +198,34 @@ mod tests {
                 Some(7),
                 Some(8),
             ]
+        );
+    }
+
+    #[test]
+    fn basic_ai_parameters_preserve_stock_values_and_reject_invalid_input() {
+        assert_eq!(
+            float_bits(BasicAiParameters::default().values()),
+            float_bits(DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES)
+        );
+        assert!(BasicAiParameters::try_from([f32::NAN; 6]).is_err());
+        assert!(BasicAiParameters::try_from([10_001.0; 6]).is_err());
+
+        let modes = BasicAiModeParameters::default();
+        assert_eq!(
+            float_bits(modes.speed().values()),
+            float_bits(DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES)
+        );
+        assert_eq!(
+            float_bits(modes.item().values()),
+            float_bits(DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES)
+        );
+        assert_eq!(
+            float_bits(*modes.race_spec_for_game_type(1).values()),
+            float_bits(DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES)
+        );
+        assert_eq!(
+            float_bits(*modes.race_spec_for_game_type(2).values()),
+            float_bits(DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES)
         );
     }
 }
@@ -186,6 +317,8 @@ pub struct ServerConfig {
     pub rider_school_pro_mission_set: RiderSchoolProMissionSet,
     /// Physics grade written into every accepted time-attack start reply.
     pub time_attack_physics_preset: TimeAttackPhysicsPreset,
+    /// Per-racer basic-AI behaviour vector written into each room start.
+    pub basic_ai_parameters: BasicAiModeParameters,
     /// Pre-resolved client catalog installed transactionally by
     /// [`crate::BoundServer::bind`]. Normal callers should leave this `None`.
     pub resolved_random_tracks: Option<Arc<ResolvedRandomTracks>>,
@@ -218,6 +351,7 @@ impl Default for ServerConfig {
             random_tracks: RandomTrackConfiguration::default(),
             rider_school_pro_mission_set: RiderSchoolProMissionSet::Automatic,
             time_attack_physics_preset: TimeAttackPhysicsPreset::default(),
+            basic_ai_parameters: BasicAiModeParameters::default(),
             resolved_random_tracks: None,
             first_message_delay: Duration::from_millis(250),
             login_timeout: Duration::from_secs(12),

@@ -84,9 +84,9 @@ Track and pool proper names come from the Korean client data and are therefore s
 
 ## Static audit of AI difficulty
 
-The ordinary room add/remove-AI request contains no difficulty value. Actual AI behaviour parameters arrive in `GrCommandStartPacket` as six encoded floats per AI racer. The Rust server currently uses `[0.7, 2400, 2950, 1.5, 1000, 1500]` for every AI. The former C# launcher's Easy, Hard, and Hell labels were server presets that generated those six values from different ranges, not a native client enum.
+The ordinary room add/remove-AI request contains no difficulty value. Actual AI behaviour parameters arrive in `GrCommandStartPacket` as six encoded floats per AI racer. **AI driving parameters** under Server management exposes separate speed and item vectors, defaulting to `[0.7, 2400, 2950, 1.5, 1000, 1500]` and `[0.6, 2400, 2950, 1.5, 1000, 1500]`. The GUI persists them and applies them to races after the server is restarted. The former C# launcher's Easy, Hard, and Hell labels were server presets that randomly generated these values from mode-specific ranges, not a native client enum.
 
-Different server-side presets can therefore be added without patching the client, but the original individual names of the six fields are not yet proven. v0.2.6 documents the static boundary in [the AI difficulty audit](AI_DIFFICULTY_AUDIT.md) instead of exposing speculative controls. Duel-mission difficulty and battle-mode AI are separate paths.
+The recovered consumer path shows that the first two values are multiplied into the AI's base target speed, the third is the boost duration in milliseconds, and the fourth is the boost-acceleration multiplier. The fifth and sixth values pass through the P5136 codec but are not read by `GoBasicAiKart`; they are reserved compatibility fields in this build. The exact formula and the complementary client-side `basicAI.xml` parameters are documented in [the AI difficulty audit](AI_DIFFICULTY_AUDIT.md). Duel-mission difficulty and battle-mode AI are separate paths.
 
 ## S0–S8 room-title physics
 
@@ -100,7 +100,7 @@ Friendly S2
 S4 Infinite Booster
 ```
 
-Tokens are case-insensitive and use ASCII alphanumeric boundaries, so `TESTS1ROOM` and `S10` do not match. Updating the room title broadcasts the title and password immediately; the physics token applies at the next race start. Without a token, normal speed uses S7, item mode uses S8, and solo/team Infinite Booster uses the stock regular Infinite Booster preset S4. S6 remains a special event preset and is used only when explicitly written in the title. Each player receives a 235-byte race-start physics block composed from the room default and that player's kart, pet, and equipment.
+Tokens are case-insensitive and use ASCII alphanumeric boundaries, so `TESTS1ROOM` and `S10` do not match. Updating the room title broadcasts the title and password immediately; the physics token applies at the next race start. Without a token, both normal speed and item channels use the integrated S7 selected by the stock P5136 `channel.xml`, while solo/team Infinite Booster uses the regular S4 preset. Item individual/team rooms select their distinct item-physics rows through game types 2/4 rather than a different speed byte. S6 remains a special event preset. S8 retains an `integrated speed` display key and physics slot in the client but is not bound to an active stock channel, so it is available only as an explicit manual preset. Each player receives a 235-byte race-start physics block composed from the room default and that player's kart, pet, and equipment.
 
 ## Account roles: observer and anonymous league
 

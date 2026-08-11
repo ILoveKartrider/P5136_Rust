@@ -30,8 +30,9 @@ pub use client_catalog::{
     load_client_kart_catalog,
 };
 pub use config::{
-    DEFAULT_MAX_LOGIN_SESSIONS, RiderSchoolProMissionSet, ServerConfig, ServerEndpoints,
-    TimeAttackPhysicsPreset,
+    BasicAiModeParameters, BasicAiParameters, DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES,
+    DEFAULT_MAX_LOGIN_SESSIONS, DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES, RiderSchoolProMissionSet,
+    ServerConfig, ServerEndpoints, TimeAttackPhysicsPreset,
 };
 pub use favorite_persistence::FavoriteItemPersistError;
 pub use identity::{

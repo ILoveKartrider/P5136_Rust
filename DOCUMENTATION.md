@@ -38,8 +38,12 @@ data.
 
 ## Current release boundary
 
-The v0.2.6 documentation baseline includes:
+The v0.2.7 documentation baseline includes:
 
+- stock S7 integrated physics for normal speed/item channels and stock S4 for
+  Infinite Booster, with S8 retained as a manual-only client physics slot;
+- validated, persistent, separately configurable speed/item basic-AI vectors
+  selected by room game type at race start;
 - atomic room departure when a racer enters MyRoom, Shop, Magic Hat, Club,
   Rider School, Time Attack, Challenger, Scenario, Single Player, or Matching;
 - conservative client-catalog quarantine with Kartneck retained and the three
@@ -49,7 +53,8 @@ The v0.2.6 documentation baseline includes:
 - the static finding that pmap 1798 activates the recovered client-side shared
   character/color/equipment projection, but does not itself anonymize
   nicknames on the server;
-- the static basic-AI difficulty boundary described above.
+- the static basic-AI difficulty boundary and four active field semantics
+  described above.
 
 Implementation status is authoritative in `PORTING.md` and
 `PORTING_STATUS.md`; the translated READMEs deliberately summarize rather than

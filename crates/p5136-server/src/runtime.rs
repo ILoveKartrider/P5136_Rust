@@ -501,6 +501,8 @@ impl BoundServer {
             random_tracks_loaded = config.resolved_random_tracks.is_some(),
             rider_school_pro_mission_set = ?config.rider_school_pro_mission_set,
             time_attack_physics_preset = ?config.time_attack_physics_preset,
+            speed_basic_ai_parameters = ?config.basic_ai_parameters.speed().values(),
+            item_basic_ai_parameters = ?config.basic_ai_parameters.item().values(),
             remote_profile_creation = config.allow_remote_profile_creation,
             "P5136 server configuration validated and transports started"
         );

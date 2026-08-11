@@ -5,6 +5,24 @@ Last updated: 2026-08-11
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
 
+## 2026-08-11 v0.2.7 stock channel physics and configurable basic AI
+
+- Corrected normal speed and item channels to the stock Korean P5136
+  `channel.xml` integrated S7 speed byte. Individual/team Infinite Booster
+  remains the original S4; S6 is the event preset and S8 is manual-only.
+- Added persistent Korean/English/Simplified-Chinese Server management inputs
+  for all six ordinary-room basic-AI start values, with separate speed/item
+  vectors, finite/range validation, and one-click stock-default restoration.
+- Room start now snapshots the speed vector for game types 1/3 and the item
+  vector for game types 2/4, then serializes that same validated snapshot for
+  each actor-owned AI racer. Defaults are
+  `[0.7, 2400, 2950, 1.5, 1000, 1500]` for speed and
+  `[0.6, 2400, 2950, 1.5, 1000, 1500]` for item, preserving the C# mode
+  distinction without its per-racer randomness.
+- Added configuration, invalid-input, mode-selection, start-packet, channel
+  mapping, and GUI persistence regressions; synchronized the translated guides
+  and the static AI audit.
+
 ## 2026-08-11 v0.2.6 stage ownership, account presets, and documentation
 
 - Fixed the C#-era ghost-room path where a room owner entered MyRoom or another
@@ -39,9 +57,10 @@ short feature ledger is in [PORTING.md](PORTING.md).
   `GrRequestBasicAiPacket` contains only `player_id:u32 + option:u8`, and the
   13-byte slot body contains loadout/team only. Native
   `GrCommandStartPacket` codecs at `0x0072D970`/`0x00730400` carry a counted
-  vector of six-float, 24-byte AI specs. Rust currently freezes the same
-  `[0.7, 2400, 2950, 1.5, 1000, 1500]` spec for every AI; no speculative GUI
-  selector was added. See [AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md).
+  vector of six-float, 24-byte AI specs. Rust freezes the same
+  `[0.7, 2400, 2950, 1.5, 1000, 1500]` spec for every AI in this release; no
+  speculative GUI selector was added. See
+  [AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md).
 - Synchronized all three user READMEs and added [DOCUMENTATION.md](DOCUMENTATION.md)
   as the complete guide/ledger index. The translated inventory documentation
   now matches the real 1,284/1,296 catalog admission and the re-quarantined
@@ -121,11 +140,13 @@ short feature ledger is in [PORTING.md](PORTING.md).
   other half is used without violating the slot/team mapping.
 - Room creation derives its advertised `speed_type` from the channel whenever
   the title has no standalone S0-S8 token. Individual/team infinite-booster
-  channels 23/24 use the stock S4 preset, item channels use S8, and speed/newbie
-  channels use S7. S6 remains available only as an explicit event preset.
-  The race-start physics lookup receives that same fallback, while game types
-  2/4 still select their individual/team item matrix rows. Thus channel/session
-  metadata and the emitted 235-byte physics block no longer disagree.
+  channels 23/24 use the stock S4 preset, while speed, item, and newbie
+  channels use the stock integrated S7. S6 remains available only as an
+  explicit event preset, and S8 remains an explicit manual preset rather than
+  an item-mode default. The race-start physics lookup receives that same
+  fallback, while game types 2/4 select their individual/team item matrix
+  rows. Thus channel/session metadata and the emitted 235-byte physics block
+  follow the P5136 client catalog.
 - The native GUI now enables eframe desktop persistence and stores a bounded
   (2 MiB maximum) versioned snapshot of all server/connector input fields:
   addresses, ports, paths, nickname, runner/Wine/CrossOver/Sikarugir settings,
@@ -140,7 +161,7 @@ short feature ledger is in [PORTING.md](PORTING.md).
   carries the prior race order (including DNF ordering) instead of the original
   join order, without leaving an empty grid position when a racer disconnected.
 - Regression coverage includes alternating team admission and physical slots,
-  true team-full rejection, S4 infinite/S8 item channel creation, matrix
+  true team-full rejection, S4 infinite/S7 integrated channel creation, matrix
   fallback selection, GUI persistence and required-path rejection, and exact
   next-start `RoomPlayer.ranking` serialization.
 - The refreshed fixed-path release is

@@ -25,11 +25,13 @@ use p5136_profile::{
     ProfileStore, RiderSchoolProgress, add_kart_with_options, additional_karts, search_karts,
 };
 use p5136_server::{
-    BoundServer, ItemProbabilityConfiguration, ItemProbabilityEntry, ItemProbabilityRankBand,
-    ItemProbabilityRankPolicy, RandomTrackCatalog, RandomTrackConfiguration, RandomTrackDefinition,
-    RandomTrackPool, RandomTrackPoolOverride, ResolvedRandomTracks, RiderSchoolProMissionSet,
-    ServerConfig, ServerEndpoints, TimeAttackPhysicsPreset, load_client_item_probabilities,
-    load_client_kart_catalog, load_client_random_track_catalog, load_item_probability_xml,
+    BasicAiModeParameters, BasicAiParameters, BoundServer, DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES,
+    DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES, ItemProbabilityConfiguration, ItemProbabilityEntry,
+    ItemProbabilityRankBand, ItemProbabilityRankPolicy, RandomTrackCatalog,
+    RandomTrackConfiguration, RandomTrackDefinition, RandomTrackPool, RandomTrackPoolOverride,
+    ResolvedRandomTracks, RiderSchoolProMissionSet, ServerConfig, ServerEndpoints,
+    TimeAttackPhysicsPreset, load_client_item_probabilities, load_client_kart_catalog,
+    load_client_random_track_catalog, load_item_probability_xml,
 };
 use serde::{Deserialize, Serialize};
 
@@ -392,6 +394,8 @@ struct ServerInputs {
     random_tracks: RandomTrackConfiguration,
     rider_school_pro_mission_set: RiderSchoolProMissionSet,
     time_attack_physics_preset: TimeAttackPhysicsPreset,
+    speed_basic_ai_parameters: [String; 6],
+    item_basic_ai_parameters: [String; 6],
     file_logging: GuiFileLogging,
 }
 
@@ -487,6 +491,10 @@ impl Default for ServerInputs {
             random_tracks: RandomTrackConfiguration::default(),
             rider_school_pro_mission_set: RiderSchoolProMissionSet::Automatic,
             time_attack_physics_preset: TimeAttackPhysicsPreset::default(),
+            speed_basic_ai_parameters: ["0.7", "2400", "2950", "1.5", "1000", "1500"]
+                .map(str::to_owned),
+            item_basic_ai_parameters: ["0.6", "2400", "2950", "1.5", "1000", "1500"]
+                .map(str::to_owned),
             file_logging: GuiFileLogging::Enabled,
         }
     }
@@ -569,6 +577,30 @@ impl ServerInputs {
                 "最大登录会话数必须至少为 1"
             )));
         }
+        let speed_basic_ai_parameters =
+            parse_basic_ai_parameters(&self.speed_basic_ai_parameters, language).with_context(
+                || {
+                    tr!(
+                        language,
+                        "스피드전 AI 파라미터가 P5136 패킷의 허용 범위를 벗어났습니다",
+                        "A speed-mode AI parameter is outside the P5136 packet limits",
+                        "竞速模式 AI 参数超出 P5136 数据包允许范围"
+                    )
+                },
+            )?;
+        let item_basic_ai_parameters =
+            parse_basic_ai_parameters(&self.item_basic_ai_parameters, language).with_context(
+                || {
+                    tr!(
+                        language,
+                        "아이템전 AI 파라미터가 P5136 패킷의 허용 범위를 벗어났습니다",
+                        "An item-mode AI parameter is outside the P5136 packet limits",
+                        "道具模式 AI 参数超出 P5136 数据包允许范围"
+                    )
+                },
+            )?;
+        let basic_ai_parameters =
+            BasicAiModeParameters::new(speed_basic_ai_parameters, item_basic_ai_parameters);
         if let Some(pool) = self
             .random_tracks
             .pools
@@ -630,6 +662,7 @@ impl ServerInputs {
             random_tracks: self.random_tracks.clone(),
             rider_school_pro_mission_set: self.rider_school_pro_mission_set,
             time_attack_physics_preset: self.time_attack_physics_preset,
+            basic_ai_parameters,
             first_message_delay: Duration::from_millis(parse_u64(
                 &self.first_message_delay_ms,
                 tr!(
@@ -802,17 +835,12 @@ fn time_attack_physics_preset_label(
             "S6 event Infinite Booster",
             "S6 活动无限加速"
         ),
-        TimeAttackPhysicsPreset::S7 => tr!(
-            language,
-            "S7 통합 스피드",
-            "S7 integrated speed",
-            "S7 统一竞速"
-        ),
+        TimeAttackPhysicsPreset::S7 => tr!(language, "S7 통합", "S7 integrated", "S7 标准速度"),
         TimeAttackPhysicsPreset::S8 => tr!(
             language,
-            "S8 통합 아이템",
-            "S8 integrated item",
-            "S8 统一道具"
+            "S8 통합속도",
+            "S8 integrated speed",
+            "S8 标准速度"
         ),
     }
 }
@@ -1020,6 +1048,66 @@ fn parse_usize(value: &str, label: &str, language: GuiLanguage) -> Result<usize>
             "{label}必须是非负整数"
         )
     })
+}
+
+fn parse_f32(value: &str, label: &str, language: GuiLanguage) -> Result<f32> {
+    value.trim().parse::<f32>().with_context(|| {
+        tr_format!(
+            language,
+            "{label}은(는) 유한한 숫자여야 합니다",
+            "{label} must be a finite number",
+            "{label}必须是有限数值"
+        )
+    })
+}
+
+fn parse_basic_ai_parameters(
+    inputs: &[String; 6],
+    language: GuiLanguage,
+) -> Result<BasicAiParameters> {
+    let labels = [
+        tr!(
+            language,
+            "AI 목표 속도 계수",
+            "AI target-speed factor",
+            "AI 目标速度系数"
+        ),
+        tr!(
+            language,
+            "AI 기본 속도 스칼라",
+            "AI base-speed scalar",
+            "AI 基础速度标量"
+        ),
+        tr!(
+            language,
+            "AI 부스터 지속 시간",
+            "AI boost duration",
+            "AI 加速器持续时间"
+        ),
+        tr!(
+            language,
+            "AI 부스터 가속 배율",
+            "AI boost-acceleration multiplier",
+            "AI 加速器加速度倍率"
+        ),
+        tr!(
+            language,
+            "AI 호환 예약값 1",
+            "AI compatibility value 1",
+            "AI 兼容保留值 1"
+        ),
+        tr!(
+            language,
+            "AI 호환 예약값 2",
+            "AI compatibility value 2",
+            "AI 兼容保留值 2"
+        ),
+    ];
+    let mut values = [0.0; 6];
+    for ((value, input), label) in values.iter_mut().zip(inputs).zip(labels) {
+        *value = parse_f32(input, label, language)?;
+    }
+    BasicAiParameters::try_from(values).map_err(Into::into)
 }
 
 fn discover_lan_ipv4_candidates(language: GuiLanguage) -> Result<Vec<(String, Ipv4Addr)>> {
@@ -4091,6 +4179,74 @@ impl P5136GuiApp {
         );
     }
 
+    fn basic_ai_parameters_editor(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.collapsing(
+            tr!(
+                language,
+                "AI 주행 파라미터",
+                "AI driving parameters",
+                "AI 驾驶参数"
+            ),
+            |ui| {
+                ui.weak(tr!(
+                    language,
+                    "스피드전과 아이템전에 각각 적용됩니다. 앞의 네 값은 실제 주행에 쓰이고, 마지막 두 값은 P5136 호환용 예약 필드입니다.",
+                    "Speed and item races use separate vectors. P5136 consumes the first four values while the final two are compatibility fields.",
+                    "竞速赛和道具赛分别使用独立参数。P5136 使用前四项，最后两项为兼容保留字段。"
+                ));
+                ui.add_space(4.0);
+                let labels = [
+                    tr!(language, "목표 속도 계수", "Target-speed factor", "目标速度系数"),
+                    tr!(language, "기본 속도 스칼라", "Base-speed scalar", "基础速度标量"),
+                    tr!(language, "부스터 지속 시간 (ms)", "Boost duration (ms)", "加速器持续时间（毫秒）"),
+                    tr!(language, "부스터 가속 배율", "Boost-acceleration multiplier", "加速器加速度倍率"),
+                    tr!(language, "호환 예약값 1 (미사용)", "Compatibility value 1 (unused)", "兼容保留值 1（未使用）"),
+                    tr!(language, "호환 예약값 2 (미사용)", "Compatibility value 2 (unused)", "兼容保留值 2（未使用）"),
+                ];
+                egui::Grid::new("basic-ai-parameters")
+                    .num_columns(3)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label("");
+                        ui.strong(tr!(language, "스피드전", "Speed", "竞速赛"));
+                        ui.strong(tr!(language, "아이템전", "Item", "道具赛"));
+                        ui.end_row();
+                        for (index, label) in labels.into_iter().enumerate() {
+                            ui.label(label);
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut self.server_inputs.speed_basic_ai_parameters[index],
+                                )
+                                .desired_width(90.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut self.server_inputs.item_basic_ai_parameters[index],
+                                )
+                                .desired_width(90.0),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                if ui
+                    .button(tr!(
+                        language,
+                        "원본 기본값으로 복원",
+                        "Restore stock defaults",
+                        "恢复原版默认值"
+                    ))
+                    .clicked()
+                {
+                    self.server_inputs.speed_basic_ai_parameters =
+                        DEFAULT_SPEED_BASIC_AI_PARAMETER_VALUES.map(|value| value.to_string());
+                    self.server_inputs.item_basic_ai_parameters =
+                        DEFAULT_ITEM_BASIC_AI_PARAMETER_VALUES.map(|value| value.to_string());
+                }
+            },
+        );
+    }
+
     fn server_management_tab(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         let active = self.server_run_state.is_active();
@@ -4110,15 +4266,16 @@ impl P5136GuiApp {
 
         ui.add_enabled_ui(!active, |ui| {
             self.time_attack_physics_editor(ui);
+            self.basic_ai_parameters_editor(ui);
             self.rider_school_pro_mission_editor(ui);
             self.item_probability_editor(ui);
         });
         if active {
             ui.weak(tr!(
                 language,
-                "타임어택 물리, PRO 미션 조합과 아이템 확률표는 현재 실행 설정에 포함되어 있으므로 서버를 정지한 뒤 변경할 수 있습니다.",
-                "The time-attack physics preset, PRO mission pair, and item-probability table are part of the current runtime configuration; stop the server before changing them.",
-                "计时赛物理预设、PRO 任务组合和道具概率表属于当前运行配置，请停止服务器后再更改。"
+                "타임어택 물리, AI 주행 파라미터, PRO 미션 조합과 아이템 확률표는 현재 실행 설정에 포함되어 있으므로 서버를 정지한 뒤 변경할 수 있습니다.",
+                "The time-attack physics preset, AI driving parameters, PRO mission pair, and item-probability table are part of the current runtime configuration; stop the server before changing them.",
+                "计时赛物理预设、AI 驾驶参数、PRO 任务组合和道具概率表属于当前运行配置，请停止服务器后再更改。"
             ));
         }
         self.inventory_editor(ui);
@@ -4698,6 +4855,10 @@ mod tests {
             max_login_sessions: "32".to_owned(),
             rider_school_pro_mission_set: RiderSchoolProMissionSet::MineMaple,
             time_attack_physics_preset: TimeAttackPhysicsPreset::S4,
+            speed_basic_ai_parameters: ["0.8", "2500", "3100", "1.7", "900", "1400"]
+                .map(str::to_owned),
+            item_basic_ai_parameters: ["0.5", "2300", "2800", "1.3", "800", "1300"]
+                .map(str::to_owned),
             ..ServerInputs::default()
         };
 
@@ -4731,6 +4892,18 @@ mod tests {
             config.time_attack_physics_preset,
             TimeAttackPhysicsPreset::S4
         );
+        assert_eq!(
+            config
+                .basic_ai_parameters
+                .speed()
+                .values()
+                .map(f32::to_bits),
+            [0.8, 2_500.0, 3_100.0, 1.7, 900.0, 1_400.0].map(f32::to_bits)
+        );
+        assert_eq!(
+            config.basic_ai_parameters.item().values().map(f32::to_bits),
+            [0.5, 2_300.0, 2_800.0, 1.3, 800.0, 1_300.0].map(f32::to_bits)
+        );
 
         let safe = ServerInputs {
             trust_client_item_rank: false,
@@ -4742,6 +4915,23 @@ mod tests {
             safe.item_probability_rank_policy,
             ItemProbabilityRankPolicy::CombinedFallback
         );
+    }
+
+    #[test]
+    fn server_inputs_reject_invalid_ai_parameters() {
+        let client = tempdir().unwrap();
+        fs::create_dir(client.path().join("Data")).unwrap();
+        let mut inputs = ServerInputs {
+            client_path: client.path().display().to_string(),
+            ..ServerInputs::default()
+        };
+        inputs.item_basic_ai_parameters[2] = "NaN".to_owned();
+
+        let error = inputs
+            .server_config(GuiLanguage::English)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("item-mode AI parameter"));
     }
 
     #[test]

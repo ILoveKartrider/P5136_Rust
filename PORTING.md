@@ -70,8 +70,9 @@ been demonstrated.
   room-master-only atomic title/password update and all-room reply; a changed
   S0-S8 token selects that variant in the next `GrCommandStartPacket` while the
   existing channel/session speed byte remains unchanged, matching the C# server
-- [x] channel-consistent no-title physics fallback: stock S4 for individual/team
-  infinite-booster channels, S7 for speed, and S8 for item game-type rows
+- [x] stock `channel.xml`-consistent no-title physics fallback: S4 for
+  individual/team infinite-booster channels and integrated S7 for both speed
+  and item channels; game types 2/4 select the distinct item-physics rows
 - [ ] verified launch of a stock client on Windows
 - [ ] verified launch of the same client through Wine, CrossOver, or Sikarugir
 
@@ -118,8 +119,10 @@ been demonstrated.
 - [x] bounded AI slot/wire primitives
 - [x] exact ordinary-room AI difficulty boundary: add/remove requests carry no
   difficulty, while `GrCommandStartPacket` carries one counted six-float spec
-  per frozen AI racer; the current Rust policy is a single fixed spec and the
-  six original field names remain explicitly unresolved (see
+  per frozen AI racer; Server management persists independently validated
+  speed/item vectors and room game type selects the applicable immutable race
+  snapshot. Four active meanings and two unused compatibility fields are
+  documented without inventing unrecovered native names (see
   [AI_DIFFICULTY_AUDIT.md](AI_DIFFICULTY_AUDIT.md))
 - [x] C#-compatible frozen-roster loading handshake: `GameControl(state=0)`
   arms, successful UDP time-sync marks ready, then timeout and ordered start

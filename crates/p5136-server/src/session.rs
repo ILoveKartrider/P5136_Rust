@@ -2895,6 +2895,7 @@ async fn dispatch_packet_admitted(
             Some(context),
             services.profiles.catalog(),
             services.config.resolved_random_tracks.clone(),
+            services.config.basic_ai_parameters,
         )
         .await;
     }
@@ -4139,6 +4140,7 @@ async fn handle_lobby_request_admitted(
     context: Option<&SessionContext>,
     catalog: Option<&CatalogInventory>,
     random_tracks: Option<Arc<ResolvedRandomTracks>>,
+    basic_ai_parameters: crate::BasicAiModeParameters,
 ) -> Result<Vec<Vec<u8>>, LoginSessionError> {
     let payload = match request {
         LobbyRequest::SetSlotState => {
@@ -4154,7 +4156,8 @@ async fn handle_lobby_request_admitted(
             let _ = parse_start_room_request(packet)?;
             LobbyCommandPayload::StartRoom(
                 StartRoomPlan::new(vec![P5136_FALLBACK_TRACK_ID], Vec::new())
-                    .with_random_tracks(random_tracks),
+                    .with_random_tracks(random_tracks)
+                    .with_basic_ai_parameters(basic_ai_parameters),
             )
         }
         LobbyRequest::ChangeTrack => {
@@ -6367,6 +6370,7 @@ async fn handle_lobby_request(
         None,
         None,
         None,
+        crate::BasicAiModeParameters::default(),
     )
     .await
 }
