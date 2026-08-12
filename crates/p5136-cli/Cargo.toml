@@ -23,6 +23,7 @@ eframe = { version = "0.35", default-features = false, features = [
 local-ip-address.workspace = true
 p5136-connector = { path = "../p5136-connector" }
 p5136-core = { path = "../p5136-core" }
+p5136-assets = { path = "../p5136-assets" }
 p5136-profile = { path = "../p5136-profile" }
 p5136-server = { path = "../p5136-server" }
 serde.workspace = true

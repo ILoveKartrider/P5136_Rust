@@ -45,6 +45,11 @@ been demonstrated.
 - [x] native Windows UAC launch specification
 - [x] Wine, CrossOver, and preconfigured macOS Sikarugir wrapper launch specifications
 - [x] no-argument Server/Connector GUI and equivalent CLI
+- [x] localized, persistent external-client import tabs for I/R tracks and the
+  audited non-XUN kart/character/pet/flying-pet set, with separate asset
+  category tabs, a not-installed-only filter, searchable multi-selection,
+  progress, additive complete-DataRaw installation, collision refusal, and
+  one-time catalog backups
 - [x] mutually exclusive connector account presets for regular pmap 0,
   observer-master pmap 718, and recovered anonymous-league pmap 1798; the
   server accepts only those presets plus legacy observer pmap 590 and persists

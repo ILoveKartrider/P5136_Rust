@@ -110,6 +110,22 @@ Observer chat uses `GrRiderEchoPacket` with observer IDs 8–15 and is sent to e
 
 **Anonymous league mode (pmap 1798)** is a mutually exclusive connector checkbox. Static analysis resolves 1798 as `0x400|0x200|0x100|0x4|0x2`; in the recovered league-ready path it projects opponents to shared character, color, and equipment values. No client branch was found that rewrites the nickname string itself, so the server does not currently anonymize names. The extra bits may affect other UI paths, and 1798 is not treated as a simple alias for 1068. Disabling the option and reconnecting persists pmap 0 again.
 
+## Blocked and hidden special tracks
+
+The Connector checkbox **Show blocked/hidden special tracks (experimental)** restores only entries for which P5136 still has both the physical track RHO and a normal `gameType` definition. The current set is the three TF tracks (Autobot Base, Galvatron's Earth Assault, and Mystery of Planet Cybertron) plus six individually blocked tracks that passed the static completeness check. Story-only Camelot, Olympus, Korea, Mabinogi, and Maple `S` stages have no normal track definition and remain excluded to avoid selector hangs or crashes.
+
+The connector does not rewrite `track_common.rho` or `aaa.pk`. It preserves the originally empty `DataPack1_00014.rho5` once as `DataPack1_00014.rho5.pristine.bak`, then replaces that slot with a one-file Korean track-locale overlay. If reserved slot 13 contains an experimental I/R track-import catalog, the patch uses that locale as its base so imported rows survive. Launching again with the option unchecked restores the pristine slot. `xyy` (Pleasant Goat) retains definitions and selector art, but only one of its three physical track RHOs and no dedicated BGM remain, so it is not part of this safe option.
+
+## Importing tracks from another client
+
+The GUI's **Track import** tab indexes RHO/RHO5 files directly from another Korean or Chinese client's `Data` directory. It provides searchable multi-selection of eligible I/R tracks, displays phase and file progress for discovery/import, and installs them into the current P5136 complete `DataRaw` tree. The audit covers track files, AI paths, thumbnails, themes, track-local/common/cross-theme materials, positional environment sounds, and theme BGM. P5136 hard-codes 34 native theme enums, so adding a BML selector row alone cannot expose a new theme. The reviewed `fengshen` import now reuses removed XYY native slot 17 only for client-side grouping while preserving the real `fengshen_*` track IDs, assets, and BGM paths. It explicitly sets `texTheme=xyy` to populate the old client's separate material-theme mask, while preserving an existing cross-theme list such as `abyss|sword` as `xyy|abyss|sword`. Because the old client resolves bare material names under `theme/xyy`, the importer also mirrors the complete `theme/fengshen` namespace into that native runtime namespace without deleting the original files. Because that dormant slot is also absent from the stock content registry, the import registers `themeXyy` as enabled and visible in `zeta_/kr/content/config.xml`. Installed tracks remain selectable for dependency, catalog, and compatibility-attribute repair. Other new themes are rejected until they receive a reviewed native slot or client patch. Existing same-path files with different bytes are preserved and reported as conflicts. Work files and the one-time catalog backup are stored under `.p5136-track-import` in the game directory. A complete data closure does not prove compatibility with a newer native gimmick or shader, which still requires separate review.
+
+## Importing assets from another client
+
+The GUI's **Asset import** tab indexes the newer Chinese client's `Data` directory. Its internal **Karts**, **Characters**, **Pets**, and **Flying pets** tabs provide searchable multi-selection of statically audited candidates, while **Not installed only** hides entries already present in the current `DataRaw`. The audited set contains 57 karts, 73 characters, 24 pets, and 47 flying pets. XUN/Kart12 native-backport karts are omitted. Six karts that require new item results absent from P5136—`SteamIV1`, `deliveryV1`, `flowerCarriageV1`, `lionmaskV1_gold`, `mechanicdragon_redV1`, and `skunaV1`—remain visible but disabled with a reason. This leaves 51 currently importable karts, 73 characters, 24 pets, and 47 flying pets.
+
+The importer rechecks the selected dependency closures and SHA-256 hashes immediately before installation. Resources are added to a complete `DataRaw` tree; an existing same-path resource with different bytes stops the operation instead of being overwritten. Display names use ASCII asset codes and remaining non-ASCII catalog fields use stable hashes. The item table, Korean shop, and four kart item-ability catalogs are merged. A Chinese regional flying-pet parameter also receives a `param@kr.bml` alias for the Korean client. The server auto-grants a new kart or character only when both its audited ID and matching DataRaw model exist, keeping blocked karts and XUN candidates hidden. The server-visible `DataPack1_00000.rho5` and `DataPack4_00002.rho5` catalogs are updated after preserving their original bytes once as `.pristine.bak`. Work files, reports, and DataRaw catalog backups live under `.p5136-asset-import`; a successful import enables the connector's complete-DataRaw option. Restart the server and client after importing. For a new flying-pet ID absent from P5136's hard-coded server table, server-side physics and special effects remain separate implementation work; this audit establishes resource/catalog compatibility needed for display and equipment.
+
 ## Teams and the next starting grid
 
 New racers in a team room join the team with fewer members. Ties choose Blue first, producing Blue, Red, Blue, Red for the initial entries. Physics slots remain Blue 0–3 and Red 4–7, with AI included in team counts.
@@ -160,7 +176,7 @@ p5136.exe connect `
   --server 192.168.1.10
 ```
 
-Add `--observer` for the observer-master profile or `--anonymous-league` for pmap 1798. The two flags conflict.
+Add `--observer` for the observer-master profile, `--anonymous-league` for the mutually exclusive pmap 1798 preset, or `--unlock-special-tracks` for the statically validated special-track overlay.
 
 macOS Sikarugir example:
 

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/p5136-assets",
     "crates/p5136-client-oracle",
     "crates/p5136-cli",
     "crates/p5136-connector",
@@ -14,7 +15,7 @@ resolver = "2"
 edition = "2024"
 license = "AFL-3.0"
 rust-version = "1.94"
-version = "0.2.7"
+version = "0.3.0"
 
 [workspace.dependencies]
 anyhow = "1.0"

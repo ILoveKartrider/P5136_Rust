@@ -8,6 +8,8 @@
 Thumbs.db
 .idea/
 .vscode/
+__pycache__/
+*.py[cod]
 
 # Local work, unrelated simulations, and historical reverse-engineering notes
 /_scratch/
@@ -16,6 +18,13 @@ Thumbs.db
 /_analysis/
 /past-analysis/
 /research/
+/tools/ida/
+/tools/debug/
+/native/p5136-xun-sidecar/
+/ASSET_IMPORT.md
+/DATARAW_LOADING_AUDIT.md
+/TRACK_IMPORT_AUDIT.md
+/XUN_BACKPORT_AUDIT.md
 /[Cc]apture/
 /[Cc]aptures/
 /[Pp]hysics[Ss]im/

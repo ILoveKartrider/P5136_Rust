@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crypto::{KeyProvider, decrypt_in_place, packed_file_key};
+use crypto::{KeyProvider, decrypt_in_place, packed_file_key_with_mixing};
 use flate2::bufread::ZlibDecoder;
 use md5::{Digest, Md5};
 use thiserror::Error;
@@ -17,6 +17,30 @@ const RHO5_VERSION: u8 = 2;
 const DATA_ALIGNMENT: u64 = 0x400;
 const DOUBLE_ENCRYPTED_PREFIX: usize = 0x400;
 const TABLE_FIXED_ENTRY_BYTES: u64 = 0x28;
+
+/// P5136 client processing flags for a zlib-compressed payload encrypted with
+/// the normal RHO5 stream plus the additional first-0x400-byte stream.
+///
+/// Stock Korean P5136 archives use this value for every populated entry.  A
+/// zero value makes the native client expose the stored ciphertext directly
+/// to resource consumers instead of decoding it.
+pub const P5136_PACKED_ENTRY_FLAGS: i32 = 0x0000_0007;
+
+/// Regional key schedule used by RHO5 archives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rho5Region {
+    Korea,
+    China,
+}
+
+impl Rho5Region {
+    const fn mixing_string(self) -> &'static str {
+        match self {
+            Self::Korea => "y&errfV6GRS!e8JL",
+            Self::China => "d$Bjgfc8@dH4TQ?k",
+        }
+    }
+}
 
 /// Resource limits applied while scanning and extracting RHO5 entries.
 ///
@@ -69,6 +93,7 @@ pub struct Rho5Offsets {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rho5Entry {
     normalized_path: String,
+    raw_path: String,
     archive_path: PathBuf,
     archive_name: String,
     archive_length: u64,
@@ -76,6 +101,7 @@ pub struct Rho5Entry {
     compressed_size: usize,
     plaintext_size: usize,
     plaintext_md5: [u8; 16],
+    flags: i32,
     key: [u8; 16],
 }
 
@@ -83,6 +109,11 @@ impl Rho5Entry {
     #[must_use]
     pub fn normalized_path(&self) -> &str {
         &self.normalized_path
+    }
+
+    #[must_use]
+    pub fn raw_path(&self) -> &str {
+        &self.raw_path
     }
 
     #[must_use]
@@ -114,6 +145,11 @@ impl Rho5Entry {
     pub fn plaintext_md5(&self) -> [u8; 16] {
         self.plaintext_md5
     }
+
+    #[must_use]
+    pub const fn flags(&self) -> i32 {
+        self.flags
+    }
 }
 
 /// A bounded, immutable index of every `*.rho5` archive in one directory.
@@ -128,6 +164,20 @@ pub struct Rho5Directory {
 impl Rho5Directory {
     /// Scans all regular `*.rho5` files in `directory` using the KR P5136 keys.
     pub fn scan_kr(directory: impl AsRef<Path>, limits: Rho5Limits) -> Result<Self, Rho5Error> {
+        Self::scan(directory, Rho5Region::Korea, limits)
+    }
+
+    /// Scans all regular `*.rho5` files using the Chinese live-client keys.
+    pub fn scan_cn(directory: impl AsRef<Path>, limits: Rho5Limits) -> Result<Self, Rho5Error> {
+        Self::scan(directory, Rho5Region::China, limits)
+    }
+
+    /// Scans all regular `*.rho5` files using an explicit regional key schedule.
+    pub fn scan(
+        directory: impl AsRef<Path>,
+        region: Rho5Region,
+        limits: Rho5Limits,
+    ) -> Result<Self, Rho5Error> {
         validate_limits(&limits)?;
         let requested_directory = directory.as_ref();
         let canonical_directory =
@@ -147,7 +197,7 @@ impl Rho5Directory {
             });
         }
         let archive_paths = collect_archive_paths(&canonical_directory, &limits)?;
-        let entries = index_archives(&archive_paths, &limits)?;
+        let entries = index_archives(&archive_paths, region, &limits)?;
 
         Ok(Self {
             directory: canonical_directory,
@@ -525,13 +575,14 @@ fn collect_archive_paths(directory: &Path, limits: &Rho5Limits) -> Result<Vec<Pa
 
 fn index_archives(
     archive_paths: &[PathBuf],
+    region: Rho5Region,
     limits: &Rho5Limits,
 ) -> Result<Vec<Rho5Entry>, Rho5Error> {
     let mut entries = Vec::new();
     let mut total_compressed = 0_u64;
     let mut total_plaintext = 0_u64;
     for archive_path in archive_paths {
-        let mut archive_entries = parse_archive(archive_path, limits)?;
+        let mut archive_entries = parse_archive(archive_path, region, limits)?;
         let new_total = entries.len().checked_add(archive_entries.len()).ok_or(
             Rho5Error::ArithmeticOverflow {
                 field: "total indexed file count",
@@ -591,14 +642,19 @@ fn add_declared_size(
     Ok(new_total)
 }
 
-fn parse_archive(path: &Path, limits: &Rho5Limits) -> Result<Vec<Rho5Entry>, Rho5Error> {
-    let descriptor = read_archive_descriptor(path, limits)?;
-    let pending = read_archive_table(path, &descriptor, limits)?;
-    finalize_entries(path, &descriptor, pending)
+fn parse_archive(
+    path: &Path,
+    region: Rho5Region,
+    limits: &Rho5Limits,
+) -> Result<Vec<Rho5Entry>, Rho5Error> {
+    let descriptor = read_archive_descriptor(path, region, limits)?;
+    let pending = read_archive_table(path, &descriptor, region, limits)?;
+    finalize_entries(path, &descriptor, pending, region)
 }
 
 fn read_archive_descriptor(
     path: &Path,
+    region: Rho5Region,
     limits: &Rho5Limits,
 ) -> Result<ArchiveDescriptor, Rho5Error> {
     let archive_metadata = fs::metadata(path).map_err(|source| Rho5Error::Io {
@@ -640,7 +696,7 @@ fn read_archive_descriptor(
         })?;
     let mut header_reader = DecryptReader::new(
         header_file,
-        KeyProvider::for_header(archive_name),
+        KeyProvider::for_header_with_mixing(archive_name, region.mixing_string()),
         offsets.header,
     );
     let header_checksum = header_reader.read_i32(path, "read RHO5 header checksum")?;
@@ -695,6 +751,7 @@ fn read_archive_descriptor(
 fn read_archive_table(
     path: &Path,
     descriptor: &ArchiveDescriptor,
+    region: Rho5Region,
     limits: &Rho5Limits,
 ) -> Result<PendingTable, Rho5Error> {
     let mut table_file = open_archive(path)?;
@@ -707,7 +764,7 @@ fn read_archive_table(
         })?;
     let mut table_reader = DecryptReader::new(
         table_file,
-        KeyProvider::for_table(&descriptor.archive_name),
+        KeyProvider::for_table_with_mixing(&descriptor.archive_name, region.mixing_string()),
         descriptor.offsets.table,
     );
     let mut pending = Vec::with_capacity(descriptor.file_count);
@@ -797,6 +854,7 @@ fn read_pending_entry(
     Ok(PendingEntry {
         normalized_path,
         raw_path,
+        flags: metadata.unknown,
         block_offset,
         compressed_size,
         plaintext_size,
@@ -895,6 +953,7 @@ fn finalize_entries(
     path: &Path,
     descriptor: &ArchiveDescriptor,
     pending: PendingTable,
+    region: Rho5Region,
 ) -> Result<Vec<Rho5Entry>, Rho5Error> {
     let archive_length = descriptor.archive_length;
     let PendingTable {
@@ -933,9 +992,14 @@ fn finalize_entries(
                 archive_length,
             });
         }
-        let key = packed_file_key(&pending_entry.plaintext_md5, &pending_entry.raw_path);
+        let key = packed_file_key_with_mixing(
+            &pending_entry.plaintext_md5,
+            &pending_entry.raw_path,
+            region.mixing_string(),
+        );
         entries.push(Rho5Entry {
             normalized_path: pending_entry.normalized_path,
+            raw_path: pending_entry.raw_path,
             archive_path: path.to_path_buf(),
             archive_name: descriptor.archive_name.clone(),
             archive_length,
@@ -943,6 +1007,7 @@ fn finalize_entries(
             compressed_size: pending_entry.compressed_size,
             plaintext_size: pending_entry.plaintext_size,
             plaintext_md5: pending_entry.plaintext_md5,
+            flags: pending_entry.flags,
             key,
         });
     }
@@ -1182,6 +1247,7 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, Rho5Error> {
 struct PendingEntry {
     normalized_path: String,
     raw_path: String,
+    flags: i32,
     block_offset: u64,
     compressed_size: usize,
     plaintext_size: usize,
@@ -1285,9 +1351,19 @@ impl DecryptReader {
     }
 }
 
+mod aaa;
 mod legacy;
 mod legacy_vectors;
+mod legacy_writer;
+mod rho5_writer;
 #[cfg(test)]
 mod tests;
 
-pub use legacy::{LegacyRhoArchive, LegacyRhoEntry, LegacyRhoError, LegacyRhoLimits};
+pub use aaa::{AaaDocument, AaaError, AaaLimits, AaaNode, AaaRhoFolder, AaaRhoMount};
+pub use legacy::{
+    LegacyRhoArchive, LegacyRhoEntry, LegacyRhoError, LegacyRhoFileProperty, LegacyRhoLimits,
+};
+pub use legacy_writer::{
+    LegacyRhoEncoded, LegacyRhoWriteEntry, LegacyRhoWriteError, LegacyRhoWriter,
+};
+pub use rho5_writer::{Rho5Encoded, Rho5WriteEntry, Rho5WriteError, Rho5Writer};

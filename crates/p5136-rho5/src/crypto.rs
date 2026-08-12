@@ -1,3 +1,4 @@
+#[cfg(test)]
 const KR_MIXING_STRING: &str = "y&errfV6GRS!e8JL";
 
 const LINEAR_TABLE_4_BASIS: [u32; 8] = [
@@ -30,12 +31,22 @@ pub(crate) struct KeyProvider {
 }
 
 impl KeyProvider {
+    #[cfg(test)]
     pub(crate) fn for_header(archive_name: &str) -> Self {
-        Self::from_key(&header_key(archive_name))
+        Self::for_header_with_mixing(archive_name, KR_MIXING_STRING)
     }
 
+    #[cfg(test)]
     pub(crate) fn for_table(archive_name: &str) -> Self {
-        Self::from_key(&table_key(archive_name))
+        Self::for_table_with_mixing(archive_name, KR_MIXING_STRING)
+    }
+
+    pub(crate) fn for_header_with_mixing(archive_name: &str, mixing: &str) -> Self {
+        Self::from_key(&header_key(archive_name, mixing))
+    }
+
+    pub(crate) fn for_table_with_mixing(archive_name: &str, mixing: &str) -> Self {
+        Self::from_key(&table_key(archive_name, mixing))
     }
 
     // This is a direct, state-by-state transcription of the two-round P5136
@@ -360,8 +371,17 @@ impl KeyProvider {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn packed_file_key(checksum: &[u8; 16], path: &str) -> [u8; 16] {
-    let u1 = file_key_u1(KR_MIXING_STRING);
+    packed_file_key_with_mixing(checksum, path, KR_MIXING_STRING)
+}
+
+pub(crate) fn packed_file_key_with_mixing(
+    checksum: &[u8; 16],
+    path: &str,
+    mixing: &str,
+) -> [u8; 16] {
+    let u1 = file_key_u1(mixing);
     let digits: Vec<u8> = u1.to_string().bytes().map(|byte| byte - b'0').collect();
     let utf16: Vec<u16> = path.encode_utf16().collect();
     debug_assert!(!utf16.is_empty());
@@ -392,7 +412,6 @@ pub(crate) fn decrypt_in_place(data: &mut [u8], key: &[u8; 16]) {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn encrypt_in_place(data: &mut [u8], key: &[u8; 16]) {
     let mut provider = KeyProvider::from_key(key);
     for chunk in data.chunks_mut(4) {
@@ -403,8 +422,8 @@ pub(crate) fn encrypt_in_place(data: &mut [u8], key: &[u8; 16]) {
     }
 }
 
-fn header_key(archive_name: &str) -> [u8; 16] {
-    let combined: Vec<u16> = format!("{}{}", archive_name.to_ascii_lowercase(), KR_MIXING_STRING)
+fn header_key(archive_name: &str, mixing: &str) -> [u8; 16] {
+    let combined: Vec<u16> = format!("{}{}", archive_name.to_ascii_lowercase(), mixing)
         .encode_utf16()
         .collect();
     std::array::from_fn(|i| {
@@ -413,8 +432,8 @@ fn header_key(archive_name: &str) -> [u8; 16] {
     })
 }
 
-fn table_key(archive_name: &str) -> [u8; 16] {
-    let combined: Vec<u16> = format!("{}{}", archive_name.to_ascii_lowercase(), KR_MIXING_STRING)
+fn table_key(archive_name: &str, mixing: &str) -> [u8; 16] {
+    let combined: Vec<u16> = format!("{}{}", archive_name.to_ascii_lowercase(), mixing)
         .encode_utf16()
         .collect();
     std::array::from_fn(|i| {

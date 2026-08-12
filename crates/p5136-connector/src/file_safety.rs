@@ -287,6 +287,21 @@ pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+pub(crate) fn restore_persistent_file(
+    path: &Path,
+    preparation: &PersistentFilePreparation,
+    maximum_bytes: usize,
+) -> Result<(), ConnectorFileError> {
+    match preparation.state {
+        PristineState::Backup => atomic_copy(
+            &append_suffix(path, PRISTINE_BACKUP_SUFFIX),
+            path,
+            maximum_bytes,
+        ),
+        PristineState::Absent => remove_file_if_exists(path, "restore pristine absence"),
+    }
+}
+
 fn create_backup_once(
     source_path: &Path,
     backup_path: &Path,

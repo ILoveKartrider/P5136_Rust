@@ -31,6 +31,13 @@ use thiserror::Error;
 const MINIMUM_KART_NAMES: usize = 1_400;
 const MINIMUM_KART_SPECS: usize = 1_300;
 const MINIMUM_TRANSFORM_RULES: usize = 450;
+// The stock Korean P5136 catalogs end at these IDs. Assets imported from a
+// newer client remain addressable for explicit, one-at-a-time validation, but
+// static resource closure alone is not enough to prove that the P5136 My
+// Items card/preview code can instantiate them safely.
+const STOCK_MAX_CHARACTER_ID: u16 = 429;
+const STOCK_MAX_KART_ID: u16 = 1_456;
+const DEFERRED_IMPORTED_KART_IDS: &[u16] = &[1_477, 1_479, 1_494, 1_496, 1_500, 1_505];
 const MAX_SOURCE_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_XML_EVENTS: usize = 200_000;
 const MAX_XML_DEPTH: usize = 32;
@@ -38,6 +45,10 @@ const MAX_SOURCE_ELEMENTS: usize = 100_000;
 const MAX_SOURCE_ATTRIBUTES: usize = 256;
 const MAX_SOURCE_STRING_BYTES: usize = 4 * 1024;
 const SHOP_INVENTORY_PATH: &str = "zeta_/kr/shop/data/item.kml";
+const ITEM_ABILITY_OVERLAY_PATHS: &[(&str, &str)] = &[
+    ("item/slot/transformByKart.bml", "transformByKart"),
+    ("item/slot/animalBooster.bml", "animalBooster"),
+];
 const SPECIAL_BOOSTER_TRANSFORM_MODE: &str = "animal_booster";
 
 const VERIFIED_ITEM_SYMBOLS: &[(&str, i16)] = &[
@@ -267,11 +278,22 @@ pub fn load_client_kart_catalog(
     data_directory: impl AsRef<Path>,
 ) -> Result<LoadedClientKartCatalog, ClientKartCatalogError> {
     let (source_directory, kart_path, item_path) = client_catalog_paths(data_directory.as_ref())?;
+    let data_raw_directory = source_directory
+        .parent()
+        .map(|parent| parent.join("DataRaw"))
+        .filter(|path| path.is_dir());
     let (names, specs, resources, rho5) = load_kart_metadata(&source_directory, &kart_path)?;
     validate_kart_metadata(&names, &specs)?;
     let mut inventory = load_inventory(&rho5, &names)?;
-    classify_karts(&mut inventory, &names, &specs, &resources);
-    let (symbols, transforms) = load_item_transforms(&item_path)?;
+    classify_characters(&mut inventory, data_raw_directory.as_deref());
+    classify_karts(
+        &mut inventory,
+        &names,
+        &specs,
+        &resources,
+        data_raw_directory.as_deref(),
+    );
+    let (symbols, transforms) = load_item_transforms(&item_path, &rho5)?;
 
     let xml = build_catalog_xml(&names, &specs, &inventory, &transforms)?;
     let catalog = CatalogInventory::from_xml(&xml)?;
@@ -422,11 +444,47 @@ fn classify_karts(
     names: &KartNames,
     specs: &KartSpecs,
     resources: &KartResources,
+    data_raw_directory: Option<&Path>,
 ) {
     for item in inventory.iter_mut().filter(|item| item.category == 3) {
-        item.auto_grant = kart_is_safe_for_automatic_grant(item, names, specs, resources);
+        item.auto_grant &=
+            kart_is_safe_for_automatic_grant(item, names, specs, resources, data_raw_directory);
         item.x_parts_compatible = kart_uses_x_parts(item, names, specs);
     }
+}
+
+fn classify_characters(inventory: &mut [InventoryItem], data_raw_directory: Option<&Path>) {
+    for item in inventory
+        .iter_mut()
+        .filter(|item| item.category == 1 && is_audited_imported_character_id(item.id))
+    {
+        let folder = match item.id {
+            47 => "xiyangyang",
+            48 => "mayyangyang",
+            _ => item.name.as_str(),
+        };
+        item.auto_grant &= data_raw_model_exists(data_raw_directory, "character", folder);
+    }
+}
+
+fn is_runtime_verified_for_implicit_grant(category: u16, id: u16) -> bool {
+    if (category == 1 && is_audited_imported_character_id(id))
+        || (category == 3 && is_audited_imported_kart_id(id))
+    {
+        return true;
+    }
+    is_stock_item_safe_for_implicit_grant(category, id)
+        && !((category == 1 && id > STOCK_MAX_CHARACTER_ID)
+            || (category == 3 && id > STOCK_MAX_KART_ID))
+}
+
+fn is_audited_imported_character_id(id: u16) -> bool {
+    matches!(id, 47 | 48 | 430..=499)
+}
+
+fn is_audited_imported_kart_id(id: u16) -> bool {
+    ((1_457..=1_512).contains(&id) || id == 1_515)
+        && DEFERRED_IMPORTED_KART_IDS.binary_search(&id).is_err()
 }
 
 fn kart_uses_x_parts(item: &InventoryItem, names: &KartNames, specs: &KartSpecs) -> bool {
@@ -446,6 +504,7 @@ fn kart_is_safe_for_automatic_grant(
     names: &KartNames,
     specs: &KartSpecs,
     resources: &KartResources,
+    data_raw_directory: Option<&Path>,
 ) -> bool {
     let Some(internal_name) = names.get(&item.id).map(|name| name.value.trim()) else {
         return false;
@@ -462,6 +521,9 @@ fn kart_is_safe_for_automatic_grant(
     if verified_exception {
         return true;
     }
+    if is_audited_imported_kart_id(item.id) {
+        return data_raw_model_exists(data_raw_directory, "kart_", internal_name);
+    }
     let model_folder = spec
         .value
         .attribute("addModelFolder")
@@ -470,6 +532,19 @@ fn kart_is_safe_for_automatic_grant(
         .unwrap_or(internal_name)
         .to_ascii_lowercase();
     resources.model_folders.contains(&model_folder)
+}
+
+fn data_raw_model_exists(data_raw_directory: Option<&Path>, root: &str, folder: &str) -> bool {
+    let folder = folder.trim();
+    if folder.is_empty()
+        || !folder
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return false;
+    }
+    data_raw_directory
+        .is_some_and(|directory| directory.join(root).join(folder).join("model.1s").is_file())
 }
 
 fn looks_like_non_player_kart(internal_name: &str, display_name: &str) -> bool {
@@ -495,6 +570,7 @@ fn kart_model_folder(path: &str) -> Option<String> {
 
 fn load_item_transforms(
     item_path: &Path,
+    rho5: &Rho5Directory,
 ) -> Result<(HashMap<String, i16>, Vec<RawTransform>), ClientKartCatalogError> {
     let item_archive = LegacyRhoArchive::open(item_path, LegacyRhoLimits::default())?;
     let mut symbols = HashMap::<String, i16>::new();
@@ -527,6 +603,7 @@ fn load_item_transforms(
     for &(name, id) in VERIFIED_ITEM_SYMBOLS {
         add_item_symbol(&mut symbols, name, id)?;
     }
+    merge_rho5_item_ability_overlays(rho5, &mut transform_sources, &mut special_booster_sources)?;
     let mut transforms = resolve_transforms(transform_sources, &symbols)?;
     transforms.extend(resolve_special_boosters(special_booster_sources)?);
     transforms.sort_unstable_by(|left, right| {
@@ -538,6 +615,32 @@ fn load_item_transforms(
         });
     }
     Ok((symbols, transforms))
+}
+
+fn merge_rho5_item_ability_overlays(
+    rho5: &Rho5Directory,
+    transforms: &mut TransformSources,
+    special_boosters: &mut TransformSources,
+) -> Result<(), ClientKartCatalogError> {
+    for &(path, kind) in ITEM_ABILITY_OVERLAY_PATHS {
+        let Some(entry) = rho5
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.normalized_path().eq_ignore_ascii_case(path))
+        else {
+            continue;
+        };
+        let bytes = checked_rho5_extract(rho5, entry)?;
+        match kind {
+            "transformByKart" => merge_transform_sources(transforms, 1_000, path, &bytes)?,
+            "animalBooster" => {
+                merge_special_booster_sources(special_boosters, 1_000, path, &bytes)?;
+            }
+            _ => unreachable!("bounded item ability overlay kinds"),
+        }
+    }
+    Ok(())
 }
 
 fn validate_p5136_sentinels(catalog: &CatalogInventory) -> Result<(), ClientKartCatalogError> {
@@ -754,7 +857,7 @@ fn parse_inventory(
             category,
             id,
             name,
-            auto_grant: is_stock_item_safe_for_implicit_grant(category, id),
+            auto_grant: is_runtime_verified_for_implicit_grant(category, id),
             x_parts_compatible: false,
         })
         .collect())
@@ -1402,12 +1505,15 @@ fn catalog_file_format_priority(file_name: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, fs};
+
+    use tempfile::tempdir;
 
     use super::{
-        InventoryItem, KartNames, KartResources, KartSpecs, Prioritized, SourceElement,
-        catalog_file_priority, classify_karts, decode_xml_text, kart_model_folder,
-        kart_param_candidate, load_client_kart_catalog,
+        ClientKartCatalogStats, InventoryItem, KartNames, KartResources, KartSpecs, Prioritized,
+        SourceElement, catalog_file_priority, classify_characters, classify_karts, decode_xml_text,
+        is_runtime_verified_for_implicit_grant, kart_model_folder, kart_param_candidate,
+        load_client_kart_catalog,
     };
 
     #[test]
@@ -1517,7 +1623,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        classify_karts(&mut inventory, &names, &specs, &resources);
+        classify_karts(&mut inventory, &names, &specs, &resources, None);
         assert_eq!(
             inventory
                 .iter()
@@ -1535,6 +1641,94 @@ mod tests {
     }
 
     #[test]
+    fn only_audited_import_candidates_pass_the_initial_grant_gate() {
+        assert!(is_runtime_verified_for_implicit_grant(1, 429));
+        assert!(is_runtime_verified_for_implicit_grant(1, 430));
+        assert!(is_runtime_verified_for_implicit_grant(1, 499));
+        assert!(!is_runtime_verified_for_implicit_grant(1, 500));
+        assert!(is_runtime_verified_for_implicit_grant(3, 1_456));
+        assert!(is_runtime_verified_for_implicit_grant(3, 1_457));
+        assert!(!is_runtime_verified_for_implicit_grant(3, 1_477));
+        assert!(!is_runtime_verified_for_implicit_grant(3, 1_513));
+        assert!(is_runtime_verified_for_implicit_grant(3, 1_515));
+        assert!(!is_runtime_verified_for_implicit_grant(3, 1_516));
+        assert!(is_runtime_verified_for_implicit_grant(4, 200));
+    }
+
+    #[test]
+    fn audited_import_grants_require_the_matching_dataraw_model() {
+        let names = KartNames::from([(
+            1_457,
+            Prioritized {
+                priority: 1,
+                value: "spinteacupV1".to_owned(),
+            },
+        )]);
+        let specs = KartSpecs::from([(
+            "spinteacupv1".to_owned(),
+            Prioritized {
+                priority: 1,
+                value: SourceElement {
+                    attributes: Vec::new(),
+                },
+            },
+        )]);
+        let resources = KartResources::default();
+        let make_inventory = || {
+            vec![
+                InventoryItem {
+                    category: 3,
+                    id: 1_457,
+                    name: "spinteacupV1".to_owned(),
+                    auto_grant: true,
+                    x_parts_compatible: false,
+                },
+                InventoryItem {
+                    category: 1,
+                    id: 430,
+                    name: "bazzi_trump".to_owned(),
+                    auto_grant: true,
+                    x_parts_compatible: false,
+                },
+                InventoryItem {
+                    category: 1,
+                    id: 47,
+                    name: "stock localized name".to_owned(),
+                    auto_grant: true,
+                    x_parts_compatible: false,
+                },
+            ]
+        };
+
+        let mut without_data_raw = make_inventory();
+        classify_characters(&mut without_data_raw, None);
+        classify_karts(&mut without_data_raw, &names, &specs, &resources, None);
+        assert!(without_data_raw.iter().all(|item| !item.auto_grant));
+
+        let root = tempdir().unwrap();
+        let data_raw = root.path().join("DataRaw");
+        for relative in [
+            "kart_/spinteacupV1/model.1s",
+            "character/bazzi_trump/model.1s",
+            "character/xiyangyang/model.1s",
+        ] {
+            let path = data_raw.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"fixture").unwrap();
+        }
+        let mut with_data_raw = make_inventory();
+        classify_characters(&mut with_data_raw, Some(&data_raw));
+        classify_karts(
+            &mut with_data_raw,
+            &names,
+            &specs,
+            &resources,
+            Some(&data_raw),
+        );
+        assert!(with_data_raw.iter().all(|item| item.auto_grant));
+    }
+
+    #[test]
     fn model_folder_detection_is_case_insensitive_and_requires_model_file() {
         assert_eq!(
             kart_model_folder("kart_/GigantesV1/MODEL.1S"),
@@ -1544,34 +1738,145 @@ mod tests {
         assert_eq!(kart_model_folder("model.1s"), None);
     }
 
+    fn known_client_catalog_shapes() -> [ClientKartCatalogStats; 3] {
+        [
+            ClientKartCatalogStats {
+                names: 1_456,
+                specs: 1_353,
+                inventory_items: 6_929,
+                inventory_categories: 65,
+                inventory_karts: 1_296,
+                auto_grant_karts: 1_284,
+                quarantined_karts: 12,
+                x_parts_karts: 251,
+                transform_rules: 626,
+                item_symbols: 73,
+            },
+            ClientKartCatalogStats {
+                names: 1_513,
+                specs: 1_410,
+                inventory_items: 7_056,
+                inventory_categories: 65,
+                inventory_karts: 1_353,
+                auto_grant_karts: 1_335,
+                quarantined_karts: 18,
+                x_parts_karts: 308,
+                transform_rules: 676,
+                item_symbols: 73,
+            },
+            ClientKartCatalogStats {
+                names: 1_513,
+                specs: 1_410,
+                inventory_items: 7_078,
+                inventory_categories: 65,
+                inventory_karts: 1_353,
+                auto_grant_karts: 1_335,
+                quarantined_karts: 18,
+                x_parts_karts: 308,
+                transform_rules: 676,
+                item_symbols: 73,
+            },
+        ]
+    }
+
     #[test]
+    #[allow(clippy::float_cmp, clippy::too_many_lines)]
     fn configured_real_client_catalog_matches_the_known_p5136_shape() {
         let Ok(data) = std::env::var("P5136_CLIENT_DATA_DIR") else {
             return;
         };
         let loaded = load_client_kart_catalog(data).unwrap();
         let stats = loaded.stats();
-        assert_eq!(stats.names, 1_456);
-        assert_eq!(stats.specs, 1_353);
-        assert_eq!(stats.inventory_items, 6_929);
-        assert_eq!(stats.inventory_categories, 65);
-        assert_eq!(stats.inventory_karts, 1_296);
-        assert_eq!(stats.auto_grant_karts, 1_284);
-        assert_eq!(stats.quarantined_karts, 12);
-        assert_eq!(stats.x_parts_karts, 251);
-        assert_eq!(stats.transform_rules, 626);
-        assert_eq!(stats.item_symbols, 73);
+        let [
+            stock,
+            compatible_asset_bundle,
+            compatible_asset_and_pet_bundle,
+        ] = known_client_catalog_shapes();
+        assert!(
+            stats == stock
+                || stats == compatible_asset_bundle
+                || stats == compatible_asset_and_pet_bundle,
+            "unexpected client catalog shape: {stats:?}"
+        );
+        if stats == compatible_asset_bundle || stats == compatible_asset_and_pet_bundle {
+            assert_eq!(loaded.catalog().kart_name(1_457), Some("spinteacupV1"));
+            assert_eq!(loaded.catalog().kart_name(1_515), Some("stingRayV1"));
+            for (category, id) in [(1, 430), (1, 499), (3, 1_457), (3, 1_515)] {
+                assert!(loaded.catalog().item(category, id).is_some());
+                assert!(loaded.catalog().grants_item(category, id));
+            }
+            assert_eq!(
+                loaded
+                    .catalog()
+                    .category(3)
+                    .filter(|item| item.id > 1_456 && !item.auto_grant)
+                    .count(),
+                6
+            );
+            for deferred_kart_id in super::DEFERRED_IMPORTED_KART_IDS {
+                assert!(!loaded.catalog().grants_item(3, *deferred_kart_id));
+            }
+            for (kart_id, source_id, target_id, probability, mode) in [
+                (1_460, 8, 37, 100, "no_flag"),
+                (1_487, 5, 103, 100, "no_flag"),
+                (1_511, 2, 38, 100, "no_flag"),
+                (1_464, 6, 31, 100, super::SPECIAL_BOOSTER_TRANSFORM_MODE),
+            ] {
+                let rule = loaded
+                    .catalog()
+                    .item_transform(kart_id, source_id, mode)
+                    .expect("imported kart ability");
+                assert_eq!(
+                    (rule.target_item_id, rule.probability),
+                    (target_id, probability)
+                );
+            }
+            let roller_brush = loaded
+                .catalog()
+                .kart_spec(1_509)
+                .expect("rollerBrushV1 regional BodyParam");
+            assert_eq!(roller_brush.item_slot_capacity, 3);
+            assert_eq!(roller_brush.special_slot_capacity, 2);
+            assert_eq!(roller_brush.use_transform_booster, 1);
+            // The unqualified fallback is 147/-0.0768, but the Chinese
+            // regional parameters used by the imported kart are 154/-0.086.
+            // The KR alias must preserve the regional physics as well as its
+            // three item slots.
+            assert_eq!(roller_brush.forward_accel_force, 154.0);
+            assert_eq!(roller_brush.drag_factor, -0.086);
+        }
+        if stats == compatible_asset_and_pet_bundle {
+            for pet_id in 175..=196 {
+                assert!(loaded.catalog().item(21, pet_id).is_some());
+                assert!(loaded.catalog().grants_item(21, pet_id));
+            }
+            // These two resource repairs reuse existing catalog rows that are
+            // intentionally excluded from implicit ownership by the stock
+            // Korean-client safety table.
+            for repaired_resource_only_pet_id in [77, 85] {
+                assert!(
+                    loaded
+                        .catalog()
+                        .item(21, repaired_resource_only_pet_id)
+                        .is_some()
+                );
+                assert!(
+                    !loaded
+                        .catalog()
+                        .grants_item(21, repaired_resource_only_pet_id)
+                );
+            }
+        }
         assert_eq!(loaded.catalog().kart_name(1_410), Some("gigantesV1"));
         assert!(loaded.catalog().grants_item(3, 1_410));
         assert!(loaded.catalog().supports_x_parts(1_410));
-        assert_eq!(
-            loaded
-                .catalog()
-                .grant_items()
-                .filter(|item| item.category == 3 && item.x_parts_compatible)
-                .count(),
-            251
-        );
+        let granted_x_parts_karts = loaded
+            .catalog()
+            .grant_items()
+            .filter(|item| item.category == 3 && item.x_parts_compatible)
+            .count();
+        let expected_granted_x_parts_karts = if stats == stock { 251 } else { 302 };
+        assert_eq!(granted_x_parts_karts, expected_granted_x_parts_karts);
         let mut profile = p5136_profile::Profile::default();
         profile.granted_karts.push(p5136_profile::GrantedKart {
             kart_id: 1_167,
@@ -1583,7 +1888,10 @@ mod tests {
             p5136_profile::EquipmentExceptions::default(),
         )
         .unwrap();
-        assert_eq!(inventory.parts_exceptions.len(), 252);
+        assert_eq!(
+            inventory.parts_exceptions.len(),
+            expected_granted_x_parts_karts + 1
+        );
         assert!(inventory.parts_exceptions.iter().all(|record| {
             *record
                 == p5136_core::inventory::PartsExcRecord {
@@ -1612,15 +1920,21 @@ mod tests {
             assert!(loaded.catalog().item(category, id).unwrap().auto_grant);
             assert!(loaded.catalog().grants_item(category, id));
         }
-        assert_eq!(
-            loaded
-                .catalog()
-                .category(3)
-                .filter(|item| !item.auto_grant)
-                .map(|item| item.id)
-                .collect::<Vec<_>>(),
-            vec![199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 814, 886]
+        let quarantined_karts = loaded
+            .catalog()
+            .category(3)
+            .filter(|item| !item.auto_grant)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let stock_quarantine = [199, 312, 323, 352, 657, 658, 659, 744, 745, 746, 814, 886];
+        assert!(
+            stock_quarantine
+                .iter()
+                .all(|id| quarantined_karts.contains(id))
         );
+        if stats == stock {
+            assert_eq!(quarantined_karts, stock_quarantine);
+        }
         for restored_id in [795, 1_167] {
             assert!(loaded.catalog().grants_item(3, restored_id));
         }

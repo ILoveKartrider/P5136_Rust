@@ -15,6 +15,7 @@ use crate::{
     identity::{IdentityError, normalize_nickname},
     limits::CodecLimits,
     pin::{PinPatchOptions, PinPatchReport, patch_p5136_pin_with_limits},
+    special_tracks::{SpecialTrackPatchError, SpecialTrackPatchReport, prepare_special_tracks},
     xml::{LauncherProfileRole, launcher_profile_xml_for_role, server_config_xml},
 };
 use std::net::SocketAddrV4;
@@ -26,6 +27,8 @@ pub const DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES: usize = 64 * 1024 * 1024;
 pub struct InstallationOptions {
     pub remove_ngs_on: bool,
     pub launcher_profile_role: LauncherProfileRole,
+    pub unlock_special_tracks: bool,
+    pub data_pack_off: bool,
     pub lock_timeout: Duration,
     pub maximum_persistent_file_bytes: usize,
     pub codec_limits: CodecLimits,
@@ -37,6 +40,8 @@ impl Default for InstallationOptions {
             // Matches the original connector's default Setting.NgsOn=false.
             remove_ngs_on: true,
             launcher_profile_role: LauncherProfileRole::Regular,
+            unlock_special_tracks: false,
+            data_pack_off: false,
             lock_timeout: DEFAULT_INSTALLATION_LOCK_TIMEOUT,
             maximum_persistent_file_bytes: DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES,
             codec_limits: CodecLimits::default(),
@@ -54,6 +59,7 @@ pub struct PreparedInstallation {
     pub game_config_pristine: PersistentFilePreparation,
     pub launcher_profile_pristine: PersistentFilePreparation,
     pub pin_patch: PinPatchReport,
+    pub special_track_patch: SpecialTrackPatchReport,
 }
 
 #[derive(Debug, Error)]
@@ -72,6 +78,9 @@ pub enum InstallationError {
 
     #[error("PIN preparation failed")]
     Pin(#[from] PinCodecError),
+
+    #[error("special-track preparation failed")]
+    SpecialTracks(#[from] SpecialTrackPatchError),
 }
 
 pub fn prepare_installation(
@@ -112,8 +121,13 @@ pub fn prepare_installation(
         },
         &options.codec_limits,
     )?;
-    let game_config = server_config_xml(login_endpoint);
+    let game_config = server_config_xml(login_endpoint, options.data_pack_off);
     let launcher_profile = launcher_profile_xml_for_role(&nickname, options.launcher_profile_role);
+    let special_track_patch = prepare_special_tracks(
+        game_directory,
+        options.unlock_special_tracks,
+        options.maximum_persistent_file_bytes,
+    )?;
 
     // All three outputs are fully generated and the PIN has been reparsed
     // before the first live file is replaced.
@@ -130,6 +144,7 @@ pub fn prepare_installation(
         game_config_pristine,
         launcher_profile_pristine,
         pin_patch: patch_report,
+        special_track_patch,
     })
 }
 
@@ -191,7 +206,7 @@ mod tests {
         assert!(append_suffix(&launcher_profile_path, PRISTINE_ABSENT_SUFFIX).is_file());
         assert_eq!(
             fs::read(&game_config_path).unwrap(),
-            server_config_xml(first_endpoint)
+            server_config_xml(first_endpoint, false)
         );
         assert_eq!(
             fs::read(&launcher_profile_path).unwrap(),
@@ -224,7 +239,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(&game_config_path).unwrap(),
-            server_config_xml(second_endpoint)
+            server_config_xml(second_endpoint, false)
         );
         assert_eq!(
             fs::read(&launcher_profile_path).unwrap(),

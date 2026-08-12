@@ -1,17 +1,12 @@
 use std::{
     ffi::{OsStr, OsString},
-    fmt,
-    fs::File,
-    io::{self, Read},
+    fmt, io,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
 };
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::process::{Child, Command};
-
-use crate::detection::{P5136_EXECUTABLE_SHA256, P5136_EXECUTABLE_SHA256_BYTES};
 
 const GAME_EXECUTABLE: &str = "KartRider.exe";
 const LAUNCH_ARGUMENT: &str = "-profile:launcher";
@@ -173,23 +168,6 @@ pub enum LaunchError {
 
     #[error("Sikarugir wrapper launch is supported only on macOS")]
     UnsupportedSikarugir,
-
-    #[error("failed to hash game executable before elevated launch: {path}")]
-    ElevatedExecutableHash {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error(
-        "refusing to elevate non-stock game executable {path}: \
-         expected SHA-256 {expected}, got {actual}"
-    )]
-    ElevatedExecutableMismatch {
-        path: PathBuf,
-        expected: &'static str,
-        actual: String,
-    },
 
     #[error("SystemRoot is unavailable; cannot resolve the trusted Windows PowerShell path")]
     MissingSystemRoot,
@@ -368,11 +346,7 @@ impl LaunchSpec {
     }
 
     pub(crate) fn preflight(&self, game_executable: &Path) -> Result<(), LaunchError> {
-        self.validate(game_executable)?;
-        if self.method == LaunchMethod::PowerShellUac {
-            verify_elevated_executable(game_executable)?;
-        }
-        Ok(())
+        self.validate(game_executable)
     }
 
     /// Commits a launch that has already passed `preflight`.
@@ -471,47 +445,6 @@ impl LaunchedProcess {
             ProcessHandle::UacDetached => Ok(LaunchStatus::StartedDetached),
         }
     }
-}
-
-fn verify_elevated_executable(path: &Path) -> Result<(), LaunchError> {
-    let mut file = File::open(path).map_err(|source| LaunchError::ElevatedExecutableHash {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let count =
-            file.read(&mut buffer)
-                .map_err(|source| LaunchError::ElevatedExecutableHash {
-                    path: path.to_owned(),
-                    source,
-                })?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    let actual: [u8; 32] = digest.finalize().into();
-    if actual == P5136_EXECUTABLE_SHA256_BYTES {
-        Ok(())
-    } else {
-        Err(LaunchError::ElevatedExecutableMismatch {
-            path: path.to_owned(),
-            expected: P5136_EXECUTABLE_SHA256,
-            actual: hex_digest(actual),
-        })
-    }
-}
-
-fn hex_digest(digest: [u8; 32]) -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(output, "{byte:02X}").expect("writing to a String cannot fail");
-    }
-    output
 }
 
 fn parse_elevated_pid(stdout: &[u8]) -> Result<u32, LaunchError> {
@@ -729,33 +662,19 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test]
-    async fn elevated_launch_rejects_a_non_stock_executable_before_starting_powershell() {
+    #[test]
+    fn elevated_preflight_accepts_an_alternate_executable() {
         let directory = tempdir().unwrap();
         let game_executable = directory.path().join("KartRider.exe");
-        fs::write(&game_executable, b"not the stock P5136 executable").unwrap();
+        fs::write(
+            &game_executable,
+            b"unpacked or otherwise modified P5136 executable",
+        )
+        .unwrap();
         let request = LaunchRequest::new(directory.path());
         let spec = Runner::NativeElevated.build(&request).unwrap();
 
-        let Err(error) = spec.spawn(&game_executable).await else {
-            panic!("a non-stock executable must not reach PowerShell");
-        };
-
-        assert!(matches!(
-            error,
-            LaunchError::ElevatedExecutableMismatch { path, .. } if path == game_executable
-        ));
-    }
-
-    #[test]
-    fn elevated_hash_failures_remain_typed() {
-        let missing = Path::new("missing-elevated-executable");
-        let error = super::verify_elevated_executable(missing).unwrap_err();
-
-        assert!(matches!(
-            error,
-            LaunchError::ElevatedExecutableHash { path, .. } if path == missing
-        ));
+        spec.preflight(&game_executable).unwrap();
     }
 
     #[tokio::test]

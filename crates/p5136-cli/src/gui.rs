@@ -12,6 +12,13 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 use eframe::egui;
+use p5136_assets::{
+    AssetCandidate, AssetCategory, AssetImportOptions, AssetImportPhase, AssetImportProgress,
+    AssetImportSummary, AssetSelection, TrackCandidate, TrackImportOptions, TrackImportPhase,
+    TrackImportProgress, TrackImportSummary, TrackSourceRegion,
+    discover_asset_candidates_with_progress, discover_track_candidates_with_progress,
+    import_assets_to_dataraw_with_progress, import_tracks_to_dataraw_with_progress,
+};
 use p5136_connector::{
     ConnectorCancellation, ConnectorPlan, ConnectorRequest, ConnectorStage, InstallationOptions,
     Runner, RunnerBackend, execute_connector_with_progress_and_cancellation,
@@ -194,12 +201,15 @@ impl GuiRunner {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 struct GuiInputs {
     game_directory: String,
     game_executable: String,
     nickname: String,
     observer_mode: bool,
     anonymous_league_mode: bool,
+    unlock_special_tracks: bool,
+    data_pack_off: bool,
     server: String,
     configured_port: String,
     runner: GuiRunner,
@@ -218,6 +228,8 @@ impl Default for GuiInputs {
             nickname: "player".to_owned(),
             observer_mode: false,
             anonymous_league_mode: false,
+            unlock_special_tracks: false,
+            data_pack_off: false,
             server: Ipv4Addr::LOCALHOST.to_string(),
             configured_port: DEFAULT_CONFIGURED_PORT.to_string(),
             runner: GuiRunner::Auto,
@@ -291,6 +303,8 @@ impl GuiInputs {
         };
         let installation_options = InstallationOptions {
             launcher_profile_role,
+            unlock_special_tracks: self.unlock_special_tracks,
+            data_pack_off: self.data_pack_off,
             ..InstallationOptions::default()
         };
 
@@ -405,6 +419,10 @@ struct GuiPersistedSettings {
     language: GuiLanguage,
     connector: GuiInputs,
     server: ServerInputs,
+    #[serde(default)]
+    track_import: TrackImportInputs,
+    #[serde(default)]
+    asset_import: AssetImportInputs,
 }
 
 impl GuiPersistedSettings {
@@ -445,6 +463,46 @@ impl GuiPersistedSettings {
             language: app.language,
             connector: app.connector_inputs.clone(),
             server: app.server_inputs.clone(),
+            track_import: app.track_import_inputs.clone(),
+            asset_import: app.asset_import_inputs.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct TrackImportInputs {
+    source_data: String,
+    source_region: TrackSourceRegion,
+    search: String,
+}
+
+impl Default for TrackImportInputs {
+    fn default() -> Self {
+        Self {
+            source_data: String::new(),
+            source_region: TrackSourceRegion::China,
+            search: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct AssetImportInputs {
+    source_data: String,
+    search: String,
+    category: AssetCategory,
+    only_not_installed: bool,
+}
+
+impl Default for AssetImportInputs {
+    fn default() -> Self {
+        Self {
+            source_data: String::new(),
+            search: String::new(),
+            category: AssetCategory::Kart,
+            only_not_installed: false,
         }
     }
 }
@@ -1265,6 +1323,176 @@ fn default_game_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn normalize_external_data_path(value: &str) -> PathBuf {
+    let path = PathBuf::from(value.trim());
+    if path.join("aaa.pk").is_file() {
+        path
+    } else if path.join("Data").join("aaa.pk").is_file() {
+        path.join("Data")
+    } else {
+        path
+    }
+}
+
+fn localized_track_candidate_reason(reason: &str, language: GuiLanguage) -> String {
+    match reason {
+        "already installed in the selected P5136 DataRaw tree" => tr!(
+            language,
+            "선택한 P5136 DataRaw에 이미 설치됨",
+            "Already installed in the selected P5136 DataRaw tree",
+            "已安装到所选 P5136 DataRaw"
+        )
+        .to_owned(),
+        "missing source locale row" => tr!(
+            language,
+            "소스 로케일 행이 없음",
+            "Missing source locale row",
+            "缺少源区域文本行"
+        )
+        .to_owned(),
+        "source locale marks the track blocked or unchoosable" => tr!(
+            language,
+            "소스에서 차단되었거나 선택 불가인 트랙",
+            "Blocked or unchoosable in the source client",
+            "在源客户端中被屏蔽或不可选择"
+        )
+        .to_owned(),
+        "source track folder has no effective files" => tr!(
+            language,
+            "소스 트랙 폴더에 유효 파일이 없음",
+            "Source track folder has no effective files",
+            "源赛道目录中没有有效文件"
+        )
+        .to_owned(),
+        _ if reason.starts_with("unsupported gameType") => tr_format!(
+            language,
+            "지원하지 않는 게임 형식: {}",
+            "Unsupported game type: {}",
+            "不支持的游戏类型：{}",
+            reason.trim_start_matches("unsupported gameType ")
+        ),
+        _ => reason.to_owned(),
+    }
+}
+
+fn track_import_phase_label(phase: TrackImportPhase, language: GuiLanguage) -> &'static str {
+    match phase {
+        TrackImportPhase::IndexSource => tr!(
+            language,
+            "소스 RHO/RHO5 인덱싱",
+            "Indexing source RHO/RHO5",
+            "正在索引源 RHO/RHO5"
+        ),
+        TrackImportPhase::IndexTarget => tr!(
+            language,
+            "P5136 RHO/RHO5 인덱싱",
+            "Indexing P5136 RHO/RHO5",
+            "正在索引 P5136 RHO/RHO5"
+        ),
+        TrackImportPhase::ReadCatalog => tr!(
+            language,
+            "트랙·테마 카탈로그 해석",
+            "Reading track and theme catalogs",
+            "正在读取赛道和主题目录"
+        ),
+        TrackImportPhase::SelectTracks => tr!(
+            language,
+            "가져오기 후보 판정",
+            "Evaluating import candidates",
+            "正在评估导入候选项"
+        ),
+        TrackImportPhase::CollectResources => tr!(
+            language,
+            "트랙·테마 리소스 수집",
+            "Collecting track and theme resources",
+            "正在收集赛道和主题资源"
+        ),
+        TrackImportPhase::AnalyzeDependencies => tr!(
+            language,
+            "재질·음원·참조 의존성 분석",
+            "Analyzing materials, audio, and references",
+            "正在分析材质、音频和引用依赖"
+        ),
+        TrackImportPhase::WriteBundle => tr!(
+            language,
+            "검증용 번들 생성",
+            "Writing verification bundle",
+            "正在生成验证资源包"
+        ),
+        TrackImportPhase::VerifyBundle => tr!(
+            language,
+            "번들 재검증",
+            "Verifying bundle",
+            "正在验证资源包"
+        ),
+        TrackImportPhase::InstallDataRaw => tr!(
+            language,
+            "DataRaw 설치 및 확인",
+            "Installing and verifying DataRaw",
+            "正在安装并验证 DataRaw"
+        ),
+        TrackImportPhase::Complete => tr!(language, "완료", "Complete", "完成"),
+    }
+}
+
+fn localized_asset_candidate_reason(reason: &str, language: GuiLanguage) -> String {
+    match reason {
+        "requires item-result rules that do not exist in P5136" => tr!(
+            language,
+            "P5136에 없는 신규 아이템 결과 규칙이 필요함",
+            "Requires new item-result rules unavailable in P5136",
+            "需要 P5136 中不存在的新道具结果规则"
+        )
+        .to_owned(),
+        _ => reason.to_owned(),
+    }
+}
+
+fn asset_import_phase_label(phase: AssetImportPhase, language: GuiLanguage) -> &'static str {
+    match phase {
+        AssetImportPhase::IndexSource => tr!(
+            language,
+            "외부 RHO/RHO5 인덱싱",
+            "Indexing external RHO/RHO5",
+            "正在索引外部 RHO/RHO5"
+        ),
+        AssetImportPhase::Plan => tr!(
+            language,
+            "호환성 및 의존성 분석",
+            "Auditing compatibility and dependencies",
+            "正在审计兼容性与依赖项"
+        ),
+        AssetImportPhase::Stage => tr!(
+            language,
+            "검증 번들 생성",
+            "Building verified bundle",
+            "正在生成验证资源包"
+        ),
+        AssetImportPhase::InstallDataRaw => tr!(
+            language,
+            "DataRaw 리소스 설치",
+            "Installing DataRaw resources",
+            "正在安装 DataRaw 资源"
+        ),
+        AssetImportPhase::UpdateCatalogs => tr!(
+            language,
+            "클라이언트·서버 카탈로그 갱신",
+            "Updating client and server catalogs",
+            "正在更新客户端与服务器目录"
+        ),
+        AssetImportPhase::Complete => tr!(language, "완료", "Complete", "完成"),
+    }
+}
+
+fn asset_category_label(category: AssetCategory, language: GuiLanguage) -> &'static str {
+    match category {
+        AssetCategory::Kart => tr!(language, "카트", "Karts", "车辆"),
+        AssetCategory::Character => tr!(language, "캐릭터", "Characters", "角色"),
+        AssetCategory::Pet => tr!(language, "펫", "Pets", "宠物"),
+        AssetCategory::FlyingPet => tr!(language, "플라잉펫", "Flying pets", "飞行宠物"),
+    }
+}
+
 fn default_crossover_binary() -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine")
@@ -1365,6 +1593,25 @@ enum GuiEvent {
         result: Result<u64, String>,
     },
     ServerFinished(Result<(), String>),
+    TrackCandidatesLoaded(Result<Vec<TrackCandidate>, String>),
+    TracksImported(Result<TrackImportSummary, String>),
+    TrackImportProgress(TrackImportProgress),
+    AssetCandidatesLoaded(Result<Vec<AssetCandidate>, String>),
+    AssetsImported(Result<AssetImportSummary, String>),
+    AssetImportProgress(AssetImportProgress),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackImportState {
+    Idle,
+    Scanning,
+    Importing,
+}
+
+impl TrackImportState {
+    const fn busy(self) -> bool {
+        matches!(self, Self::Scanning | Self::Importing)
+    }
 }
 
 struct P5136GuiApp {
@@ -1402,6 +1649,18 @@ struct P5136GuiApp {
     inventory_status: String,
     rider_school_selection: RiderSchoolProgress,
     rider_school_status: String,
+    track_import_inputs: TrackImportInputs,
+    track_candidates: Vec<TrackCandidate>,
+    selected_import_tracks: HashSet<String>,
+    track_import_state: TrackImportState,
+    track_import_progress: Option<TrackImportProgress>,
+    track_import_status: String,
+    asset_import_inputs: AssetImportInputs,
+    asset_candidates: Vec<AssetCandidate>,
+    selected_import_assets: HashSet<String>,
+    asset_import_state: TrackImportState,
+    asset_import_progress: Option<AssetImportProgress>,
+    asset_import_status: String,
 }
 
 impl P5136GuiApp {
@@ -1410,6 +1669,7 @@ impl P5136GuiApp {
         Self::new_with_logging(log_path, FileLoggingControl::default(), storage)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn new_with_logging(
         log_path: PathBuf,
         logging_control: FileLoggingControl,
@@ -1423,6 +1683,21 @@ impl P5136GuiApp {
         let connector_inputs = persisted
             .as_ref()
             .map_or_else(GuiInputs::default, |settings| settings.connector.clone());
+        let track_import_inputs = persisted
+            .as_ref()
+            .map_or_else(TrackImportInputs::default, |settings| {
+                settings.track_import.clone()
+            });
+        let mut asset_import_inputs = persisted
+            .as_ref()
+            .map_or_else(AssetImportInputs::default, |settings| {
+                settings.asset_import.clone()
+            });
+        if asset_import_inputs.source_data.trim().is_empty() {
+            asset_import_inputs
+                .source_data
+                .clone_from(&track_import_inputs.source_data);
+        }
         let server_inputs =
             persisted.map_or_else(ServerInputs::default, |settings| settings.server);
         let inventory_nickname = connector_inputs.nickname.clone();
@@ -1492,9 +1767,34 @@ impl P5136GuiApp {
                 "请选择昵称和驾照等级，然后应用。"
             )
             .to_owned(),
+            track_import_inputs,
+            track_candidates: Vec::new(),
+            selected_import_tracks: HashSet::new(),
+            track_import_state: TrackImportState::Idle,
+            track_import_progress: None,
+            track_import_status: tr!(
+                language,
+                "외부 클라이언트의 Data 폴더를 지정한 뒤 트랙 목록을 불러오세요.",
+                "Choose an external client's Data directory, then load its track list.",
+                "请选择外部客户端的 Data 目录，然后加载赛道列表。"
+            )
+            .to_owned(),
+            asset_import_inputs,
+            asset_candidates: Vec::new(),
+            selected_import_assets: HashSet::new(),
+            asset_import_state: TrackImportState::Idle,
+            asset_import_progress: None,
+            asset_import_status: tr!(
+                language,
+                "외부 클라이언트의 Data 폴더를 지정한 뒤 자산 목록을 불러오세요.",
+                "Choose an external client's Data directory, then load its asset list.",
+                "请选择外部客户端的 Data 目录，然后加载资源列表。"
+            )
+            .to_owned(),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn drain_events(&mut self) {
         while let Ok(event) = self.event_receiver.try_recv() {
             match event {
@@ -1540,6 +1840,154 @@ impl P5136GuiApp {
                     progress,
                     result,
                 } => self.apply_rider_school_result(&nickname, progress, result),
+                GuiEvent::TrackCandidatesLoaded(result) => {
+                    self.track_import_state = TrackImportState::Idle;
+                    match result {
+                        Ok(candidates) => {
+                            self.selected_import_tracks.retain(|id| {
+                                candidates
+                                    .iter()
+                                    .any(|candidate| candidate.eligible && candidate.id == *id)
+                            });
+                            let eligible = candidates
+                                .iter()
+                                .filter(|candidate| candidate.eligible)
+                                .count();
+                            self.track_import_status = tr_format!(
+                                self.language,
+                                "트랙 {}개를 찾았습니다. 가져오기 가능: {}개.",
+                                "Found {} tracks; {} can be imported.",
+                                "找到 {} 条赛道，其中 {} 条可导入。",
+                                candidates.len(),
+                                eligible
+                            );
+                            self.track_candidates = candidates;
+                        }
+                        Err(error) => {
+                            self.track_import_status = tr_format!(
+                                self.language,
+                                "트랙 목록을 불러오지 못했습니다: {error}",
+                                "Failed to load the track list: {error}",
+                                "无法加载赛道列表：{error}"
+                            );
+                        }
+                    }
+                }
+                GuiEvent::TracksImported(result) => {
+                    self.track_import_state = TrackImportState::Idle;
+                    match result {
+                        Ok(summary) => {
+                            self.track_import_status = tr_format!(
+                                self.language,
+                                "트랙 {}개, 리소스 {}개를 가져왔습니다. 의존성 감사 {}건, 경고 {}건. 보고서: {}",
+                                "Imported {} tracks and {} resources; audited {} dependencies with {} warnings. Report: {}",
+                                "已导入 {} 条赛道和 {} 个资源；审计了 {} 个依赖项，共 {} 条警告。报告：{}",
+                                summary.tracks,
+                                summary.resources,
+                                summary.dependencies,
+                                summary.warnings.len(),
+                                summary.report.display()
+                            );
+                            self.connector_inputs.data_pack_off = true;
+                            self.selected_import_tracks.clear();
+                            for candidate in &mut self.track_candidates {
+                                if summary
+                                    .track_ids
+                                    .iter()
+                                    .any(|id| id.eq_ignore_ascii_case(&candidate.id))
+                                {
+                                    candidate.already_installed = true;
+                                    candidate.eligible = true;
+                                    candidate.reason = None;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.track_import_status = tr_format!(
+                                self.language,
+                                "트랙 가져오기에 실패했습니다: {error}",
+                                "Track import failed: {error}",
+                                "赛道导入失败：{error}"
+                            );
+                        }
+                    }
+                }
+                GuiEvent::TrackImportProgress(progress) => {
+                    self.track_import_progress = Some(progress);
+                }
+                GuiEvent::AssetCandidatesLoaded(result) => {
+                    self.asset_import_state = TrackImportState::Idle;
+                    match result {
+                        Ok(candidates) => {
+                            self.selected_import_assets.retain(|key| {
+                                candidates
+                                    .iter()
+                                    .any(|candidate| candidate.eligible && candidate.key() == *key)
+                            });
+                            let eligible = candidates
+                                .iter()
+                                .filter(|candidate| candidate.eligible)
+                                .count();
+                            let blocked = candidates.len().saturating_sub(eligible);
+                            self.asset_import_status = tr_format!(
+                                self.language,
+                                "감사 완료: 가져오기 가능 {}개, P5136 미지원 아이템 규칙으로 제외 {}개.",
+                                "Audit complete: {} importable; {} excluded for unsupported P5136 item rules.",
+                                "审计完成：可导入 {} 个；因 P5136 不支持的道具规则而排除 {} 个。",
+                                eligible,
+                                blocked
+                            );
+                            self.asset_candidates = candidates;
+                        }
+                        Err(error) => {
+                            self.asset_import_status = tr_format!(
+                                self.language,
+                                "자산 목록을 불러오지 못했습니다: {error}",
+                                "Failed to load the asset list: {error}",
+                                "无法加载资源列表：{error}"
+                            );
+                        }
+                    }
+                }
+                GuiEvent::AssetsImported(result) => {
+                    self.asset_import_state = TrackImportState::Idle;
+                    match result {
+                        Ok(summary) => {
+                            self.asset_import_status = tr_format!(
+                                self.language,
+                                "카트 {}개, 캐릭터 {}개, 펫 {}개, 플라잉펫 {}개를 가져왔습니다. 새 리소스 {}개, 재사용 {}개, 카탈로그 갱신 {}건. 현재 실행 중인 서버는 이전 카탈로그를 유지하므로 서버를 중지했다 다시 시작하고 게임도 완전히 재실행하세요. 보고서: {}",
+                                "Imported {} karts, {} characters, {} pets, and {} flying pets. {} new resources, {} reused, {} catalog updates. A running server retains its previous catalog; stop and restart the server, then fully relaunch the game. Report: {}",
+                                "已导入 {} 辆车、{} 个角色、{} 个宠物和 {} 个飞行宠物。新增资源 {} 个，复用 {} 个，目录更新 {} 项。正在运行的服务器仍保留旧目录；请停止并重新启动服务器，然后彻底重启游戏。报告：{}",
+                                summary.karts,
+                                summary.characters,
+                                summary.pets,
+                                summary.flying_pets,
+                                summary.resources_written,
+                                summary.resources_identical,
+                                summary.catalogs_updated,
+                                summary.report.display()
+                            );
+                            self.connector_inputs.data_pack_off = true;
+                            self.selected_import_assets.clear();
+                            for candidate in &mut self.asset_candidates {
+                                if summary.asset_keys.iter().any(|key| key == &candidate.key()) {
+                                    candidate.already_installed = true;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.asset_import_status = tr_format!(
+                                self.language,
+                                "자산 가져오기에 실패했습니다: {error}",
+                                "Asset import failed: {error}",
+                                "资源导入失败：{error}"
+                            );
+                        }
+                    }
+                }
+                GuiEvent::AssetImportProgress(progress) => {
+                    self.asset_import_progress = Some(progress);
+                }
                 GuiEvent::ServerFinished(result) => self.finish_server_worker(result),
             }
         }
@@ -1612,6 +2060,287 @@ impl P5136GuiApp {
                 "Failed to start the connector worker thread: {error}",
                 "无法启动连接器工作线程：{error}"
             ));
+        }
+    }
+
+    fn start_track_candidate_scan(&mut self, context: &egui::Context) {
+        if self.track_import_state.busy() {
+            return;
+        }
+        let source_data = normalize_external_data_path(&self.track_import_inputs.source_data);
+        let game_root = PathBuf::from(self.connector_inputs.game_directory.trim());
+        if self.track_import_inputs.source_data.trim().is_empty()
+            || game_root.as_os_str().is_empty()
+        {
+            tr!(
+                self.language,
+                "소스 Data 폴더와 P5136 게임 폴더를 모두 지정하세요.",
+                "Specify both the source Data directory and the P5136 game directory.",
+                "请同时指定源 Data 目录和 P5136 游戏目录。"
+            )
+            .clone_into(&mut self.track_import_status);
+            return;
+        }
+        let source_region = self.track_import_inputs.source_region;
+        let target_data_raw = game_root.join("DataRaw");
+        let cache = game_root.join(".p5136-track-import").join("cache");
+        self.track_import_state = TrackImportState::Scanning;
+        self.track_import_progress = Some(TrackImportProgress {
+            phase: TrackImportPhase::IndexSource,
+            fraction: 0.0,
+            current: 0,
+            total: 0,
+        });
+        tr!(
+            self.language,
+            "외부 RHO/RHO5 인덱스를 읽고 트랙 후보를 찾는 중입니다…",
+            "Indexing the external RHO/RHO5 files and discovering tracks…",
+            "正在索引外部 RHO/RHO5 文件并查找赛道…"
+        )
+        .clone_into(&mut self.track_import_status);
+        let notifier = GuiNotifier {
+            sender: self.event_sender.clone(),
+            context: context.clone(),
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("p5136-track-scan-worker".to_owned())
+            .spawn(move || {
+                let data_raw = target_data_raw
+                    .is_dir()
+                    .then_some(target_data_raw.as_path());
+                let mut last_progress = None;
+                let mut on_progress = |progress| {
+                    send_track_progress_throttled(&notifier, &mut last_progress, progress);
+                };
+                let result = discover_track_candidates_with_progress(
+                    &source_data,
+                    source_region,
+                    data_raw,
+                    &cache,
+                    &mut on_progress,
+                )
+                .map_err(|error| format!("{error:#}"));
+                notifier.send(GuiEvent::TrackCandidatesLoaded(result));
+            })
+        {
+            self.track_import_state = TrackImportState::Idle;
+            self.track_import_status = tr_format!(
+                self.language,
+                "트랙 검색 작업을 시작하지 못했습니다: {error}",
+                "Failed to start the track scan: {error}",
+                "无法启动赛道扫描：{error}"
+            );
+        }
+    }
+
+    fn start_track_import(&mut self, context: &egui::Context) {
+        if self.track_import_state.busy() {
+            return;
+        }
+        let tracks = self
+            .selected_import_tracks
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if tracks.is_empty() {
+            tr!(
+                self.language,
+                "가져올 트랙을 하나 이상 선택하세요.",
+                "Select at least one track to import.",
+                "请至少选择一条要导入的赛道。"
+            )
+            .clone_into(&mut self.track_import_status);
+            return;
+        }
+        let game_root = PathBuf::from(self.connector_inputs.game_directory.trim());
+        let workspace = game_root.join(".p5136-track-import");
+        let options = TrackImportOptions {
+            source_data: normalize_external_data_path(&self.track_import_inputs.source_data),
+            source_region: self.track_import_inputs.source_region,
+            target_data: game_root.join("Data"),
+            target_data_raw: game_root.join("DataRaw"),
+            backup: workspace.join("backup"),
+            workspace,
+            tracks,
+        };
+        self.track_import_state = TrackImportState::Importing;
+        self.track_import_progress = Some(TrackImportProgress {
+            phase: TrackImportPhase::IndexSource,
+            fraction: 0.0,
+            current: 0,
+            total: 0,
+        });
+        tr!(
+            self.language,
+            "의존성 폐쇄를 계산하고 검증된 번들을 DataRaw에 설치하는 중입니다…",
+            "Resolving the dependency closure and installing a verified bundle into DataRaw…",
+            "正在解析完整依赖关系，并将已验证的资源包安装到 DataRaw…"
+        )
+        .clone_into(&mut self.track_import_status);
+        let notifier = GuiNotifier {
+            sender: self.event_sender.clone(),
+            context: context.clone(),
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("p5136-track-import-worker".to_owned())
+            .spawn(move || {
+                let mut last_progress = None;
+                let mut on_progress = |progress| {
+                    send_track_progress_throttled(&notifier, &mut last_progress, progress);
+                };
+                let result = import_tracks_to_dataraw_with_progress(&options, &mut on_progress)
+                    .map_err(|error| format!("{error:#}"));
+                notifier.send(GuiEvent::TracksImported(result));
+            })
+        {
+            self.track_import_state = TrackImportState::Idle;
+            self.track_import_status = tr_format!(
+                self.language,
+                "트랙 가져오기 작업을 시작하지 못했습니다: {error}",
+                "Failed to start track import: {error}",
+                "无法启动赛道导入：{error}"
+            );
+        }
+    }
+
+    fn start_asset_candidate_scan(&mut self, context: &egui::Context) {
+        if self.asset_import_state.busy() {
+            return;
+        }
+        let source_data = normalize_external_data_path(&self.asset_import_inputs.source_data);
+        let game_root = PathBuf::from(self.connector_inputs.game_directory.trim());
+        if self.asset_import_inputs.source_data.trim().is_empty()
+            || game_root.as_os_str().is_empty()
+        {
+            tr!(
+                self.language,
+                "소스 Data 폴더와 P5136 게임 폴더를 모두 지정하세요.",
+                "Specify both the source Data directory and the P5136 game directory.",
+                "请同时指定源 Data 目录和 P5136 游戏目录。"
+            )
+            .clone_into(&mut self.asset_import_status);
+            return;
+        }
+        let target_data_raw = game_root.join("DataRaw");
+        let cache = game_root.join(".p5136-asset-import").join("cache");
+        self.asset_import_state = TrackImportState::Scanning;
+        self.asset_import_progress = Some(AssetImportProgress {
+            phase: AssetImportPhase::IndexSource,
+            fraction: 0.0,
+            current: 0,
+            total: 0,
+        });
+        tr!(
+            self.language,
+            "외부 RHO/RHO5에서 감사된 자산 후보를 찾는 중입니다…",
+            "Discovering audited asset candidates in the external RHO/RHO5 files…",
+            "正在外部 RHO/RHO5 中查找已审计的资源候选项…"
+        )
+        .clone_into(&mut self.asset_import_status);
+        let notifier = GuiNotifier {
+            sender: self.event_sender.clone(),
+            context: context.clone(),
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("p5136-asset-scan-worker".to_owned())
+            .spawn(move || {
+                let data_raw = target_data_raw
+                    .is_dir()
+                    .then_some(target_data_raw.as_path());
+                let mut last_progress = None;
+                let mut on_progress = |progress| {
+                    send_asset_progress_throttled(&notifier, &mut last_progress, progress);
+                };
+                let result = discover_asset_candidates_with_progress(
+                    &source_data,
+                    data_raw,
+                    &cache,
+                    &mut on_progress,
+                )
+                .map_err(|error| format!("{error:#}"));
+                notifier.send(GuiEvent::AssetCandidatesLoaded(result));
+            })
+        {
+            self.asset_import_state = TrackImportState::Idle;
+            self.asset_import_status = tr_format!(
+                self.language,
+                "자산 검색 작업을 시작하지 못했습니다: {error}",
+                "Failed to start the asset scan: {error}",
+                "无法启动资源扫描：{error}"
+            );
+        }
+    }
+
+    fn start_asset_import(&mut self, context: &egui::Context) {
+        if self.asset_import_state.busy() {
+            return;
+        }
+        let assets = self
+            .asset_candidates
+            .iter()
+            .filter(|candidate| self.selected_import_assets.contains(&candidate.key()))
+            .map(|candidate| AssetSelection {
+                category: candidate.category,
+                id: candidate.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if assets.is_empty() {
+            tr!(
+                self.language,
+                "가져올 자산을 하나 이상 선택하세요.",
+                "Select at least one asset to import.",
+                "请至少选择一个要导入的资源。"
+            )
+            .clone_into(&mut self.asset_import_status);
+            return;
+        }
+        let game_root = PathBuf::from(self.connector_inputs.game_directory.trim());
+        let workspace = game_root.join(".p5136-asset-import");
+        let options = AssetImportOptions {
+            source_data: normalize_external_data_path(&self.asset_import_inputs.source_data),
+            target_data: game_root.join("Data"),
+            target_data_raw: game_root.join("DataRaw"),
+            backup: workspace.join("backup"),
+            workspace,
+            assets,
+        };
+        self.asset_import_state = TrackImportState::Importing;
+        self.asset_import_progress = Some(AssetImportProgress {
+            phase: AssetImportPhase::Plan,
+            fraction: 0.0,
+            current: 0,
+            total: 0,
+        });
+        tr!(
+            self.language,
+            "호환성·의존성을 재검증하고 DataRaw 및 서버 카탈로그에 설치하는 중입니다…",
+            "Re-auditing compatibility and dependencies, then installing into DataRaw and the server catalogs…",
+            "正在重新审计兼容性与依赖项，并安装到 DataRaw 与服务器目录…"
+        )
+        .clone_into(&mut self.asset_import_status);
+        let notifier = GuiNotifier {
+            sender: self.event_sender.clone(),
+            context: context.clone(),
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("p5136-asset-import-worker".to_owned())
+            .spawn(move || {
+                let mut last_progress = None;
+                let mut on_progress = |progress| {
+                    send_asset_progress_throttled(&notifier, &mut last_progress, progress);
+                };
+                let result = import_assets_to_dataraw_with_progress(&options, &mut on_progress)
+                    .map_err(|error| format!("{error:#}"));
+                notifier.send(GuiEvent::AssetsImported(result));
+            })
+        {
+            self.asset_import_state = TrackImportState::Idle;
+            self.asset_import_status = tr_format!(
+                self.language,
+                "자산 가져오기 작업을 시작하지 못했습니다: {error}",
+                "Failed to start asset import: {error}",
+                "无法启动资源导入：{error}"
+            );
         }
     }
 
@@ -1695,6 +2424,52 @@ impl P5136GuiApp {
                 if league_response.changed() && self.connector_inputs.anonymous_league_mode {
                     self.connector_inputs.observer_mode = false;
                 }
+                ui.end_row();
+
+                ui.label(tr!(
+                    language,
+                    "클라이언트 콘텐츠",
+                    "Client content",
+                    "客户端内容"
+                ));
+                ui.checkbox(
+                    &mut self.connector_inputs.unlock_special_tracks,
+                    tr!(
+                        language,
+                        "차단·숨김 특수 트랙 표시 (실험적)",
+                        "Show blocked/hidden special tracks (experimental)",
+                        "显示受限/隐藏特殊赛道（实验性）"
+                    ),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "리소스와 일반 트랙 정의가 모두 남아 있는 항목만 표시합니다. TF 트랙 3종과 안전 판정된 차단 트랙을 복원하며, 스토리 전용 트랙은 제외합니다. 체크 해제 후 다시 실행하면 원본 RHO5 슬롯을 복원합니다.",
+                    "Shows only entries whose resources and normal track definitions are both present. Restores three TF tracks and safely validated blocked tracks, while excluding story-only tracks. Launch again with this unchecked to restore the original RHO5 slot.",
+                    "仅显示资源与普通赛道定义均完整的项目。恢复 3 条 TF 赛道及经安全验证的受限赛道，并排除剧情专用赛道。取消勾选后再次启动会恢复原始 RHO5 槽位。"
+                ));
+                ui.end_row();
+
+                ui.label(tr!(
+                    language,
+                    "클라이언트 데이터",
+                    "Client data source",
+                    "客户端数据源"
+                ));
+                ui.checkbox(
+                    &mut self.connector_inputs.data_pack_off,
+                    tr!(
+                        language,
+                        "전체 DataRaw 사용 (실험적)",
+                        "Use complete DataRaw tree (experimental)",
+                        "使用完整 DataRaw 目录（实验性）"
+                    ),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "KartRider.xml에 <datapackOff/>를 기록해 압축 RHO/RHO5 대신 DataRaw를 사용합니다. 완전히 추출된 DataRaw가 없으면 클라이언트가 시작 중 종료될 수 있습니다.",
+                    "Writes <datapackOff/> to KartRider.xml and uses DataRaw instead of packed RHO/RHO5 data. The client may terminate during startup unless DataRaw is complete.",
+                    "在 KartRider.xml 中写入 <datapackOff/>，使用 DataRaw 代替压缩的 RHO/RHO5 数据。DataRaw 不完整时客户端可能在启动过程中退出。"
+                ));
                 ui.end_row();
 
                 ui.label(tr!(language, "서버 IPv4", "Server IPv4", "服务器 IPv4"));
@@ -1877,6 +2652,8 @@ impl P5136GuiApp {
 enum GuiTab {
     Server,
     ServerManagement,
+    TrackImport,
+    AssetImport,
     Connector,
 }
 
@@ -4282,6 +5059,460 @@ impl P5136GuiApp {
         self.random_track_editor(ui);
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn track_import_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        let busy = self.track_import_state.busy();
+        ui.heading(tr!(
+            language,
+            "외부 클라이언트 트랙 가져오기",
+            "Import tracks from another client",
+            "从其他客户端导入赛道"
+        ));
+        ui.label(tr!(
+            language,
+            "외부 클라이언트의 RHO/RHO5를 직접 읽어 트랙을 고르고, 트랙 파일·AI 경로·테마·썸네일·재질·환경음·BGM 의존성을 검증한 뒤 현재 P5136 DataRaw에 추가합니다.",
+            "Reads an external client's RHO/RHO5 files, lets you select tracks, audits track files, AI paths, themes, thumbnails, materials, environment sounds, and BGM, then adds the verified closure to this P5136 DataRaw tree.",
+            "直接读取外部客户端的 RHO/RHO5，选择赛道，审计赛道文件、AI 路径、主题、缩略图、材质、环境音和 BGM，然后将验证后的完整依赖添加到当前 P5136 DataRaw。"
+        ));
+        ui.add_space(8.0);
+        egui::Grid::new("track-import-inputs")
+            .num_columns(2)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(tr!(
+                    language,
+                    "소스 Data 폴더",
+                    "Source Data directory",
+                    "源 Data 目录"
+                ));
+                ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.track_import_inputs.source_data)
+                        .hint_text(r"C:\Nexon\launcher_v2\Data")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label(tr!(language, "소스 지역", "Source region", "源区域"));
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("track-import-source-region")
+                        .selected_text(match self.track_import_inputs.source_region {
+                            TrackSourceRegion::Korea => tr!(
+                                language,
+                                "한국 (KR 암호화/로케일)",
+                                "Korea (KR crypto/locale)",
+                                "韩国（KR 加密/区域）"
+                            ),
+                            TrackSourceRegion::China => tr!(
+                                language,
+                                "중국 (CN 암호화/로케일)",
+                                "China (CN crypto/locale)",
+                                "中国（CN 加密/区域）"
+                            ),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.track_import_inputs.source_region,
+                                TrackSourceRegion::China,
+                                tr!(language, "중국", "China", "中国"),
+                            );
+                            ui.selectable_value(
+                                &mut self.track_import_inputs.source_region,
+                                TrackSourceRegion::Korea,
+                                tr!(language, "한국", "Korea", "韩国"),
+                            );
+                        });
+                });
+                ui.end_row();
+
+                ui.label(tr!(language, "대상 P5136", "Target P5136", "目标 P5136"));
+                ui.label(&self.connector_inputs.game_directory);
+                ui.end_row();
+            });
+        ui.weak(tr!(
+            language,
+            "대상에는 완전히 추출된 DataRaw가 필요합니다. 가져온 표시 이름은 레거시 인코딩 오류를 피하기 위해 우선 ASCII 트랙 ID를 사용합니다. 기존 리소스와 바이트가 다른 동일 경로 파일은 덮어쓰지 않고 보고서에 충돌로 기록합니다.",
+            "The target must contain a complete DataRaw tree. Imported display names initially use ASCII track IDs to avoid legacy encoding failures. Same-path files with different bytes are never overwritten and are reported as conflicts.",
+            "目标必须包含完整的 DataRaw。导入后的显示名称暂时使用 ASCII 赛道 ID，以避免旧版编码错误。同路径但字节不同的文件不会被覆盖，并会在报告中记录为冲突。"
+        ));
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new(tr!(
+                    language,
+                    "트랙 목록 불러오기",
+                    "Load track list",
+                    "加载赛道列表"
+                )),
+            )
+            .clicked()
+        {
+            self.start_track_candidate_scan(ui.ctx());
+        }
+        ui.add_space(8.0);
+        if let Some(progress) = &self.track_import_progress {
+            let phase = track_import_phase_label(progress.phase, language);
+            let text = if progress.total > 0 {
+                format!(
+                    "{phase} · {}/{}",
+                    progress.current.min(progress.total),
+                    progress.total
+                )
+            } else {
+                phase.to_owned()
+            };
+            ui.add(
+                egui::ProgressBar::new(progress.fraction)
+                    .show_percentage()
+                    .animate(busy)
+                    .text(text),
+            );
+            ui.add_space(8.0);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(tr!(language, "검색", "Search", "搜索"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.track_import_inputs.search)
+                    .desired_width(260.0),
+            );
+            ui.label(tr_format!(
+                language,
+                "선택 {}개",
+                "{} selected",
+                "已选择 {} 条",
+                self.selected_import_tracks.len()
+            ));
+        });
+        let needle = self.track_import_inputs.search.trim().to_lowercase();
+        let visible_eligible = self
+            .track_candidates
+            .iter()
+            .filter(|candidate| {
+                needle.is_empty()
+                    || candidate.id.to_lowercase().contains(&needle)
+                    || candidate.name.to_lowercase().contains(&needle)
+                    || candidate.theme.to_lowercase().contains(&needle)
+            })
+            .filter(|candidate| candidate.eligible)
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && !visible_eligible.is_empty(),
+                    egui::Button::new(tr!(
+                        language,
+                        "검색 결과 모두 선택",
+                        "Select all shown",
+                        "选择所有显示项"
+                    )),
+                )
+                .clicked()
+            {
+                self.selected_import_tracks
+                    .extend(visible_eligible.iter().cloned());
+            }
+            if ui
+                .add_enabled(
+                    !busy && !self.selected_import_tracks.is_empty(),
+                    egui::Button::new(tr!(language, "선택 해제", "Clear", "清除选择")),
+                )
+                .clicked()
+            {
+                self.selected_import_tracks.clear();
+            }
+        });
+
+        egui::ScrollArea::vertical()
+            .id_salt("track-import-candidates")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                for candidate in &self.track_candidates {
+                    if !needle.is_empty()
+                        && !candidate.id.to_lowercase().contains(&needle)
+                        && !candidate.name.to_lowercase().contains(&needle)
+                        && !candidate.theme.to_lowercase().contains(&needle)
+                    {
+                        continue;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let mut selected = self.selected_import_tracks.contains(&candidate.id);
+                        let installed_suffix = if candidate.already_installed {
+                            tr!(
+                                language,
+                                " · 설치됨/복구 가능",
+                                " · installed/repairable",
+                                " · 已安装/可修复"
+                            )
+                        } else {
+                            ""
+                        };
+                        let response = ui.add_enabled(
+                            !busy && candidate.eligible,
+                            egui::Checkbox::new(
+                                &mut selected,
+                                format!(
+                                    "{} [{}] · {} · {}{}",
+                                    candidate.name,
+                                    candidate.id,
+                                    candidate.game_type,
+                                    candidate.theme,
+                                    installed_suffix
+                                ),
+                            ),
+                        );
+                        if response.changed() {
+                            if selected {
+                                self.selected_import_tracks.insert(candidate.id.clone());
+                            } else {
+                                self.selected_import_tracks.remove(&candidate.id);
+                            }
+                        }
+                        if let Some(reason) = &candidate.reason {
+                            ui.weak(localized_track_candidate_reason(reason, language));
+                        }
+                    });
+                }
+            });
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(
+                !busy && !self.selected_import_tracks.is_empty(),
+                egui::Button::new(tr!(
+                    language,
+                    "선택한 트랙 검증 및 가져오기",
+                    "Audit and import selected tracks",
+                    "审计并导入所选赛道"
+                ))
+                .min_size([240.0, 34.0].into()),
+            )
+            .clicked()
+        {
+            self.start_track_import(ui.ctx());
+        }
+        ui.add_space(8.0);
+        ui.label(&self.track_import_status);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn asset_import_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        let busy = self.asset_import_state.busy();
+        ui.heading(tr!(
+            language,
+            "다른 클라이언트에서 카트·캐릭터·펫·플라잉펫 가져오기",
+            "Import karts, characters, pets, and flying pets from another client",
+            "从其他客户端导入车辆、角色、宠物与飞行宠物"
+        ));
+        ui.label(tr!(
+            language,
+            "정적 분석과 과거 실행 시험을 통과한 후보만 표시합니다. XUN 엔진 카트는 목록에서 제외하며, P5136에 없는 새 아이템 결과 규칙을 요구하는 카트는 비활성화합니다.",
+            "Only candidates that passed the static audit and prior runtime trials are shown. XUN karts are omitted, and karts requiring item-result rules absent from P5136 are disabled.",
+            "仅显示已通过静态审计和既往运行测试的候选项。XUN 车辆不会列出；需要 P5136 中不存在的新道具结果规则的车辆将被禁用。"
+        ));
+        ui.add_space(8.0);
+        egui::Grid::new("asset-import-inputs")
+            .num_columns(2)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(tr!(
+                    language,
+                    "소스 Data 폴더",
+                    "Source Data directory",
+                    "源 Data 目录"
+                ));
+                ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.asset_import_inputs.source_data)
+                        .hint_text(r"C:\Nexon\launcher_v2\Data")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label(tr!(language, "대상 P5136", "Target P5136", "目标 P5136"));
+                ui.label(&self.connector_inputs.game_directory);
+                ui.end_row();
+            });
+        ui.weak(tr!(
+            language,
+            "완전히 추출된 DataRaw가 필요합니다. 리소스는 가산 설치하고 기존 파일과 바이트가 다른 충돌은 중단합니다. itemTable·상점·아이템 능력 카탈로그와 서버가 읽는 두 RHO5는 1회 백업 후 병합 갱신합니다. 변경 후 서버와 클라이언트를 다시 시작하세요.",
+            "A complete DataRaw tree is required. Resources are installed additively and different-byte path conflicts stop the import. itemTable, shop, item-ability catalogs, and the two RHO5 catalogs read by the server are merged after one-time backups. Restart the server and client afterward.",
+            "需要完整的 DataRaw。资源以追加方式安装；同路径但字节不同的冲突会中止导入。itemTable、商店、道具能力目录以及服务器读取的两个 RHO5 目录会在一次性备份后合并更新。完成后请重启服务器与客户端。"
+        ));
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new(tr!(
+                    language,
+                    "자산 목록 불러오기",
+                    "Load asset list",
+                    "加载资源列表"
+                )),
+            )
+            .clicked()
+        {
+            self.start_asset_candidate_scan(ui.ctx());
+        }
+        ui.add_space(8.0);
+        if let Some(progress) = &self.asset_import_progress {
+            let phase = asset_import_phase_label(progress.phase, language);
+            let text = if progress.total > 0 {
+                format!(
+                    "{phase} · {}/{}",
+                    progress.current.min(progress.total),
+                    progress.total
+                )
+            } else {
+                phase.to_owned()
+            };
+            ui.add(
+                egui::ProgressBar::new(progress.fraction)
+                    .show_percentage()
+                    .animate(busy)
+                    .text(text),
+            );
+            ui.add_space(8.0);
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            for category in AssetCategory::ALL {
+                ui.selectable_value(
+                    &mut self.asset_import_inputs.category,
+                    category,
+                    asset_category_label(category, language),
+                );
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tr!(language, "검색", "Search", "搜索"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.asset_import_inputs.search)
+                    .desired_width(240.0),
+            );
+            ui.checkbox(
+                &mut self.asset_import_inputs.only_not_installed,
+                tr!(
+                    language,
+                    "설치되지 않음만",
+                    "Not installed only",
+                    "仅显示未安装"
+                ),
+            );
+            ui.label(tr_format!(
+                language,
+                "선택 {}개",
+                "{} selected",
+                "已选择 {} 个",
+                self.selected_import_assets.len()
+            ));
+        });
+        let needle = self.asset_import_inputs.search.trim().to_ascii_lowercase();
+        let visible = self
+            .asset_candidates
+            .iter()
+            .filter(|candidate| candidate.category == self.asset_import_inputs.category)
+            .filter(|candidate| {
+                !self.asset_import_inputs.only_not_installed || !candidate.already_installed
+            })
+            .filter(|candidate| {
+                needle.is_empty() || candidate.id.to_ascii_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+        let visible_eligible = visible
+            .iter()
+            .filter(|candidate| candidate.eligible)
+            .map(|candidate| candidate.key())
+            .collect::<Vec<_>>();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && !visible_eligible.is_empty(),
+                    egui::Button::new(tr!(
+                        language,
+                        "표시된 항목 모두 선택",
+                        "Select all shown",
+                        "全选当前显示项"
+                    )),
+                )
+                .clicked()
+            {
+                self.selected_import_assets
+                    .extend(visible_eligible.iter().cloned());
+            }
+            if ui
+                .add_enabled(
+                    !busy && !self.selected_import_assets.is_empty(),
+                    egui::Button::new(tr!(language, "선택 해제", "Clear", "清除选择")),
+                )
+                .clicked()
+            {
+                self.selected_import_assets.clear();
+            }
+        });
+
+        egui::ScrollArea::vertical()
+            .id_salt("asset-import-candidates")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                for candidate in visible {
+                    ui.horizontal_wrapped(|ui| {
+                        let key = candidate.key();
+                        let mut selected = self.selected_import_assets.contains(&key);
+                        let installed = if candidate.already_installed {
+                            tr!(
+                                language,
+                                " · 설치됨/복구 가능",
+                                " · installed/repairable",
+                                " · 已安装/可修复"
+                            )
+                        } else {
+                            ""
+                        };
+                        let response = ui.add_enabled(
+                            !busy && candidate.eligible,
+                            egui::Checkbox::new(
+                                &mut selected,
+                                format!("{}{}", candidate.id, installed),
+                            ),
+                        );
+                        if response.changed() {
+                            if selected {
+                                self.selected_import_assets.insert(key);
+                            } else {
+                                self.selected_import_assets.remove(&key);
+                            }
+                        }
+                        if let Some(reason) = &candidate.reason {
+                            ui.weak(localized_asset_candidate_reason(reason, language));
+                        }
+                    });
+                }
+            });
+        ui.add_space(8.0);
+        if ui
+            .add_enabled(
+                !busy && !self.selected_import_assets.is_empty(),
+                egui::Button::new(tr!(
+                    language,
+                    "선택 항목 감사 및 가져오기",
+                    "Audit and import selected assets",
+                    "审计并导入所选资源"
+                ))
+                .min_size([240.0, 34.0].into()),
+            )
+            .clicked()
+        {
+            self.start_asset_import(ui.ctx());
+        }
+        ui.add_space(8.0);
+        ui.label(&self.asset_import_status);
+    }
+
     fn connector_tab(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         let running = self.connector_run_state.is_running();
@@ -4340,7 +5571,11 @@ impl eframe::App for P5136GuiApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.handle_close_request(context);
-        if self.connector_run_state.is_running() || self.server_run_state.is_active() {
+        if self.connector_run_state.is_running()
+            || self.server_run_state.is_active()
+            || self.track_import_state.busy()
+            || self.asset_import_state.busy()
+        {
             context.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -4407,6 +5642,16 @@ impl eframe::App for P5136GuiApp {
                 );
                 ui.selectable_value(
                     &mut self.selected_tab,
+                    GuiTab::TrackImport,
+                    tr!(language, "트랙 가져오기", "Track import", "赛道导入"),
+                );
+                ui.selectable_value(
+                    &mut self.selected_tab,
+                    GuiTab::AssetImport,
+                    tr!(language, "자산 가져오기", "Asset import", "资源导入"),
+                );
+                ui.selectable_value(
+                    &mut self.selected_tab,
                     GuiTab::Connector,
                     tr!(language, "접속기", "Connector", "连接器"),
                 );
@@ -4415,6 +5660,8 @@ impl eframe::App for P5136GuiApp {
             egui::ScrollArea::vertical().show(ui, |ui| match self.selected_tab {
                 GuiTab::Server => self.server_tab(ui),
                 GuiTab::ServerManagement => self.server_management_tab(ui),
+                GuiTab::TrackImport => self.track_import_tab(ui),
+                GuiTab::AssetImport => self.asset_import_tab(ui),
                 GuiTab::Connector => self.connector_tab(ui),
             });
         });
@@ -4424,6 +5671,38 @@ impl eframe::App for P5136GuiApp {
 struct GuiNotifier {
     sender: Sender<GuiEvent>,
     context: egui::Context,
+}
+
+fn send_track_progress_throttled(
+    notifier: &GuiNotifier,
+    last: &mut Option<TrackImportProgress>,
+    progress: TrackImportProgress,
+) {
+    let should_send = last.as_ref().is_none_or(|previous| {
+        previous.phase != progress.phase
+            || progress.fraction - previous.fraction >= 0.005
+            || (progress.total != 0 && progress.current >= progress.total)
+    });
+    if should_send {
+        *last = Some(progress.clone());
+        notifier.send(GuiEvent::TrackImportProgress(progress));
+    }
+}
+
+fn send_asset_progress_throttled(
+    notifier: &GuiNotifier,
+    last: &mut Option<AssetImportProgress>,
+    progress: AssetImportProgress,
+) {
+    let should_send = last.as_ref().is_none_or(|previous| {
+        previous.phase != progress.phase
+            || progress.fraction - previous.fraction >= 0.005
+            || (progress.total != 0 && progress.current >= progress.total)
+    });
+    if should_send {
+        *last = Some(progress);
+        notifier.send(GuiEvent::AssetImportProgress(progress));
+    }
 }
 
 impl GuiNotifier {
@@ -4699,11 +5978,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BUILD_VERSION, ConnectorGuiEvent, GUI_SETTINGS_KEY, GuiInputs, GuiItemProbabilitySource,
-        GuiRunState, GuiRunner, GuiSuccess, MAX_GUI_SETTINGS_BYTES, P5136GuiApp, ServerInputs,
-        lan_address_rank, virtual_adapter_rank,
+        AssetImportInputs, BUILD_VERSION, ConnectorGuiEvent, GUI_SETTINGS_KEY, GuiInputs,
+        GuiItemProbabilitySource, GuiRunState, GuiRunner, GuiSuccess, MAX_GUI_SETTINGS_BYTES,
+        P5136GuiApp, ServerInputs, TrackImportInputs, lan_address_rank, virtual_adapter_rank,
     };
     use crate::gui_i18n::GuiLanguage;
+    use p5136_assets::{AssetCategory, TrackSourceRegion};
 
     #[derive(Default)]
     struct MemoryStorage(HashMap<String, String>);
@@ -4731,6 +6011,8 @@ mod tests {
             nickname: "fixture-user".to_owned(),
             observer_mode: true,
             anonymous_league_mode: false,
+            unlock_special_tracks: true,
+            data_pack_off: true,
             server: "192.0.2.10".to_owned(),
             configured_port: "39311".to_owned(),
             runner: GuiRunner::Wine,
@@ -4763,6 +6045,11 @@ mod tests {
             plan.installation_options.launcher_profile_role,
             p5136_connector::LauncherProfileRole::ObserverMaster
         );
+        assert!(plan.installation_options.unlock_special_tracks);
+        assert!(plan.installation_options.data_pack_off);
+        assert!(plan.prepared_paths().iter().any(|path| {
+            path.ends_with(Path::new("Data").join(p5136_connector::SPECIAL_TRACK_OVERLAY_FILE))
+        }));
         assert_eq!(plan.login_endpoint.to_string(), "192.0.2.10:39312");
         assert_eq!(plan.messenger_endpoint.to_string(), "192.0.2.10:39313");
         assert_eq!(plan.launch_spec.backend(), RunnerBackend::Wine);
@@ -4989,6 +6276,17 @@ mod tests {
         let mut app = P5136GuiApp::new(PathBuf::new(), None);
         app.language = GuiLanguage::SimplifiedChinese;
         app.connector_inputs = fixture_inputs();
+        app.track_import_inputs = TrackImportInputs {
+            source_data: "D:/OtherKartRider/Data".to_owned(),
+            source_region: TrackSourceRegion::Korea,
+            search: "wkc".to_owned(),
+        };
+        app.asset_import_inputs = AssetImportInputs {
+            source_data: "D:/NewerKartRider/Data".to_owned(),
+            search: "roller".to_owned(),
+            category: AssetCategory::FlyingPet,
+            only_not_installed: true,
+        };
         app.server_inputs = ServerInputs {
             bind_address: "0.0.0.0".to_owned(),
             advertised_address: "192.168.1.10".to_owned(),
@@ -5019,6 +6317,8 @@ mod tests {
         app.server_inputs.item_probabilities.individual[0].top_weight += 17;
         let expected_connector = app.connector_inputs.clone();
         let expected_server = app.server_inputs.clone();
+        let expected_track_import = app.track_import_inputs.clone();
+        let expected_asset_import = app.asset_import_inputs.clone();
         let expected_language = app.language;
         let mut storage = MemoryStorage::default();
         eframe::App::save(&mut app, &mut storage);
@@ -5027,6 +6327,8 @@ mod tests {
         let restored = P5136GuiApp::new(PathBuf::new(), Some(&storage));
         assert_eq!(restored.connector_inputs, expected_connector);
         assert_eq!(restored.server_inputs, expected_server);
+        assert_eq!(restored.track_import_inputs, expected_track_import);
+        assert_eq!(restored.asset_import_inputs, expected_asset_import);
         assert_eq!(restored.language, expected_language);
     }
 

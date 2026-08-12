@@ -124,6 +124,9 @@ struct ProbeArgs {
 }
 
 #[derive(Debug, clap::Args)]
+// These are intentionally independent command-line switches. Replacing them
+// with enums would make clap's conflict/default behavior less explicit.
+#[allow(clippy::struct_excessive_bools)]
 struct ConnectArgs {
     #[arg(long)]
     game_dir: PathBuf,
@@ -142,6 +145,14 @@ struct ConnectArgs {
     /// Request the recovered P5136 anonymous-league profile (pmap 1798).
     #[arg(long, conflicts_with = "observer")]
     anonymous_league: bool,
+
+    /// Show safely recoverable blocked tracks and the three archived TF tracks.
+    #[arg(long)]
+    unlock_special_tracks: bool,
+
+    /// Disable packed RHO loading and use a complete `DataRaw` tree instead.
+    #[arg(long)]
+    data_pack_off: bool,
 
     #[arg(long, default_value = "127.0.0.1")]
     server: Ipv4Addr,
@@ -527,6 +538,8 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
             (false, true) => LauncherProfileRole::AnonymousLeague,
             (true, true) => unreachable!("clap rejects conflicting account-role flags"),
         },
+        unlock_special_tracks: args.unlock_special_tracks,
+        data_pack_off: args.data_pack_off,
         ..InstallationOptions::default()
     };
     let plan = ConnectorPlan::new(ConnectorRequest {
@@ -548,7 +561,10 @@ async fn run_connector(args: ConnectArgs) -> Result<()> {
     println!("\nKartRider.xml (UTF-8, no BOM):");
     println!(
         "{}",
-        String::from_utf8_lossy(&server_config_xml(plan.login_endpoint))
+        String::from_utf8_lossy(&server_config_xml(
+            plan.login_endpoint,
+            plan.installation_options.data_pack_off,
+        ))
     );
     println!("\nProfile/kr/launcher.xml (UTF-8, no BOM):");
     println!(
@@ -736,6 +752,8 @@ mod tests {
             username: "dry-run-user".to_owned(),
             observer: false,
             anonymous_league: false,
+            unlock_special_tracks: false,
+            data_pack_off: false,
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
             runner: RunnerKind::Native,
@@ -761,6 +779,8 @@ mod tests {
             username: "user".to_owned(),
             observer: false,
             anonymous_league: false,
+            unlock_special_tracks: false,
+            data_pack_off: false,
             server: Ipv4Addr::LOCALHOST,
             configured_port: 39_311,
             runner: RunnerKind::Native,

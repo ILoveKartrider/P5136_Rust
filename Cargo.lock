@@ -2285,13 +2285,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "p5136-assets"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "p5136-core",
+ "p5136-rho5",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "p5136-cli"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "eframe",
  "local-ip-address",
+ "p5136-assets",
  "p5136-connector",
  "p5136-core",
  "p5136-profile",
@@ -2307,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-client-oracle"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "p5136-core",
  "p5136-server",
@@ -2315,12 +2330,13 @@ dependencies = [
 
 [[package]]
 name = "p5136-connector"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "base64",
  "flate2",
  "fs2",
  "p5136-core",
+ "p5136-rho5",
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
@@ -2329,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-core"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "sha2",
  "thiserror 2.0.19",
@@ -2339,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-profile"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -2355,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-rho5"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "base64",
  "flate2",
@@ -2367,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "p5136-server"
-version = "0.2.7"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "p5136-core",

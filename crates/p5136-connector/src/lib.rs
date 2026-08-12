@@ -12,6 +12,7 @@ mod launch;
 mod limits;
 mod pin;
 mod probe;
+mod special_tracks;
 #[cfg(test)]
 mod test_fixture;
 mod wire;
@@ -20,8 +21,8 @@ mod xml;
 pub use bml::BmlObject;
 pub use codec_error::PinCodecError;
 pub use detection::{
-    BuildDetectionError, BuildEvidence, P5136_CLIENT_LOCATION, P5136_EXECUTABLE_SHA256,
-    P5136_LOCALE_ID, PinDetectionSource, detect_p5136,
+    BuildDetectionError, BuildEvidence, P5136_CLIENT_LOCATION, P5136_LOCALE_ID, PinDetectionSource,
+    detect_p5136,
 };
 pub use encoded_block::{
     BlockEncoding, DEFAULT_KART_CRYPTO_KEY, DecodedBlock, EncodedBlockError, FLAG_KART_CRYPTO,
@@ -51,6 +52,10 @@ pub use pin::{
     decode_shallow_pin_header_with_limits, patch_p5136_pin, patch_p5136_pin_with_limits,
 };
 pub use probe::{DEFAULT_PROBE_TIMEOUT, ProbeError, probe_messenger, probe_tcp};
+pub use special_tracks::{
+    SAFE_BLOCKED_TRACK_IDS, SPECIAL_TRACK_OVERLAY_FILE, SpecialTrackPatchError,
+    SpecialTrackPatchReport,
+};
 pub use xml::{
     LauncherProfileRole, launcher_profile_xml, launcher_profile_xml_for_role, server_config_xml,
 };

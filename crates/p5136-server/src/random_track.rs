@@ -9,12 +9,16 @@ use p5136_core::{
     packet::PacketReader,
     track::is_random_track_selector,
 };
-use p5136_rho5::{LegacyRhoArchive, LegacyRhoError, LegacyRhoLimits};
+use p5136_rho5::{
+    LegacyRhoArchive, LegacyRhoError, LegacyRhoLimits, Rho5Directory, Rho5Error, Rho5Limits,
+};
 use thiserror::Error;
 
 const RANDOM_TRACK_BML: &str = "randomTrack@kr.bml";
 const TRACK_BML: &str = "track@zz.bml";
 const TRACK_LOCALE_BML: &str = "trackLocale@kr.bml";
+const TRACK_BML_OVERLAY: &str = "track/common/track@zz.bml";
+const TRACK_LOCALE_BML_OVERLAY: &str = "track/common/trackLocale@kr.bml";
 const MAX_POOLS: usize = 32;
 const MAX_TRACKS_PER_POOL: usize = 512;
 const SUPPORTED_SELECTORS: [u32; 12] = [0, 1, 3, 4, 5, 6, 7, 8, 23, 30, 33, 40];
@@ -208,6 +212,8 @@ pub enum RandomTrackError {
     #[error(transparent)]
     Archive(#[from] LegacyRhoError),
     #[error(transparent)]
+    Rho5(#[from] Rho5Error),
+    #[error(transparent)]
     Bml(#[from] BmlError),
     #[error("random-track BML contains trailing bytes")]
     BmlTrailingBytes,
@@ -242,9 +248,20 @@ pub fn load_client_random_track_catalog(
 ) -> Result<RandomTrackCatalog, RandomTrackError> {
     let source_path = data_directory.as_ref().join("track_common.rho");
     let archive = LegacyRhoArchive::open(&source_path, LegacyRhoLimits::default())?;
+    let overlays = Rho5Directory::scan_kr(data_directory.as_ref(), Rho5Limits::default())?;
     let random_root = decode_bml(&archive.extract_exact(RANDOM_TRACK_BML)?)?;
-    let track_root = decode_bml(&archive.extract_exact(TRACK_BML)?)?;
-    let locale_root = decode_bml(&archive.extract_exact(TRACK_LOCALE_BML)?)?;
+    let track_root = decode_bml(&effective_catalog_bytes(
+        &overlays,
+        TRACK_BML_OVERLAY,
+        &archive,
+        TRACK_BML,
+    )?)?;
+    let locale_root = decode_bml(&effective_catalog_bytes(
+        &overlays,
+        TRACK_LOCALE_BML_OVERLAY,
+        &archive,
+        TRACK_LOCALE_BML,
+    )?)?;
     let tracks = build_tracks(&track_root, &locale_root);
     let pools = build_pools(&random_root, &tracks);
     if tracks.len() < 200 || pools.len() < 15 {
@@ -270,6 +287,23 @@ pub fn load_client_random_track_catalog(
         tracks_by_id,
         pools_by_key,
     })
+}
+
+fn effective_catalog_bytes(
+    overlays: &Rho5Directory,
+    overlay_path: &str,
+    legacy: &LegacyRhoArchive,
+    legacy_path: &str,
+) -> Result<Vec<u8>, RandomTrackError> {
+    if let Some(entry) = overlays
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| entry.normalized_path().eq_ignore_ascii_case(overlay_path))
+    {
+        return Ok(overlays.extract_entry_with_legacy_padding(entry)?);
+    }
+    Ok(legacy.extract_exact(legacy_path)?)
 }
 
 fn decode_bml(bytes: &[u8]) -> Result<BmlNode, RandomTrackError> {

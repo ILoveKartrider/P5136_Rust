@@ -149,12 +149,20 @@ impl ConnectorPlan {
     }
 
     #[must_use]
-    pub fn prepared_paths(&self) -> [PathBuf; 3] {
-        [
+    pub fn prepared_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
             self.game_directory.join("KartRider.pin"),
             self.game_directory.join("KartRider.xml"),
             self.game_directory.join("Profile/kr/launcher.xml"),
-        ]
+        ];
+        if self.installation_options.unlock_special_tracks {
+            paths.push(
+                self.game_directory
+                    .join("Data")
+                    .join(crate::SPECIAL_TRACK_OVERLAY_FILE),
+            );
+        }
+        paths
     }
 }
 

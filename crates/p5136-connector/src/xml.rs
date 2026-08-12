@@ -24,11 +24,17 @@ impl LauncherProfileRole {
 }
 
 #[must_use]
-pub fn server_config_xml(login_endpoint: SocketAddrV4) -> Vec<u8> {
+pub fn server_config_xml(login_endpoint: SocketAddrV4, data_pack_off: bool) -> Vec<u8> {
+    let data_pack_off = if data_pack_off {
+        "\t<datapackOff/>\r\n"
+    } else {
+        ""
+    };
     format!(
         "<?xml version='1.0' encoding='UTF-16'?>\r\n\
          <config>\r\n\
          \t<server addr='{login_endpoint}'/>\r\n\
+         {data_pack_off}\
          </config>"
     )
     .into_bytes()
@@ -76,7 +82,10 @@ mod tests {
 
     #[test]
     fn p5136_server_xml_is_utf8_without_bom_despite_declaration() {
-        let bytes = server_config_xml(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 20), 46_001));
+        let bytes = server_config_xml(
+            SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 20), 46_001),
+            false,
+        );
         assert_eq!(
             bytes,
             b"<?xml version='1.0' encoding='UTF-16'?>\r\n\
@@ -85,6 +94,22 @@ mod tests {
               </config>"
         );
         assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
+    }
+
+    #[test]
+    fn data_raw_mode_emits_stock_datapack_off_node() {
+        let bytes = server_config_xml(
+            SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 20), 46_001),
+            true,
+        );
+        assert_eq!(
+            bytes,
+            b"<?xml version='1.0' encoding='UTF-16'?>\r\n\
+              <config>\r\n\
+              \t<server addr='192.0.2.20:46001'/>\r\n\
+              \t<datapackOff/>\r\n\
+              </config>"
+        );
     }
 
     #[test]

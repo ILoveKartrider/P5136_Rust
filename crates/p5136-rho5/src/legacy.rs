@@ -1,5 +1,5 @@
-//! Bounded read-only access to the legacy `Rh layer spec 1.0` and `1.1`
-//! archives used by the Korean P5136 client.
+//! Bounded access to the legacy `Rh layer spec 1.0` and `1.1` archives used
+//! by the Korean P5136 client. Writing lives in the sibling writer module.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -54,6 +54,7 @@ pub struct LegacyRhoArchive {
     path: PathBuf,
     bytes: Box<[u8]>,
     rho_key: u32,
+    data_hash: u32,
     blocks: HashMap<u32, LegacyBlock>,
     limits: LegacyRhoLimits,
 }
@@ -67,6 +68,7 @@ pub struct LegacyRhoArchive {
 pub struct LegacyRhoEntry {
     normalized_path: String,
     plaintext_size: usize,
+    file_property: LegacyRhoFileProperty,
 }
 
 impl LegacyRhoEntry {
@@ -78,6 +80,43 @@ impl LegacyRhoEntry {
     #[must_use]
     pub const fn plaintext_size(&self) -> usize {
         self.plaintext_size
+    }
+
+    #[must_use]
+    pub const fn file_property(&self) -> LegacyRhoFileProperty {
+        self.file_property
+    }
+}
+
+/// Storage transformation recorded in one legacy RHO directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LegacyRhoFileProperty {
+    None = 0,
+    Compressed = 1,
+    Encrypted = 4,
+    PartialEncrypted = 5,
+    CompressedEncrypted = 6,
+}
+
+impl TryFrom<u32> for LegacyRhoFileProperty {
+    type Error = LegacyRhoError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            // Stock monolithic archives such as P5136 `kart.rho` use -1 for
+            // some directory-entry properties. The original client treats
+            // that value as unspecified and follows the referenced block's
+            // transformation metadata. Reading already does the latter, so
+            // retain the historical parser behaviour and expose it as None
+            // for callers that only need a safe materialization default.
+            0 | u32::MAX => Ok(Self::None),
+            1 => Ok(Self::Compressed),
+            4 => Ok(Self::Encrypted),
+            5 => Ok(Self::PartialEncrypted),
+            6 => Ok(Self::CompressedEncrypted),
+            _ => Err(LegacyRhoError::InvalidFileProperty(value)),
+        }
     }
 }
 
@@ -104,6 +143,7 @@ struct LegacyFile {
     extension_word: u32,
     block_index: u32,
     plaintext_size: usize,
+    file_property: LegacyRhoFileProperty,
 }
 
 impl LegacyRhoArchive {
@@ -160,12 +200,13 @@ impl LegacyRhoArchive {
                 actual: bytes.len(),
             });
         }
-        let (rho_key, blocks) = parse_archive_index(requested_path, &bytes, limits)?;
+        let (rho_key, data_hash, blocks) = parse_archive_index(requested_path, &bytes, limits)?;
 
         Ok(Self {
             path: requested_path.to_path_buf(),
             bytes: bytes.into_boxed_slice(),
             rho_key,
+            data_hash,
             blocks,
             limits,
         })
@@ -176,6 +217,16 @@ impl LegacyRhoArchive {
         &self.path
     }
 
+    #[must_use]
+    pub const fn rho_key(&self) -> u32 {
+        self.rho_key
+    }
+
+    #[must_use]
+    pub const fn data_hash(&self) -> u32 {
+        self.data_hash
+    }
+
     pub fn extract_exact(&self, path: &str) -> Result<Vec<u8>, LegacyRhoError> {
         let components = normalize_path(path, self.limits)?;
         let (file_name, directory_components) = components
@@ -184,7 +235,7 @@ impl LegacyRhoArchive {
         let directory_key = self.rho_key.wrapping_add(0x2593_a9f1);
         let mut directory_index = ROOT_DIRECTORY_INDEX;
         for component in directory_components {
-            let bytes = self.read_block(directory_index, directory_key)?;
+            let bytes = self.read_block(directory_index, directory_key, false)?;
             let directory = parse_directory(&bytes, self.limits)?;
             directory_index = unique_directory_index(&directory, component)?.ok_or_else(|| {
                 LegacyRhoError::EntryNotFound {
@@ -192,7 +243,7 @@ impl LegacyRhoArchive {
                 }
             })?;
         }
-        let bytes = self.read_block(directory_index, directory_key)?;
+        let bytes = self.read_block(directory_index, directory_key, false)?;
         let directory = parse_directory(&bytes, self.limits)?;
         let file =
             unique_file(&directory, file_name)?.ok_or_else(|| LegacyRhoError::EntryNotFound {
@@ -201,7 +252,22 @@ impl LegacyRhoArchive {
         let key = unicode_adler(&file.name)
             .wrapping_add(file.extension_word)
             .wrapping_add(self.rho_key.wrapping_sub(0x756d_e654));
-        let plaintext = self.read_block(file.block_index, key)?;
+        let primary = self
+            .blocks
+            .get(&file.block_index)
+            .copied()
+            .ok_or(LegacyRhoError::MissingBlock(file.block_index))?;
+        // Block property 4 only says that the block payload is encrypted. It
+        // does not, by itself, prove that index+1 is a continuation: stock
+        // archives can place another encrypted file at that adjacent index.
+        // Directory property 5 is authoritative. For legacy entries whose
+        // property is unspecified, a short first block provides the bounded
+        // fallback used by the original reader.
+        let append_partial_tail = file.file_property == LegacyRhoFileProperty::PartialEncrypted
+            || (file.file_property == LegacyRhoFileProperty::None
+                && primary.property == 4
+                && primary.uncompressed_size < file.plaintext_size);
+        let plaintext = self.read_block(file.block_index, key, append_partial_tail)?;
         if plaintext.len() != file.plaintext_size {
             return Err(LegacyRhoError::FileSizeMismatch {
                 path: file.full_name.clone(),
@@ -234,7 +300,7 @@ impl LegacyRhoArchive {
                     index: directory_index,
                 });
             }
-            let bytes = self.read_block(directory_index, directory_key)?;
+            let bytes = self.read_block(directory_index, directory_key, false)?;
             let directory = parse_directory(&bytes, self.limits)?;
             for file in directory.files {
                 let mut path = components.join("/");
@@ -245,6 +311,7 @@ impl LegacyRhoArchive {
                 entries.push(LegacyRhoEntry {
                     normalized_path: path,
                     plaintext_size: file.plaintext_size,
+                    file_property: file.file_property,
                 });
                 if entries.len() > self.limits.max_blocks {
                     return Err(LegacyRhoError::TooManyEnumeratedFiles {
@@ -266,7 +333,12 @@ impl LegacyRhoArchive {
         self.extract_exact(&entry.normalized_path)
     }
 
-    fn read_block(&self, index: u32, key: u32) -> Result<Vec<u8>, LegacyRhoError> {
+    fn read_block(
+        &self,
+        index: u32,
+        key: u32,
+        append_partial_tail: bool,
+    ) -> Result<Vec<u8>, LegacyRhoError> {
         let block = self
             .blocks
             .get(&index)
@@ -310,7 +382,8 @@ impl LegacyRhoArchive {
         if block.property & 4 != 0 {
             decrypt_data(&mut plaintext, key);
         }
-        if block.property == 4
+        if append_partial_tail
+            && block.property == 4
             && let Some(second) = index
                 .checked_add(1)
                 .and_then(|second_index| self.blocks.get(&second_index))
@@ -358,7 +431,7 @@ fn parse_archive_index(
     path: &Path,
     bytes: &[u8],
     limits: LegacyRhoLimits,
-) -> Result<(u32, HashMap<u32, LegacyBlock>), LegacyRhoError> {
+) -> Result<(u32, u32, HashMap<u32, LegacyBlock>), LegacyRhoError> {
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -420,6 +493,10 @@ fn parse_archive_index(
     if end_magic != END_MAGIC {
         return Err(LegacyRhoError::InvalidEndMagic(end_magic));
     }
+    let data_hash = match version {
+        LegacyRhoVersion::V10 => 0,
+        LegacyRhoVersion::V11 => read_u32(&header, 24, "archive data hash")?,
+    };
     let table_bytes = block_count
         .checked_mul(BLOCK_INFO_LENGTH)
         .ok_or(LegacyRhoError::ArithmeticOverflow)?;
@@ -454,7 +531,7 @@ fn parse_archive_index(
         }
     }
     validate_block_ranges(&blocks)?;
-    Ok((rho_key, blocks))
+    Ok((rho_key, data_hash, blocks))
 }
 
 #[derive(Debug, Error)]
@@ -590,6 +667,8 @@ pub enum LegacyRhoError {
     InvalidUtf16,
     #[error("legacy RHO file extension {0:#010x} is not ASCII")]
     InvalidExtension(u32),
+    #[error("legacy RHO file property {0} is unsupported")]
+    InvalidFileProperty(u32),
     #[error("legacy RHO directory entry has invalid plaintext size {0}")]
     InvalidFileSize(i32),
     #[error("legacy RHO path is invalid: {0:?}")]
@@ -789,7 +868,7 @@ fn parse_directory(
         let name = reader.utf16_z(limits.max_name_utf16_units)?;
         let extension_word = reader.u32("file extension")?;
         let extension = extension(extension_word)?;
-        let _file_property = reader.u32("file property")?;
+        let file_property = LegacyRhoFileProperty::try_from(reader.u32("file property")?)?;
         let block_index = reader.u32("file block index")?;
         let file_size = reader.i32("file size")?;
         let plaintext_size =
@@ -817,6 +896,7 @@ fn parse_directory(
             extension_word,
             block_index,
             plaintext_size,
+            file_property,
         });
     }
     Ok(LegacyDirectory { directories, files })
@@ -895,7 +975,7 @@ fn decrypt_header_info(data: &[u8], key: u32) -> Vec<u8> {
     output
 }
 
-fn decrypt_data(data: &mut [u8], key: u32) {
+pub(super) fn decrypt_data(data: &mut [u8], key: u32) {
     let mut expanded = [0_u8; 64];
     let mut current = key ^ 0x8473_fbc1;
     for chunk in expanded.chunks_exact_mut(4) {
@@ -907,11 +987,11 @@ fn decrypt_data(data: &mut [u8], key: u32) {
     }
 }
 
-fn unicode_adler(value: &str) -> u32 {
+pub(super) fn unicode_adler(value: &str) -> u32 {
     adler32_iter(value.encode_utf16().flat_map(u16::to_le_bytes))
 }
 
-fn adler32(bytes: &[u8]) -> u32 {
+pub(super) fn adler32(bytes: &[u8]) -> u32 {
     adler32_iter(bytes.iter().copied())
 }
 
@@ -1016,8 +1096,9 @@ mod tests {
 
     use super::{
         BLOCK_TABLE_OFFSET, END_MAGIC, HEADER_INFO_LENGTH, HEADER_INFO_OFFSET, HEADER_MAGIC_10,
-        LegacyRhoError, LegacyRhoLimits, VERSION_MAGIC_10, adler32, decrypt_data,
-        parse_archive_index, parse_block, parse_directory, unicode_adler, validate_block_ranges,
+        LegacyRhoError, LegacyRhoFileProperty, LegacyRhoLimits, VERSION_MAGIC_10, adler32,
+        decrypt_data, parse_archive_index, parse_block, parse_directory, unicode_adler,
+        validate_block_ranges,
     };
 
     #[test]
@@ -1030,6 +1111,14 @@ mod tests {
         assert_ne!(bytes, original);
         decrypt_data(&mut bytes, 0x5136_5136);
         assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn stock_unspecified_file_property_keeps_legacy_read_compatibility() {
+        assert_eq!(
+            LegacyRhoFileProperty::try_from(u32::MAX).unwrap(),
+            LegacyRhoFileProperty::None
+        );
     }
 
     #[test]
@@ -1067,7 +1156,7 @@ mod tests {
             *destination = byte ^ key;
         }
 
-        let (decoded_key, blocks) =
+        let (decoded_key, _, blocks) =
             parse_archive_index(path, &archive, LegacyRhoLimits::default()).unwrap();
         assert_eq!(decoded_key, rho_key);
         let block = blocks.get(&1).unwrap();
