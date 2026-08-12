@@ -108,6 +108,7 @@ impl fmt::Display for RunnerBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchMethod {
     Direct,
+    #[cfg_attr(not(windows), allow(dead_code))]
     PowerShellUac,
 }
 
