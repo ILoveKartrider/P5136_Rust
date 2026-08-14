@@ -2,6 +2,7 @@
 
 mod bml;
 mod codec_error;
+mod dataraw_preflight;
 mod detection;
 mod encoded_block;
 mod execution;
@@ -20,6 +21,7 @@ mod xml;
 
 pub use bml::BmlObject;
 pub use codec_error::PinCodecError;
+pub use dataraw_preflight::{DataRawPreflightError, verify_dataraw_preflight};
 pub use detection::{
     BuildDetectionError, BuildEvidence, P5136_CLIENT_LOCATION, P5136_LOCALE_ID, PinDetectionSource,
     detect_p5136,
@@ -39,7 +41,7 @@ pub use file_safety::{
 pub use identity::{IdentityError, MAXIMUM_NICKNAME_LENGTH, normalize_nickname};
 pub use installation::{
     DEFAULT_INSTALLATION_LOCK_TIMEOUT, DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES, InstallationError,
-    InstallationOptions, PreparedInstallation, prepare_installation,
+    InstallationOptions, PreparedInstallation, XUN_SIDECAR_SESSION_FILE, prepare_installation,
 };
 pub use launch::{
     LaunchError, LaunchRequest, LaunchSpec, LaunchStatus, LaunchedProcess, Runner, RunnerBackend,

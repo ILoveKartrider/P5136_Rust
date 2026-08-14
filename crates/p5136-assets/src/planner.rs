@@ -17,10 +17,10 @@ use sha2::{Digest, Sha256};
 use crate::asset_index::{
     AssetExtractor, AssetIndex, AssetOrigin, AssetRecord, AssetRegion, OriginReport, fold_path,
 };
+use crate::{COMPATIBILITY_ASSERTION, EXPERIMENTAL_NATIVE_ASSERTION};
 
 const MAX_STRUCTURED_STRINGS: usize = 250_000;
 const MAX_STRING_BYTES: usize = 64 * 1024;
-const VERIFIED: &str = "p5136-static-verified-v1";
 const REVIEW_REQUIRED: &str = "review-required-not-importable";
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,10 @@ pub(crate) struct PlanOptions {
     /// The legacy CLI leaves this empty and retains its existing category/asset
     /// filtering behavior.
     pub asset_selectors: BTreeSet<String>,
+    /// Exact native-backport selectors that may receive the experimental
+    /// sidecar assertion. The integrated importer supplies a bounded allowlist;
+    /// the general CLI deliberately leaves this empty.
+    pub experimental_native_selectors: BTreeSet<String>,
     pub include_existing: bool,
     pub max_assets: usize,
     pub max_asset_bytes: usize,
@@ -77,6 +81,7 @@ struct AssetPlan {
 #[serde(rename_all = "snake_case")]
 enum CompatibilityStatus {
     CompatibleCandidate,
+    ExperimentalNativeCandidate,
     LocalizationRequired,
     NativeBackportRequired,
     Unresolved,
@@ -86,6 +91,7 @@ impl CompatibilityStatus {
     const fn label(self) -> &'static str {
         match self {
             Self::CompatibleCandidate => "compatible_candidate",
+            Self::ExperimentalNativeCandidate => "experimental_native_candidate",
             Self::LocalizationRequired => "localization_required",
             Self::NativeBackportRequired => "native_backport_required",
             Self::Unresolved => "unresolved",
@@ -222,7 +228,7 @@ pub(crate) fn run_plan(
     };
     let mut assets = Vec::new();
     for group in groups {
-        match planner.plan_group(&group, output, options.max_asset_bytes) {
+        match planner.plan_group(&group, output, options) {
             Ok(plan) => assets.push(plan),
             Err(error) => warnings.push(format!("{}: {error:#}", group.prefix)),
         }
@@ -292,6 +298,7 @@ fn render_markdown(report: &PlanReport) -> String {
             matches!(
                 asset.status,
                 CompatibilityStatus::CompatibleCandidate
+                    | CompatibilityStatus::ExperimentalNativeCandidate
                     | CompatibilityStatus::LocalizationRequired
             )
         }),
@@ -463,8 +470,14 @@ impl Planner<'_> {
         &mut self,
         group: &AssetGroup,
         output: &Path,
-        max_asset_bytes: usize,
+        options: &PlanOptions,
     ) -> Result<AssetPlan> {
+        let asset_key = format!(
+            "{}:{}",
+            group.category.to_ascii_lowercase(),
+            group.asset_id.to_ascii_lowercase()
+        );
+        let experimental_native = options.experimental_native_selectors.contains(&asset_key);
         let mut queue = VecDeque::<String>::new();
         for record in self.source.effective_records() {
             if path_in_prefix(&record.virtual_path, &group.prefix) {
@@ -472,6 +485,18 @@ impl Planner<'_> {
             }
         }
         ensure!(!queue.is_empty(), "asset group contains no effective files");
+        if experimental_native
+            && group.category.eq_ignore_ascii_case("kart")
+            && group.asset_id.to_ascii_lowercase().ends_with("xun")
+        {
+            for record in self.source.effective_records() {
+                if path_in_prefix(&record.virtual_path, "gui/tachometer/xun")
+                    || path_in_prefix(&record.virtual_path, "effect/charger")
+                {
+                    queue.push_back(record.virtual_path.clone());
+                }
+            }
+        }
 
         let mut visited = HashSet::new();
         let mut files = Vec::new();
@@ -499,8 +524,9 @@ impl Planner<'_> {
                 .checked_add(record.size)
                 .context("asset dependency byte count overflow")?;
             ensure!(
-                total_bytes <= max_asset_bytes,
-                "dependency closure exceeds max-asset-bytes {max_asset_bytes}"
+                total_bytes <= options.max_asset_bytes,
+                "dependency closure exceeds max-asset-bytes {}",
+                options.max_asset_bytes
             );
             let bytes = self
                 .source_extractor
@@ -618,7 +644,14 @@ impl Planner<'_> {
                 "{format_mismatch_count} .1s files have no format signature observed in P5136"
             ));
         }
-        let status = if native_required {
+        let status = if native_required
+            && experimental_native
+            && !format_unresolved
+            && unresolved.is_empty()
+            && localization.is_empty()
+        {
+            CompatibilityStatus::ExperimentalNativeCandidate
+        } else if native_required {
             CompatibilityStatus::NativeBackportRequired
         } else if format_unresolved || !unresolved.is_empty() {
             CompatibilityStatus::Unresolved
@@ -633,10 +666,12 @@ impl Planner<'_> {
         let manifest_path = output.join("manifests").join(&manifest_name);
         let manifest = DraftManifest {
             schema_version: 1,
-            compatibility: if status == CompatibilityStatus::CompatibleCandidate {
-                VERIFIED.to_owned()
-            } else {
-                REVIEW_REQUIRED.to_owned()
+            compatibility: match status {
+                CompatibilityStatus::CompatibleCandidate => COMPATIBILITY_ASSERTION.to_owned(),
+                CompatibilityStatus::ExperimentalNativeCandidate => {
+                    EXPERIMENTAL_NATIVE_ASSERTION.to_owned()
+                }
+                _ => REVIEW_REQUIRED.to_owned(),
             },
             output_archive: format!("import_{}.rho", safe_asset_name(&group.prefix)),
             rho_folder_name: String::new(),

@@ -1,6 +1,6 @@
 # P5136 Rust 服务器
 
-[한국어](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md)
+[한국어](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md) | [韩文更新记录](CHANGELOG.md)
 
 如果发现翻译不自然、含义错误或术语不准确，请[提交 issue](https://github.com/ILoveKartrider/P5136_Rust/issues) 或 pull request。
 
@@ -33,6 +33,7 @@ target/p5136-finish-kart-abilities/release/p5136.exe
 3. 远程昵称首次连接时，请启用“允许在局域网创建新昵称”。
 4. 选择“启动服务器”。
 5. 在“连接器”标签页中填写游戏目录、昵称和服务器 IPv4，然后选择“准备并启动客户端”。
+6. 使用 XUN 赛车时，请等待客户端启动，选择旁边的“连接 XUN DLL”按钮并批准 UAC 请求。默认使用连接器同目录下的 `p5136-xun-attach.exe` 和 `p5136-xun.dll`；也可以在“连接器”标签页分别选择两个文件。DLL 文件日志可通过同一页的复选框开关。
 
 连接器会通过不可变的 pristine 备份和进程锁准备 PIN/XML，随后使用 Windows UAC、Wine、CrossOver 或 macOS Sikarugir wrapper 启动客户端。手动 prefix 与 wrapper 设置请参阅 [macOS Sikarugir 指南](MACOS_SIKARUGIR.md)。
 
@@ -122,9 +123,9 @@ GUI 的“赛道导入”标签页可直接索引其他韩国或中国客户端 
 
 ## 从其他客户端导入资源
 
-GUI 的“资源导入”标签页会索引较新的中国客户端 `Data`。内部的“车辆”“角色”“宠物”“飞行宠物”标签页提供经过静态审计的可搜索、多选列表，“仅显示未安装”可隐藏当前 `DataRaw` 中已有的条目。审计集合包含 57 辆车、73 个角色、24 个宠物和 47 个飞行宠物；需要 XUN/Kart12 原生回移的车辆不会列出。`SteamIV1`、`deliveryV1`、`flowerCarriageV1`、`lionmaskV1_gold`、`mechanicdragon_redV1`、`skunaV1` 需要 P5136 中不存在的新道具结果，因此会显示原因但无法选择。当前实际可导入 51 辆车、73 个角色、24 个宠物和 47 个飞行宠物。
+GUI 的“资源导入”标签页会索引较新的中国客户端 `Data`。内部的“车辆”“角色”“宠物”“飞行宠物”标签页提供经过静态审计的可搜索、多选列表，“仅显示未安装”可隐藏当前 `DataRaw` 中已有的条目。审计集合包含 57 辆普通车、100 辆已恢复 `defaultExceedType` 1–4 的实验性 XUN 车辆、73 个角色、24 个宠物和 47 个飞行宠物。6 辆普通车需要 P5136 中不存在的新道具结果而无法选择，因此当前可导入 51 辆普通车和 100 辆实验性 XUN 车辆。使用 5 以上独立技能状态机的 XUN 车辆暂不显示。
 
-安装前会重新检查所选资源的完整依赖闭包和 SHA-256。资源只追加到完整的 `DataRaw`；若同路径文件的字节不同，操作会中止而不会覆盖。显示名称使用 ASCII 资源代码，其余非 ASCII 目录字段使用稳定哈希。导入程序会合并 itemTable、韩国商店和四个车辆道具能力表，并为中国区飞行宠物参数生成韩国客户端读取的 `param@kr.bml` 别名。服务器仅在已审计 ID 与对应 DataRaw 模型同时存在时自动发放新车辆或角色，仍会隐藏被阻止的车辆和 XUN 候选项；随后在一次性保存 `.pristine.bak` 后更新服务器读取的 `DataPack1_00000.rho5` 与 `DataPack4_00002.rho5`。工作文件、报告和 DataRaw 目录备份位于 `.p5136-asset-import`；成功后会自动启用连接器的完整 DataRaw 选项。导入后请重启服务器与客户端。若新飞行宠物 ID 不在 P5136 服务器的硬编码表中，其服务器端物理和特殊效果仍需另行实现；本次审计确认的是显示和装备所需的资源/目录兼容性。
+安装前会重新检查所选资源的完整依赖闭包和 SHA-256。资源只追加到完整的 `DataRaw`；若同路径文件的字节不同，操作会中止而不会覆盖。显示名称使用 ASCII 资源代码，其余非 ASCII 目录字段使用稳定哈希。导入程序会合并 itemTable、韩国商店和四个车辆道具能力表，并为中国区飞行宠物参数生成韩国客户端读取的 `param@kr.bml` 别名。XUN 目录中 P5136 不支持的 `grade=13 / engineGrade=9` 只会映射为 V1 分类值 `12 / 8`，BodyParam 与线上 KartSpec 物理数值保持不变。服务器仅在已审计 ID 与对应 DataRaw 模型同时存在时自动发放新车辆或角色。XUN 车辆需要精确版本的 XUN 边车。边车已连接生命周期/XUN 状态、六个竞速模式物理消费者、独立的连续充能器仪表，以及新版车体与默认部件的显示换算。黑骑士 XUN 因此显示为“漂移 1158 / 加速 1159 / 弯道 1050 / 加速器时间 1054”。充能器与普通 Exceed 的状态、UI 和效果路径彼此独立。导入程序会依据 `defaultExceedType` 恢复 P5136 的 `ExceedWaveType`，保留普通 Exceed 效果；边车则把导入的 `effect/charger/카트바디차저발동` 场景绑定到独立渲染对象，并在充能器启动、结束时分别启动和停止其子发射器。该实现不会扩大 `GoPlayKart`，也不会拿 Exceed 效果代替充能器光环。对于精确的 `KartSpec.defaultExceedType=1` 道具型车辆，服务器会从个人道具概率表选择起始道具，并应用该车辆的普通道具转换规则。随后在一次性保存 `.pristine.bak` 后更新服务器读取的 `DataPack1_00000.rho5` 与 `DataPack4_00002.rho5`。工作文件、报告和 DataRaw 目录备份位于 `.p5136-asset-import`；成功后会自动启用连接器的完整 DataRaw 选项。导入后请重启服务器与客户端。若新飞行宠物 ID 不在 P5136 服务器的硬编码表中，其服务器端物理和特殊效果仍需另行实现；本次审计确认的是显示和装备所需的资源/目录兼容性。
 
 ## 队伍与下一场起跑位
 
@@ -152,6 +153,9 @@ Windows 会优先加载 Malgun Gothic、Microsoft YaHei 和 SimSun；macOS 会�
 | 登录 | TCP | 39312 |
 | P2P/转发 | UDP | 39312 |
 | Messenger | TCP | 39313 |
+| XUN 辅助通道 | TCP | 39314 |
+
+XUN 辅助端点与原版游戏协议分离，仅供可选 XUN DLL 接收车辆专用配置。
 
 从两台电脑测试时，请在服务器电脑的防火墙中允许这些 TCP/UDP 端口。
 

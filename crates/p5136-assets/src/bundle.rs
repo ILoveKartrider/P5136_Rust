@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    COMPATIBILITY_ASSERTION,
+    COMPATIBILITY_ASSERTION, EXPERIMENTAL_NATIVE_ASSERTION,
     asset_index::{AssetIndex, AssetRegion, fold_path},
     ensure_staging_destination, verify_sha256,
 };
@@ -178,6 +178,7 @@ struct BundleReport {
     preserved_catalog_archive_entries: usize,
     localized_kart_param_aliases: usize,
     localized_flying_pet_param_aliases: usize,
+    xun_tachometer_compatibility_patches: usize,
     catalog_items: Vec<CatalogItemReport>,
     item_abilities: ItemAbilityReport,
     resource_only_assets: Vec<String>,
@@ -331,8 +332,11 @@ fn stage_compatible_inner(
             asset.category.to_ascii_lowercase(),
             asset.asset_id.to_ascii_lowercase()
         );
+        let explicitly_selected = selected_assets.is_some_and(|selected| selected.contains(&key));
+        let accepted_status = asset.status == "compatible_candidate"
+            || (asset.status == "experimental_native_candidate" && explicitly_selected);
         if category_set.contains(&asset.category.to_ascii_lowercase())
-            && asset.status == "compatible_candidate"
+            && accepted_status
             && selected_assets.is_none_or(|selected| selected.contains(&key))
         {
             *group_counts.entry(asset.category.clone()).or_default() += 1;
@@ -359,9 +363,14 @@ fn stage_compatible_inner(
         )
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
         ensure!(manifest.schema_version == 1, "unsupported manifest schema");
+        let expected_assertion = if asset.status == "experimental_native_candidate" {
+            EXPERIMENTAL_NATIVE_ASSERTION
+        } else {
+            COMPATIBILITY_ASSERTION
+        };
         ensure!(
-            manifest.compatibility == COMPATIBILITY_ASSERTION,
-            "{} is not a verified compatible manifest",
+            manifest.compatibility == expected_assertion,
+            "{} has an invalid compatibility assertion",
             manifest_path.display()
         );
         for entry in manifest.entries {
@@ -442,6 +451,7 @@ fn stage_compatible_inner(
     )?;
     let mut extractor = source.extractor();
     let mut entries = Vec::with_capacity(pending.len());
+    let mut xun_tachometer_compatibility_patches = 0_usize;
     for (index, file) in pending.values().enumerate() {
         if index != 0 && index.is_multiple_of(250) {
             eprintln!("extracted {index}/{} resource entries", pending.len());
@@ -451,6 +461,9 @@ fn stage_compatible_inner(
             .with_context(|| format!("planned source path disappeared: {}", file.source_path))?;
         let bytes = extractor.extract(record)?;
         verify_sha256(&bytes, &file.expected_sha256, &file.source_path)?;
+        let (bytes, patched_xun_tachometer_resource) =
+            normalize_imported_xun_resource(&file.path, &bytes)?;
+        xun_tachometer_compatibility_patches += usize::from(patched_xun_tachometer_resource);
         entries.push(Rho5WriteEntry {
             path: file.path.clone(),
             data: bytes,
@@ -530,6 +543,7 @@ fn stage_compatible_inner(
         preserved_catalog_archive_entries: catalog_archive.preserved_entries,
         localized_kart_param_aliases,
         localized_flying_pet_param_aliases,
+        xun_tachometer_compatibility_patches,
         catalog_items: catalogs.items,
         item_abilities: catalogs.ability_report,
         resource_only_assets: catalogs.resource_only,
@@ -560,6 +574,7 @@ fn build_catalog_overlays(
     let target_shop = effective_bytes(target, TARGET_SHOP_PATH)?;
     let source_table_text = decode_xml(&source_table)?;
     let target_table_text = decode_xml(&target_table)?;
+    let (target_table_text, _) = normalize_xun_kart_table_text(&target_table_text)?;
     let source_shop_text = decode_xml(&source_shop)?;
     let target_shop_text = decode_xml(&target_shop)?;
     let source_table_rows = xml_rows(
@@ -580,6 +595,7 @@ fn build_catalog_overlays(
     let mut shop_append = Vec::new();
     let mut reports = Vec::new();
     let mut mapped_codes = HashSet::new();
+    let mut table_codes = HashSet::new();
 
     for source_row in &source_table_rows {
         let category = canonical_table_category(&source_row.element).to_owned();
@@ -595,9 +611,25 @@ fn build_catalog_overlays(
         {
             continue;
         }
-        mapped_codes.insert(format!("{category}:{}", code.to_ascii_lowercase()));
+        let code_key = format!("{category}:{}", code.to_ascii_lowercase());
+        table_codes.insert(code_key.clone());
         let id = parse_u16(source_row, "id")?;
         let key = (category.clone(), id);
+        let shop_category = shop_category_for_asset(&category)
+            .expect("itemTable rows were filtered to supported asset categories");
+        let shop_key = (shop_category, id);
+
+        // Some modern item tables retain hidden/derived rows that deliberately
+        // have no public shop-catalog entry.  In particular, cottonXUN_20year
+        // appears as both ID 1603 (published) and ID 1604 (orphan).  Importing
+        // both rows either aborts here or exposes an inventory entry that the
+        // client cannot describe.  Keep only rows backed by either catalog.
+        if !target_shop_keys.contains_key(&shop_key) && !source_shop_by_key.contains_key(&shop_key)
+        {
+            continue;
+        }
+
+        mapped_codes.insert(code_key);
         let table_state = if let Some(target_row) = target_table_by_key.get(&key) {
             ensure!(
                 target_row
@@ -607,12 +639,11 @@ fn build_catalog_overlays(
             );
             "existing"
         } else {
-            table_append.push(source_row.clone());
+            let mut compatible_row = source_row.clone();
+            normalize_xun_kart_table_row(&mut compatible_row)?;
+            table_append.push(compatible_row);
             "added"
         };
-        let shop_category = shop_category_for_asset(&category)
-            .expect("itemTable rows were filtered to supported asset categories");
-        let shop_key = (shop_category, id);
         let (shop_state, hashed_fields) = if target_shop_keys.contains_key(&shop_key) {
             ("existing", 0)
         } else {
@@ -642,6 +673,10 @@ fn build_catalog_overlays(
                 code.to_ascii_lowercase()
             );
             if !mapped_codes.contains(&key) {
+                ensure!(
+                    !table_codes.contains(&key),
+                    "source shop catalog has no published row for {category} {code}"
+                );
                 resource_only.push(format!("{category}/{code}"));
             }
         }
@@ -693,6 +728,506 @@ fn korean_region_param_alias(category: &str, path: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Makes the modern XUN tachometer resource consumable by P5136's V1 ABI.
+///
+/// The injected sidecar resolves `XunGenTacho` to a native V1-layout object.
+/// Modern XUN BML renamed four nodes that the P5136 V1 initializer requires;
+/// without these aliases it calls `front()` on an empty lookup result and
+/// faults at 0x4F6ED1. XUN-only nodes remain intact for the sidecar overlay.
+pub(crate) fn normalize_imported_xun_resource(path: &str, bytes: &[u8]) -> Result<(Vec<u8>, bool)> {
+    let folded = fold_path(path);
+    if folded == "gui/tachometer/xun/tacho.bml" {
+        return normalize_xun_tachometer_bml(bytes);
+    }
+
+    let Some(file_name) = folded.rsplit('/').next() else {
+        return Ok((bytes.to_vec(), false));
+    };
+    if !folded.starts_with("kart_/")
+        || !file_name.starts_with("param")
+        || !Path::new(file_name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+    {
+        return Ok((bytes.to_vec(), false));
+    }
+
+    let mut text = decode_xml(bytes)?;
+    if !xml_attribute_equals(&text, "TachometerName", "xun") {
+        return Ok((bytes.to_vec(), false));
+    }
+    // Migrate bundles produced by the earlier crash-only V1 fallback back to
+    // the real factory name now handled by the sidecar lookup hook.
+    let mut changed =
+        replace_xml_attribute_value(&mut text, "TachometerType", "V1GenTacho", "XunGenTacho");
+    // P5136's native Exceed renderer still selects its wave through this
+    // BodyParam attribute. Modern XUN parameters replaced the explicit wave
+    // name with defaultExceedType, so translate only that selector here. The
+    // sidecar keeps the XUN charger aura on its own resource/state path.
+    if let Some(wave) =
+        xml_attribute_value(&text, "defaultExceedType").and_then(xun_exceed_wave_type)
+    {
+        changed |= set_xml_attribute(&mut text, "ExceedWaveType", wave)?;
+    }
+    if !changed {
+        return Ok((bytes.to_vec(), false));
+    }
+    validate_xml(&text)?;
+    Ok((encode_utf16(&text), true))
+}
+
+/// Accepts only migrations produced by this XUN normalizer.
+///
+/// Compare canonicalized resources so bundles produced by earlier revisions
+/// can be upgraded without granting a general overwrite exception.
+#[allow(dead_code)]
+pub(crate) fn is_safe_imported_xun_migration(
+    path: &str,
+    existing: &[u8],
+    staged: &[u8],
+) -> Result<bool> {
+    let (normalized, changed) = normalize_imported_xun_resource(path, existing)?;
+    let (staged_normalized, staged_changed) = normalize_imported_xun_resource(path, staged)?;
+    if !changed || staged_changed {
+        return Ok(false);
+    }
+    if normalized == staged_normalized {
+        return Ok(true);
+    }
+
+    let folded = fold_path(path);
+    if !folded.starts_with("kart_/")
+        || !Path::new(&folded)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+    {
+        return Ok(false);
+    }
+    let normalized = decode_xml(&normalized)?;
+    let staged = decode_xml(&staged_normalized)?;
+    Ok(normalized
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .eq(staged.lines().filter(|line| !line.trim().is_empty())))
+}
+
+#[allow(clippy::too_many_lines)]
+fn normalize_xun_tachometer_bml(bytes: &[u8]) -> Result<(Vec<u8>, bool)> {
+    let limits = BmlLimits {
+        max_depth: 32,
+        max_nodes: 200_000,
+        max_attributes_per_node: 512,
+        max_children_per_node: 100_000,
+        max_string_code_units: 8_192,
+    };
+    let mut reader = PacketReader::new(bytes);
+    let mut root = BmlNode::decode_with_limits(&mut reader, limits)
+        .context("failed to decode imported XUN tachometer BML")?;
+    ensure!(
+        reader.remaining().is_empty(),
+        "imported XUN tachometer BML contains trailing bytes"
+    );
+
+    let mut changed = false;
+    let mut pending = vec![&mut root];
+    while let Some(node) = pending.pop() {
+        if let Some((_, name)) = node
+            .attributes
+            .iter_mut()
+            .find(|(key, _)| key.eq_ignore_ascii_case("name"))
+        {
+            let replacement = if name.eq_ignore_ascii_case("xungen_bg1") {
+                Some("v1gen_bg1")
+            } else if name.eq_ignore_ascii_case("xungen_bg2") {
+                Some("v1gen_bg2")
+            } else if name.eq_ignore_ascii_case("bg_engineIcon1") {
+                Some("n2o")
+            } else if name.eq_ignore_ascii_case("bg_engineIcon2") {
+                Some("n2o_always")
+            } else if name.eq_ignore_ascii_case("xunLegacyRoad1") {
+                Some("blinkRoad1")
+            } else if name.eq_ignore_ascii_case("xunLegacyRoad2") {
+                Some("blinkRoad2")
+            } else if name.eq_ignore_ascii_case("xunLegacyRoad3") {
+                Some("blinkRoad3")
+            } else {
+                None
+            };
+            if let Some(replacement) = replacement {
+                replacement.clone_into(name);
+                changed = true;
+            }
+        }
+        pending.extend(node.children.iter_mut());
+    }
+
+    // P5136's V1 flat-gauge controller reads this misspelled legacy property
+    // from the tachometer root. The modern XUN resource relies on the later
+    // client's implicit default instead, so make the P5136 contract explicit.
+    changed |= set_bml_attribute(&mut root, "instAccelFullLenth", "1000");
+
+    // P5136's V1 flat-gauge controller clips and moves these three surfaces,
+    // but the later XUN class normally performs their first visibility
+    // transition. P5136 never toggles the later `exceedFeatures` parent, so
+    // expose that parent while keeping its XUN-only idling/usable/full
+    // overlays hidden. The stock controller then owns only the ordinary
+    // Exceed gauge leaves, independently from the charger display.
+    if let Some(exceed_features) = find_bml_node_mut(&mut root, "exceedFeatures") {
+        changed |= set_bml_attribute(exceed_features, "visible", "true");
+        for name in ["idling", "usable", "playFull"] {
+            if let Some(overlay) = find_bml_node_mut(exceed_features, name) {
+                changed |= set_bml_attribute(overlay, "visible", "false");
+            }
+        }
+    }
+    if let Some(inst_accel) = find_bml_node_mut(&mut root, "instAccel") {
+        // Keep the modern XUN layout geometry intact. Converting this Window
+        // into a textured Panel changes how its existing adjust/anchor pair is
+        // interpreted and moved a previously-correct Exceed gauge. Also undo
+        // that migration for bundles generated by the earlier patch.
+        if !inst_accel.name.eq_ignore_ascii_case("Window") {
+            "Window".clone_into(&mut inst_accel.name);
+            changed = true;
+        }
+        changed |= set_bml_attribute(inst_accel, "leftTopTex", "0 512");
+        changed |= remove_bml_attribute(inst_accel, "texture");
+        changed |= set_bml_attribute(inst_accel, "visible", "true");
+    }
+    if let Some(inst_accel_gauge) = find_bml_node_mut(&mut root, "instAccelGauge") {
+        changed |= set_bml_attribute(inst_accel_gauge, "visible", "true");
+    }
+    if let Some(inst_accel_bar) = find_bml_node_mut(&mut root, "instAccelBar") {
+        changed |= set_bml_attribute(inst_accel_bar, "visible", "true");
+    }
+    // These are activation animations, not the charge gauge itself. The
+    // sidecar starts/stops the kart-attached charger effect independently;
+    // leaving either dashboard scene visible here would show a permanent
+    // full-charge image before the first booster is used.
+    for name in ["charger", "charger2"] {
+        if let Some(panel) = find_bml_node_mut(&mut root, name) {
+            changed |= set_bml_attribute(panel, "visible", "false");
+        }
+    }
+
+    // The later XUN UI draws three speed-number layers. P5136's V1 controller
+    // updates only the legacy `kmh` layer, leaving `kmh2` and `kmh3` at their
+    // BML default text (`0`) as a permanent background. Keep the live layer and
+    // hide only the two unsupported decorative duplicates.
+    for name in ["kmh2", "kmh3"] {
+        if let Some(panel) = find_bml_node_mut(&mut root, name) {
+            changed |= set_bml_attribute(panel, "visible", "false");
+        }
+    }
+
+    // V1's update routine unconditionally toggles `n2o/on` at 0x006C1714.
+    // Modern XUN flattened the two engine-icon states into sibling panels
+    // (`bg_engineIcon1/2`), so aliasing only their names leaves this one
+    // required child pointer null. Reuse the second modern icon as the V1
+    // active-state child while retaining its sibling alias for the separate
+    // `n2o_always` field.
+    let n2o_on_template = find_bml_node(&root, "n2o_always").cloned();
+    if let (Some(n2o), Some(mut active_icon)) =
+        (find_bml_node_mut(&mut root, "n2o"), n2o_on_template)
+    {
+        let has_active_child = n2o.children.iter().any(|node| {
+            xun_bml_attribute(node, "name").is_some_and(|name| name.eq_ignore_ascii_case("on"))
+        });
+        if !has_active_child {
+            set_bml_attribute(&mut active_icon, "name", "on");
+            set_bml_attribute(&mut active_icon, "leftTopTex", "0 0");
+            set_bml_attribute(&mut active_icon, "visible", "false");
+            remove_bml_attribute(&mut active_icon, "windowSize");
+            remove_bml_attribute(&mut active_icon, "adjust");
+            remove_bml_attribute(&mut active_icon, "align");
+            active_icon.children.clear();
+            n2o.children.push(active_icon);
+            changed = true;
+        }
+    }
+
+    // Preserve the modern anchor/adjust contract. The sidecar binds a fourth
+    // native flat-gauge controller to these exact names and supplies a
+    // continuous 0..1 fraction. This hierarchy is separate from instAccel
+    // (ordinary Exceed) and from the dashboard blinkRoad state indicators.
+    if let Some(charger_features) = find_bml_node_mut(&mut root, "chargerFeatures") {
+        changed |= set_bml_attribute(charger_features, "leftTopWH", "0 0 396 74");
+    }
+    let charger = find_bml_node_mut(&mut root, "instCharger");
+    if let Some(charger) = charger {
+        if !charger.name.eq_ignore_ascii_case("Window") {
+            "Window".clone_into(&mut charger.name);
+            changed = true;
+        }
+        changed |= remove_bml_attribute(charger, "leftTopWH");
+        changed |= set_bml_attribute(charger, "visible", "true");
+        // Remove the three synthetic slices emitted by the former coarse
+        // compatibility patch. They shadowed the real dashboard blinkRoad
+        // nodes and turned a continuous 396-pixel gauge into three steps.
+        let original_len = charger.children.len();
+        charger.children.retain(|node| {
+            !xun_bml_attribute(node, "name").is_some_and(|name| {
+                ["blinkRoad1", "blinkRoad2", "blinkRoad3"]
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            })
+        });
+        changed |= charger.children.len() != original_len;
+        let gauge_index = charger.children.iter().position(|node| {
+            xun_bml_attribute(node, "name").is_some_and(|name| {
+                name.eq_ignore_ascii_case("instChargerGauge")
+                    || name.eq_ignore_ascii_case("xunInstChargerGauge")
+            })
+        });
+        if let Some(gauge_index) = gauge_index {
+            changed |= set_bml_attribute(
+                &mut charger.children[gauge_index],
+                "name",
+                "instChargerGauge",
+            );
+            changed |= set_bml_attribute(&mut charger.children[gauge_index], "visible", "true");
+        }
+    }
+    if !changed {
+        return Ok((bytes.to_vec(), false));
+    }
+
+    let mut writer = PacketWriter::new();
+    root.encode_with_limits(&mut writer, limits)
+        .context("failed to encode compatible XUN tachometer BML")?;
+    Ok((writer.into_inner(), true))
+}
+
+fn xun_bml_attribute<'a>(node: &'a BmlNode, wanted: &str) -> Option<&'a str> {
+    node.attributes
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+        .map(|(_, value)| value.as_str())
+}
+
+fn set_bml_attribute(node: &mut BmlNode, wanted: &str, value: &str) -> bool {
+    if let Some((_, existing)) = node
+        .attributes
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+    {
+        if existing == value {
+            return false;
+        }
+        value.clone_into(existing);
+    } else {
+        node.attributes.push((wanted.to_owned(), value.to_owned()));
+    }
+    true
+}
+
+fn remove_bml_attribute(node: &mut BmlNode, wanted: &str) -> bool {
+    let old_len = node.attributes.len();
+    node.attributes
+        .retain(|(name, _)| !name.eq_ignore_ascii_case(wanted));
+    node.attributes.len() != old_len
+}
+
+fn find_bml_node<'a>(node: &'a BmlNode, wanted: &str) -> Option<&'a BmlNode> {
+    if xun_bml_attribute(node, "name").is_some_and(|name| name.eq_ignore_ascii_case(wanted)) {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_bml_node(child, wanted))
+}
+
+fn find_bml_node_mut<'a>(node: &'a mut BmlNode, wanted: &str) -> Option<&'a mut BmlNode> {
+    if xun_bml_attribute(node, "name").is_some_and(|name| name.eq_ignore_ascii_case(wanted)) {
+        return Some(node);
+    }
+    node.children
+        .iter_mut()
+        .find_map(|child| find_bml_node_mut(child, wanted))
+}
+
+#[cfg(test)]
+fn has_bml_node_named(node: &BmlNode, wanted: &str) -> bool {
+    xun_bml_attribute(node, "name").is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        || node
+            .children
+            .iter()
+            .any(|child| has_bml_node_named(child, wanted))
+}
+
+fn xml_attribute_equals(text: &str, attribute: &str, expected: &str) -> bool {
+    let folded = text.to_ascii_lowercase();
+    let name = attribute.to_ascii_lowercase();
+    let bytes = folded.as_bytes();
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        let Some(relative) = folded[cursor..].find(&name) else {
+            return false;
+        };
+        let mut index = cursor + relative + name.len();
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'=') {
+            cursor = index;
+            continue;
+        }
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(index) else {
+            cursor = index;
+            continue;
+        };
+        let value_start = index + 1;
+        let Some(value_length) = bytes[value_start..]
+            .iter()
+            .position(|value| *value == quote)
+        else {
+            return false;
+        };
+        let value_end = value_start + value_length;
+        return text[value_start..value_end].eq_ignore_ascii_case(expected);
+    }
+    false
+}
+
+fn xml_attribute_value<'a>(text: &'a str, attribute: &str) -> Option<&'a str> {
+    let folded = text.to_ascii_lowercase();
+    let name = attribute.to_ascii_lowercase();
+    let bytes = folded.as_bytes();
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        let relative = folded[cursor..].find(&name)?;
+        let name_start = cursor + relative;
+        let name_end = name_start + name.len();
+        let left_boundary = name_start == 0
+            || !bytes[name_start - 1].is_ascii_alphanumeric() && bytes[name_start - 1] != b'_';
+        let right_boundary = bytes
+            .get(name_end)
+            .is_none_or(|value| !value.is_ascii_alphanumeric() && *value != b'_');
+        if !left_boundary || !right_boundary {
+            cursor = name_end;
+            continue;
+        }
+        let mut equals = name_end;
+        while bytes.get(equals).is_some_and(u8::is_ascii_whitespace) {
+            equals += 1;
+        }
+        if bytes.get(equals) != Some(&b'=') {
+            cursor = name_end;
+            continue;
+        }
+        let mut quote_index = equals + 1;
+        while bytes.get(quote_index).is_some_and(u8::is_ascii_whitespace) {
+            quote_index += 1;
+        }
+        let &quote @ (b'\'' | b'"') = bytes.get(quote_index)? else {
+            cursor = name_end;
+            continue;
+        };
+        let value_start = quote_index + 1;
+        let value_length = bytes[value_start..]
+            .iter()
+            .position(|value| *value == quote)?;
+        return Some(&text[value_start..value_start + value_length]);
+    }
+    None
+}
+
+fn xun_exceed_wave_type(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "1" => Some("Exd_Wave_C"),
+        "2" => Some("Exd_Wave_S"),
+        "3" => Some("Exd_Wave_B"),
+        "4" => Some("Exd_Wave_L"),
+        _ => None,
+    }
+}
+
+fn set_xml_attribute(text: &mut String, attribute: &str, value: &str) -> Result<bool> {
+    if let Some(current) = xml_attribute_value(text, attribute) {
+        if current.eq_ignore_ascii_case(value) {
+            return Ok(false);
+        }
+        let value_start = current.as_ptr() as usize - text.as_ptr() as usize;
+        let value_end = value_start + current.len();
+        text.replace_range(value_start..value_end, value);
+        return Ok(true);
+    }
+
+    let folded = text.to_ascii_lowercase();
+    let root_start = folded
+        .find("<bodyparam")
+        .context("XUN kart parameter is missing its BodyParam root")?;
+    let close = text[root_start..]
+        .find('>')
+        .map(|relative| root_start + relative)
+        .context("XUN BodyParam start tag is unterminated")?;
+    let insert_at = if text.as_bytes().get(close.wrapping_sub(1)) == Some(&b'/') {
+        close - 1
+    } else {
+        close
+    };
+    let opening = &text[root_start..insert_at];
+    let insertion = if opening.contains('\n') {
+        let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        format!("\t{attribute}='{value}'{newline}")
+    } else {
+        format!(" {attribute}='{value}'")
+    };
+    text.insert_str(insert_at, &insertion);
+    Ok(true)
+}
+
+fn replace_xml_attribute_value(
+    text: &mut String,
+    attribute: &str,
+    expected: &str,
+    replacement: &str,
+) -> bool {
+    let folded = text.to_ascii_lowercase();
+    let name = attribute.to_ascii_lowercase();
+    let bytes = folded.as_bytes();
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        let Some(relative) = folded[cursor..].find(&name) else {
+            return false;
+        };
+        let name_start = cursor + relative;
+        let mut index = name_start + name.len();
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'=') {
+            cursor = index;
+            continue;
+        }
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(index) else {
+            cursor = index;
+            continue;
+        };
+        let value_start = index + 1;
+        let Some(value_length) = bytes[value_start..]
+            .iter()
+            .position(|value| *value == quote)
+        else {
+            return false;
+        };
+        let value_end = value_start + value_length;
+        if text[value_start..value_end].eq_ignore_ascii_case(expected) {
+            text.replace_range(value_start..value_end, replacement);
+            return true;
+        }
+        cursor = value_end + 1;
+    }
+    false
 }
 
 fn build_item_ability_overlays(
@@ -996,6 +1531,63 @@ fn shop_category_for_asset(category: &str) -> Option<u16> {
         "flying_pet" => Some(52),
         _ => None,
     }
+}
+
+fn normalize_xun_kart_table_row(row: &mut XmlRow) -> Result<bool> {
+    if !row.element.eq_ignore_ascii_case("kart")
+        || !row
+            .attribute("name")
+            .is_some_and(|name| name.to_ascii_lowercase().contains("xun"))
+    {
+        return Ok(false);
+    }
+
+    // P5136's catalog/UI tables only define the V1 generation and grade. The
+    // sidecar restores XUN's separate body/parts display conversion, while the
+    // stock client still receives values it can safely classify everywhere
+    // else in the inventory and tuning UI.
+    let mut changed = false;
+    if row.attribute("grade") == Some("13") {
+        row.replace_attribute("grade", "12".to_owned())?;
+        changed = true;
+    }
+    if row.attribute("engineGrade") == Some("9") {
+        row.replace_attribute("engineGrade", "8".to_owned())?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn normalize_xun_kart_table_text(text: &str) -> Result<(String, usize)> {
+    let mut output = text.to_owned();
+    let mut cursor = 0_usize;
+    let mut changed = 0_usize;
+    loop {
+        let folded = output.to_ascii_lowercase();
+        let Some(relative_start) = folded[cursor..].find("<kart") else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let Some(relative_end) = output[start..].find('>') else {
+            bail!("itemTable kart row is not closed");
+        };
+        let end = start + relative_end + 1;
+        let wrapper = format!("<root>{}</root>", &output[start..end]);
+        let mut rows = xml_rows(&wrapper, &["kart"])?;
+        let Some(mut row) = rows.pop() else {
+            cursor = end;
+            continue;
+        };
+        if normalize_xun_kart_table_row(&mut row)? {
+            let replacement = render_row(&row)?;
+            output.replace_range(start..end, &replacement);
+            cursor = start + replacement.len();
+            changed += 1;
+        } else {
+            cursor = end;
+        }
+    }
+    Ok((output, changed))
 }
 
 fn keyed_shop_rows(rows: &[XmlRow]) -> Result<HashMap<(u16, u16), XmlRow>> {
@@ -1312,7 +1904,9 @@ fn validate_archive_name(value: &str) -> Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        XmlRow, ascii_hash, korean_region_param_alias, sanitize_shop_row, sequential_archive_names,
+        BmlLimits, BmlNode, PacketReader, PacketWriter, XmlRow, ascii_hash,
+        is_safe_imported_xun_migration, korean_region_param_alias, normalize_imported_xun_resource,
+        normalize_xun_kart_table_text, sanitize_shop_row, sequential_archive_names,
         shop_category_for_asset,
     };
 
@@ -1383,6 +1977,325 @@ mod tests {
     }
 
     #[test]
+    fn old_xun_v1_fallback_is_restored_to_the_sidecar_factory() {
+        let source = "<?xml version='1.0' encoding='UTF-16'?><BodyParam TachometerType='V1GenTacho' TachometerName = \"xun\"/>";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(source.encode_utf16().flat_map(u16::to_le_bytes));
+
+        let (normalized, changed) =
+            normalize_imported_xun_resource("kart_/mancarXUN/param@kr.xml", &bytes).unwrap();
+        let text = super::decode_xml(&normalized).unwrap();
+
+        assert!(changed);
+        assert!(text.contains("TachometerType='XunGenTacho'"));
+        assert!(text.contains("TachometerName = \"xun\""));
+        assert!(!text.contains("ExceedWaveType"));
+    }
+
+    #[test]
+    fn xun_param_restores_native_exceed_wave_without_conflating_charger() {
+        let source = "<?xml version='1.0' encoding='UTF-16'?><BodyParam TachometerType='XunGenTacho' TachometerName='xun' defaultExceedType='4'/>";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(source.encode_utf16().flat_map(u16::to_le_bytes));
+
+        let (normalized, changed) =
+            normalize_imported_xun_resource("kart_/slrProXUN/param@kr.xml", &bytes).unwrap();
+        let text = super::decode_xml(&normalized).unwrap();
+        assert!(changed);
+        assert!(text.contains("ExceedWaveType='Exd_Wave_L'"));
+
+        let (second, second_changed) =
+            normalize_imported_xun_resource("kart_/slrProXUN/param@kr.xml", &normalized).unwrap();
+        assert!(!second_changed);
+        assert_eq!(second, normalized);
+    }
+
+    #[test]
+    fn xun_migration_accepts_only_the_canonical_exceed_selector_upgrade() {
+        let existing = "<?xml version='1.0' encoding='UTF-16'?>\r\n<BodyParam\r\n\tTachometerType='XunGenTacho'\r\n\tTachometerName='xun'\r\n\tdefaultExceedType='4'\r\n>\r\n</BodyParam>\r\n";
+        let staged = "<?xml version='1.0' encoding='UTF-16'?>\r\n<BodyParam\r\n\tTachometerType='XunGenTacho'\r\n\tTachometerName='xun'\r\n\tdefaultExceedType='4'\r\n\tExceedWaveType='Exd_Wave_L'\r\n>\r\n</BodyParam>\r\n";
+        let encode = |text: &str| {
+            let mut bytes = vec![0xff, 0xfe];
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+
+        assert!(
+            is_safe_imported_xun_migration(
+                "kart_/slrProXUN/param@kr.xml",
+                &encode(existing),
+                &encode(staged),
+            )
+            .unwrap()
+        );
+
+        let changed_value = staged.replace("TachometerName='xun'", "TachometerName='v1'");
+        assert!(
+            !is_safe_imported_xun_migration(
+                "kart_/slrProXUN/param@kr.xml",
+                &encode(existing),
+                &encode(&changed_value),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn xun_item_profile_maps_default_exceed_type_one_to_c_wave() {
+        let source = "<?xml version='1.0' encoding='UTF-16'?>\n<BodyParam\n\tTachometerType='XunGenTacho'\n\tTachometerName='xun'\n\tdefaultExceedType='1'\n>\n</BodyParam>\n";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(source.encode_utf16().flat_map(u16::to_le_bytes));
+
+        let (normalized, changed) =
+            normalize_imported_xun_resource("kart_/mancarXUN/param@kr.xml", &bytes).unwrap();
+        let text = super::decode_xml(&normalized).unwrap();
+        assert!(changed);
+        assert!(text.contains("ExceedWaveType='Exd_Wave_C'"));
+    }
+
+    #[test]
+    fn xun_param_corrects_a_stale_exceed_wave_selector() {
+        let source = "<?xml version='1.0' encoding='UTF-16'?><BodyParam TachometerType='XunGenTacho' TachometerName='xun' defaultExceedType='3' ExceedWaveType='Exd_Wave_S'/>";
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(source.encode_utf16().flat_map(u16::to_le_bytes));
+
+        let (normalized, changed) =
+            normalize_imported_xun_resource("kart_/testXUN/param@kr.xml", &bytes).unwrap();
+        let text = super::decode_xml(&normalized).unwrap();
+        assert!(changed);
+        assert!(text.contains("ExceedWaveType='Exd_Wave_B'"));
+        assert!(!text.contains("ExceedWaveType='Exd_Wave_S'"));
+    }
+
+    #[test]
+    fn xun_catalog_uses_safe_v1_generation_while_sidecar_restores_display_conversion() {
+        let source = r#"<itemtable><kart id="1574" name="slrProXUN" uniqueLevel="2" grade="13" engineGrade="9" kartType="2"/><kart id="1486" name="artemisV1" grade="12" engineGrade="8"/></itemtable>"#;
+        let (normalized, changed) = normalize_xun_kart_table_text(source).unwrap();
+        assert_eq!(changed, 1);
+        assert!(normalized.contains("name=\"slrProXUN\""));
+        assert!(normalized.contains("grade=\"12\" engineGrade=\"8\""));
+        assert!(normalized.contains("name=\"artemisV1\" grade=\"12\" engineGrade=\"8\""));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn xun_tachometer_bml_keeps_modern_nodes_and_restores_v1_required_names() {
+        let limits = BmlLimits {
+            max_depth: 8,
+            max_nodes: 64,
+            max_attributes_per_node: 16,
+            max_children_per_node: 64,
+            max_string_code_units: 128,
+        };
+        let mut root = BmlNode::new("Container", "");
+        for name in [
+            "xungen_bg1",
+            "xungen_bg2",
+            "bg_engineIcon1",
+            "bg_engineIcon2",
+        ] {
+            let mut child = BmlNode::new("Panel", "");
+            child.attributes.push(("name".to_owned(), name.to_owned()));
+            root.children.push(child);
+        }
+        for name in ["blinkRoad1", "blinkRoad2", "blinkRoad3"] {
+            let mut child = BmlNode::new("Panel", "");
+            child.attributes.push(("name".to_owned(), name.to_owned()));
+            root.children.push(child);
+        }
+        let mut charger = BmlNode::new("Panel", "");
+        charger
+            .attributes
+            .push(("name".to_owned(), "instCharger".to_owned()));
+        let mut gauge = BmlNode::new("Panel", "");
+        gauge
+            .attributes
+            .push(("name".to_owned(), "instChargerGauge".to_owned()));
+        gauge
+            .attributes
+            .push(("visible".to_owned(), "true".to_owned()));
+        charger.children.push(gauge);
+        root.children.push(charger);
+        let mut charger_features = BmlNode::new("Container", "");
+        charger_features
+            .attributes
+            .push(("name".to_owned(), "chargerFeatures".to_owned()));
+        charger_features
+            .attributes
+            .push(("leftTopWH".to_owned(), "0 0 396 74".to_owned()));
+        root.children.push(charger_features);
+        let mut exceed_features = BmlNode::new("Container", "");
+        exceed_features
+            .attributes
+            .push(("name".to_owned(), "exceedFeatures".to_owned()));
+        exceed_features
+            .attributes
+            .push(("visible".to_owned(), "false".to_owned()));
+        for name in ["idling", "usable", "playFull"] {
+            let mut overlay = BmlNode::new("Panel", "");
+            overlay
+                .attributes
+                .push(("name".to_owned(), name.to_owned()));
+            overlay
+                .attributes
+                .push(("visible".to_owned(), "true".to_owned()));
+            exceed_features.children.push(overlay);
+        }
+        let mut inst_accel = BmlNode::new("Window", "");
+        inst_accel
+            .attributes
+            .push(("name".to_owned(), "instAccel".to_owned()));
+        inst_accel
+            .attributes
+            .push(("visible".to_owned(), "false".to_owned()));
+        let mut inst_accel_gauge = BmlNode::new("Panel", "");
+        inst_accel_gauge
+            .attributes
+            .push(("name".to_owned(), "instAccelGauge".to_owned()));
+        inst_accel_gauge
+            .attributes
+            .push(("visible".to_owned(), "false".to_owned()));
+        let mut inst_accel_bar = BmlNode::new("Panel", "");
+        inst_accel_bar
+            .attributes
+            .push(("name".to_owned(), "instAccelBar".to_owned()));
+        inst_accel_bar
+            .attributes
+            .push(("visible".to_owned(), "false".to_owned()));
+        inst_accel.children.push(inst_accel_gauge);
+        inst_accel.children.push(inst_accel_bar);
+        exceed_features.children.push(inst_accel);
+        root.children.push(exceed_features);
+        for name in ["charger", "charger2"] {
+            let mut panel = BmlNode::new("Play1SPanel", "");
+            panel.attributes.push(("name".to_owned(), name.to_owned()));
+            panel
+                .attributes
+                .push(("visible".to_owned(), "true".to_owned()));
+            root.children.push(panel);
+        }
+        for name in ["kmh", "kmh2", "kmh3"] {
+            let mut panel = BmlNode::new("CharPanel", "");
+            panel.attributes.push(("name".to_owned(), name.to_owned()));
+            panel
+                .attributes
+                .push(("visible".to_owned(), "true".to_owned()));
+            panel.attributes.push(("text".to_owned(), "0".to_owned()));
+            root.children.push(panel);
+        }
+        let mut encoded = PacketWriter::new();
+        root.encode_with_limits(&mut encoded, limits).unwrap();
+
+        let (normalized, changed) =
+            normalize_imported_xun_resource("gui/tachometer/xun/tacho.bml", &encoded.into_inner())
+                .unwrap();
+        assert!(changed);
+        let mut reader = PacketReader::new(&normalized);
+        let decoded = BmlNode::decode_with_limits(&mut reader, limits).unwrap();
+        for expected in [
+            "v1gen_bg1",
+            "v1gen_bg2",
+            "n2o",
+            "n2o_always",
+            "instChargerGauge",
+            "blinkRoad1",
+            "blinkRoad2",
+            "blinkRoad3",
+        ] {
+            assert!(
+                super::has_bml_node_named(&decoded, expected),
+                "missing {expected}"
+            );
+        }
+        let n2o = super::find_bml_node(&decoded, "n2o").unwrap();
+        let n2o_on = n2o
+            .children
+            .iter()
+            .find(|node| super::xun_bml_attribute(node, "name") == Some("on"))
+            .expect("V1 update requires the nested n2o/on state panel");
+        assert_eq!(super::xun_bml_attribute(n2o_on, "visible"), Some("false"));
+        assert_eq!(super::xun_bml_attribute(n2o_on, "leftTopTex"), Some("0 0"));
+        assert_eq!(
+            super::xun_bml_attribute(&decoded, "instAccelFullLenth"),
+            Some("1000")
+        );
+        for name in ["instAccel", "instAccelGauge", "instAccelBar"] {
+            let node = super::find_bml_node(&decoded, name).unwrap();
+            assert_eq!(
+                super::xun_bml_attribute(node, "visible"),
+                Some("true"),
+                "P5136 V1 Exceed gauge node {name} must be drawable by the stock controller"
+            );
+        }
+        let inst_accel = super::find_bml_node(&decoded, "instAccel").unwrap();
+        assert_eq!(inst_accel.name, "Window");
+        assert_eq!(super::xun_bml_attribute(inst_accel, "texture"), None);
+        assert_eq!(
+            super::xun_bml_attribute(inst_accel, "leftTopTex"),
+            Some("0 512")
+        );
+        let exceed_features = super::find_bml_node(&decoded, "exceedFeatures").unwrap();
+        assert_eq!(
+            super::xun_bml_attribute(exceed_features, "visible"),
+            Some("true")
+        );
+        for name in ["idling", "usable", "playFull"] {
+            let node = super::find_bml_node(exceed_features, name).unwrap();
+            assert_eq!(
+                super::xun_bml_attribute(node, "visible"),
+                Some("false"),
+                "modern-only Exceed overlay {name} must not start permanently visible"
+            );
+        }
+        for name in ["charger", "charger2"] {
+            let node = super::find_bml_node(&decoded, name).unwrap();
+            assert_eq!(
+                super::xun_bml_attribute(node, "visible"),
+                Some("false"),
+                "modern-only XUN animation {name} must not start permanently visible"
+            );
+        }
+        assert_eq!(
+            super::xun_bml_attribute(super::find_bml_node(&decoded, "kmh").unwrap(), "visible"),
+            Some("true")
+        );
+        for name in ["kmh2", "kmh3"] {
+            assert_eq!(
+                super::xun_bml_attribute(super::find_bml_node(&decoded, name).unwrap(), "visible"),
+                Some("false"),
+                "unsupported decorative speed layer {name} must not leave a static zero"
+            );
+        }
+        let charger = decoded
+            .children
+            .iter()
+            .find(|node| super::xun_bml_attribute(node, "name") == Some("instCharger"))
+            .unwrap();
+        assert_eq!(charger.name, "Window");
+        assert_eq!(super::xun_bml_attribute(charger, "leftTopWH"), None);
+        let charger_features = super::find_bml_node(&decoded, "chargerFeatures").unwrap();
+        assert_eq!(
+            super::xun_bml_attribute(charger_features, "leftTopWH"),
+            Some("0 0 396 74")
+        );
+        let gauge = charger
+            .children
+            .iter()
+            .find(|node| super::xun_bml_attribute(node, "name") == Some("instChargerGauge"))
+            .unwrap();
+        assert_eq!(super::xun_bml_attribute(gauge, "visible"), Some("true"));
+        assert!(charger.children.iter().all(|node| {
+            !super::xun_bml_attribute(node, "name")
+                .is_some_and(|name| ["blinkRoad1", "blinkRoad2", "blinkRoad3"].contains(&name))
+        }));
+
+        let (second_pass, second_changed) =
+            normalize_imported_xun_resource("gui/tachometer/xun/tacho.bml", &normalized).unwrap();
+        assert!(!second_changed);
+        assert_eq!(second_pass, normalized);
+    }
+
+    #[test]
     fn asset_categories_map_to_stock_shop_categories() {
         assert_eq!(shop_category_for_asset("character"), Some(1));
         assert_eq!(shop_category_for_asset("kart"), Some(3));
@@ -1424,6 +2337,12 @@ fn render_markdown(report: &BundleReport) -> String {
         output,
         "- Imported kart `param@cn.xml` -> `param@kr.xml` aliases: {}",
         report.localized_kart_param_aliases
+    )
+    .expect("String write");
+    writeln!(
+        output,
+        "- XUN tachometer resources patched for the P5136-compatible sidecar ABI: {}",
+        report.xun_tachometer_compatibility_patches
     )
     .expect("String write");
     writeln!(

@@ -20,6 +20,7 @@ mod track_bundle;
 
 const MANIFEST_SCHEMA: u32 = 1;
 const COMPATIBILITY_ASSERTION: &str = "p5136-static-verified-v1";
+const EXPERIMENTAL_NATIVE_ASSERTION: &str = "p5136-xun-sidecar-experimental-v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,6 +43,22 @@ enum Command {
         target_data_raw: Option<PathBuf>,
         #[arg(long)]
         cache: PathBuf,
+    },
+    /// Resolve, verify, and install selected audited assets into a complete P5136 `DataRaw` tree.
+    ImportAssetsDataRaw {
+        #[arg(long)]
+        source_data: PathBuf,
+        #[arg(long)]
+        target_data: PathBuf,
+        #[arg(long)]
+        target_data_raw: PathBuf,
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        backup: PathBuf,
+        /// Asset selectors such as `kart:mancarXUN`.
+        #[arg(long = "asset", value_delimiter = ',')]
+        assets: Vec<String>,
     },
     /// Build dependency closures and guarded import manifests without changing live Data.
     Plan {
@@ -371,6 +388,41 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::ImportAssetsDataRaw {
+            source_data,
+            target_data,
+            target_data_raw,
+            workspace,
+            backup,
+            assets,
+        } => {
+            let assets = assets
+                .iter()
+                .map(|value| parse_asset_selection(value))
+                .collect::<Result<Vec<_>>>()?;
+            let summary =
+                p5136_assets::import_assets_to_dataraw(&p5136_assets::AssetImportOptions {
+                    source_data,
+                    target_data,
+                    target_data_raw,
+                    workspace,
+                    backup,
+                    assets,
+                })?;
+            println!(
+                "imported assets={} karts={} characters={} pets={} flying_pets={} resources_written={} resources_identical={} catalogs_updated={} report={}",
+                summary.assets,
+                summary.karts,
+                summary.characters,
+                summary.pets,
+                summary.flying_pets,
+                summary.resources_written,
+                summary.resources_identical,
+                summary.catalogs_updated,
+                summary.report.display()
+            );
+            Ok(())
+        }
         Command::Plan {
             source_data,
             target_data,
@@ -389,6 +441,7 @@ fn main() -> Result<()> {
                     category,
                     asset,
                     asset_selectors: std::collections::BTreeSet::new(),
+                    experimental_native_selectors: std::collections::BTreeSet::new(),
                     include_existing,
                     max_assets,
                     max_asset_bytes,
@@ -564,6 +617,24 @@ fn main() -> Result<()> {
         Command::RepackRho { input, output } => repack_rho(&input, &output),
         Command::RepackAaa { input, output } => repack_aaa(&input, &output),
     }
+}
+
+fn parse_asset_selection(value: &str) -> Result<p5136_assets::AssetSelection> {
+    let (category, id) = value
+        .split_once(':')
+        .with_context(|| format!("asset selector must be category:id: {value}"))?;
+    ensure!(!id.trim().is_empty(), "asset selector has an empty ID");
+    let category = match category.to_ascii_lowercase().as_str() {
+        "kart" => p5136_assets::AssetCategory::Kart,
+        "character" => p5136_assets::AssetCategory::Character,
+        "pet" => p5136_assets::AssetCategory::Pet,
+        "flying_pet" | "flying-pet" => p5136_assets::AssetCategory::FlyingPet,
+        _ => bail!("unsupported asset category in selector: {value}"),
+    };
+    Ok(p5136_assets::AssetSelection {
+        category,
+        id: id.trim().to_owned(),
+    })
 }
 
 fn list_legacy(input: &Path, contains: Option<&str>, limit: usize) -> Result<()> {

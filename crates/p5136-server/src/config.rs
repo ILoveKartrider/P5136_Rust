@@ -299,6 +299,10 @@ pub struct ServerConfig {
     /// Optional stock-client `Data` directory containing the KR `*.rho5`
     /// archives used to load authoritative emblem definitions.
     pub client_data_dir: Option<PathBuf>,
+    /// Optional unpacked client tree. When configured, the server publishes a
+    /// content-free file-list fingerprint on the private sidecar port and
+    /// refuses `DataRaw` clients whose tree differs.
+    pub data_raw_directory: Option<PathBuf>,
     /// Pre-resolved direct-RHO catalog snapshot. The GUI uses this after an
     /// inventory search load so server startup does not parse `kart.rho`
     /// twice. Normal CLI callers leave it `None`.
@@ -345,6 +349,7 @@ impl Default for ServerConfig {
             profile_root: PathBuf::from("Profile"),
             catalog_path: None,
             client_data_dir: None,
+            data_raw_directory: None,
             resolved_catalog: None,
             item_probabilities: None,
             item_probability_rank_policy: ItemProbabilityRankPolicy::default(),
@@ -371,4 +376,5 @@ pub struct ServerEndpoints {
     pub game_udp: SocketAddr,
     pub p2p_udp: SocketAddr,
     pub messenger_tcp: SocketAddr,
+    pub xun_sidecar_tcp: SocketAddr,
 }

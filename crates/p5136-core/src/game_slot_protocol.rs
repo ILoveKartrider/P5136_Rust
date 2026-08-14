@@ -20,6 +20,7 @@ use crate::game_slot_item_schema::{
 use crate::game_slot_item_semantics::{
     ItemOperationSemantics, decode_validated_item_operation_semantics,
 };
+use crate::packet::PacketWriter;
 
 pub const GAME_SLOT_PACKET_NAME: &str = "GameSlotPacket";
 pub const GAME_SLOT_PACKET_HASH: u32 = 0x27C0_0574;
@@ -41,6 +42,41 @@ pub const GOP_ROCKET_HASH: u32 = 0x1129_038E;
 pub const GO_ITEM_ROCKET_HASH: u32 = 0x1D4C_04AD;
 pub const GOP_BARRICADE_HASH: u32 = 0x1D86_04A3;
 pub const GO_ITEM_BARRICADE_HASH: u32 = 0x2D06_05C2;
+
+/// Builds the stock type-1 item acquisition response used to place an item
+/// directly into one player's local held-item slots.
+///
+/// The normal server path obtains this shape by reflecting a validated cube
+/// pickup and replacing bytes 38..=40. XUN item karts instead start with an
+/// item selected by the server, so there is no client pickup request to
+/// reflect. `GopCube` state 1 consumes only the target player and transition
+/// token; the reserved synthetic cube ID is deliberately outside normal track
+/// cube ranges. Item ID zero is valid here and denotes the ordinary cloud.
+#[must_use]
+pub fn serialize_direct_item_award(player_id: u8, item_id: i16, tick: u32) -> Vec<u8> {
+    const SYNTHETIC_CUBE_ID: u32 = 0xF000_00FF;
+
+    let mut packet = PacketWriter::named(GAME_SLOT_PACKET_NAME);
+    packet.write_i32(i32::from(player_id));
+    packet.write_u32(u32::MAX);
+    packet.write_u8(1);
+    packet.write_u8(0);
+    packet.write_u32(SYNTHETIC_CUBE_ID);
+    packet.write_u32(tick);
+    packet.write_u32(tick.wrapping_add(1_500));
+    packet.write_bytes(&[0; 12]);
+    packet.write_i16(item_id);
+    packet.write_u8(1);
+    packet.write_u32(0x0000_FFFF);
+    packet.write_u32(u32::try_from(PICKUP_BLOB_LENGTH).expect("fixed pickup blob length fits u32"));
+    packet.write_u32(GOP_CUBE_HASH);
+    packet.write_u32(GO_ITEM_CUBE_HASH);
+    packet.write_u32(SYNTHETIC_CUBE_ID);
+    packet.write_u32(1);
+    packet.write_u32(u32::from(player_id));
+    packet.write_u32(tick);
+    packet.into_inner()
+}
 
 pub const GOP_LUCCI_HASH: u32 = 0x0D89_0316;
 pub const GO_LUCCI_HASH: u32 = 0x0A33_02A6;
@@ -1842,6 +1878,40 @@ mod tests {
             assert_eq!(award[40], 1);
             assert_eq!(&award[41..], original_tail);
         }
+    }
+
+    #[test]
+    fn direct_item_award_matches_the_stock_type_one_response_shape() {
+        let cloud = super::serialize_direct_item_award(3, 0, 0x1122_3344);
+        assert_eq!(cloud.len(), 73);
+        let u32_at = |wire: &[u8], offset: usize| {
+            u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap())
+        };
+        let i32_at = |wire: &[u8], offset: usize| {
+            i32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap())
+        };
+        let i16_at = |wire: &[u8], offset: usize| {
+            i16::from_le_bytes(wire[offset..offset + 2].try_into().unwrap())
+        };
+        assert_eq!(u32_at(&cloud, 0), GAME_SLOT_PACKET_HASH);
+        assert_eq!(i32_at(&cloud, 4), 3);
+        assert_eq!(u32_at(&cloud, 8), u32::MAX);
+        assert_eq!(cloud[12], 1);
+        assert_eq!(u32_at(&cloud, 14), 0xF000_00FF);
+        assert_eq!(u32_at(&cloud, 18), 0x1122_3344);
+        assert_eq!(u32_at(&cloud, 22), 0x1122_3344_u32.wrapping_add(1_500));
+        assert_eq!(i16_at(&cloud, 38), 0);
+        assert_eq!(cloud[40], 1);
+        assert_eq!(u32_at(&cloud, 45), 24);
+        assert_eq!(u32_at(&cloud, 49), GOP_CUBE_HASH);
+        assert_eq!(u32_at(&cloud, 53), GO_ITEM_CUBE_HASH);
+        assert_eq!(u32_at(&cloud, 61), 1);
+        assert_eq!(u32_at(&cloud, 65), 3);
+        assert_eq!(u32_at(&cloud, 69), 0x1122_3344);
+
+        let rocket = super::serialize_direct_item_award(15, 7, u32::MAX - 100);
+        assert_eq!(i16_at(&rocket, 38), 7);
+        assert_eq!(rocket[40], 1);
     }
 
     #[test]

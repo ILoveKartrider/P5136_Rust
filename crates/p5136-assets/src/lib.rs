@@ -17,6 +17,7 @@ mod planner;
 mod track_bundle;
 
 const COMPATIBILITY_ASSERTION: &str = "p5136-static-verified-v1";
+const EXPERIMENTAL_NATIVE_ASSERTION: &str = "p5136-xun-sidecar-experimental-v1";
 
 pub use asset_import::{
     AssetCandidate, AssetCategory, AssetImportOptions, AssetImportPhase, AssetImportProgress,

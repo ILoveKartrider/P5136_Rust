@@ -1,9 +1,127 @@
 # Rust port status and resumable handoff
 
-Last updated: 2026-08-11
+Last updated: 2026-08-14
 
 This is the authoritative resume document for the independent Rust port. The
 short feature ledger is in [PORTING.md](PORTING.md).
+
+## 2026-08-14 v1.0.0 attach-path and source release boundary
+
+- The Connector tab now persists independently selectable XUN hook-helper and
+  DLL paths. Both controls provide a native file picker, and a new installation
+  defaults to `p5136-xun-attach.exe` and `p5136-xun.dll` beside `p5136.exe`.
+- The Windows release archive places those files at its root, so the default
+  paths work without copying files into the game directory. DLL file logging
+  remains an independent checkbox and does not disable hooks.
+- The complete Win32 sidecar, attach helper, optional DirectInput proxy, CMake
+  definitions, public ABI header, and smoke-test sources are now tracked under
+  `native/p5136-xun-sidecar`. Proprietary client data, IDB/decompiler output,
+  executable fixtures, and runtime logs remain excluded.
+- The Rust workspace and native CMake project are versioned `1.0.0`. The Korean
+  `CHANGELOG.md` is the user-facing release summary; this file remains the
+  evidence-heavy engineering handoff.
+
+## 2026-08-12 integrated kart/character/pet/flying-pet importer
+
+- Added a persistent Korean/English/Simplified-Chinese **Asset import** GUI
+  tab with source selection, separate kart/character/pet/flying-pet tabs,
+  search, a not-installed-only filter, multi-selection, installed/repairable
+  markers, localized exclusion reasons, and throttled phase progress.
+- Candidate discovery is deliberately allowlisted to the audited 57 kart, 73
+  character, 24 pet, and 47 flying-pet groups. XUN/Kart12 groups are omitted. Six karts
+  whose item transforms require client-native results absent from P5136 are
+  visible but disabled, leaving 51 selectable karts, 73 characters, 24 pets,
+  and 47 flying pets.
+- Added exact `category:asset_id` planner selectors and selected-only bundle
+  staging. This prevents same-name groups in different categories from crossing and
+  rechecks dependency closures and SHA-256 pins immediately before install.
+- Added an additive complete-DataRaw installer. Different-byte resource
+  collisions fail closed; catalog rows are merged with one-time backups. Only
+  the two server-visible catalog RHO5 files are updated in packed `Data`, each
+  preserving its first source as a sibling `.pristine.bak`; generated resource
+  archives are never copied into packed `Data`.
+- Added the read-only `p5136-assets list-compatible-assets` command. Against
+  the current newer Chinese source and live target it reports exactly 201
+  candidates: 51 eligible installed karts, 73 eligible installed characters,
+  24 eligible uninstalled pets, 47 eligible uninstalled flying pets, and six
+  blocked installed item-rule karts.
+- Full staging smoke tests verified all 24 pet groups (1,230 resources,
+  45,552,718 bytes, three resource archives) and all 47 flying-pet groups
+  (2,277 resources, 48,099,805 bytes, four resource archives), including 29
+  guarded `param@cn.bml` to `param@kr.bml` aliases. Generated bundles reopened
+  successfully with the stock reader and did not modify live client data.
+- Connected the importer allowlist to server inventory publication. The
+  previous stock ceilings quarantined every character above ID 429 and every
+  kart above ID 1456 even after a successful import. The server now grants the
+  51 reviewed kart IDs and 72 character catalog rows only when their matching
+  DataRaw `model.1s` exists; the six deferred-rule karts and XUN candidates
+  remain hidden. Real installed-catalog loading verifies 302 granted X/V1
+  parts records and all reviewed imported item rows.
+- Revalidated `rollerBrushV1` against the live source/target pair: 13 source
+  files, 356,447 bytes, zero unresolved references, one Korean parameter alias,
+  and a reader-verified three-archive staging bundle. No live client file was
+  changed by this smoke test.
+
+## 2026-08-11 compatible asset import foundation
+
+- Added a deterministic, bounded legacy RHO 1.1 writer covering all five
+  stock file-storage modes and exposing the key/data-hash metadata required by
+  `aaa.pk`. Existing legacy archives can be materialized with their original
+  storage properties and semantically repacked.
+- Added a bounded `aaa.pk` KRData/binary-XML codec with order-preserving
+  `RhoFolder` upsert. Real P5136 `aaa.pk` and `character_.rho` semantic
+  round-trips pass against the local stock client.
+- Added explicit CN RHO5 key support and verified 62 archives / 22,429 entries
+  in the newer local Chinese Data set.
+- Added a deterministic bounded RHO5 writer and a bulk `stage-compatible`
+  path. It splits output below the server's 64 MiB archive bound, rewrites new
+  names to asset codes, hashes other non-ASCII shop fields, and verifies every
+  generated archive with the normal reader.
+- Added the standalone `p5136-assets` scanner and staging importer. Imports are
+  SHA-256 pinned, require an explicit static-compatibility assertion, and are
+  refused when output points at either live Data directory.
+- Added the read-only asset planner. It reconstructs `aaa.pk` legacy mounts and
+  RHO5 overlays, builds bounded kart/character/track dependency closures,
+  parses XML/KML/BML structurally, emits localization tasks, checks P5136 `.1s`
+  signatures, and generates guarded manifests with four explicit compatibility
+  outcomes. Invalidated legacy-index caches avoid reopening roughly 3,200 RHO
+  mounts on every run.
+- Corrected the planner boundary so ordinary V1 `exceed` is recognized as a
+  stock P5136 feature; only XUN/Kart12 extensions trigger the native marker.
+  Binary image metadata is no longer interpreted as a dependency/native-class
+  source, and root-level catalogs are no longer counted as asset groups.
+- Completed the deployed-client newer-CN-to-P5136 census: 294 source-only
+  groups produced 183 direct static candidates (57 karts, 73 characters, and
+  53 tracks), 111
+  XUN-native-gated karts, and zero unresolved groups. Every planner run now
+  writes both JSON and Korean Markdown reports; the retained candidate list is
+  in `ASSET_CONVERSION_CANDIDATES.md`. The generated 60-file `bazzi_20year`
+  manifest passed staging plus legacy-RHO and `aaa.pk` semantic repack
+  verification.
+- Staged and locally applied the 57 compatible karts and 73 compatible
+  characters as five `DataPack1_00002`-`00006` reserved-slot resource packs
+  plus a preserving replacement of the original shop catalog entry in
+  `DataPack4_00002` (4,862 resource entries and 129 catalog rows). The initial
+  `DataPack4_00004` duplicate was server-visible but client-shadowed: imported
+  models loaded through `itemTable`, while names and descriptions did not.
+  The first attempt using new
+  `DataPack4_00005`-`00009` names proved server-visible but client-invisible
+  through repeated unknown `ItemObject` errors; P5136 only enumerates its stock
+  pack ranges. Replaced files receive one-time `.pristine.bak` backups.
+  Effective-catalog
+  extraction confirmed code names and hashed descriptions, the server loaded
+  the enlarged exact catalog shape, and a post-import plan left only 53 tracks
+  plus 111 XUN-native-gated karts.
+- Extended compatible kart staging to import the four item-ability tables used
+  by pickup transforms, post-hit rewards, post-use rewards, and special
+  boosters. The deployed 57-kart set adds 43 `transformByKart`, 14
+  `fired2Gain`, 10 `firing2Gain`, and 7 `animalBooster` rows; eight rules whose
+  result items do not exist in P5136 are deliberately skipped. The Rust server
+  now overlays the supported pickup/special-booster rules from RHO5 and loads
+  676 resolved transforms for the imported client shape.
+- Recorded version-pinned IDA addresses and the additive sidecar boundary for
+  XUN tachometer, charger state, lead-charge packet, KartSpec tail fields, and
+  Kart12 tuning in `XUN_BACKPORT_AUDIT.md`.
 
 ## 2026-08-11 v0.2.7 stock channel physics and configurable basic AI
 
@@ -3195,6 +3313,145 @@ These items prevent a "port complete" claim.
   `CatalogInventory`: the client owns those decisions, while the server only
   validates and relays the resulting GameSlot use/reaction reports.
 
+## 2026-08-12 track import boundary
+
+- The 53 source-only track-shaped folders are no longer treated as 53 ordinary
+  compatible tracks. Global BML inspection split them into 34 active ordinary
+  rows, nine blocked special rows, and ten unregistered/dormant folders.
+- Per-folder manifests omit global track/locale rows, P5136 thumbnail aliases,
+  and 64 required AI-path files across eight ordinary candidates.
+- Decoded theme comparison found substantially stable existing themes, but
+  `china`, `ice`, and `mine` have large same-path texture revisions and must
+  not receive automatic whole-theme overlays.
+- Cemetery is not revised in the inspected pair: all 152 common
+  `theme_tomb.rho` payloads and the compared `tomb_I07/track.1s` are identical;
+  P5136 has one extra fog texture.
+- `fengshen` is a full new-theme bundle: track folders alone omit 235 theme
+  resources, selector UI, BGM, custom item cubes, AI paths, and presentation
+  art. IDA Professional 9.4 found the generic scene RTTI boundary in both
+  clients and no newer-only scene class, but runtime gimmick testing remains
+  mandatory.
+- The evidence, exact lists, archive deltas, and importer resume steps are in
+  `TRACK_IMPORT_AUDIT.md`. The `compare_legacy` example reproduces decoded-file
+  and PNG/DDS layout comparisons without distributing client payloads.
+- The connector now exposes a reversible experimental hidden-track option. It
+  writes only `track/common/trackLocale@kr.bml` into the stock-empty
+  `DataPack1_00014.rho5` slot, preserving the slot once with the existing
+  `.pristine.bak` contract and restoring it when the option is disabled.
+- The locale patch injects the three physically complete `transFormer` rows
+  and removes `blocked` only for six rows whose ordinary definitions and track
+  archives are present. It excludes story-only `S` rows and incomplete XYY;
+  live-data integration verifies P5136 BML decode, Korean RHO5 encode/decode,
+  and byte-exact reserved-slot restoration without modifying the live client.
+- `p5136-assets stage-tracks` now stages only source-catalog-backed active
+  `Ixx`/`Rxx` item/speed rows (plus `_kd` variants). It merges selected
+  `track@zz` and ASCII-safe Korean-locale rows, adds AI paths and both selector
+  image aliases, and packages source-only theme/UI/BGM/item-cube/stage assets.
+- Existing same-path P5136 theme files are never overwritten. This makes
+  stable-theme extensions bounded and turns `fengshen` into a full data-side
+  theme bundle, while leaving revised `china`/`ice`/`mine` shared resources for
+  explicit material-closure review.
+- The track catalog uses reserved slot `DataPack1_00013`; the connector's slot
+  14 special-track patch now derives from the latest earlier locale overlay so
+  imported rows survive when both features are enabled. A real `forest_I10`
+  staging smoke test reopened the catalog and resource archives successfully;
+  no live client data was modified.
+- Track resources use only the client's existing empty enumerable slots:
+  `DataPack1_00007`-`00012` and `DataPack3_00001`/`00004`/`00005`. Missing or
+  nonempty slots are rejected; new post-range archive names are not emitted
+  because earlier item import testing proved that such files can be invisible
+  to the native client despite being readable by server tooling.
+- The server random-track loader now resolves `track@zz` and the Korean locale
+  through the effective last RHO5 overlay before falling back to
+  `track_common.rho`. Imported tracks therefore become available to the manual
+  random-pool editor without silently changing stock random pools.
+
+## 2026-08-12 generalized external track importer
+
+- The integrated GUI now has a persistent, localized Track import tab. It
+  indexes an arbitrary KR- or CN-family external `Data` directory, lists 328
+  catalog-backed I/R rows in the inspected current Chinese source, marks valid
+  source rows as selectable, and labels already-installed rows as idempotent
+  dependency/catalog repair candidates. Source/target indexing, dependency
+  analysis, bundle writing, verification, and DataRaw installation report
+  throttled phase/file progress to the GUI.
+- A selected import merges against the current DataRaw catalogs, stages and
+  reopens transport RHO5 archives outside live `Data`, verifies hashes, backs
+  up catalog files once, and installs additively. Existing non-catalog files
+  with different bytes are never overwritten.
+- Known data dependency closure now includes the complete track folder, AI
+  paths, selector aliases, theme/UI/item-cube/stage resources, material-symbol
+  lookup across track-local/common/cross-theme namespaces, positional
+  environment sounds, theme BGM, and explicit serialized asset references.
+- New theme tabs are not inferred from selector images: they are ordered by
+  `dialog2/selectTrackEx/config@cn.bml` and its `@tw` peer, then gated by the
+  executable's 34-entry table at `0x1206DC0`. The earlier schema-3
+  catalog-only Fengshen repair was therefore invisible. Schema 4 mapped
+  Fengshen to numeric native slot 17 (`xyy`), writes explicit `theme=xyy`
+  plus `bgmTheme=fengshen` compatibility attributes, but runtime testing
+  exposed both a second content-registry gate and a separate zero-valued
+  material-theme mask. Schema 5 also adds enabled/visible `themeXyy` to
+  `zeta_/kr/content/config.xml`, then verifies all three catalog layers while
+  repairing already-installed definitions. Static follow-up at `sub_7C6550`
+  confirmed that `theme=xyy` does not update the material mask previously
+  derived from the unknown `fengshen_*` prefix. The importer now writes
+  `texTheme=xyy`, preserves any extra source list as e.g.
+  `xyy|abyss|sword`, and mirrors all 235 `theme/fengshen` files under
+  `theme/xyy` while preserving their original paths. The seven installed Fengshen I/R
+  rows, both selector catalogs, content registry, and runtime resource alias
+  are updated together. Unknown non-native themes
+  now fail closed instead of creating an unusable selector row.
+- Schema-5 JSON/Markdown reports distinguish staged, byte-identical,
+  unresolved, dynamic-PPL, and same-path-conflict dependencies. Native
+  gimmicks and shaders remain an explicit static/runtime compatibility gate;
+  no data scanner claims to synthesize missing client code.
+- Isolated `wkc_R12` staging resolved 80/80 material symbols (54 identical,
+  13 staged, 13 conflicts preserved), three positional sounds, and two BGM
+  files with zero unresolved known data dependencies. The audit bundle was not
+  installed into the live client.
+
+## 2026-08-12 XUN sidecar phase 1
+
+- Added a separate CMake/MSVC Win32 project under
+  `native/p5136-xun-sidecar`; it stays outside the Rust workspace because the
+  client ABI needs native 32-bit hooks while the Rust workspace forbids unsafe
+  code and builds the launcher/server for 64-bit hosts.
+- The 84 KiB release `dinput8.dll` proxy forwards all six system exports,
+  links the CRT statically, exposes a versioned diagnostic ABI, logs its
+  decision, and remains inert unless the exact unpacked P5136 PE metadata and
+  SHA-256 match.
+- Loader tests verify exact-file acceptance, wrong-process rejection, export
+  presence, and a real `IDirectInput8W` create/release through the proxy.
+  Dumpbin confirms PE32/x86, ASLR/NX, and only ADVAPI32/KERNEL32/USER32 direct
+  dependencies.
+- Added a second `p5136-xun.dll` target and a 32-bit
+  `p5136-xun-attach.exe`. The helper accepts a PID or uniquely discovers the
+  running client, refuses every non-matching executable, loads the DLL through
+  a remote module-relative `LoadLibraryW`, and calls the ABI-v2 initializer
+  outside loader lock. A standalone attach-DLL smoke test and wrong-process
+  refusal test pass. Artifacts install under the shared
+  `target/p5136-finish-kart-abilities/release/xun` tree.
+- No gameplay hook is installed in phase 1. Even with `enabled=1`, status is
+  diagnostic-ready and the public hooks-installed bit remains zero.
+- IDA 9.4 xrefs confirm XUN uses two added runtime-type registrations for its
+  flat-gauge and derived tachometer, with init-array entries at `0x011F209C`
+  and `0x011F20A0`; it is not a one-byte selection of the existing X/V1
+  allocator. Exact addresses and the remaining implementation boundary are in
+  `XUN_BACKPORT_AUDIT.md`.
+
+## 2026-08-12 XUN sidecar phase 2 lifecycle probes
+
+- Reconfirmed the exact P5136 V1/X tachometer allocator prologues in IDA 9.4
+  and added ABI-v3 observation hooks at `0x006C2980` and `0x006CECF0`.
+- Hook installation checks the exact image plus live six-byte prologues,
+  allocates RX trampolines, suspends and checks other client threads, and
+  patches both sites in one page-protected transaction. Any failure leaves the
+  sites untouched.
+- The naked probes preserve registers and flags, execute the original
+  allocators unchanged, and record only allocator kind/count/thread ID. Status
+  `5` means lifecycle probes are active, not that XUN driving is implemented.
+- DirectInput, standalone attach, and exact probe-site release tests all pass.
+
 ## Definition of port complete
 
 The port is complete only when every supported P5136 request has explicit
@@ -3203,3 +3460,384 @@ work is cancellation-safe and crash-diagnosable, normal/force shutdown is
 tested, strict gates pass on Windows/macOS/Linux, and the stock client completes
 a two-client login/channel/room/race/persistence flow through the Rust server
 and connector.
+## 2026-08-12 experimental `mancarXUN` import boundary
+
+- Added one deliberately bounded XUN asset candidate: `mancarXUN` (kart ID
+  1590). Its 13-file, 520,779-byte dependency closure has no unresolved
+  references, no localization task, and uses a `.1s` signature already seen by
+  P5136. The other 110 native-gated kart groups remain hidden.
+- Experimental native assets use the distinct
+  `p5136-xun-sidecar-experimental-v1` manifest assertion. Bulk staging cannot
+  consume it; only an exact explicit integrated selection can.
+- The client catalog grants ID 1590 only when its imported DataRaw model exists.
+  This does not generalize the automatic-grant range to later unknown karts.
+- Fixed the packed-catalog/DataRaw split exposed by the first live test. The
+  server now merges parameter files only for audited imported kart IDs whose
+  matching `DataRaw/kart_/<code>/model.1s` exists. Previously ID 1590 had a
+  global item/name row but no server-side spec because resource archives are
+  intentionally not copied into packed Data, so it appeared only after an
+  explicit manual grant. Existing accounts now receive it through the normal
+  catalog-backed inventory snapshot after the next server restart.
+- The first live test confirmed the `XunGenTacho` factory path but displayed
+  the stock X skin. A second V1-prefix experiment reached the real XUN BML but
+  crashed during `sub_6BFA90+0x4AE`: P5136 looked up the V1-only `n2o/on`
+  hierarchy, received a null parent, and dereferenced `null+0x4C` at
+  `0x004F6ED1`. This proves that the common `0x2B8` prefix is not a functional
+  XUN implementation. The V1/X aliases and proposed BML-name shim were removed;
+  sidecar ABI v6 now exposes lifecycle probes only (`status=5`).
+- Experimental XUN imports now include the effective
+  `gui/tachometer/xun` BML/PNG/1S dependency closure. The kart keeps
+  `TachometerName=xun`, but the tree is now treated only as input data for an
+  independent native port. The XUN tachometer and flat-gauge runtime types,
+  charger/lead-charge state, later KartSpec fields, effects, and packets remain
+  unimplemented.
+
+## 2026-08-12 XUN physics-first state probe
+
+- Matched the later XUN drive-event handler/main tick to P5136 `0x00A2D720`
+  and `0x00A33420`, and recovered the booster-cycle activation, duration, and
+  strict expiry rules.
+- Confirmed the later `GoPlayKart` vtable adds four trailing slots while the
+  P5136 prefix and V1 instant-acceleration helpers remain compatible. The
+  backport therefore uses a `GoPlayKart*` side table instead of enlarging or
+  replacing the client object.
+- Sidecar ABI v7 adds exact-boundary observation hooks for the drive-event and
+  physics-tick functions plus a tested, allocation-free charger state model.
+  Status counters and transition logs are diagnostic only; no physics consumer
+  is patched yet.
+- Mapped six later conditional consumers onto P5136 acceleration, collision,
+  wall-gauge, and boost-gauge functions. Their addresses and current semantic
+  confidence are recorded in `XUN_BACKPORT_AUDIT.md`.
+
+## 2026-08-12 XUN speed-based boost-gauge consumer
+
+- Corrected the first XUN consumer's meaning: later `0x00B4E9F0` / P5136
+  `0x00A34640` controls speed-derived ordinary booster-gauge charging, not
+  vehicle acceleration. The raw S/B/L table value is `350`; S activates after
+  four boosters for 3000 ms, B after five/3750, and L after six/4500.
+- Live validation confirmed the effect and its intentionally extreme gauge
+  gain. The documented "about 3x" applies to Exceed gauge during booster use,
+  while this separate ordinary booster-gauge effect is meant to fill from a
+  very short drift. The embedded KartSpec layout maps source `+300` directly
+  to `GoPlayKart+0x994`; no percent-to-ratio conversion occurs before the
+  later consumer's multiplication.
+- Sidecar ABI v8 verifies and redirects only the three protected-float add
+  calls at P5136 `0x00A3481D`, `0x00A3486C`, and `0x00A348AB`. The bridge
+  preserves flags, GPRs, and FPU/SSE state and scales the pending gauge addend
+  only while the external charger state is active.
+- `probe_apply_speed_boost_gauge` remains an explicit V1 mock switch because
+  per-kart XUN runtime binding is not complete. The other gauge/collision
+  consumers, visuals, item-mode start item, tachometer, and lead-charge packet
+  remain pending. Four release tests now include all seven exact hook sites and
+  the raw multiplier calculation.
+
+## 2026-08-13 XUN remaining speed-mode consumers
+
+- Sidecar ABI v9 now connects the five remaining recovered speed-mode
+  consumers: drift boost-gauge `base+2`, wall/booster Exceed-gauge
+  `base+0.09`/`base+0.03`, anti-collision balance `0.8`, and the XUN
+  wall-collision response multiplier `100`.
+- The implementation redirects six additional complete call instructions at
+  P5136 `0x00A349B0`, `0x00A3B058`, `0x00A3DBC1`, `0x00A3DC36`,
+  `0x00A3F8B9`, and `0x00A3FC13`. Together with lifecycle and the first
+  consumer, thirteen sites must all match before the atomic installation runs.
+- Getter wrappers preserve P5136's protected-float representation and alter
+  only the returned operand for an active side-table kart. The collision
+  wrapper also preserves the original x87 floating return expected by the
+  caller, avoiding an FPU-stack imbalance.
+- `probe_apply_remaining_consumers` controls this group, with recovered S/B/L
+  defaults exposed in the INI. Static site tests, formula tests, proxy loading,
+  and attachable-DLL verification all pass in Release. Per-kart XUN binding is
+  now server-selected. Barrier visuals, tachometer, and lead-charge state remain
+  outside this checkpoint.
+
+## 2026-08-13 server-selected XUN profiles
+
+- Added an optional private TCP endpoint at configured base port +3 (default
+  `39314`). It is separate from the stock game protocol and cannot introduce
+  unknown packets into an unmodified P5136 client.
+- The connector atomically writes `p5136-xun-session.ini` beside the game
+  executable. The sidecar uses its normalized nickname to subscribe to the
+  current server-selected kart profile.
+- Catalog generation and parsing now preserve the XUN BodyParam markers rather
+  than maintaining a hardcoded kart list. Baseline speed types 2/3/4 select
+  S/B/L booster counts and durations. Item type 1 is identified but has no DLL
+  physics consumers; absent metadata and special types 5-10 remain disabled.
+- The previous global S-profile INI mock no longer enables physics. Consumers
+  are fail-closed until a valid server frame arrives, reset on disconnect, and
+  bind to one locally observed `GoPlayKart*` after profile selection.
+- The auxiliary protocol reserves bounded DLL-to-server event frames for a
+  future identity-generation/room-epoch-fenced multiplayer effect relay. They
+  are currently consumed without publication or gameplay effect.
+
+## 2026-08-13 exact XUN item-profile start grant
+
+- Removed the provisional `XunGenTacho + three slots` item-mode heuristic. It
+  was observably wrong: the modern `keraunosXUN` BodyParam has three item slots
+  and `useExtendedAfterBoosterMore=true`, but its exact
+  `defaultExceedType='4'` identifies the L speed profile. `mancarXUN`,
+  `honeyXUN`, and `trainXUN` declare exact type 1 item profiles.
+- Recovered the modern reference-server path in `V2ExcSpec.ExceedSpec`: only
+  `KartSpec.defaultExceedType == 1` assigns `KartSpec.startItemId`, using
+  `SlotData.RandomItemSkill(nickname, 2)`. The `2` deliberately chooses the
+  individual item probability table regardless of the room's team flag.
+- P5136 cannot consume the post-5136 KartSpec tail directly. At race start the
+  compatibility server therefore selects from its configured individual table,
+  applies the equipped kart's ordinary `no_flag` transform, and emits one
+  target-scoped stock `GameSlotPacket` type-1 award. Floater and
+  `animal_booster` pickup transforms are intentionally excluded because they
+  are not part of the recovered `startItemId` calculation.
+
+## 2026-08-13 superseded XUN charger sound-manager experiment
+
+> Superseded by the renderer analysis documented below. The three routines in
+> this section were later proved to be sound-resource operations, not the
+> charger visual lifecycle. They are retained only as an investigation record
+> and are no longer called by the sidecar.
+
+- Recovered the later client's exact charger visual lifecycle. Setup registers
+  the `charger` node through modern `0x01116D60`; activation creates mode
+  `0x0C` through `0x01116800`, and expiry removes the returned handle through
+  `0x011170A0`. The resource ID and live handle occupy later-client
+  `GoPlayKart+0xCF4/+0xCF8` and therefore cannot be appended to P5136's object.
+- Structural fingerprints map those manager calls exactly to P5136
+  `0x00F66000`, `0x00F65AA0`, and `0x00F66340`. The first implementation
+  redirected P5136 `0x00A31D4B`, but that is the `draft` registration backed
+  by the kart-root context. The latest client registers `dualBooster`,
+  `dualBoosterReady`, `exceed`, and `charger` from the separately loaded
+  `engine_common` context. ABI v11 therefore redirects P5136's existing
+  `exceed` registration at `0x00A31E52`, preserves it, and queries that exact
+  `engine_common` context for the imported `charger` node.
+  The resulting resource ID and instance handle stay in the existing
+  `GoPlayKart*` side table.
+- Effect creation/removal runs after the physics-state lock is released and on
+  the client physics thread. An in-flight bit prevents duplicate instances;
+  a state change during creation immediately discards the stale returned
+  handle. Resource registration, spawn, removal, and failure are written only
+  through the asynchronous logger.
+- Experimental `mancarXUN` imports now add the complete `effect/charger`
+  closure (one 4,690-byte `.1s` and three textures) in addition to the XUN
+  tachometer tree. Re-importing the live test client wrote exactly these four
+  files and found the other 96 resource/catalog files byte-identical.
+- Hook installation now verifies fourteen exact instruction boundaries. All
+  four native Release tests and all `p5136-assets` tests pass. Runtime behavior
+  remains exact-build and server-profile gated; a kart context without the
+  `charger` node returns `-1` and never enters the effect manager's spawn path.
+
+## 2026-08-13 XUN tachometer compatibility layer
+
+- The fatal XUN dashboard exception was pinned to P5136 `0x00AC14FC`: the
+  `XunGenTacho` factory lookup returned null and the caller dereferenced it.
+  Routing the name to P5136's V1 allocator reached initialization but exposed
+  a second incompatibility at `0x004F6ED1`: the modern BML does not contain the
+  four V1 node names `n2o`, `n2o_always`, `v1gen_bg1`, and `v1gen_bg2`.
+- ABI v11 hooks the exact factory lookup at `0x00684960`, preserves the lookup
+  object's `ECX`, and returns a P5136 V1-layout object only for
+  `XunGenTacho`. Other factory requests pass through unchanged. The imported
+  XUN BML maps its four equivalent nodes to the required names, so the actual
+  XUN skin can initialize without copying the later client's larger C++
+  object into P5136.
+- XUN-only dashboard state remains in the existing `GoPlayKart*` side table.
+  The importer turns the modern charger gauge into three P5136-compatible
+  segments, and a post-update hook at `0x006C11E0` drives them from the exact
+  booster-count/active state. This is a functional coarse gauge, not yet the
+  latest client's continuous fill and animation implementation.
+- The transformation is idempotent and also migrates the earlier
+  `TachometerType=V1GenTacho` fallback back to `XunGenTacho`. Hook installation
+  now verifies sixteen exact instruction boundaries and reports status `6`.
+- The first live ABI-v11 pass proved that the factory key returned by
+  P5136 `0x004DE560` is UTF-16, not the similarly shaped narrow-string type.
+  The ANSI comparison saw only the first `X`, missed `XunGenTacho`, and left
+  the original null dereference at `0x00AC14FC` unchanged. The detour now uses
+  the recovered `wchar_t` contract and `lstrcmpiW`.
+- P5136's ordinary Exceed display still uses the stock V1 flat-gauge
+  controller at `0x006BEA20`. The modern XUN BML omitted the legacy root
+  `instAccelFullLenth` contract and started `instAccelBar` hidden because the
+  later, larger XUN tachometer owns that first visibility transition. The
+  importer now pins the legacy length to `1000` and starts `instAccel`, its
+  fill, and its position marker visible so P5136 can clip and move them with
+  the native controller. ABI-v11 also records the controller's normalized
+  fill in 5-percent buckets through the asynchronous logger, allowing visual
+  skin faults to be distinguished from missing KartSpec/Exceed state without
+  per-frame file I/O.
+
+## 2026-08-13 Black Knight XUN import candidate
+
+- Added `slrProXUN` (kart ID 1574, Chinese catalog name `黑骑士 迅`) as the
+  second deliberately bounded XUN import candidate. It is a speed kart with
+  exact `defaultExceedType=4`, so the server selects the recovered L profile:
+  six boosters and 4500 ms.
+- Installed its complete dependency closure into the live P5136 `DataRaw` and
+  merged its item-table/shop/kart-spec rows. Sixteen resources were new and 84
+  shared XUN resources were byte-identical. Existing accounts receive it from
+  the normal audited catalog grant after the server restarts.
+- The real-client catalog test recognizes the new 1515-name/1412-spec shape,
+  verifies ID 1574 ownership, and verifies the exact type-4 XUN profile. The
+  audited importer now exposes 51 ordinary karts plus two XUN candidates;
+  remaining XUN/Kart12 karts stay fail-closed.
+
+## 2026-08-13 XUN live-profile and initial-visibility repair
+
+- Corrected the connector's private `p5136-xun-session.ini` encoding from
+  BOM-less UTF-8 to UTF-16LE with BOM. `GetPrivateProfileStringW` previously
+  interpreted Korean nicknames through the system ANSI code page, causing the
+  server to reject every sidecar handshake before a kart profile was sent.
+- The imported XUN tachometer now exposes the separate `exceedFeatures`
+  hierarchy required by P5136's stock V1 flat-gauge controller. Its ordinary
+  `instAccel`, fill, and marker nodes start visible, while the later-client-only
+  `idling`, `usable`, and `playFull` overlays start hidden. This is independent
+  of `chargerFeatures`; conflating the two left a full-charge-looking image
+  permanently visible while the real Exceed gauge remained under a hidden
+  parent.
+- Recovered the reference server's exact `V2ExcSpec` compatibility projection
+  for XUN BodyParam data. The server now applies `defaultExceedType` 1-10 to
+  P5136's existing Exceed KartSpec fields and projects all four default part
+  types into the stock V2 contribution block. For `slrProXUN` type 4 with
+  engine/handle/wheel/booster type 21 this includes fill rates
+  `0.02/0.07/0.15`, factor `1.16`, length `2500`, usable threshold `500`, and
+  default-part contributions `0.45438/0.488/494/-13`. The previous raw modern
+  BodyParam import omitted both compositions, explaining zero gauge fill and
+  the incorrect effective kart specification.
+- P5136 already registers `dualBooster`, `dualBoosterReady`, and `exceed` from
+  the shared `engine_common` resource. Imported `slrProXUN` retains its V1
+  dual-booster fields (`20/30`, multiplier `1.07`, low-speed threshold `100`)
+  and engine grade 9 satisfies the stock eligibility gate. No speculative
+  `dualBoosterSetAuto` override is applied because stock P9/X/V1 data also
+  leaves it disabled; dual behavior must be revalidated after the corrected
+  effective KartSpec reaches the client.
+- Sidecar profile subscription/closure and failed charger-resource lookups now
+  emit explicit diagnostics. A missing effect-context binding can therefore be
+  separated from profile delivery and charger state on the next live pass.
+- IDA 9.4 corrected the first charger registration detour: P5136
+  `0x00A31D4B` is `draft` and receives the kart-root context, whereas the
+  existing `exceed` registration at `0x00A31E52` receives the same
+  `engine_common` context used by the modern client's `charger` registration.
+  ABI v11 now preserves that original exceed registration and queries charger
+  from the proven shared context. The subsequent live lookup still returned
+  `-1`, which established that the missing node is a resource-graph/version
+  limitation rather than the earlier wrong-context bug.
+
+## 2026-08-13 XUN charger presentation compatibility
+
+> The `engine_common` lookup conclusion below was also superseded. Loose
+> `effect/charger` is a directly loadable renderer scene and does not need to
+> become a named node in `engine_common`; the corrected implementation uses
+> P5136's renderer/resource ABI described in the final section.
+
+- A live run proved the remaining split precisely: the stock P5136 Exceed
+  controller advanced from `0.000` to `0.986`, and the independent charger
+  state activated and expired repeatedly, while neither surface was visible.
+  This was therefore a presentation binding fault rather than another
+  KartSpec, counter, or state-machine fault.
+- The imported XUN `instAccel` node was a generic later-client `Window` with
+  no textured drawable of its own. The importer now converts it to the legacy
+  `Panel` contract used by P5136 `V1GenTacho`, pins the XUN Exceed background,
+  and leaves the native P5136 flat-gauge controller in charge of clipping the
+  fill and moving the marker. The separate charger hierarchy uses its modern
+  `instChargerGauge` as one continuous clipped bar. Booster-use increments are
+  interpolated over ten update ticks; `blinkRoad1/2/3` remain independent road
+  state indicators rather than three charger levels.
+- Static analysis of P5136 `0x00A3E7F0` confirmed that both its native
+  `dualBooster` and `exceed` effects call `0x00F65AA0` with creation mode
+  `0x0C`, matching the later charger's recovered mode. A live resource lookup
+  also showed that importing loose `effect/charger` files does not add the
+  post-5136 `charger` node to P5136's already-built `engine_common` graph.
+  The registration hook therefore uses a real `charger` ID only. A missing
+  node stays fail-closed; it never substitutes the unrelated stock `exceed`
+  resource. The resource and instance handle remain in the DLL side table, so
+  no P5136 object is enlarged.
+- Re-importing `mancarXUN` and `slrProXUN` updated exactly the shared XUN
+  tachometer BML in the live `DataRaw`; all other asset and catalog files were
+  unchanged. The Rust asset tests and all four Win32 sidecar tests pass.
+
+## 2026-08-13 XUN display conversion and continuous charger gauge
+
+- IDA 9.4 recovered P5136's four-stat converter at RVA `0x002F64A0` and the
+  newer client's separate `weightKart`/`weightParts` formulas. Sidecar
+  protocol v2 extends the fixed profile frame from 48 to 52 bytes with the
+  selected kart's default engine, handle, wheel, and booster part types.
+- For `slrProXUN`, the body converts to acceleration `912`, drift `911`,
+  cornering `803`, and booster time `807`. Default type-21 parts add `247` to
+  every category, producing the expected final display values: acceleration
+  `1159`, drift `1158`, cornering `1050`, and booster time `1054`. This hook is
+  display-only and does not alter the already-correct KartSpec physics.
+- The former three-step charger approximation and `ExceedWaveType` aura
+  fallback were removed. Charger now owns a separate continuous dashboard
+  controller, state machine, and resource lookup. Ordinary Exceed keeps its
+  original P5136 controller and effect untouched.
+
+## 2026-08-13 elevated XUN attach GUI
+
+- Added an `Attach XUN DLL` action immediately beside the Connector launch
+  button. It resolves the helper/DLL pair from the release `xun` directory,
+  prefers the PID returned by the most recent client launch, and falls back to
+  the helper's single-process discovery when the GUI has no PID.
+- The helper is started through trusted Windows PowerShell
+  `Start-Process -Verb RunAs -WindowStyle Hidden`. Paths and PID are passed in
+  environment variables rather than interpolated into script source. UAC
+  cancellation, missing files, and nonzero helper exit status are returned to
+  the asynchronous GUI status area; the UI thread never waits on UAC or DLL
+  injection.
+
+## 2026-08-13 corrected Exceed wave and charger aura renderer
+
+- A second IDA 9.4 pass disproved the earlier effect-manager interpretation:
+  modern `0x00B4B8D0`, `0x01116D60`, `0x01116800`, and `0x011170A0` operate on
+  sound resources. The sidecar no longer hooks or calls their P5136 matches.
+- The actual later-client wrapper is `ReChargerEffect`: constructor
+  `0x0070C640`, scene load `0x0070C960`, kart attach `0x0070C6D0`, start
+  `0x0070C7C0`, and stop `0x0070C810`. Renderer update `0x01003F30` owns the
+  activation timestamp and invokes those methods. The scene is the UTF-16
+  resource pair `charger` / `카트바디차저발동`.
+- P5136 renderer update `0x00E56D20` predates the `ReChargerEffect` member, so
+  the sidecar does not enlarge `GoPlayKart` or any render-entry structure.
+  Instead it owns one process-lifetime object per tracked kart in the existing
+  side table. P5136 `ReCrashEffect` provides the compatible base/resource ABI:
+  constructor `0x00E5DCA0`, kart attach `0x00E5DD60`, and attached-resource
+  slot `+0x194`. The sidecar replaces that resource with the imported charger
+  scene through the stock catalog/path/assignment routines.
+- Starting only the scene root was insufficient. Modern charger start first
+  enables the root and then recursively starts its child emitters; stop uses
+  the inverse order. The exact P5136 matches are `0x00EEBFE0` and
+  `0x00EEC120`. The sidecar now calls them with the current race timestamp,
+  which supplies the missing live aura lifecycle. Creation, start, and stop
+  are reported through the asynchronous logger.
+- Modern scene initialization also visits every `ReBillboard`, attaches an
+  alpha property configured as `enabled=1 / source=5 / destination=6`, and
+  assigns render depth `-1000.0`. P5136 retains the same class layouts,
+  property ABI, and recursive `ReRenderee` helper at `0x00F2A530`; the sidecar
+  reproduces those bindings with client-owned reference-counted properties so
+  the imported emitters are drawable rather than merely active.
+- Ordinary Exceed remains a separate stock P5136 effect. Import now derives
+  its selector from `defaultExceedType`: `1 -> Exd_Wave_C`,
+  `2 -> Exd_Wave_S`, `3 -> Exd_Wave_B`, and `4 -> Exd_Wave_L`. It also repairs
+  a stale noncanonical selector during safe re-import. This restores the
+  normal Exceed wave without using it as a charger substitute.
+- Both live XUN test assets were safely re-imported: `mancarXUN` now carries
+  `Exd_Wave_C` and `slrProXUN` carries `Exd_Wave_L`; all other staged files
+  were byte-identical. Six focused Rust import tests and all four Win32
+  sidecar smoke tests pass.
+
+## 2026-08-13 experimental DataRaw/XUN compatibility gate
+
+- Added symmetric GUI flags for the server and connector. The server flag
+  builds a manifest for its sibling `DataRaw`; the connector's existing
+  complete-DataRaw flag now performs a mandatory pre-login comparison.
+- The comparison hashes only sorted, case-normalized relative file names with
+  length delimiters. It deliberately does not read file contents, sizes, or
+  timestamps. The manifest is bounded to 250,000 files and rejects links and
+  oversized/non-Unicode relative paths.
+- Preflight uses a versioned `P5DR`/`P5DS` exchange on the private base+3 TCP
+  endpoint before the messenger probe and game launch. It is disjoint from
+  every stock P5136 packet and from the DLL's `P5XC` subscription handshake.
+  A disabled server or a differing file count/list digest stops client launch
+  with an actionable error.
+- Expanded the importer from the two live-test vehicles to 100 statically
+  audited XUN candidates whose merged BodyParam has `defaultExceedType` 1, 2,
+  3, or 4. These are the item/S/B/L profiles implemented by the current
+  sidecar; later special-profile karts remain fail-closed. Multiplayer XUN
+  behavior remains explicitly experimental.
+- P5136 updates only the legacy `kmh` CharPanel in the imported modern XUN
+  dashboard. The two decorative `kmh2`/`kmh3` layers therefore retained their
+  default text `0`. Import normalization now hides those duplicate layers and
+  preserves the live `kmh` speed display.

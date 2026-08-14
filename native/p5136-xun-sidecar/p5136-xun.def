@@ -1,0 +1,6 @@
+LIBRARY p5136-xun
+EXPORTS
+    P5136XunGetAbiVersion @1
+    P5136XunInitialize @2
+    P5136XunGetStatus @3
+    P5136XunVerifyExecutableFile @4

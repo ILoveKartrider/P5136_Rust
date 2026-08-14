@@ -210,6 +210,9 @@ struct GuiInputs {
     anonymous_league_mode: bool,
     unlock_special_tracks: bool,
     data_pack_off: bool,
+    xun_attach_helper: String,
+    xun_attach_dll: String,
+    xun_dll_logging: bool,
     server: String,
     configured_port: String,
     runner: GuiRunner,
@@ -230,6 +233,9 @@ impl Default for GuiInputs {
             anonymous_league_mode: false,
             unlock_special_tracks: false,
             data_pack_off: false,
+            xun_attach_helper: default_xun_attach_path(XUN_ATTACH_HELPER_NAME),
+            xun_attach_dll: default_xun_attach_path(XUN_ATTACH_DLL_NAME),
+            xun_dll_logging: true,
             server: Ipv4Addr::LOCALHOST.to_string(),
             configured_port: DEFAULT_CONFIGURED_PORT.to_string(),
             runner: GuiRunner::Auto,
@@ -387,6 +393,7 @@ impl GuiInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 struct ServerInputs {
     bind_address: String,
     advertised_address: String,
@@ -394,6 +401,7 @@ struct ServerInputs {
     profile_root: String,
     client_path: String,
     client_data_dir: String,
+    data_raw_support: bool,
     allow_remote_profile_creation: bool,
     first_message_delay_ms: String,
     login_timeout_seconds: String,
@@ -535,6 +543,7 @@ impl Default for ServerInputs {
             profile_root: "Profile".to_owned(),
             client_path: String::new(),
             client_data_dir: String::new(),
+            data_raw_support: false,
             allow_remote_profile_creation: false,
             first_message_delay_ms: "250".to_owned(),
             login_timeout_seconds: "12".to_owned(),
@@ -688,6 +697,29 @@ impl ServerInputs {
             Some(&client_path),
             optional_path_ref(&self.client_data_dir),
         )?;
+        let data_raw_directory = if self.data_raw_support {
+            let data_directory = client_paths.client_data_dir.as_deref().ok_or_else(|| {
+                anyhow!("DataRaw support requires a resolved client Data directory")
+            })?;
+            let directory = data_directory
+                .parent()
+                .ok_or_else(|| anyhow!("client Data directory has no installation root"))?
+                .join("DataRaw");
+            if !directory.is_dir() {
+                return Err(anyhow!(
+                    "DataRaw directory was not found: {}",
+                    directory.display()
+                ));
+            }
+            Some(std::fs::canonicalize(&directory).with_context(|| {
+                format!(
+                    "failed to resolve DataRaw directory {}",
+                    directory.display()
+                )
+            })?)
+        } else {
+            None
+        };
 
         Ok(ServerConfig {
             bind_address,
@@ -705,6 +737,7 @@ impl ServerInputs {
             )?,
             catalog_path: None,
             client_data_dir: client_paths.client_data_dir,
+            data_raw_directory,
             item_probability_rank_policy: if self.trust_client_item_rank {
                 ItemProbabilityRankPolicy::TrustClientReported
             } else {
@@ -1323,6 +1356,13 @@ fn default_game_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn default_xun_attach_path(file_name: &str) -> String {
+    default_game_directory()
+        .join(file_name)
+        .display()
+        .to_string()
+}
+
 fn normalize_external_data_path(value: &str) -> PathBuf {
     let path = PathBuf::from(value.trim());
     if path.join("aaa.pk").is_file() {
@@ -1442,6 +1482,13 @@ fn localized_asset_candidate_reason(reason: &str, language: GuiLanguage) -> Stri
             "P5136에 없는 신규 아이템 결과 규칙이 필요함",
             "Requires new item-result rules unavailable in P5136",
             "需要 P5136 中不存在的新道具结果规则"
+        )
+        .to_owned(),
+        "experimental XUN sidecar candidate; extended driving systems remain incomplete" => tr!(
+            language,
+            "XUN 사이드카 실험 후보 · 확장 주행 기능은 아직 미완성",
+            "Experimental XUN sidecar candidate; extended driving systems remain incomplete",
+            "XUN 边车实验候选；扩展驾驶系统尚未完成"
         )
         .to_owned(),
         _ => reason.to_owned(),
@@ -1565,6 +1612,20 @@ enum ConnectorGuiEvent {
     Finished(Result<GuiSuccess, String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XunAttachState {
+    Idle,
+    Running,
+    Succeeded(String),
+    Failed(String),
+}
+
+impl XunAttachState {
+    const fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
 enum ServerControl {
     GracefulShutdown,
     ForceShutdown,
@@ -1583,6 +1644,7 @@ enum ServerControl {
 
 enum GuiEvent {
     Connector(ConnectorGuiEvent),
+    XunAttachFinished(Result<String, String>),
     ServerStarted(ServerEndpoints),
     ServerStopBlocked(String),
     RandomTracksUpdated(Result<(), String>),
@@ -1621,6 +1683,7 @@ struct P5136GuiApp {
     selected_tab: GuiTab,
     connector_inputs: GuiInputs,
     connector_run_state: GuiRunState,
+    xun_attach_state: XunAttachState,
     server_inputs: ServerInputs,
     server_run_state: ServerRunState,
     event_sender: Sender<GuiEvent>,
@@ -1709,6 +1772,7 @@ impl P5136GuiApp {
             selected_tab: GuiTab::Server,
             connector_inputs,
             connector_run_state: GuiRunState::Idle,
+            xun_attach_state: XunAttachState::Idle,
             server_inputs,
             server_run_state: ServerRunState::Stopped,
             event_sender,
@@ -1804,6 +1868,12 @@ impl P5136GuiApp {
                     if finished {
                         self.cancellation = None;
                     }
+                }
+                GuiEvent::XunAttachFinished(result) => {
+                    self.xun_attach_state = match result {
+                        Ok(status) => XunAttachState::Succeeded(status),
+                        Err(error) => XunAttachState::Failed(error),
+                    };
                 }
                 GuiEvent::ServerStarted(endpoints) => {
                     self.server_run_state = if self.close_requested {
@@ -2059,6 +2129,66 @@ impl P5136GuiApp {
                 "접속기 작업 스레드를 시작하지 못했습니다: {error}",
                 "Failed to start the connector worker thread: {error}",
                 "无法启动连接器工作线程：{error}"
+            ));
+        }
+    }
+
+    fn start_xun_attach(&mut self, context: &egui::Context) {
+        if self.xun_attach_state.is_running() {
+            return;
+        }
+        let language = self.language;
+        let application = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.xun_attach_state = XunAttachState::Failed(tr_format!(
+                    language,
+                    "현재 실행 파일 위치를 확인하지 못했습니다: {error}",
+                    "Could not locate the running launcher executable: {error}",
+                    "无法确定当前启动器可执行文件的位置：{error}"
+                ));
+                return;
+            }
+        };
+        let files = match resolve_xun_attach_files(
+            &application,
+            &self.connector_inputs.xun_attach_helper,
+            &self.connector_inputs.xun_attach_dll,
+        ) {
+            Ok(files) => files,
+            Err(error) => {
+                self.xun_attach_state = XunAttachState::Failed(format!("{error:#}"));
+                return;
+            }
+        };
+        if let Err(error) =
+            write_xun_attach_configuration(&files, self.connector_inputs.xun_dll_logging)
+        {
+            self.xun_attach_state = XunAttachState::Failed(format!("{error:#}"));
+            return;
+        }
+        let target_pid = match &self.connector_run_state {
+            GuiRunState::Succeeded(success) => success.pid,
+            _ => None,
+        };
+        self.xun_attach_state = XunAttachState::Running;
+        let notifier = GuiNotifier {
+            sender: self.event_sender.clone(),
+            context: context.clone(),
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("p5136-xun-attach-worker".to_owned())
+            .spawn(move || {
+                let result = run_xun_attach_elevated(&files, target_pid, language)
+                    .map_err(|error| format!("{error:#}"));
+                notifier.send(GuiEvent::XunAttachFinished(result));
+            })
+        {
+            self.xun_attach_state = XunAttachState::Failed(tr_format!(
+                language,
+                "XUN DLL 연결 작업을 시작하지 못했습니다: {error}",
+                "Failed to start the XUN DLL attach worker: {error}",
+                "无法启动 XUN DLL 连接任务：{error}"
             ));
         }
     }
@@ -4557,6 +4687,29 @@ impl P5136GuiApp {
 
                 ui.label(tr!(
                     language,
+                    "서버 DataRaw 지원",
+                    "Server DataRaw support",
+                    "服务器 DataRaw 支持"
+                ));
+                ui.checkbox(
+                    &mut self.server_inputs.data_raw_support,
+                    tr!(
+                        language,
+                        "DataRaw/XUN 시험 기능 사용",
+                        "Enable experimental DataRaw/XUN support",
+                        "启用实验性 DataRaw/XUN 支持"
+                    ),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "서버 시작 시 DataRaw 파일 목록 지문을 만들고, DataRaw 접속기가 같은 파일 목록을 사용하는지 로그인 전에 검사합니다. XUN 멀티플레이는 아직 시험 기능입니다.",
+                    "Builds a DataRaw file-list fingerprint at server start and checks DataRaw connectors before login. XUN multiplayer remains experimental.",
+                    "服务器启动时生成 DataRaw 文件列表指纹，并在登录前检查客户端。XUN 多人游戏仍属实验功能。"
+                ));
+                ui.end_row();
+
+                ui.label(tr!(
+                    language,
                     "원격 프로필 생성",
                     "Remote profile creation",
                     "远程创建配置文件"
@@ -4576,9 +4729,9 @@ impl P5136GuiApp {
         self.server_advanced_input_panel(ui);
         ui.weak(tr!(
             language,
-            "포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2.",
-            "Ports: game UDP = base, login TCP/P2P UDP = base + 1, messenger TCP = base + 2.",
-            "端口：游戏 UDP = 基准，登录 TCP/P2P UDP = 基准 + 1，聊天 TCP = 基准 + 2。"
+            "포트: 게임 UDP = 기준, 로그인 TCP/P2P UDP = 기준 + 1, 메신저 TCP = 기준 + 2, XUN 보조 TCP = 기준 + 3.",
+            "Ports: game UDP = base, login TCP/P2P UDP = base + 1, messenger TCP = base + 2, XUN sidecar TCP = base + 3.",
+            "端口：游戏 UDP = 基准，登录 TCP/P2P UDP = 基准 + 1，聊天 TCP = 基准 + 2，XUN 辅助 TCP = 基准 + 3。"
         ));
         ui.weak(tr!(
             language,
@@ -4740,6 +4893,13 @@ impl P5136GuiApp {
                         endpoints.messenger_tcp,
                     ),
                 );
+                ui.small(tr_format!(
+                    language,
+                    "XUN 보조 TCP {}",
+                    "XUN sidecar TCP {}",
+                    "XUN 辅助 TCP {}",
+                    endpoints.xun_sidecar_tcp,
+                ));
             }
             ServerRunState::Stopping => {
                 ui.horizontal(|ui| {
@@ -5513,9 +5673,79 @@ impl P5136GuiApp {
         ui.label(&self.asset_import_status);
     }
 
+    fn xun_attach_file_panel(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        egui::Grid::new("xun-attach-files")
+            .num_columns(3)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(tr!(
+                    language,
+                    "XUN 훅 실행기",
+                    "XUN hook helper",
+                    "XUN 挂钩工具"
+                ));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.xun_attach_helper)
+                        .desired_width(f32::INFINITY),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "기본값은 접속기와 같은 폴더의 p5136-xun-attach.exe입니다.",
+                    "Defaults to p5136-xun-attach.exe beside the connector.",
+                    "默认使用连接器同目录下的 p5136-xun-attach.exe。"
+                ));
+                if ui
+                    .button(tr!(language, "찾아보기", "Browse", "浏览"))
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title(tr!(
+                            language,
+                            "XUN 훅 실행기 선택",
+                            "Select the XUN hook helper",
+                            "选择 XUN 挂钩工具"
+                        ))
+                        .add_filter("Executable", &["exe"])
+                        .pick_file()
+                {
+                    self.connector_inputs.xun_attach_helper = path.display().to_string();
+                }
+                ui.end_row();
+
+                ui.label(tr!(language, "XUN DLL", "XUN DLL", "XUN DLL"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.connector_inputs.xun_attach_dll)
+                        .desired_width(f32::INFINITY),
+                )
+                .on_hover_text(tr!(
+                    language,
+                    "기본값은 접속기와 같은 폴더의 p5136-xun.dll입니다.",
+                    "Defaults to p5136-xun.dll beside the connector.",
+                    "默认使用连接器同目录下的 p5136-xun.dll。"
+                ));
+                if ui
+                    .button(tr!(language, "찾아보기", "Browse", "浏览"))
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title(tr!(
+                            language,
+                            "XUN DLL 선택",
+                            "Select the XUN DLL",
+                            "选择 XUN DLL"
+                        ))
+                        .add_filter("Dynamic library", &["dll"])
+                        .pick_file()
+                {
+                    self.connector_inputs.xun_attach_dll = path.display().to_string();
+                }
+                ui.end_row();
+            });
+    }
+
     fn connector_tab(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         let running = self.connector_run_state.is_running();
+        let attaching = self.xun_attach_state.is_running();
         ui.heading(tr!(language, "접속기", "Connector", "连接器"));
         ui.label(tr!(
             language,
@@ -5528,24 +5758,84 @@ impl P5136GuiApp {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(10.0);
+        self.xun_attach_file_panel(ui);
+        ui.add_space(10.0);
 
-        if ui
-            .add_enabled(
-                !running,
-                egui::Button::new(tr!(
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !running,
+                    egui::Button::new(tr!(
+                        language,
+                        "클라이언트 준비 및 실행",
+                        "Prepare and launch client",
+                        "准备并启动客户端"
+                    ))
+                    .min_size([180.0, 34.0].into()),
+                )
+                .clicked()
+            {
+                self.start_connector(ui.ctx());
+            }
+            if ui
+                .add_enabled(
+                    !running && !attaching,
+                    egui::Button::new(tr!(
+                        language,
+                        "XUN DLL 연결",
+                        "Attach XUN DLL",
+                        "连接 XUN DLL"
+                    ))
+                    .min_size([150.0, 34.0].into()),
+                )
+                .on_hover_text(tr!(
                     language,
-                    "클라이언트 준비 및 실행",
-                    "Prepare and launch client",
-                    "准备并启动客户端"
+                    "실행 중인 클라이언트에 관리자 권한으로 XUN DLL을 연결합니다.",
+                    "Attaches the XUN DLL to the running client with administrator privileges.",
+                    "以管理员权限将 XUN DLL 连接到正在运行的客户端。"
                 ))
-                .min_size([180.0, 34.0].into()),
+                .clicked()
+            {
+                self.start_xun_attach(ui.ctx());
+            }
+            ui.checkbox(
+                &mut self.connector_inputs.xun_dll_logging,
+                tr!(
+                    language,
+                    "DLL 로그 기록",
+                    "DLL logging",
+                    "DLL 日志记录"
+                ),
             )
-            .clicked()
-        {
-            self.start_connector(ui.ctx());
-        }
+            .on_hover_text(tr!(
+                language,
+                "끄면 XUN 기능은 유지하지만 p5136-xun-sidecar.log 파일을 기록하지 않습니다.",
+                "When disabled, XUN features remain active but p5136-xun-sidecar.log is not written.",
+                "关闭后仍启用 XUN 功能，但不会写入 p5136-xun-sidecar.log。"
+            ));
+        });
         ui.add_space(10.0);
         self.connector_status_panel(ui);
+        match &self.xun_attach_state {
+            XunAttachState::Idle => {}
+            XunAttachState::Running => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(tr!(
+                        language,
+                        "관리자 권한으로 XUN DLL을 연결하는 중입니다…",
+                        "Attaching the XUN DLL with administrator privileges…",
+                        "正在以管理员权限连接 XUN DLL…"
+                    ));
+                });
+            }
+            XunAttachState::Succeeded(status) => {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, status);
+            }
+            XunAttachState::Failed(error) => {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+        }
     }
 }
 
@@ -5937,6 +6227,156 @@ async fn await_graceful_shutdown_or_force(
     }
 }
 
+const XUN_ATTACH_HELPER_NAME: &str = "p5136-xun-attach.exe";
+const XUN_ATTACH_DLL_NAME: &str = "p5136-xun.dll";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XunAttachFiles {
+    helper: PathBuf,
+    dll: PathBuf,
+}
+
+fn resolve_xun_attach_files(
+    application: &Path,
+    helper_value: &str,
+    dll_value: &str,
+) -> Result<XunAttachFiles> {
+    let application_directory = application
+        .parent()
+        .context("the running launcher has no parent directory")?;
+    let resolve = |value: &str, default_name: &str| {
+        let value = value.trim();
+        let path = if value.is_empty() {
+            application_directory.join(default_name)
+        } else {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                application_directory.join(path)
+            }
+        };
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(anyhow!("XUN attach file was not found: {}", path.display()))
+        }
+    };
+    Ok(XunAttachFiles {
+        helper: resolve(helper_value, XUN_ATTACH_HELPER_NAME)?,
+        dll: resolve(dll_value, XUN_ATTACH_DLL_NAME)?,
+    })
+}
+
+fn write_xun_attach_configuration(files: &XunAttachFiles, logging: bool) -> Result<()> {
+    let directory = files
+        .dll
+        .parent()
+        .context("the XUN attach DLL has no parent directory")?;
+    let path = directory.join("p5136-xun.ini");
+    let contents = format!(
+        "[xun]\r\n; Hooks stay fail-closed until the server selects a kart profile.\r\nenabled=1\r\nlogging={}\r\n",
+        u8::from(logging)
+    );
+    std::fs::write(&path, contents)
+        .with_context(|| format!("failed to write XUN DLL configuration {}", path.display()))
+}
+
+#[cfg(windows)]
+fn run_xun_attach_elevated(
+    files: &XunAttachFiles,
+    target_pid: Option<u32>,
+    language: GuiLanguage,
+) -> Result<String> {
+    use std::process::{Command, Stdio};
+
+    const SCRIPT: &str = concat!(
+        "$ErrorActionPreference = 'Stop'; ",
+        "$quotedDll = '\"' + $env:P5136_XUN_ATTACH_DLL + '\"'; ",
+        "$arguments = if ([string]::IsNullOrWhiteSpace($env:P5136_XUN_ATTACH_PID)) ",
+        "{ $quotedDll } else { $env:P5136_XUN_ATTACH_PID + ' ' + $quotedDll }; ",
+        "$process = Start-Process -FilePath $env:P5136_XUN_ATTACH_EXE ",
+        "-ArgumentList $arguments -WorkingDirectory $env:P5136_XUN_ATTACH_DIR ",
+        "-Verb RunAs -WindowStyle Hidden -Wait -PassThru; ",
+        "[Console]::Out.WriteLine('P5136_XUN_ATTACH_EXIT=' + $process.ExitCode); ",
+        "exit $process.ExitCode"
+    );
+
+    let system_root = std::env::var_os("SystemRoot")
+        .filter(|value| !value.is_empty())
+        .context("SystemRoot is unavailable; cannot locate Windows PowerShell")?;
+    let powershell =
+        PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let working_directory = files
+        .helper
+        .parent()
+        .context("the XUN attach helper has no parent directory")?;
+    let output = Command::new(&powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .env("P5136_XUN_ATTACH_EXE", &files.helper)
+        .env("P5136_XUN_ATTACH_DLL", &files.dll)
+        .env("P5136_XUN_ATTACH_DIR", working_directory)
+        .env(
+            "P5136_XUN_ATTACH_PID",
+            target_pid.map_or_else(String::new, |pid| pid.to_string()),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to launch elevated helper through {}",
+                powershell.display()
+            )
+        })?;
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(anyhow!(tr_format!(
+            language,
+            "XUN DLL 연결이 취소되었거나 실패했습니다 (종료 코드 {code}). {detail}",
+            "XUN DLL attachment was cancelled or failed (exit code {code}). {detail}",
+            "XUN DLL 连接已取消或失败（退出代码 {code}）。{detail}"
+        )));
+    }
+
+    let target = target_pid.map_or_else(
+        || tr!(language, "자동 검색", "automatic discovery", "自动查找").to_owned(),
+        |pid| format!("PID {pid}"),
+    );
+    Ok(tr_format!(
+        language,
+        "XUN DLL 연결 완료 ({target}).",
+        "XUN DLL attached successfully ({target}).",
+        "XUN DLL 连接成功（{target}）。"
+    ))
+}
+
+#[cfg(not(windows))]
+fn run_xun_attach_elevated(
+    _files: &XunAttachFiles,
+    _target_pid: Option<u32>,
+    language: GuiLanguage,
+) -> Result<String> {
+    Err(anyhow!(tr!(
+        language,
+        "관리자 권한 DLL 연결은 Windows에서만 지원됩니다.",
+        "Elevated DLL attachment is supported only on Windows.",
+        "管理员权限 DLL 连接仅支持 Windows。"
+    )))
+}
+
 fn stage_label(stage: ConnectorStage, language: GuiLanguage) -> &'static str {
     match stage {
         ConnectorStage::PreparingInstallation => tr!(
@@ -5944,6 +6384,12 @@ fn stage_label(stage: ConnectorStage, language: GuiLanguage) -> &'static str {
             "PIN과 XML 파일을 준비하는 중…",
             "Preparing PIN and XML files…",
             "正在准备 PIN 和 XML 文件……"
+        ),
+        ConnectorStage::CheckingDataRaw => tr!(
+            language,
+            "DataRaw 파일 목록을 서버와 확인하는 중…",
+            "Checking the DataRaw file list with the server…",
+            "正在与服务器核对 DataRaw 文件列表…"
         ),
         ConnectorStage::ProbingMessenger => tr!(
             language,
@@ -5980,7 +6426,9 @@ mod tests {
     use super::{
         AssetImportInputs, BUILD_VERSION, ConnectorGuiEvent, GUI_SETTINGS_KEY, GuiInputs,
         GuiItemProbabilitySource, GuiRunState, GuiRunner, GuiSuccess, MAX_GUI_SETTINGS_BYTES,
-        P5136GuiApp, ServerInputs, TrackImportInputs, lan_address_rank, virtual_adapter_rank,
+        P5136GuiApp, ServerInputs, TrackImportInputs, XUN_ATTACH_DLL_NAME, XUN_ATTACH_HELPER_NAME,
+        lan_address_rank, resolve_xun_attach_files, virtual_adapter_rank,
+        write_xun_attach_configuration,
     };
     use crate::gui_i18n::GuiLanguage;
     use p5136_assets::{AssetCategory, TrackSourceRegion};
@@ -6013,6 +6461,9 @@ mod tests {
             anonymous_league_mode: false,
             unlock_special_tracks: true,
             data_pack_off: true,
+            xun_attach_helper: "/tools/p5136-xun-attach.exe".to_owned(),
+            xun_attach_dll: "/tools/p5136-xun.dll".to_owned(),
+            xun_dll_logging: false,
             server: "192.0.2.10".to_owned(),
             configured_port: "39311".to_owned(),
             runner: GuiRunner::Wine,
@@ -6027,6 +6478,80 @@ mod tests {
     #[test]
     fn build_version_footer_uses_the_compiled_package_version() {
         assert_eq!(BUILD_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn xun_attach_files_default_to_the_connector_directory() {
+        let directory = tempdir().unwrap();
+        let application = directory.path().join("p5136.exe");
+        fs::write(&application, b"launcher fixture").unwrap();
+        fs::write(
+            directory.path().join(XUN_ATTACH_HELPER_NAME),
+            b"helper fixture",
+        )
+        .unwrap();
+        fs::write(directory.path().join(XUN_ATTACH_DLL_NAME), b"dll fixture").unwrap();
+
+        let resolved = resolve_xun_attach_files(&application, "", "").unwrap();
+
+        assert_eq!(
+            resolved.helper,
+            directory.path().join(XUN_ATTACH_HELPER_NAME)
+        );
+        assert_eq!(resolved.dll, directory.path().join(XUN_ATTACH_DLL_NAME));
+    }
+
+    #[test]
+    fn xun_attach_files_accept_independent_explicit_paths() {
+        let directory = tempdir().unwrap();
+        let application = directory.path().join("p5136.exe");
+        let helper = directory.path().join("tools").join("attach.exe");
+        let dll = directory.path().join("plugins").join("xun.dll");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::create_dir_all(dll.parent().unwrap()).unwrap();
+        fs::write(&application, b"launcher fixture").unwrap();
+        fs::write(&helper, b"helper fixture").unwrap();
+        fs::write(&dll, b"dll fixture").unwrap();
+
+        let resolved = resolve_xun_attach_files(
+            &application,
+            helper.to_str().unwrap(),
+            dll.to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, super::XunAttachFiles { helper, dll });
+    }
+
+    #[test]
+    fn xun_attach_files_report_the_missing_selected_path() {
+        let directory = tempdir().unwrap();
+        let application = directory.path().join("p5136.exe");
+        fs::write(&application, b"launcher fixture").unwrap();
+        fs::write(
+            directory.path().join(XUN_ATTACH_HELPER_NAME),
+            b"helper fixture",
+        )
+        .unwrap();
+
+        let error = resolve_xun_attach_files(&application, "", "").unwrap_err();
+
+        assert!(error.to_string().contains(XUN_ATTACH_DLL_NAME));
+    }
+
+    #[test]
+    fn xun_attach_configuration_controls_only_logging_and_keeps_hooks_enabled() {
+        let directory = tempdir().unwrap();
+        let files = super::XunAttachFiles {
+            helper: directory.path().join(XUN_ATTACH_HELPER_NAME),
+            dll: directory.path().join(XUN_ATTACH_DLL_NAME),
+        };
+
+        write_xun_attach_configuration(&files, false).unwrap();
+
+        let contents = fs::read_to_string(directory.path().join("p5136-xun.ini")).unwrap();
+        assert!(contents.contains("enabled=1"));
+        assert!(contents.contains("logging=0"));
     }
 
     #[test]

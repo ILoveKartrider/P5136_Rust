@@ -1,6 +1,6 @@
 # Documentation map
 
-The documentation was audited as one set on 2026-08-12. User-facing guides
+The documentation was audited as one set on 2026-08-14. User-facing guides
 are translated into Korean, English, and Simplified Chinese. Protocol and
 reverse-engineering ledgers remain in English so packet names, evidence grades,
 and source references stay unambiguous.
@@ -16,6 +16,7 @@ or decompiler databases.
 | `README.md` | Korean setup, features, account roles, LAN, CLI, and troubleshooting |
 | `README.en.md` | English version of the user guide |
 | `README.zh-CN.md` | Simplified Chinese version of the user guide |
+| `CHANGELOG.md` | Korean user-facing release history and known limitations |
 | `WINDOWS_SERVER_2012.md` | English legacy-target/static-CRT build guide; source changes are not required |
 | `MACOS_SIKARUGIR.md` | Korean manual Wine/Sikarugir wrapper setup |
 
@@ -39,35 +40,20 @@ data.
 
 ## Current release boundary
 
-The v0.3.0 documentation baseline includes:
+The v1.0.0 documentation baseline retains the v0.3.0 track and ordinary asset
+import workflows and adds:
 
-- stock S7 integrated physics for normal speed/item channels and stock S4 for
-  Infinite Booster, with S8 retained as a manual-only client physics slot;
-- validated, persistent, separately configurable speed/item basic-AI vectors
-  selected by room game type at race start;
-- atomic room departure when a racer enters MyRoom, Shop, Magic Hat, Club,
-  Rider School, Time Attack, Challenger, Scenario, Single Player, or Matching;
-- conservative client-catalog quarantine with Kartneck retained and the three
-  incomplete Boxter variants hidden again;
-- regular pmap 0, observer-master pmap 718, and anonymous-league pmap 1798
-  connector presets;
-- a reversible connector-side Korean track-locale overlay for the three
-  complete TF tracks and six statically validated blocked tracks, with
-  incomplete XYY and story-only `S` stages kept excluded;
-- a selectable KR/CN external-client I/R track importer that merges
-  catalog/locale rows, supplies AI and selector aliases, resolves guarded
-  track-local/cross-theme material dependencies, audits positional environment
-  sounds and theme BGM, reports phase/file progress, maps the reviewed
-  Fengshen theme through P5136's dormant native XYY selector slot, mirrors its
-  theme resources into the XYY runtime namespace used for bare materials, and
-  installs only into a complete DataRaw tree without overwriting
-  existing same-path P5136 resources; installed tracks can be selected again
-  for an idempotent dependency/catalog repair;
-- the static finding that pmap 1798 activates the recovered client-side shared
-  character/color/equipment projection, but does not itself anonymize
-  nicknames on the server;
-- the static basic-AI difficulty boundary and four active field semantics
-  described above.
+- symmetric server/connector DataRaw flags and a mandatory normalized file-list
+  preflight before login when both sides opt in;
+- 100 audited experimental XUN import candidates with recovered
+  `defaultExceedType` 1-4 and dynamic server inventory publication;
+- a source-available, exact-build Win32 XUN sidecar implementing S/B/L charger
+  state, six speed-mode physics consumers, continuous charger UI, independent
+  aura and ordinary Exceed effects, display conversion, and type-1 server start
+  items;
+- a private base-port+3 profile channel and per-race generation reset;
+- elevated XUN attachment from the Connector tab, independent helper/DLL file
+  selection, connector-directory defaults, and a DLL file-logging toggle.
 
 Implementation status is authoritative in `PORTING.md` and
 `PORTING_STATUS.md`; the translated READMEs deliberately summarize rather than

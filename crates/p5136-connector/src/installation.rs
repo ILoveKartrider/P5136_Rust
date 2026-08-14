@@ -18,10 +18,19 @@ use crate::{
     special_tracks::{SpecialTrackPatchError, SpecialTrackPatchReport, prepare_special_tracks},
     xml::{LauncherProfileRole, launcher_profile_xml_for_role, server_config_xml},
 };
+use p5136_core::xun_sidecar_protocol::XUN_SIDECAR_PROTOCOL_VERSION;
 use std::net::SocketAddrV4;
 
 pub const DEFAULT_INSTALLATION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAXIMUM_PERSISTENT_FILE_BYTES: usize = 64 * 1024 * 1024;
+pub const XUN_SIDECAR_SESSION_FILE: &str = "p5136-xun-session.ini";
+
+fn encode_windows_unicode_ini(text: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(2 + text.len() * 2);
+    encoded.extend_from_slice(&[0xFF, 0xFE]);
+    encoded.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    encoded
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallationOptions {
@@ -55,6 +64,7 @@ pub struct PreparedInstallation {
     pub pin_path: PathBuf,
     pub game_config_path: PathBuf,
     pub launcher_profile_path: PathBuf,
+    pub xun_sidecar_session_path: PathBuf,
     pub pin_pristine: PersistentFilePreparation,
     pub game_config_pristine: PersistentFilePreparation,
     pub launcher_profile_pristine: PersistentFilePreparation,
@@ -81,6 +91,9 @@ pub enum InstallationError {
 
     #[error("special-track preparation failed")]
     SpecialTracks(#[from] SpecialTrackPatchError),
+
+    #[error("login port {login_port} cannot address the XUN sidecar at offset +2")]
+    XunSidecarPortOverflow { login_port: u16 },
 }
 
 pub fn prepare_installation(
@@ -97,6 +110,7 @@ pub fn prepare_installation(
     let pin_path = game_directory.join("KartRider.pin");
     let game_config_path = game_directory.join("KartRider.xml");
     let launcher_profile_path = game_directory.join("Profile/kr/launcher.xml");
+    let xun_sidecar_session_path = game_directory.join(XUN_SIDECAR_SESSION_FILE);
 
     let pin_pristine =
         prepare_persistent_file(&pin_path, true, options.codec_limits.max_pin_file_bytes)?;
@@ -123,23 +137,43 @@ pub fn prepare_installation(
     )?;
     let game_config = server_config_xml(login_endpoint, options.data_pack_off);
     let launcher_profile = launcher_profile_xml_for_role(&nickname, options.launcher_profile_role);
+    let xun_sidecar_port =
+        login_endpoint
+            .port()
+            .checked_add(2)
+            .ok_or(InstallationError::XunSidecarPortOverflow {
+                login_port: login_endpoint.port(),
+            })?;
+    let xun_sidecar_session = format!(
+        "[session]\r\nprotocol={}\r\nserver={}\r\nport={}\r\nnickname={}\r\n",
+        XUN_SIDECAR_PROTOCOL_VERSION,
+        login_endpoint.ip(),
+        xun_sidecar_port,
+        nickname,
+    );
+    // GetPrivateProfileStringW treats a BOM-less INI as an ANSI file. Write
+    // the private sidecar session in the native Windows Unicode INI form so
+    // Korean and Chinese nicknames survive the connector -> DLL handshake.
+    let xun_sidecar_session = encode_windows_unicode_ini(&xun_sidecar_session);
     let special_track_patch = prepare_special_tracks(
         game_directory,
         options.unlock_special_tracks,
         options.maximum_persistent_file_bytes,
     )?;
 
-    // All three outputs are fully generated and the PIN has been reparsed
+    // All outputs are fully generated and the PIN has been reparsed
     // before the first live file is replaced.
     atomic_write(&pin_path, &patched_pin)?;
     atomic_write(&game_config_path, &game_config)?;
     atomic_write(&launcher_profile_path, &launcher_profile)?;
+    atomic_write(&xun_sidecar_session_path, &xun_sidecar_session)?;
 
     Ok(PreparedInstallation {
         build_evidence,
         pin_path,
         game_config_path,
         launcher_profile_path,
+        xun_sidecar_session_path,
         pin_pristine,
         game_config_pristine,
         launcher_profile_pristine,
@@ -157,7 +191,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{InstallationOptions, prepare_installation};
+    use super::{
+        InstallationOptions, XUN_SIDECAR_SESSION_FILE, encode_windows_unicode_ini,
+        prepare_installation,
+    };
     use crate::{
         P5136_RIDER_DATA_DIRECTORY, P5136_SCREENSHOT_DIRECTORY, P5136_STORAGE_ROOT,
         detection::{BuildEvidence, PinDetectionSource},
@@ -168,6 +205,20 @@ mod tests {
         test_fixture::csharp_synthetic_pin,
         xml::{LauncherProfileRole, launcher_profile_xml_for_role, server_config_xml},
     };
+
+    #[test]
+    fn xun_session_ini_preserves_non_ascii_nicknames_for_win32() {
+        let encoded = encode_windows_unicode_ini("[session]\r\nnickname=다오\r\n");
+        assert_eq!(&encoded[..2], &[0xFF, 0xFE]);
+        let decoded = encoded[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf16(&decoded).unwrap(),
+            "[session]\r\nnickname=다오\r\n"
+        );
+    }
 
     #[test]
     fn prepares_all_three_files_and_keeps_pristine_state_across_repatches() {
@@ -212,6 +263,12 @@ mod tests {
             fs::read(&launcher_profile_path).unwrap(),
             launcher_profile_xml_for_role("first-user", LauncherProfileRole::Regular)
         );
+        assert_eq!(
+            fs::read(directory.path().join(XUN_SIDECAR_SESSION_FILE)).unwrap(),
+            encode_windows_unicode_ini(
+                "[session]\r\nprotocol=2\r\nserver=192.0.2.20\r\nport=46003\r\nnickname=first-user\r\n"
+            )
+        );
         let patched = PinDocument::decode(&fs::read(&pin_path).unwrap()).unwrap();
         assert!(
             patched
@@ -244,6 +301,12 @@ mod tests {
         assert_eq!(
             fs::read(&launcher_profile_path).unwrap(),
             launcher_profile_xml_for_role("second-user", LauncherProfileRole::ObserverMaster)
+        );
+        assert_eq!(
+            fs::read(directory.path().join(XUN_SIDECAR_SESSION_FILE)).unwrap(),
+            encode_windows_unicode_ini(
+                "[session]\r\nprotocol=2\r\nserver=192.0.2.21\r\nport=46004\r\nnickname=second-user\r\n"
+            )
         );
         let repatched = PinDocument::decode(&fs::read(&pin_path).unwrap()).unwrap();
         assert_p5136_storage(&repatched);

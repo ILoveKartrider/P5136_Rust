@@ -48,7 +48,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the four-port P5136 server foundation.
+    /// Run the P5136 server and its optional XUN sidecar endpoint.
     Server(ServerArgs),
 
     /// Test the connector's messenger TCP reachability check.
@@ -80,6 +80,11 @@ struct ServerArgs {
     /// Stock-client Data directory containing KR archives and item.rho.
     #[arg(long, value_name = "DATA_DIR")]
     client_data_dir: Option<PathBuf>,
+
+    /// Enable experimental DataRaw/XUN support and require `DataRaw` clients to
+    /// match this installation's normalized file list.
+    #[arg(long)]
+    data_raw_support: bool,
 
     /// Portable item-probability XML override. Without this, client
     /// item.rho/RHO5 data is loaded automatically when Data is configured.
@@ -378,6 +383,21 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         .map(load_item_probability_xml)
         .transpose()
         .context("failed to load the item-probability XML override")?;
+    let data_raw_directory = if args.data_raw_support {
+        let data = client_paths
+            .client_data_dir
+            .as_deref()
+            .context("--data-raw-support requires --client-dir or --client-data-dir")?;
+        let directory = data
+            .parent()
+            .context("client Data directory has no installation root")?
+            .join("DataRaw");
+        Some(std::fs::canonicalize(&directory).with_context(|| {
+            format!("failed to locate DataRaw directory {}", directory.display())
+        })?)
+    } else {
+        None
+    };
     let config = ServerConfig {
         bind_address: args.bind,
         advertised_address: args.advertise,
@@ -385,6 +405,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         profile_root: args.profile_root,
         catalog_path: None,
         client_data_dir: client_paths.client_data_dir,
+        data_raw_directory,
         item_probabilities,
         item_probability_rank_policy: if args.trust_client_item_rank {
             ItemProbabilityRankPolicy::TrustClientReported
@@ -413,6 +434,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
         login_tcp = %endpoints.login_tcp,
         p2p_udp = %endpoints.p2p_udp,
         messenger_tcp = %endpoints.messenger_tcp,
+        xun_sidecar_tcp = %endpoints.xun_sidecar_tcp,
         "P5136 foundation server is running"
     );
     if catalog_configured {

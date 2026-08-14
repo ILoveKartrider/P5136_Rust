@@ -13,6 +13,7 @@ use std::{
 };
 
 pub use p5136_core::kart_physics::P5136KartSpecSnapshot;
+use p5136_core::kart_physics::P5136V2SpecSnapshot;
 use p5136_core::{dotnet_decimal::DotNetDecimal, myroom_protocol::MAX_MYROOM_EMBLEMS};
 use quick_xml::{
     Reader, XmlVersion,
@@ -152,6 +153,140 @@ pub struct CatalogItemTransformRule {
     pub mode: String,
 }
 
+/// XUN-generation metadata retained from a kart's `BodyParam`.
+///
+/// Type 1 is the recovered item profile. Types 2-4 are the recovered baseline
+/// S/B/L speed profiles; types 5-10 remain intentionally unsupported until
+/// their variant semantics are recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CatalogXunProfile {
+    pub exceed_type: u8,
+    pub default_engine_type: u8,
+    pub default_handle_type: u8,
+    pub default_wheel_type: u8,
+    pub default_booster_type: u8,
+}
+
+impl CatalogXunProfile {
+    #[must_use]
+    pub const fn is_item_profile(self) -> bool {
+        self.exceed_type == 1
+    }
+
+    #[must_use]
+    pub const fn supported_speed_timing(self) -> Option<(u32, u32)> {
+        match self.exceed_type {
+            2 => Some((4, 3_000)),
+            3 => Some((5, 3_750)),
+            4 => Some((6, 4_500)),
+            _ => None,
+        }
+    }
+
+    /// Projects the newer XUN-only `KartSpec` tail into fields that stock P5136
+    /// already understands. This mirrors the reference server's `V2ExcSpec`
+    /// default-part and ordinary-Exceed composition without extending the
+    /// target client's fixed 235-byte `KartSpec` wire layout.
+    #[must_use]
+    pub fn apply_p5136_compatibility(
+        self,
+        kart: &mut P5136KartSpecSnapshot,
+    ) -> P5136V2SpecSnapshot {
+        if self.exceed_type == 0 {
+            return P5136V2SpecSnapshot::default();
+        }
+
+        apply_xun_exceed_type(kart, self.exceed_type);
+        P5136V2SpecSnapshot {
+            parts_trans_accel_factor: xun_default_engine_value(self.default_engine_type),
+            parts_steer_constraint: xun_default_handle_value(self.default_handle_type),
+            parts_drift_escape_force: xun_default_wheel_value(self.default_wheel_type),
+            parts_normal_booster_time: xun_default_booster_value(self.default_booster_type),
+            ..P5136V2SpecSnapshot::default()
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn xun_part_scalar(part_type: u8) -> f32 {
+    if part_type == 0 {
+        return 0.0;
+    }
+    let zero_based = i32::from(part_type) - 1;
+    let full_cycles = zero_based / 10;
+    let position = zero_based % 10;
+    let mut value = 201 + full_cycles * 23;
+    for index in 1..=position {
+        value += match index {
+            1..=2 => 2,
+            3..=5 => 3,
+            6..=8 => 4,
+            9 => 5,
+            _ => 0,
+        };
+    }
+    value as f32
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn xun_default_engine_value(part_type: u8) -> f32 {
+    let value = f64::from(xun_part_scalar(part_type));
+    if value == 0.0 {
+        0.0
+    } else {
+        ((value - 800.0) / 25_000.0 + 0.4765) as f32
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn xun_default_handle_value(part_type: u8) -> f32 {
+    let value = f64::from(xun_part_scalar(part_type));
+    if value == 0.0 {
+        0.0
+    } else {
+        ((value - 800.0) / 250.0 + 2.7) as f32
+    }
+}
+
+fn xun_default_wheel_value(part_type: u8) -> f32 {
+    xun_part_scalar(part_type) * 2.0
+}
+
+fn xun_default_booster_value(part_type: u8) -> f32 {
+    let value = xun_part_scalar(part_type);
+    if value == 0.0 { 0.0 } else { value - 260.0 }
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_xun_exceed_type(kart: &mut P5136KartSpecSnapshot, exceed_type: u8) {
+    let values = match exceed_type {
+        1 => (0.016, 0.06, 0.15, 1.30, 3_000, 1_000.0, 300.0, 1, 160.0),
+        2 => (0.020, 0.07, 0.15, 1.29, 3_000, 1_040.0, 208.0, 0, 200.0),
+        3 => (0.020, 0.07, 0.15, 1.19, 3_000, 2_000.0, 400.0, 0, 200.0),
+        4 | 7 => (0.020, 0.07, 0.15, 1.16, 3_000, 2_500.0, 500.0, 0, 200.0),
+        5 => (0.016, 0.06, 0.15, 1.30, 3_000, 1_000.0, 300.0, 0, 200.0),
+        6 => (0.017, 0.07, 0.15, 1.16, 3_000, 3_000.0, 600.0, 0, 200.0),
+        8 => (0.020, 0.07, 0.15, 1.32, 3_000, 1_040.0, 260.0, 0, 200.0),
+        9 => (0.020, 0.07, 0.18, 1.19, 2_100, 2_000.0, 400.0, 0, 200.0),
+        10 => (0.030, 0.07, 0.15, 1.1425, 3_000, 2_000.0, 400.0, 0, 200.0),
+        _ => return,
+    };
+    kart.charge_inst_accel_gauge_by_boost = values.0;
+    kart.charge_inst_accel_gauge_by_grip = values.1;
+    kart.charge_inst_accel_gauge_by_wall = values.2;
+    kart.inst_accel_factor = values.3;
+    kart.inst_accel_gauge_cooldown_time = values.4;
+    kart.inst_accel_gauge_length = values.5;
+    kart.inst_accel_gauge_min_usable = values.6;
+    kart.inst_accel_gauge_min_vel_bound = 0.0;
+    kart.inst_accel_gauge_min_vel_loss = 50.0;
+    kart.use_extended_after_booster_more = values.7;
+    kart.wall_coll_gauge_cooldown_time = 3_000;
+    kart.wall_coll_gauge_max_vel_loss = 200.0;
+    kart.wall_coll_gauge_min_vel_bound = values.8;
+    kart.wall_coll_gauge_min_vel_loss = 50.0;
+}
+
 impl fmt::Display for CatalogKartSpecStats {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -173,6 +308,7 @@ pub struct CatalogInventory {
     kart_names: BTreeMap<u16, String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
     kart_enchant_caps: BTreeMap<String, u8>,
+    kart_xun_profiles: BTreeMap<String, CatalogXunProfile>,
     kart_spec_stats: CatalogKartSpecStats,
     emblem_catalog: Option<EmblemCatalog>,
     item_transforms: BTreeMap<(u16, i16), Vec<CatalogItemTransformRule>>,
@@ -267,6 +403,15 @@ impl CatalogInventory {
     #[must_use]
     pub fn supports_legacy_kart_enhancements(&self, kart_id: u16) -> bool {
         self.kart_enchant_cap(kart_id).is_some()
+    }
+
+    /// Returns XUN-generation metadata for a kart that declares
+    /// `TachometerType='XunGenTacho'` in its client `BodyParam`.
+    #[must_use]
+    pub fn kart_xun_profile(&self, kart_id: u16) -> Option<CatalogXunProfile> {
+        self.kart_name(kart_id)
+            .and_then(|name| self.kart_xun_profiles.get(&normalize_spec_name(name)))
+            .copied()
     }
 
     #[must_use]
@@ -646,6 +791,7 @@ struct CatalogParser {
     spec_keys: HashSet<String>,
     kart_specs: BTreeMap<String, P5136KartSpecSnapshot>,
     kart_enchant_caps: BTreeMap<String, u8>,
+    kart_xun_profiles: BTreeMap<String, CatalogXunProfile>,
     active_spec: Option<PendingKartSpec>,
     transform_section_seen: bool,
     in_transform_section: bool,
@@ -659,6 +805,7 @@ struct PendingKartSpec {
     normalized_name: String,
     body: Option<P5136KartSpecSnapshot>,
     enchant_cap: Option<u8>,
+    xun_profile: Option<CatalogXunProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,6 +842,7 @@ impl CatalogParser {
             spec_keys: HashSet::new(),
             kart_specs: BTreeMap::new(),
             kart_enchant_caps: BTreeMap::new(),
+            kart_xun_profiles: BTreeMap::new(),
             active_spec: None,
             transform_section_seen: false,
             in_transform_section: false,
@@ -1098,6 +1246,7 @@ impl CatalogParser {
             normalized_name,
             body: None,
             enchant_cap: None,
+            xun_profile: None,
         });
         Ok(())
     }
@@ -1127,6 +1276,27 @@ impl CatalogParser {
             })
             .transpose()?
             .filter(|capacity| *capacity != 0);
+        let tachometer_type = attribute(reader, element, b"TachometerType")?;
+        if tachometer_type
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("XunGenTacho"))
+        {
+            let exceed_type = attribute(reader, element, b"defaultExceedType")?
+                .and_then(|value| value.trim().parse::<u8>().ok())
+                .unwrap_or_default();
+            let read_part_type = |name: &[u8]| -> Result<u8, CatalogInventoryError> {
+                Ok(attribute(reader, element, name)?
+                    .and_then(|value| value.trim().parse::<u8>().ok())
+                    .unwrap_or_default())
+            };
+            pending.xun_profile = Some(CatalogXunProfile {
+                exceed_type,
+                default_engine_type: read_part_type(b"defaultEngineType")?,
+                default_handle_type: read_part_type(b"defaultHandleType")?,
+                default_wheel_type: read_part_type(b"defaultWheelType")?,
+                default_booster_type: read_part_type(b"defaultBoosterType")?,
+            });
+        }
         pending.body = Some(parse_body_param(reader, element, &pending.name)?);
         Ok(())
     }
@@ -1144,6 +1314,10 @@ impl CatalogParser {
         if let Some(enchant_cap) = pending.enchant_cap {
             self.kart_enchant_caps
                 .insert(pending.normalized_name.clone(), enchant_cap);
+        }
+        if let Some(xun_profile) = pending.xun_profile {
+            self.kart_xun_profiles
+                .insert(pending.normalized_name.clone(), xun_profile);
         }
         self.kart_specs.insert(pending.normalized_name, body);
         Ok(())
@@ -1339,6 +1513,7 @@ impl CatalogParser {
             kart_names: std::mem::take(&mut self.kart_names),
             kart_specs: std::mem::take(&mut self.kart_specs),
             kart_enchant_caps: std::mem::take(&mut self.kart_enchant_caps),
+            kart_xun_profiles: std::mem::take(&mut self.kart_xun_profiles),
             kart_spec_stats,
             emblem_catalog,
             item_transforms: std::mem::take(&mut self.item_transforms),
@@ -2148,6 +2323,72 @@ mod tests {
         assert!(catalog.kart_spec(1450).is_none());
         assert_eq!(catalog.emblem_catalog(), None);
         assert!(catalog.emblems().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn retains_xun_body_param_classification_without_a_hardcoded_kart_list() {
+        let catalog = parse_structural(
+            r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
+                <Names>
+                    <Kart id="2001" name="speedS" />
+                    <Kart id="2002" name="itemL" />
+                    <Kart id="2003" name="special" />
+                    <Kart id="2004" name="threeSlotSpeedL" />
+                </Names>
+                <Specs>
+                    <Spec name="speedS"><BodyParam TachometerType="XunGenTacho" defaultExceedType="2" useExtendedAfterBoosterMore="false" /></Spec>
+                    <Spec name="itemL"><BodyParam TachometerType="XunGenTacho" defaultExceedType="1" useExtendedAfterBoosterMore="true" ItemSlotCapacity="3" /></Spec>
+                    <Spec name="special"><BodyParam TachometerType="XunGenTacho" defaultExceedType="7" useExtendedAfterBoosterMore="false" /></Spec>
+                    <Spec name="threeSlotSpeedL"><BodyParam TachometerType="XunGenTacho" defaultExceedType="4" defaultEngineType="21" defaultHandleType="21" defaultWheelType="21" defaultBoosterType="21" useExtendedAfterBoosterMore="true" ItemSlotCapacity="3" /></Spec>
+                </Specs>
+                <Inventory total="4" categories="1">
+                    <Item category="3" id="2001" />
+                    <Item category="3" id="2002" />
+                    <Item category="3" id="2003" />
+                    <Item category="3" id="2004" />
+                </Inventory>
+            </KartCatalog>"#,
+        )
+        .unwrap();
+
+        let speed = catalog.kart_xun_profile(2001).unwrap();
+        assert_eq!(speed.exceed_type, 2);
+        assert!(!speed.is_item_profile());
+        assert_eq!(speed.supported_speed_timing(), Some((4, 3_000)));
+
+        let item = catalog.kart_xun_profile(2002).unwrap();
+        assert_eq!(item.exceed_type, 1);
+        assert!(item.is_item_profile());
+        assert_eq!(item.supported_speed_timing(), None);
+
+        let special = catalog.kart_xun_profile(2003).unwrap();
+        assert_eq!(special.exceed_type, 7);
+        assert!(!special.is_item_profile());
+        assert_eq!(special.supported_speed_timing(), None);
+
+        let three_slot_speed = catalog.kart_xun_profile(2004).unwrap();
+        assert_eq!(three_slot_speed.exceed_type, 4);
+        assert_eq!(three_slot_speed.default_engine_type, 21);
+        assert_eq!(three_slot_speed.default_handle_type, 21);
+        assert_eq!(three_slot_speed.default_wheel_type, 21);
+        assert_eq!(three_slot_speed.default_booster_type, 21);
+        assert!(!three_slot_speed.is_item_profile());
+        assert_eq!(three_slot_speed.supported_speed_timing(), Some((6, 4_500)));
+
+        let mut projected = *catalog.kart_spec(2004).unwrap();
+        let v2 = three_slot_speed.apply_p5136_compatibility(&mut projected);
+        assert_eq!(projected.charge_inst_accel_gauge_by_boost, 0.02);
+        assert_eq!(projected.charge_inst_accel_gauge_by_grip, 0.07);
+        assert_eq!(projected.charge_inst_accel_gauge_by_wall, 0.15);
+        assert_eq!(projected.inst_accel_factor, 1.16);
+        assert_eq!(projected.inst_accel_gauge_cooldown_time, 3_000);
+        assert_eq!(projected.inst_accel_gauge_length, 2_500.0);
+        assert_eq!(projected.inst_accel_gauge_min_usable, 500.0);
+        assert_eq!(v2.parts_trans_accel_factor, 0.45438);
+        assert_eq!(v2.parts_steer_constraint, 0.488);
+        assert_eq!(v2.parts_drift_escape_force, 494.0);
+        assert_eq!(v2.parts_normal_booster_time, -13.0);
     }
 
     #[test]

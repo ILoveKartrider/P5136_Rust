@@ -1,4 +1,4 @@
-//! P5136's four-port topology.
+//! P5136's four stock ports plus the optional XUN sidecar endpoint.
 
 use thiserror::Error;
 
@@ -18,9 +18,9 @@ pub struct PortTopology {
 
 impl PortTopology {
     pub fn new(configured_port: u16) -> Result<Self, PortOverflow> {
-        configured_port.checked_add(2).ok_or(PortOverflow {
+        configured_port.checked_add(3).ok_or(PortOverflow {
             configured_port,
-            required_offset: 2,
+            required_offset: 3,
         })?;
         Ok(Self { configured_port })
     }
@@ -49,6 +49,12 @@ impl PortTopology {
     pub fn messenger_tcp(self) -> u16 {
         self.configured_port + 2
     }
+
+    /// Private server-to-DLL profile transport. Stock clients never use it.
+    #[must_use]
+    pub fn xun_sidecar_tcp(self) -> u16 {
+        self.configured_port + 3
+    }
 }
 
 impl Default for PortTopology {
@@ -69,10 +75,12 @@ mod tests {
         assert_eq!(ports.game_udp(), 39_311);
         assert_eq!(ports.p2p_udp(), 39_312);
         assert_eq!(ports.messenger_tcp(), 39_313);
+        assert_eq!(ports.xun_sidecar_tcp(), 39_314);
     }
 
     #[test]
     fn rejects_a_base_that_would_wrap() {
+        assert!(PortTopology::new(u16::MAX - 2).is_err());
         assert!(PortTopology::new(u16::MAX - 1).is_err());
     }
 }

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     asset_index::{AssetIndex, AssetRegion, fold_path},
-    bundle::stage_selected_compatible,
+    bundle::{is_safe_imported_xun_migration, stage_selected_compatible},
     planner::{PlanOptions, run_plan},
 };
 
@@ -31,6 +31,8 @@ const MAX_ASSET_BYTES: usize = 512 * 1024 * 1024;
 const PRISTINE_SUFFIX: &str = ".pristine.bak";
 pub const UNSUPPORTED_ITEM_RULE_REASON: &str =
     "requires item-result rules that do not exist in P5136";
+pub const EXPERIMENTAL_XUN_REASON: &str =
+    "experimental XUN sidecar candidate; supported profile, multiplayer not yet validated";
 
 // These are the statically audited, previously staged successfully candidates.
 // XUN/kart12 native-backport groups are intentionally absent.
@@ -92,6 +94,113 @@ const AUDITED_KARTS: &[&str] = &[
     "unicorntubeV1",
     "yongyong_redV1",
     "yongyongV1",
+];
+
+// Audited XUN resources whose merged BodyParam uses one of the four profiles
+// implemented by the exact-build sidecar: item (1), speed-S (2), speed-B (3),
+// or speed-L (4). Later special profiles remain excluded until their state
+// machines are recovered independently.
+const EXPERIMENTAL_XUN_KARTS: &[&str] = &[
+    "battleXUN_bazzi",
+    "battleXUN_dao",
+    "behemothXUN",
+    "blackLeopardXUN",
+    "bluesnakeXUN",
+    "caocaoXUN",
+    "DolphintubeXUN",
+    "dragon_redXUN",
+    "firewheelXUN",
+    "gomsinXUN_flower",
+    "honeyXUN",
+    "huolalaXUN",
+    "hydraXUN",
+    "Lodi_blast",
+    "lunaXUN",
+    "mancarXUN",
+    "mancarXUN_block",
+    "mancarXUN_XE",
+    "martKartXUN_Item",
+    "pandaXUN",
+    "pinkbinTaxiXUN",
+    "projectXUN_green",
+    "projectXUN_pink",
+    "projectXUN_purple",
+    "projectXUN_yellow",
+    "protoXUN_item",
+    "rabbitXUN",
+    "redhorseXUN",
+    "rudolfXUN",
+    "run_dizini_zombie",
+    "snowmanXUN",
+    "snowmanXUN_bazzi",
+    "snowmanXUN_gold",
+    "trainXUN",
+    "trigramXUN",
+    "weddingXUN",
+    "wildBatXUN",
+    "zeneonXUN",
+    "zongziXUN",
+    "burstXUN",
+    "burstXUN_Epic",
+    "burstXUN_Rare",
+    "burstXUN_TH",
+    "fourswordXUN",
+    "GstormXUN",
+    "ionXUN",
+    "ionXUN_LE",
+    "Lodi_swift",
+    "miluXUN_heaven",
+    "projectXUN_red",
+    "protoXUN_speedS",
+    "run_bazzi_zombie",
+    "sledgeXUN",
+    "stormXUN",
+    "stormXUN_red",
+    "victoriaTaxiXUN",
+    "cottonXUN_gold",
+    "grapityXUN",
+    "KunPengforceXUN",
+    "Lodi_mercury",
+    "miluXUN_hell",
+    "projectXUN_amber",
+    "protoXUN_speed",
+    "run_dao_zombie",
+    "saberXUN",
+    "saberXUN_Epic",
+    "saberXUN_knight",
+    "saberXUN_Rare",
+    "solarXUN",
+    "spectorXUN",
+    "stormXUN_gold",
+    "sunquanXUN",
+    "zenithXUN",
+    "beatXUN",
+    "blackBatXUN",
+    "cottonXUN",
+    "cottonXUN_20year",
+    "cottonXUN_block",
+    "cottonXUN_Epic",
+    "cottonXUN_ice",
+    "cottonXUN_Rare",
+    "damarhouXUN",
+    "dangerZoneTaxiXUN",
+    "keraunosXUN",
+    "keraunosXUN_BE",
+    "marathonXUN",
+    "marathonXUN_Epic",
+    "marathonXUN_Rare",
+    "martKartXUN_Speed",
+    "projectXUN_blue",
+    "projectXUN_cyan",
+    "protoXUN_speedL",
+    "slrProXUN",
+    "solidXUN",
+    "solidXUN_Epic",
+    "solidXUN_iron",
+    "solidXUN_Rare",
+    "stormXUN_black",
+    "stormXUN_silver",
+    "weddingXUN_S",
 ];
 
 const AUDITED_CHARACTERS: &[&str] = &[
@@ -424,6 +533,13 @@ pub fn discover_asset_candidates_with_progress(
     );
     append_candidates(
         &mut candidates,
+        AssetCategory::Kart,
+        EXPERIMENTAL_XUN_KARTS,
+        &prefixes,
+        target_data_raw,
+    );
+    append_candidates(
+        &mut candidates,
         AssetCategory::Pet,
         AUDITED_PETS,
         &prefixes,
@@ -493,6 +609,10 @@ fn append_candidates(
             && UNSUPPORTED_RULE_KARTS
                 .iter()
                 .any(|blocked| blocked.eq_ignore_ascii_case(id));
+        let experimental_xun = category == AssetCategory::Kart
+            && EXPERIMENTAL_XUN_KARTS
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(id));
         let already_installed = target_data_raw.is_some_and(|data_raw| {
             prefix
                 .split('/')
@@ -506,7 +626,13 @@ fn append_candidates(
             id: id.to_owned(),
             already_installed,
             eligible: !unsupported_rule,
-            reason: unsupported_rule.then(|| UNSUPPORTED_ITEM_RULE_REASON.to_owned()),
+            reason: if unsupported_rule {
+                Some(UNSUPPORTED_ITEM_RULE_REASON.to_owned())
+            } else if experimental_xun {
+                Some(EXPERIMENTAL_XUN_REASON.to_owned())
+            } else {
+                None
+            },
         });
     }
 }
@@ -524,6 +650,17 @@ pub fn import_assets_to_dataraw_with_progress(
     let selected = options
         .assets
         .iter()
+        .map(AssetSelection::key)
+        .collect::<BTreeSet<_>>();
+    let experimental_native_selectors = options
+        .assets
+        .iter()
+        .filter(|asset| {
+            asset.category == AssetCategory::Kart
+                && EXPERIMENTAL_XUN_KARTS
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(&asset.id))
+        })
         .map(AssetSelection::key)
         .collect::<BTreeSet<_>>();
     ensure!(
@@ -565,6 +702,7 @@ pub fn import_assets_to_dataraw_with_progress(
             category: "all".to_owned(),
             asset: None,
             asset_selectors: selected.clone(),
+            experimental_native_selectors,
             include_existing: true,
             max_assets: options.assets.len(),
             max_asset_bytes: MAX_ASSET_BYTES,
@@ -646,7 +784,12 @@ pub fn import_assets_to_dataraw_with_progress(
 
 fn audited(asset: &AssetSelection) -> bool {
     let values = match asset.category {
-        AssetCategory::Kart => AUDITED_KARTS,
+        AssetCategory::Kart => {
+            return AUDITED_KARTS
+                .iter()
+                .chain(EXPERIMENTAL_XUN_KARTS)
+                .any(|value| value.eq_ignore_ascii_case(&asset.id));
+        }
         AssetCategory::Character => AUDITED_CHARACTERS,
         AssetCategory::Pet => AUDITED_PETS,
         AssetCategory::FlyingPet => AUDITED_FLYING_PETS,
@@ -768,12 +911,14 @@ fn install_bundle(
                 counts.identical += 1;
                 continue;
             }
+            let safe_xun_tachometer_migration =
+                !catalog && is_safe_imported_xun_migration(path, &existing, &bytes)?;
             ensure!(
-                catalog,
+                catalog || safe_xun_tachometer_migration,
                 "resource path conflicts with existing DataRaw file: {path}"
             );
             backup_once(&destination, &backup.join(&relative))?;
-            counts.catalogs += 1;
+            counts.catalogs += usize::from(catalog);
         } else {
             ensure!(
                 !destination.exists(),
@@ -883,12 +1028,20 @@ mod tests {
     #[test]
     fn audited_sets_have_expected_sizes_and_no_duplicate_keys() {
         assert_eq!(AUDITED_KARTS.len(), 57);
+        assert!(EXPERIMENTAL_XUN_KARTS.len() > 90);
+        assert!(EXPERIMENTAL_XUN_KARTS.contains(&"mancarXUN"));
+        assert!(EXPERIMENTAL_XUN_KARTS.contains(&"slrProXUN"));
         assert_eq!(AUDITED_CHARACTERS.len(), 73);
         assert_eq!(AUDITED_PETS.len(), 24);
         assert_eq!(AUDITED_FLYING_PETS.len(), 47);
         let keys = AUDITED_KARTS
             .iter()
             .map(|id| format!("kart:{}", id.to_ascii_lowercase()))
+            .chain(
+                EXPERIMENTAL_XUN_KARTS
+                    .iter()
+                    .map(|id| format!("kart:{}", id.to_ascii_lowercase())),
+            )
             .chain(
                 AUDITED_CHARACTERS
                     .iter()
@@ -905,7 +1058,14 @@ mod tests {
                     .map(|id| format!("flying_pet:{}", id.to_ascii_lowercase())),
             )
             .collect::<BTreeSet<_>>();
-        assert_eq!(keys.len(), 201);
+        assert_eq!(
+            keys.len(),
+            AUDITED_KARTS.len()
+                + EXPERIMENTAL_XUN_KARTS.len()
+                + AUDITED_CHARACTERS.len()
+                + AUDITED_PETS.len()
+                + AUDITED_FLYING_PETS.len()
+        );
     }
 
     #[test]

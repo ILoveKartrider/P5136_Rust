@@ -1,6 +1,6 @@
 # P5136 Rust Server
 
-[한국어](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md)
+[한국어](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md) | [Korean changelog](CHANGELOG.md)
 
 If any translation sounds unnatural or is incorrect, please [open an issue](https://github.com/ILoveKartrider/P5136_Rust/issues) or submit a pull request.
 
@@ -33,6 +33,7 @@ Run `p5136.exe` without arguments to open the GUI. Choose 한국어, English, or
 3. Enable **Allow new nicknames on LAN** when a remote nickname connects for the first time.
 4. Select **Start server**.
 5. In the Connector tab, enter the game directory, nickname, and server IPv4, then select **Prepare and launch client**.
+6. To use an XUN kart, wait for the client to start, select the adjacent **Attach XUN DLL** button, and approve the UAC request. By default, the connector uses `p5136-xun-attach.exe` and `p5136-xun.dll` beside its own executable; each path can also be selected separately on the Connector tab. DLL file logging is controlled by the checkbox on the same tab.
 
 The connector prepares PIN/XML using an immutable pristine backup and a process lock, then launches through Windows UAC, Wine, CrossOver, or a macOS Sikarugir wrapper. For manual prefix and wrapper setup, see the [macOS Sikarugir walkthrough](MACOS_SIKARUGIR.md).
 
@@ -122,9 +123,9 @@ The GUI's **Track import** tab indexes RHO/RHO5 files directly from another Kore
 
 ## Importing assets from another client
 
-The GUI's **Asset import** tab indexes the newer Chinese client's `Data` directory. Its internal **Karts**, **Characters**, **Pets**, and **Flying pets** tabs provide searchable multi-selection of statically audited candidates, while **Not installed only** hides entries already present in the current `DataRaw`. The audited set contains 57 karts, 73 characters, 24 pets, and 47 flying pets. XUN/Kart12 native-backport karts are omitted. Six karts that require new item results absent from P5136—`SteamIV1`, `deliveryV1`, `flowerCarriageV1`, `lionmaskV1_gold`, `mechanicdragon_redV1`, and `skunaV1`—remain visible but disabled with a reason. This leaves 51 currently importable karts, 73 characters, 24 pets, and 47 flying pets.
+The GUI's **Asset import** tab indexes the newer Chinese client's `Data` directory. Its internal **Karts**, **Characters**, **Pets**, and **Flying pets** tabs provide searchable multi-selection of statically audited candidates, while **Not installed only** hides entries already present in the current `DataRaw`. The audited set contains 57 ordinary karts, 100 experimental XUN karts whose recovered `defaultExceedType` is 1–4, 73 characters, 24 pets, and 47 flying pets. Six ordinary karts that require new item results absent from P5136—`SteamIV1`, `deliveryV1`, `flowerCarriageV1`, `lionmaskV1_gold`, `mechanicdragon_redV1`, and `skunaV1`—remain visible but disabled with a reason. This leaves 51 ordinary importable karts plus 100 experimental XUN candidates. Later XUN special profiles remain hidden until their separate state machines are recovered.
 
-The importer rechecks the selected dependency closures and SHA-256 hashes immediately before installation. Resources are added to a complete `DataRaw` tree; an existing same-path resource with different bytes stops the operation instead of being overwritten. Display names use ASCII asset codes and remaining non-ASCII catalog fields use stable hashes. The item table, Korean shop, and four kart item-ability catalogs are merged. A Chinese regional flying-pet parameter also receives a `param@kr.bml` alias for the Korean client. The server auto-grants a new kart or character only when both its audited ID and matching DataRaw model exist, keeping blocked karts and XUN candidates hidden. The server-visible `DataPack1_00000.rho5` and `DataPack4_00002.rho5` catalogs are updated after preserving their original bytes once as `.pristine.bak`. Work files, reports, and DataRaw catalog backups live under `.p5136-asset-import`; a successful import enables the connector's complete-DataRaw option. Restart the server and client after importing. For a new flying-pet ID absent from P5136's hard-coded server table, server-side physics and special effects remain separate implementation work; this audit establishes resource/catalog compatibility needed for display and equipment.
+The importer rechecks the selected dependency closures and SHA-256 hashes immediately before installation. Resources are added to a complete `DataRaw` tree; an existing same-path resource with different bytes stops the operation instead of being overwritten. Display names use ASCII asset codes and remaining non-ASCII catalog fields use stable hashes. The item table, Korean shop, and four kart item-ability catalogs are merged. A Chinese regional flying-pet parameter also receives a `param@kr.bml` alias for the Korean client. Unsupported XUN catalog metadata `grade=13 / engineGrade=9` is mapped only to P5136's V1 classification values `12 / 8`; BodyParam and wire KartSpec physics remain unchanged. The server auto-grants a new kart or character only when both its audited ID and matching DataRaw model exist. XUN karts require the exact-build XUN sidecar. The sidecar implements lifecycle/XUN state, all six recovered speed-mode physics consumers, an independent continuous charger gauge, and the newer body/default-part display conversion. Black Knight XUN consequently displays `Drift 1158 / Acceleration 1159 / Cornering 1050 / Booster Time 1054`. Charger remains separate from ordinary Exceed in state, UI, and effect routing. Import derives P5136's `ExceedWaveType` from `defaultExceedType` to retain the ordinary Exceed effect, while the sidecar attaches the imported `effect/charger/카트바디차저발동` scene to an independent renderer object and starts/stops its child emitters for the charger aura. This does not grow `GoPlayKart` or substitute an Exceed effect for the aura. For exact `KartSpec.defaultExceedType=1` item profiles, the server selects the starting item from the configured individual item table and applies the kart's ordinary item transform. The server-visible `DataPack1_00000.rho5` and `DataPack4_00002.rho5` catalogs are updated after preserving their original bytes once as `.pristine.bak`. Work files, reports, and DataRaw catalog backups live under `.p5136-asset-import`; a successful import enables the connector's complete-DataRaw option. Restart the server and client after importing. For a new flying-pet ID absent from P5136's hard-coded server table, server-side physics and special effects remain separate implementation work; this audit establishes resource/catalog compatibility needed for display and equipment.
 
 ## Teams and the next starting grid
 
@@ -152,6 +153,10 @@ With base port `39311`:
 | Login | TCP | 39312 |
 | P2P/relay | UDP | 39312 |
 | Messenger | TCP | 39313 |
+| XUN sidecar | TCP | 39314 |
+
+The XUN sidecar endpoint is separate from the stock game protocol and is used
+only for kart-specific profiles consumed by the optional XUN DLL.
 
 Allow these TCP/UDP ports through the server PC firewall when testing from two machines.
 

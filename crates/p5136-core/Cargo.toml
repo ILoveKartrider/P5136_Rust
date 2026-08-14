@@ -7,12 +7,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+sha2.workspace = true
 thiserror.workspace = true
 unicode-casefold.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
+tempfile = "3.23"
 
 [lints]
 workspace = true

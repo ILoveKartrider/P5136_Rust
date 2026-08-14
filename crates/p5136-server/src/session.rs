@@ -209,6 +209,7 @@ use crate::{
         OutboundBatch, ProfiledMyRoomOwnerLoad, RaceCommandOutcome, RaceCommandPayload,
         RoomCommandPayload, RoomKartPhysicsVariants, RoomParticipant, StartRoomPlan,
     },
+    xun_sidecar::XunSidecarHandle,
 };
 
 const MAX_OUTBOUND_BATCH_BURST: usize = 8;
@@ -556,6 +557,7 @@ pub(crate) struct ProfileCoordinator {
     io: ProfileIoHandle,
     catalog: Option<Arc<CatalogInventory>>,
     emblems: Option<Arc<EmblemCatalog>>,
+    xun_sidecar: XunSidecarHandle,
     #[cfg(test)]
     blocking_update_hook: Option<Arc<BlockingUpdateHook>>,
     #[cfg(test)]
@@ -658,7 +660,7 @@ impl ProfileCoordinator {
     #[must_use]
     #[cfg(test)]
     pub(crate) fn new(io: ProfileIoHandle, catalog: Option<Arc<CatalogInventory>>) -> Self {
-        Self::new_with_emblems(io, catalog, None)
+        Self::new_with_emblems(io, catalog, None, XunSidecarHandle::default())
     }
 
     #[must_use]
@@ -666,6 +668,7 @@ impl ProfileCoordinator {
         io: ProfileIoHandle,
         catalog: Option<Arc<CatalogInventory>>,
         emblems: Option<Arc<EmblemCatalog>>,
+        xun_sidecar: XunSidecarHandle,
     ) -> Self {
         let emblems = emblems.or_else(|| {
             catalog
@@ -678,6 +681,7 @@ impl ProfileCoordinator {
             io,
             catalog,
             emblems,
+            xun_sidecar,
             #[cfg(test)]
             blocking_update_hook: None,
             #[cfg(test)]
@@ -703,6 +707,11 @@ impl ProfileCoordinator {
 
     fn emblem_catalog(&self) -> Option<&EmblemCatalog> {
         self.emblems.as_deref()
+    }
+
+    fn publish_xun_profile(&self, nickname: &str, kart_id: u16) {
+        self.xun_sidecar
+            .publish_catalog_profile(nickname, kart_id, self.catalog());
     }
 
     #[cfg(test)]
@@ -3064,6 +3073,7 @@ async fn handle_single_player_request(
                 },
             )?;
             trace_single_player_physics_fallback(&identity, &physics, "PqKartSpec");
+            profiles.publish_xun_profile(&identity.nickname, physics.kart_id);
             Ok(vec![serialize_kart_spec_reply(&physics.block)])
         }
         SinglePlayerRequest::StartTimeAttack(request) => {
@@ -3125,6 +3135,7 @@ async fn handle_challenger_kart_spec(
         },
     )?;
     trace_single_player_physics_fallback(&identity, &physics, "PqchallengerKartSpec");
+    profiles.publish_xun_profile(&identity.nickname, physics.kart_id);
     Ok(vec![serialize_challenger_kart_spec_reply(&physics.block)])
 }
 
@@ -3189,6 +3200,7 @@ async fn handle_start_time_attack(
         },
     )?;
     trace_single_player_physics_fallback(&after, &physics, "PqStartTimeAttack");
+    profiles.publish_xun_profile(&after.nickname, physics.kart_id);
     tracing::trace!(
         nickname = %after.nickname,
         requested_speed_type = request.speed_type,
@@ -4026,6 +4038,7 @@ async fn handle_login(
         connector_override = requested_pmap.is_some(),
         "authenticated P5136 account role"
     );
+    profiles.publish_xun_profile(&identity.nickname, profile.rider_item.kart);
 
     let response = serialize_pr_login(&PrLoginFields {
         time: current_legacy_time(),
@@ -4107,6 +4120,8 @@ async fn handle_room_request_admitted(
         RoomProtocolRequest::CreateRoom => {
             let request = parse_ch_create_room_request(packet)?;
             let identity = world.authorize_identity().await?;
+            let kart_id = context.profile_for(&identity)?.rider_item.kart;
+            profiles.publish_xun_profile(&identity.nickname, kart_id);
             RoomCommandPayload::Create {
                 request,
                 participant: context.room_participant_for(&identity, profiles.catalog())?,
@@ -4115,6 +4130,8 @@ async fn handle_room_request_admitted(
         RoomProtocolRequest::JoinRoom => {
             let request = parse_ch_join_room_request(packet)?;
             let identity = world.authorize_identity().await?;
+            let kart_id = context.profile_for(&identity)?.rider_item.kart;
+            profiles.publish_xun_profile(&identity.nickname, kart_id);
             RoomCommandPayload::Join {
                 request,
                 participant: context.room_participant_for(&identity, profiles.catalog())?,
@@ -5137,6 +5154,7 @@ async fn update_rider_equipment(
     let after = world.authorize_identity().await?;
     ensure_identity_fence(&before, &after)?;
     let physics = room_physics_metadata(&profile.profile, &equipment, profiles.catalog.as_deref())?;
+    profiles.publish_xun_profile(&after.nickname, physics.kart_id);
     let refreshed_room_physics = world
         .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
         .await?;
@@ -5180,6 +5198,7 @@ async fn equip_plant_part(
     upsert_plant_record(&mut equipment, record);
     context.replace_equipment(&after_write, equipment.clone())?;
     let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
+    profiles.publish_xun_profile(&after_write.nickname, physics.kart_id);
     let refreshed_room_physics = world
         .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
         .await?;
@@ -5221,6 +5240,7 @@ async fn equip_x_part(
     upsert_parts_record(&mut equipment, record);
     context.replace_equipment(&after, equipment.clone())?;
     let physics = room_physics_metadata(&profile, &equipment, profiles.catalog())?;
+    profiles.publish_xun_profile(&after.nickname, physics.kart_id);
     let refreshed_room_physics = world
         .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
         .await?;
@@ -5262,6 +5282,7 @@ async fn handle_floater_request(
     let accepted = result.result_code == FLOATER_RESULT_SUCCESS;
     let refreshed_room_physics = if accepted && changes_physics {
         let physics = room_physics_metadata(&profile, &result.equipment, profiles.catalog())?;
+        profiles.publish_xun_profile(&after.nickname, physics.kart_id);
         world
             .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
             .await?
@@ -5324,6 +5345,7 @@ async fn handle_kart_level_request(
     let mut refreshed_room_physics = false;
     if result.accepted && !matches!(request, KartLevelRequest::LevelUpProbability(_)) {
         let physics = room_physics_metadata(&profile, &result.equipment, profiles.catalog())?;
+        profiles.publish_xun_profile(&after.nickname, physics.kart_id);
         refreshed_room_physics = world
             .refresh_room_kart_physics(physics.variants.clone(), physics.floater_codes)
             .await?;
@@ -5504,6 +5526,9 @@ fn selected_physics_metadata(
     } else if let Some(catalog) = catalog {
         if let Some(spec) = catalog.kart_spec(kart_id) {
             snapshot.kart = *spec;
+            if let Some(xun) = catalog.kart_xun_profile(kart_id) {
+                snapshot.v2 = xun.apply_p5136_compatibility(&mut snapshot.kart);
+            }
             RoomKartBaseResolution::CatalogBaseSpec
         } else {
             fallback_reasons.push(RoomPhysicsFallbackReason::CatalogSpecUnavailable);
@@ -6647,7 +6672,7 @@ mod tests {
         let mut item_count = 0;
         for &category in GRANT_CATEGORIES {
             let ids: Box<dyn Iterator<Item = u16>> = if category == 3 {
-                Box::new((1..=1_199).chain([1_450, 1_453]))
+                Box::new((1..=1_199).chain([1_450, 1_453, 1_454]))
             } else {
                 Box::new(1_000..1_110)
             };
@@ -6671,12 +6696,13 @@ mod tests {
                 item_count += 1;
             }
         }
-        assert_eq!(item_count, 6_801);
+        assert_eq!(item_count, 6_802);
         let xml = format!(
             r#"<KartCatalog formatVersion="3" protocolVersion="5136" region="kr">
                 <Names>
                     <Kart id="1450" name="sessionKnownKart" />
                     <Kart id="1453" name="sessionMissingKartSpec" />
+                    <Kart id="1454" name="sessionXunKart" />
                 </Names>
                 <Specs>
                     <Spec name="sessionBaseKart">
@@ -6684,6 +6710,13 @@ mod tests {
                     </Spec>
                     <Spec name="sessionKnownKart">
                         <BodyParam ForwardAccelForce="147" DragFactor="-0.05" />
+                    </Spec>
+                    <Spec name="sessionXunKart">
+                        <BodyParam TachometerType="XunGenTacho"
+                            defaultExceedType="4" defaultEngineType="21"
+                            defaultHandleType="21" defaultWheelType="21"
+                            defaultBoosterType="21" ForwardAccelForce="147"
+                            DragFactor="-0.05" />
                     </Spec>
                 </Specs>
                 <Inventory total="{item_count}" categories="60">{items}</Inventory>
@@ -11044,6 +11077,43 @@ mod tests {
         assert_eq!(resolved.block.as_bytes().len(), 235);
         assert_ne!(resolved.block, baseline);
         assert_eq!(resolved.block, expected);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn xun_catalog_metadata_is_projected_into_the_p5136_physics_block() {
+        let catalog = test_catalog();
+        let mut profile = Profile::default();
+        profile.rider_item.kart = 1_454;
+
+        let resolved = room_physics_metadata(
+            &profile,
+            &EquipmentExceptions::default(),
+            Some(catalog.as_ref()),
+        )
+        .unwrap();
+        let xun = catalog.kart_xun_profile(1_454).unwrap();
+        let mut expected_snapshot = P5136KartPhysicsSnapshot::csharp_s7_baseline();
+        expected_snapshot.kart = *catalog.kart_spec(1_454).unwrap();
+        expected_snapshot.v2 = xun.apply_p5136_compatibility(&mut expected_snapshot.kart);
+
+        assert_eq!(
+            resolved.base_resolution,
+            RoomKartBaseResolution::CatalogBaseSpec
+        );
+        assert!(resolved.fallback_reasons.is_empty());
+        assert_eq!(resolved.block.as_bytes().len(), 235);
+        assert_eq!(
+            resolved.block,
+            build_p5136_kart_physics_block(&expected_snapshot).unwrap()
+        );
+        assert_eq!(
+            expected_snapshot.kart.charge_inst_accel_gauge_by_boost,
+            0.02
+        );
+        assert_eq!(expected_snapshot.kart.inst_accel_gauge_length, 2_500.0);
+        assert_eq!(expected_snapshot.v2.parts_trans_accel_factor, 0.45438);
+        assert_eq!(expected_snapshot.v2.parts_normal_booster_time, -13.0);
     }
 
     #[test]

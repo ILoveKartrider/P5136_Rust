@@ -26,6 +26,7 @@ p5136-core = { path = "../p5136-core" }
 p5136-assets = { path = "../p5136-assets" }
 p5136-profile = { path = "../p5136-profile" }
 p5136-server = { path = "../p5136-server" }
+rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

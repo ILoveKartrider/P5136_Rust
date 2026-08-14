@@ -28,9 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut matched = 0_usize;
-    let mut pending = vec![&root];
-    while let Some(node) = pending.pop() {
-        pending.extend(node.children.iter().rev());
+    let mut pending = vec![(&root, 0_usize)];
+    while let Some((node, depth)) = pending.pop() {
+        pending.extend(node.children.iter().rev().map(|child| (child, depth + 1)));
         let kart_id = node
             .attributes
             .iter()
@@ -41,8 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if minimum_kart_id.is_none() || kart_id.is_some() {
             println!(
-                "{} value={:?} attrs={:?}",
-                node.name, node.value, node.attributes
+                "{}{} value={:?} attrs={:?}",
+                "  ".repeat(depth),
+                node.name,
+                node.value,
+                node.attributes
             );
             matched += 1;
         }

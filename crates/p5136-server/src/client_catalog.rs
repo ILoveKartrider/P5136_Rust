@@ -282,7 +282,8 @@ pub fn load_client_kart_catalog(
         .parent()
         .map(|parent| parent.join("DataRaw"))
         .filter(|path| path.is_dir());
-    let (names, specs, resources, rho5) = load_kart_metadata(&source_directory, &kart_path)?;
+    let (names, specs, resources, rho5) =
+        load_kart_metadata(&source_directory, &kart_path, data_raw_directory.as_deref())?;
     validate_kart_metadata(&names, &specs)?;
     let mut inventory = load_inventory(&rho5, &names)?;
     classify_characters(&mut inventory, data_raw_directory.as_deref());
@@ -361,6 +362,7 @@ fn client_catalog_paths(
 fn load_kart_metadata(
     source_directory: &Path,
     kart_path: &Path,
+    data_raw_directory: Option<&Path>,
 ) -> Result<(KartNames, KartSpecs, KartResources, Rho5Directory), ClientKartCatalogError> {
     let kart_archive = LegacyRhoArchive::open(kart_path, kart_rho_limits())?;
     let mut names = KartNames::new();
@@ -403,10 +405,61 @@ fn load_kart_metadata(
             merge_spec(&mut specs, priority, kart_name, path, &bytes)?;
         }
     }
+    merge_audited_data_raw_specs(data_raw_directory, &names, &mut specs)?;
     // `kart.rho` is 112 MiB in the stock build. Release it before opening
     // `item.rho` so startup does not retain both legacy archives at once.
     drop(kart_archive);
     Ok((names, specs, resources, rho5))
+}
+
+/// The integrated importer installs model resources additively into `DataRaw`,
+/// while the server-visible packed overlay contains only global catalogs.
+/// Complete the server's spec view from the exact audited imported folders so
+/// a new catalog row is not incorrectly quarantined solely because its
+/// per-kart parameter remains outside packed Data.
+fn merge_audited_data_raw_specs(
+    data_raw_directory: Option<&Path>,
+    names: &KartNames,
+    specs: &mut KartSpecs,
+) -> Result<(), ClientKartCatalogError> {
+    let Some(data_raw_directory) = data_raw_directory else {
+        return Ok(());
+    };
+    for name in names
+        .iter()
+        .filter(|(id, name)| {
+            is_audited_imported_kart_id(**id) || is_xun_internal_name(name.value.trim())
+        })
+        .map(|(_, name)| name)
+    {
+        let internal_name = name.value.trim();
+        if !data_raw_model_exists(Some(data_raw_directory), "kart_", internal_name) {
+            continue;
+        }
+        let directory = data_raw_directory.join("kart_").join(internal_name);
+        for file_name in [
+            "param.bml",
+            "param.kml",
+            "param.xml",
+            "param@kr.bml",
+            "param@kr.kml",
+            "param@kr.xml",
+        ] {
+            let priority = catalog_file_priority(file_name, "param", "kr");
+            let path = directory.join(file_name);
+            if priority == 0 || !path.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|source| ClientKartCatalogError::InspectData {
+                path: path.clone(),
+                source,
+            })?;
+            let label = format!("DataRaw/kart_/{internal_name}/{file_name}");
+            check_source_size(&label, bytes.len())?;
+            merge_spec(specs, priority, internal_name, &label, &bytes)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_kart_metadata(
@@ -447,8 +500,9 @@ fn classify_karts(
     data_raw_directory: Option<&Path>,
 ) {
     for item in inventory.iter_mut().filter(|item| item.category == 3) {
-        item.auto_grant &=
-            kart_is_safe_for_automatic_grant(item, names, specs, resources, data_raw_directory);
+        let installed_xun = installed_data_raw_xun(item, names, specs, data_raw_directory);
+        item.auto_grant = (item.auto_grant || installed_xun)
+            && kart_is_safe_for_automatic_grant(item, names, specs, resources, data_raw_directory);
         item.x_parts_compatible = kart_uses_x_parts(item, names, specs);
     }
 }
@@ -483,8 +537,37 @@ fn is_audited_imported_character_id(id: u16) -> bool {
 }
 
 fn is_audited_imported_kart_id(id: u16) -> bool {
-    ((1_457..=1_512).contains(&id) || id == 1_515)
-        && DEFERRED_IMPORTED_KART_IDS.binary_search(&id).is_err()
+    (((1_457..=1_512).contains(&id) || id == 1_515)
+        && DEFERRED_IMPORTED_KART_IDS.binary_search(&id).is_err())
+        || matches!(id, 1_574 | 1_590)
+}
+
+fn is_xun_internal_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && name.to_ascii_lowercase().contains("xun")
+}
+
+fn installed_data_raw_xun(
+    item: &InventoryItem,
+    names: &KartNames,
+    specs: &KartSpecs,
+    data_raw_directory: Option<&Path>,
+) -> bool {
+    let Some(internal_name) = names.get(&item.id).map(|name| name.value.trim()) else {
+        return false;
+    };
+    if !is_xun_internal_name(internal_name)
+        || !data_raw_model_exists(data_raw_directory, "kart_", internal_name)
+    {
+        return false;
+    }
+    specs
+        .get(&internal_name.to_ascii_lowercase())
+        .and_then(|spec| spec.value.attribute("TachometerType"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("XunGenTacho"))
 }
 
 fn kart_uses_x_parts(item: &InventoryItem, names: &KartNames, specs: &KartSpecs) -> bool {
@@ -521,7 +604,13 @@ fn kart_is_safe_for_automatic_grant(
     if verified_exception {
         return true;
     }
-    if is_audited_imported_kart_id(item.id) {
+    if is_audited_imported_kart_id(item.id)
+        || (is_xun_internal_name(internal_name)
+            && spec
+                .value
+                .attribute("TachometerType")
+                .is_some_and(|value| value.eq_ignore_ascii_case("XunGenTacho")))
+    {
         return data_raw_model_exists(data_raw_directory, "kart_", internal_name);
     }
     let model_folder = spec
@@ -1513,7 +1602,7 @@ mod tests {
         ClientKartCatalogStats, InventoryItem, KartNames, KartResources, KartSpecs, Prioritized,
         SourceElement, catalog_file_priority, classify_characters, classify_karts, decode_xml_text,
         is_runtime_verified_for_implicit_grant, kart_model_folder, kart_param_candidate,
-        load_client_kart_catalog,
+        load_client_kart_catalog, merge_audited_data_raw_specs,
     };
 
     #[test]
@@ -1652,7 +1741,76 @@ mod tests {
         assert!(!is_runtime_verified_for_implicit_grant(3, 1_513));
         assert!(is_runtime_verified_for_implicit_grant(3, 1_515));
         assert!(!is_runtime_verified_for_implicit_grant(3, 1_516));
+        assert!(is_runtime_verified_for_implicit_grant(3, 1_574));
+        assert!(is_runtime_verified_for_implicit_grant(3, 1_590));
+        assert!(!is_runtime_verified_for_implicit_grant(3, 1_591));
         assert!(is_runtime_verified_for_implicit_grant(4, 200));
+    }
+
+    #[test]
+    fn audited_xun_spec_is_completed_from_dataraw_for_server_inventory() {
+        let root = tempdir().unwrap();
+        let data_raw = root.path().join("DataRaw");
+        let kart = data_raw.join("kart_").join("mancarXUN");
+        fs::create_dir_all(&kart).unwrap();
+        fs::write(kart.join("model.1s"), b"fixture").unwrap();
+        fs::write(
+            kart.join("param@kr.xml"),
+            b"<BodyParam TachometerType='XunGenTacho' itemSlotCapacity='2'/>",
+        )
+        .unwrap();
+        let names = KartNames::from([(
+            1_590,
+            Prioritized {
+                priority: 1,
+                value: "mancarXUN".to_owned(),
+            },
+        )]);
+        let mut specs = KartSpecs::new();
+        merge_audited_data_raw_specs(Some(&data_raw), &names, &mut specs).unwrap();
+        let spec = &specs["mancarxun"];
+        assert_eq!(spec.priority, 103);
+        assert_eq!(spec.value.attribute("TachometerType"), Some("XunGenTacho"));
+    }
+
+    #[test]
+    fn installed_catalog_xun_is_discovered_without_a_hardcoded_kart_id() {
+        let root = tempdir().unwrap();
+        let data_raw = root.path().join("DataRaw");
+        let kart = data_raw.join("kart_").join("cottonXUN_20year");
+        fs::create_dir_all(&kart).unwrap();
+        fs::write(kart.join("model.1s"), b"fixture").unwrap();
+        fs::write(
+            kart.join("param@kr.xml"),
+            b"<BodyParam TachometerType='XunGenTacho' itemSlotCapacity='2'/>",
+        )
+        .unwrap();
+        let names = KartNames::from([(
+            1_603,
+            Prioritized {
+                priority: 1,
+                value: "cottonXUN_20year".to_owned(),
+            },
+        )]);
+        let mut specs = KartSpecs::new();
+        merge_audited_data_raw_specs(Some(&data_raw), &names, &mut specs).unwrap();
+        let mut inventory = vec![InventoryItem {
+            category: 3,
+            id: 1_603,
+            name: "cottonXUN_20year".to_owned(),
+            auto_grant: false,
+            x_parts_compatible: false,
+        }];
+
+        classify_karts(
+            &mut inventory,
+            &names,
+            &specs,
+            &KartResources::default(),
+            Some(&data_raw),
+        );
+
+        assert!(inventory[0].auto_grant);
     }
 
     #[test]
@@ -1738,7 +1896,7 @@ mod tests {
         assert_eq!(kart_model_folder("model.1s"), None);
     }
 
-    fn known_client_catalog_shapes() -> [ClientKartCatalogStats; 3] {
+    fn known_client_catalog_shapes() -> [ClientKartCatalogStats; 5] {
         [
             ClientKartCatalogStats {
                 names: 1_456,
@@ -1776,6 +1934,30 @@ mod tests {
                 transform_rules: 676,
                 item_symbols: 73,
             },
+            ClientKartCatalogStats {
+                names: 1_514,
+                specs: 1_411,
+                inventory_items: 7_079,
+                inventory_categories: 65,
+                inventory_karts: 1_354,
+                auto_grant_karts: 1_336,
+                quarantined_karts: 18,
+                x_parts_karts: 308,
+                transform_rules: 677,
+                item_symbols: 73,
+            },
+            ClientKartCatalogStats {
+                names: 1_515,
+                specs: 1_412,
+                inventory_items: 7_080,
+                inventory_categories: 65,
+                inventory_karts: 1_355,
+                auto_grant_karts: 1_337,
+                quarantined_karts: 18,
+                x_parts_karts: 308,
+                transform_rules: 677,
+                item_symbols: 73,
+            },
         ]
     }
 
@@ -1791,27 +1973,51 @@ mod tests {
             stock,
             compatible_asset_bundle,
             compatible_asset_and_pet_bundle,
+            experimental_xun_bundle,
+            experimental_two_xun_bundle,
         ] = known_client_catalog_shapes();
+        let additive_import_bundle = stats.inventory_categories
+            == experimental_two_xun_bundle.inventory_categories
+            && stats.item_symbols == experimental_two_xun_bundle.item_symbols
+            && stats.names >= experimental_two_xun_bundle.names
+            && stats.specs >= experimental_two_xun_bundle.specs
+            && stats.inventory_items >= experimental_two_xun_bundle.inventory_items
+            && stats.inventory_karts >= experimental_two_xun_bundle.inventory_karts
+            && stats.auto_grant_karts >= experimental_two_xun_bundle.auto_grant_karts
+            && stats.quarantined_karts >= experimental_two_xun_bundle.quarantined_karts
+            && stats.x_parts_karts >= experimental_two_xun_bundle.x_parts_karts
+            && stats.transform_rules >= experimental_two_xun_bundle.transform_rules
+            && stats.auto_grant_karts + stats.quarantined_karts == stats.inventory_karts
+            // Keep this test useful as a corruption guard while allowing the
+            // user to install additional audited asset bundles into DataRaw.
+            && stats.names <= experimental_two_xun_bundle.names + 512
+            && stats.specs <= experimental_two_xun_bundle.specs + 512
+            && stats.inventory_items <= experimental_two_xun_bundle.inventory_items + 1_024
+            && stats.inventory_karts <= experimental_two_xun_bundle.inventory_karts + 512;
         assert!(
             stats == stock
                 || stats == compatible_asset_bundle
-                || stats == compatible_asset_and_pet_bundle,
+                || stats == compatible_asset_and_pet_bundle
+                || stats == experimental_xun_bundle
+                || stats == experimental_two_xun_bundle
+                || additive_import_bundle,
             "unexpected client catalog shape: {stats:?}"
         );
-        if stats == compatible_asset_bundle || stats == compatible_asset_and_pet_bundle {
+        let has_compatible_assets = loaded.catalog().kart_name(1_457) == Some("spinteacupV1");
+        if has_compatible_assets {
             assert_eq!(loaded.catalog().kart_name(1_457), Some("spinteacupV1"));
             assert_eq!(loaded.catalog().kart_name(1_515), Some("stingRayV1"));
             for (category, id) in [(1, 430), (1, 499), (3, 1_457), (3, 1_515)] {
                 assert!(loaded.catalog().item(category, id).is_some());
                 assert!(loaded.catalog().grants_item(category, id));
             }
-            assert_eq!(
+            assert!(
                 loaded
                     .catalog()
                     .category(3)
                     .filter(|item| item.id > 1_456 && !item.auto_grant)
-                    .count(),
-                6
+                    .count()
+                    >= 6
             );
             for deferred_kart_id in super::DEFERRED_IMPORTED_KART_IDS {
                 assert!(!loaded.catalog().grants_item(3, *deferred_kart_id));
@@ -1845,7 +2051,8 @@ mod tests {
             assert_eq!(roller_brush.forward_accel_force, 154.0);
             assert_eq!(roller_brush.drag_factor, -0.086);
         }
-        if stats == compatible_asset_and_pet_bundle {
+        let has_compatible_pets = loaded.catalog().item(21, 175).is_some();
+        if has_compatible_pets {
             for pet_id in 175..=196 {
                 assert!(loaded.catalog().item(21, pet_id).is_some());
                 assert!(loaded.catalog().grants_item(21, pet_id));
@@ -1867,6 +2074,42 @@ mod tests {
                 );
             }
         }
+        if loaded.catalog().kart_name(1_590) == Some("mancarXUN") {
+            assert_eq!(loaded.catalog().kart_name(1_590), Some("mancarXUN"));
+            assert!(loaded.catalog().grants_item(3, 1_590));
+        }
+        if loaded.catalog().kart_name(1_574) == Some("slrProXUN") {
+            assert_eq!(loaded.catalog().kart_name(1_574), Some("slrProXUN"));
+            assert!(loaded.catalog().grants_item(3, 1_574));
+            assert_eq!(
+                loaded.catalog().kart_xun_profile(1_574),
+                Some(p5136_profile::CatalogXunProfile {
+                    exceed_type: 4,
+                    default_engine_type: 21,
+                    default_handle_type: 21,
+                    default_wheel_type: 21,
+                    default_booster_type: 21,
+                })
+            );
+            let mut projected = *loaded.catalog().kart_spec(1_574).unwrap();
+            let _ = loaded
+                .catalog()
+                .kart_xun_profile(1_574)
+                .unwrap()
+                .apply_p5136_compatibility(&mut projected);
+            // P5136 already owns the V1 crash-gauge consumer. XUN
+            // compatibility must feed that ordinary booster-gauge path, not
+            // confuse it with the separate wall-to-Exceed coefficient used
+            // while the charger effect is active.
+            assert_eq!(projected.wall_coll_gauge_cooldown_time, 3_000);
+            assert_eq!(projected.wall_coll_gauge_max_vel_loss, 200.0);
+            assert_eq!(projected.wall_coll_gauge_min_vel_bound, 200.0);
+            assert_eq!(projected.wall_coll_gauge_min_vel_loss, 50.0);
+        }
+        if loaded.catalog().kart_name(1_603) == Some("cottonXUN_20year") {
+            assert!(loaded.catalog().grants_item(3, 1_603));
+            assert!(loaded.catalog().kart_xun_profile(1_603).is_some());
+        }
         assert_eq!(loaded.catalog().kart_name(1_410), Some("gigantesV1"));
         assert!(loaded.catalog().grants_item(3, 1_410));
         assert!(loaded.catalog().supports_x_parts(1_410));
@@ -1875,8 +2118,8 @@ mod tests {
             .grant_items()
             .filter(|item| item.category == 3 && item.x_parts_compatible)
             .count();
-        let expected_granted_x_parts_karts = if stats == stock { 251 } else { 302 };
-        assert_eq!(granted_x_parts_karts, expected_granted_x_parts_karts);
+        let minimum_granted_x_parts_karts = if stats == stock { 251 } else { 302 };
+        assert!(granted_x_parts_karts >= minimum_granted_x_parts_karts);
         let mut profile = p5136_profile::Profile::default();
         profile.granted_karts.push(p5136_profile::GrantedKart {
             kart_id: 1_167,
@@ -1888,10 +2131,7 @@ mod tests {
             p5136_profile::EquipmentExceptions::default(),
         )
         .unwrap();
-        assert_eq!(
-            inventory.parts_exceptions.len(),
-            expected_granted_x_parts_karts + 1
-        );
+        assert_eq!(inventory.parts_exceptions.len(), granted_x_parts_karts + 1);
         assert!(inventory.parts_exceptions.iter().all(|record| {
             *record
                 == p5136_core::inventory::PartsExcRecord {

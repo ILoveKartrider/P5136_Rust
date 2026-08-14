@@ -17,7 +17,7 @@ use p5136_core::{
     game_slot_protocol::{
         BarricadeOperation, GameSlotAction, GameSlotBody, GameSlotEvidencePending,
         GameSlotRelayAudience, GameSlotSynthesisError, ItemOperation, ItemPickupKind,
-        ParsedGameSlotPacket,
+        ParsedGameSlotPacket, serialize_direct_item_award,
     },
     kart_physics::{P5136_MODERN_SPEED_TYPE_COUNT, csharp_room_title_speed_type},
     lobby_protocol::{
@@ -330,6 +330,45 @@ impl ItemProbabilityService {
             special_booster_applied,
         })
     }
+
+    /// Reproduces the modern server's `KartSpec.startItemId` selection for an
+    /// item-profile XUN kart. The reference implementation deliberately uses
+    /// the individual item table (`gameType == 2`) even in a team room, then
+    /// applies the kart's ordinary `no_flag` item transform. Floater and
+    /// animal-booster pickup effects are not part of this `KartSpec` field.
+    fn select_kart_spec_start_item(
+        &self,
+        kart_id: u16,
+        item_rolls: &mut impl ItemRollSource,
+    ) -> Result<KartSpecStartItemSelection, ItemProbabilityError> {
+        let (rank_band, total) = self.roll_total(false, -1, 0)?;
+        let roll = item_rolls.draw_item(total);
+        let (base_item_id, selected_band) = self.select_with_roll(false, -1, 0, roll)?;
+        debug_assert_eq!(rank_band, selected_band);
+        let transform = self
+            .catalog
+            .as_deref()
+            .and_then(|catalog| catalog.item_transform(kart_id, base_item_id, "no_flag"))
+            .map(|rule| (rule.target_item_id, rule.probability));
+        let (item_id, transform_probability, transform_applied) = match transform {
+            Some((target_item_id, probability))
+                if probability >= 100
+                    || item_rolls.draw_item(NonZeroU64::new(100).expect("100 is nonzero"))
+                        < u64::from(probability) =>
+            {
+                (target_item_id, Some(probability), true)
+            }
+            Some((_, probability)) => (base_item_id, Some(probability), false),
+            None => (base_item_id, None, false),
+        };
+        Ok(KartSpecStartItemSelection {
+            rank_band,
+            base_item_id,
+            item_id,
+            transform_probability,
+            transform_applied,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -350,6 +389,15 @@ struct ItemAwardSelection {
     floater_applied: bool,
     special_booster_probability: Option<u8>,
     special_booster_applied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KartSpecStartItemSelection {
+    rank_band: ItemProbabilityRankBand,
+    base_item_id: i16,
+    item_id: i16,
+    transform_probability: Option<u8>,
+    transform_applied: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8271,6 +8319,7 @@ impl World {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn try_start_scheduled_room(&mut self, room_id: RoomId, now: Instant, clock: &ServerClock) {
         if !self.protocol_rooms.get(&room_id).is_some_and(|room| {
             matches!(
@@ -8281,10 +8330,72 @@ impl World {
             return;
         }
         let start_tick = race_start_tick(clock.tick());
-        let batch = OutboundBatch::ordered(vec![
-            serialize_ai_master_notice(),
-            serialize_game_control(ServerGameControl::RaceStart, start_tick),
-        ]);
+        let (batch, xun_start_awards) = {
+            let room = self
+                .protocol_rooms
+                .get(&room_id)
+                .expect("the loading room list contains existing rooms");
+            let frozen = room
+                .frozen_race
+                .as_ref()
+                .expect("a Loading room has a frozen roster");
+            let mut packets = vec![
+                serialize_ai_master_notice(),
+                serialize_game_control(ServerGameControl::RaceStart, start_tick),
+            ];
+            let mut awards = Vec::new();
+            if matches!(room.settings.game_type, 2 | 4)
+                && let Some(catalog) = self.item_probability.catalog.as_deref()
+            {
+                let mut item_rolls = RandomItemRollSource;
+                for participant in frozen
+                    .participants
+                    .iter()
+                    .filter(|participant| !participant.observer)
+                {
+                    let Some(result) = participant.result else {
+                        continue;
+                    };
+                    if !catalog
+                        .kart_xun_profile(result.kart_id)
+                        .is_some_and(p5136_profile::CatalogXunProfile::is_item_profile)
+                    {
+                        continue;
+                    }
+                    let selection = match self
+                        .item_probability
+                        .select_kart_spec_start_item(result.kart_id, &mut item_rolls)
+                    {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            tracing::warn!(
+                                room_id = room_id.0,
+                                nickname = participant.nickname,
+                                player_id = participant.player_id,
+                                kart_id = result.kart_id,
+                                %error,
+                                "could not select an item-profile KartSpec starting item"
+                            );
+                            continue;
+                        }
+                    };
+                    let player_id = u8::try_from(participant.player_id)
+                        .expect("a frozen human player ID is always in 0..=15");
+                    packets.push(serialize_direct_item_award(
+                        player_id,
+                        selection.item_id,
+                        start_tick,
+                    ));
+                    awards.push((
+                        participant.nickname.clone(),
+                        participant.player_id,
+                        result.kart_id,
+                        selection,
+                    ));
+                }
+            }
+            (OutboundBatch::ordered(packets), awards)
+        };
         let deliveries = {
             let room = self
                 .protocol_rooms
@@ -8326,6 +8437,24 @@ impl World {
         room.phase = RoomPhase::Running;
         room.loading_handshake = LoadingHandshake::Dormant;
         Self::publish_reserved(reserved);
+        for (nickname, player_id, kart_id, selection) in xun_start_awards {
+            tracing::info!(
+                room_id = room_id.0,
+                race_epoch = room
+                    .race_fence
+                    .map_or(0, |fence| fence.race_epoch.get()),
+                nickname,
+                player_id,
+                kart_id,
+                base_item_id = selection.base_item_id,
+                item_id = selection.item_id,
+                rank_band = ?selection.rank_band,
+                transform_mode = "no_flag",
+                transform_probability = ?selection.transform_probability,
+                transform_applied = selection.transform_applied,
+                "granted a KartSpec type-1 kart's server-selected starting item"
+            );
+        }
     }
 
     fn try_flush_pending_race_fanouts(&mut self, room_id: RoomId) -> bool {
@@ -17136,6 +17265,67 @@ mod tests {
         assert_eq!(
             take_race_start_tick(&mut owner.outbound),
             take_race_start_tick(&mut guest.outbound)
+        );
+    }
+
+    #[test]
+    fn kart_spec_type_one_receives_the_configured_start_item_once_per_race_epoch() {
+        let mut world = World::default();
+        world.item_probability.catalog = Some(Arc::new(test_equipment_catalog()));
+        world.item_probability.configuration = Arc::new(ItemProbabilityConfiguration {
+            rank_band: ItemProbabilityRankBand::Combined,
+            individual: vec![ItemProbabilityEntry {
+                item_id: 7,
+                name: "rocket".to_owned(),
+                top_weight: 1,
+                high_weight: 1,
+                middle_weight: 1,
+                low_weight: 1,
+            }],
+            team: Vec::new(),
+        });
+        let mut owner = register_channel_session(&mut world, "ItemXun", 65, 41_651, 64);
+        let room_id = create_protocol_room(&mut world, &owner, 2);
+        set_result_admission(&mut world, room_id, 0, 1, 1_450, 20_000_000, 0);
+        drain_batches(&mut owner.outbound);
+        world
+            .lobby_command(
+                owner.session,
+                LobbyCommandPayload::StartRoom(StartRoomPlan::new(vec![0x1111_2222], Vec::new())),
+            )
+            .unwrap();
+        drain_batches(&mut owner.outbound);
+
+        let armed_at = Instant::now();
+        world
+            .race_command(owner.session, game_control_request(0), armed_at)
+            .unwrap();
+        let deadline = armed_at + Duration::from_secs(30);
+        let clock = ServerClock::new();
+        world.advance_loading(deadline, &clock);
+        world.advance_loading(deadline + Duration::from_secs(1), &clock);
+
+        let packets = owner.outbound.try_recv().unwrap().into_packets();
+        assert_eq!(packets.len(), 3);
+        assert_eq!(
+            logical_packet_hash(&packets[0]),
+            adler32::packet_hash(GAME_AI_MASTER_NOTICE_NAME)
+        );
+        assert_eq!(
+            logical_packet_hash(&packets[1]),
+            adler32::packet_hash(GAME_CONTROL_PACKET_NAME)
+        );
+        let award = &packets[2];
+        assert_eq!(logical_packet_hash(award), GAME_SLOT_PACKET_HASH);
+        assert_eq!(i32::from_le_bytes(award[4..8].try_into().unwrap()), 0);
+        assert_eq!(award[12], 1);
+        assert_eq!(i16::from_le_bytes(award[38..40].try_into().unwrap()), 7);
+        assert_eq!(award[40], 1);
+
+        world.advance_loading(deadline + Duration::from_secs(2), &clock);
+        assert!(
+            owner.outbound.try_recv().is_err(),
+            "a running race epoch must not receive the start item twice"
         );
     }
 

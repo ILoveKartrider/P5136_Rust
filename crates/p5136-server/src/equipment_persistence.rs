@@ -684,7 +684,7 @@ pub(crate) mod tests {
                 </Names>
                 <Specs>
                     <Spec name="testKnownKart">
-                        <BodyParam ForwardAccelForce="147" DragFactor="-0.05" />
+                        <BodyParam ForwardAccelForce="147" DragFactor="-0.05" TachometerType="XunGenTacho" defaultExceedType="1" />
                     </Spec>
                 </Specs>
                 <Inventory total="{item_count}" categories="60">{items}</Inventory>

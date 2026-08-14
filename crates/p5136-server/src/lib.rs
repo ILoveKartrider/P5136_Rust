@@ -24,6 +24,7 @@ mod session;
 mod udp_runtime;
 mod udp_state;
 mod world;
+mod xun_sidecar;
 
 pub use client_catalog::{
     ClientKartCatalogError, ClientKartCatalogStats, LoadedClientKartCatalog,

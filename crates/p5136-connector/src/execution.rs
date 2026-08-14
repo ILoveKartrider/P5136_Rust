@@ -10,9 +10,9 @@ use thiserror::Error;
 use tokio::{sync::watch, task::JoinError};
 
 use crate::{
-    IdentityError, InstallationError, InstallationOptions, LaunchError, LaunchRequest, LaunchSpec,
-    LaunchedProcess, PreparedInstallation, ProbeError, Runner, normalize_nickname,
-    prepare_installation, probe_messenger,
+    DataRawPreflightError, IdentityError, InstallationError, InstallationOptions, LaunchError,
+    LaunchRequest, LaunchSpec, LaunchedProcess, PreparedInstallation, ProbeError, Runner,
+    normalize_nickname, prepare_installation, probe_messenger, verify_dataraw_preflight,
 };
 
 #[derive(Debug, Clone)]
@@ -50,6 +50,7 @@ pub struct ConnectorExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorStage {
     PreparingInstallation,
+    CheckingDataRaw,
     ProbingMessenger,
     LaunchingGame,
 }
@@ -114,6 +115,9 @@ pub enum ConnectorExecutionError {
     #[error("installation preparation failed")]
     Installation(#[from] InstallationError),
 
+    #[error("DataRaw compatibility preflight failed")]
+    DataRawPreflight(#[from] DataRawPreflightError),
+
     #[error("messenger reachability probe failed")]
     Probe(#[from] ProbeError),
 
@@ -154,6 +158,7 @@ impl ConnectorPlan {
             self.game_directory.join("KartRider.pin"),
             self.game_directory.join("KartRider.xml"),
             self.game_directory.join("Profile/kr/launcher.xml"),
+            self.game_directory.join(crate::XUN_SIDECAR_SESSION_FILE),
         ];
         if self.installation_options.unlock_special_tracks {
             paths.push(
@@ -215,6 +220,22 @@ pub async fn execute_connector_with_progress_and_cancellation(
     .await??;
 
     ensure_not_cancelled(cancellation)?;
+    if plan.installation_options.data_pack_off {
+        report_stage(ConnectorStage::CheckingDataRaw);
+        cancel_or(cancellation, async {
+            verify_dataraw_preflight(
+                &plan.game_directory,
+                plan.server_address,
+                plan.ports,
+                plan.probe_timeout,
+            )
+            .await
+            .map(|_| ())
+            .map_err(ConnectorExecutionError::from)
+        })
+        .await?;
+        ensure_not_cancelled(cancellation)?;
+    }
     report_stage(ConnectorStage::ProbingMessenger);
     cancel_or(cancellation, async {
         probe_messenger(plan.server_address, plan.ports, plan.probe_timeout)

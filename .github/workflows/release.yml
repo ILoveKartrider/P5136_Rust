@@ -50,6 +50,20 @@ jobs:
       - name: Build release binary
         run: cargo build -p p5136-cli --release --locked
 
+      - name: Build and test Win32 XUN sidecar
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S native/p5136-xun-sidecar `
+            -B target/p5136-finish-kart-abilities/xun-sidecar-win32 `
+            -G "Visual Studio 17 2022" -A Win32
+          cmake --build target/p5136-finish-kart-abilities/xun-sidecar-win32 `
+            --config Release
+          ctest --test-dir target/p5136-finish-kart-abilities/xun-sidecar-win32 `
+            -C Release --output-on-failure
+          cmake --install target/p5136-finish-kart-abilities/xun-sidecar-win32 `
+            --config Release --prefix package-root
+
       - name: Package release binary
         shell: bash
         run: |
@@ -59,6 +73,13 @@ jobs:
           arch="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cp target/p5136-finish-kart-abilities/release/p5136.exe "dist/p5136-${platform}-${arch}.exe"
+            cp target/p5136-finish-kart-abilities/release/p5136.exe package-root/p5136.exe
+            mkdir -p package-root/startup-proxy
+            mv package-root/dinput8.dll package-root/startup-proxy/dinput8.dll
+            cp README.md README.en.md README.zh-CN.md CHANGELOG.md WINDOWS_SERVER_2012.md package-root/
+            cp native/p5136-xun-sidecar/README.md package-root/XUN-SIDECAR.md
+            pwsh -NoLogo -NoProfile -NonInteractive -Command \
+              "Compress-Archive -Path 'package-root/*' -DestinationPath 'dist/p5136-${platform}-${arch}.zip' -CompressionLevel Optimal"
           else
             tar -czf "dist/p5136-${platform}-${arch}.tar.gz" \
               -C target/p5136-finish-kart-abilities/release p5136
@@ -80,6 +101,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v7
+
       - name: Download release binaries
         uses: actions/download-artifact@v8
         with:
@@ -95,6 +118,18 @@ jobs:
             sha256sum p5136-* > SHA256SUMS
           )
 
+      - name: Prepare Korean release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            index($0, "## " version " ") == 1 { copy=1; next }
+            copy && /^## / { exit }
+            copy { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -104,5 +139,5 @@ jobs:
           dist/*
           --repo "$GITHUB_REPOSITORY"
           --verify-tag
-          --generate-notes
+          --notes-file release-notes.md
           --title "P5136 Rust $GITHUB_REF_NAME"

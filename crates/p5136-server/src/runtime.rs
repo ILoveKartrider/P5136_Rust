@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use p5136_core::dataraw_manifest::{DataRawManifest, DataRawManifestError};
 use p5136_profile::{
     AddKartOutcome, CatalogInventory, CatalogInventoryError, EmblemCatalog, EmblemCatalogError,
     KartGrantOptions, KartInventoryEditError, MAX_EMBLEM_XML_BYTES, ProfileStoreError,
@@ -42,6 +43,7 @@ use crate::{
         ItemProbabilityService, RewardCompletionDisposition, RewardDrainStatus,
         RewardPersistenceCompletion, RewardSettlementTask, RewardTerminalReason, WorldSidecarError,
     },
+    xun_sidecar::XunSidecarHandle,
 };
 
 const MAX_REWARD_PERSISTENCE_WORKERS: usize = 32;
@@ -68,6 +70,15 @@ pub enum ServerError {
 
     #[error("failed to bind messenger TCP listener")]
     BindMessengerTcp(#[source] io::Error),
+
+    #[error("failed to bind XUN sidecar TCP listener")]
+    BindXunSidecarTcp(#[source] io::Error),
+
+    #[error("DataRaw file-list fingerprint task failed")]
+    DataRawManifestTask(#[source] JoinError),
+
+    #[error("failed to build the DataRaw file-list fingerprint")]
+    DataRawManifest(#[source] DataRawManifestError),
 
     #[error("failed to inspect a bound listener address")]
     LocalAddress(#[source] io::Error),
@@ -332,11 +343,14 @@ pub struct BoundServer {
     login_tcp: TcpListener,
     p2p_udp: UdpSocket,
     messenger_tcp: TcpListener,
+    xun_sidecar_tcp: TcpListener,
+    data_raw_manifest: Option<DataRawManifest>,
 }
 
 impl BoundServer {
-    /// Transactionally binds all four P5136 transports. If any bind fails,
-    /// already-created sockets are dropped before the error is returned.
+    /// Transactionally binds the stock P5136 transports and the private XUN
+    /// sidecar transport. If any bind fails, already-created sockets are
+    /// dropped before the error is returned.
     pub async fn bind(mut config: ServerConfig) -> Result<Self, ServerError> {
         if config.max_login_sessions == 0 {
             return Err(ServerError::InvalidLoginSessionLimit);
@@ -383,7 +397,23 @@ impl BoundServer {
             TcpListener::bind(SocketAddr::new(bind_address, config.ports.messenger_tcp()))
                 .await
                 .map_err(ServerError::BindMessengerTcp)?;
+        let xun_sidecar_tcp = TcpListener::bind(SocketAddr::new(
+            bind_address,
+            config.ports.xun_sidecar_tcp(),
+        ))
+        .await
+        .map_err(ServerError::BindXunSidecarTcp)?;
         let profile_root = config.profile_root.clone();
+        let data_raw_manifest = if let Some(directory) = config.data_raw_directory.clone() {
+            Some(
+                tokio::task::spawn_blocking(move || DataRawManifest::scan(&directory))
+                    .await
+                    .map_err(ServerError::DataRawManifestTask)?
+                    .map_err(ServerError::DataRawManifest)?,
+            )
+        } else {
+            None
+        };
         config.resolved_random_tracks.clone_from(&random_tracks);
         let profiles = tokio::task::spawn_blocking(move || {
             ProfileIoBootstrap::acquire(profile_root, profile_limits)
@@ -402,6 +432,8 @@ impl BoundServer {
             login_tcp,
             p2p_udp,
             messenger_tcp,
+            xun_sidecar_tcp,
+            data_raw_manifest,
         })
     }
 
@@ -423,6 +455,10 @@ impl BoundServer {
                 .messenger_tcp
                 .local_addr()
                 .map_err(ServerError::LocalAddress)?,
+            xun_sidecar_tcp: self
+                .xun_sidecar_tcp
+                .local_addr()
+                .map_err(ServerError::LocalAddress)?,
         })
     }
 
@@ -442,6 +478,8 @@ impl BoundServer {
             login_tcp,
             p2p_udp,
             messenger_tcp,
+            xun_sidecar_tcp,
+            data_raw_manifest,
         } = self;
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let force_shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -478,6 +516,7 @@ impl BoundServer {
             login_tcp = %endpoints.login_tcp,
             p2p_udp = %endpoints.p2p_udp,
             messenger_tcp = %endpoints.messenger_tcp,
+            xun_sidecar_tcp = %endpoints.xun_sidecar_tcp,
             profile_root = %config.profile_root.display(),
             catalog_path = ?config.catalog_path,
             catalog_source = if config.resolved_catalog.is_some() {
@@ -492,6 +531,9 @@ impl BoundServer {
             catalog_loaded = catalog.is_some(),
             catalog_item_transform_count,
             client_data_dir = ?config.client_data_dir,
+            data_raw_directory = ?config.data_raw_directory,
+            data_raw_files = data_raw_manifest.map(|manifest| manifest.file_count),
+            data_raw_list_digest = data_raw_manifest.map(|manifest| manifest.digest_hex()),
             emblem_catalog_loaded = emblems.is_some(),
             item_probabilities_overridden = config.item_probabilities.is_some(),
             ?item_probability_rank_band,
@@ -516,6 +558,8 @@ impl BoundServer {
                     profile_runtime,
                     login_tcp,
                     messenger_tcp,
+                    xun_sidecar_tcp,
+                    data_raw_manifest,
                     udp,
                     wire_operations: supervisor_wire_operations,
                 },
@@ -1068,6 +1112,20 @@ fn spawn_messenger_session(
     });
 }
 
+fn spawn_xun_sidecar_session(
+    sessions: &mut JoinSet<()>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    permit: OwnedSemaphorePermit,
+    sidecar: &XunSidecarHandle,
+) {
+    let sidecar = sidecar.clone();
+    sessions.spawn(async move {
+        let _permit = permit;
+        sidecar.serve_connection(stream, peer).await;
+    });
+}
+
 fn try_login_session_permit(
     permits: &Arc<Semaphore>,
     maximum: usize,
@@ -1614,6 +1672,8 @@ struct SupervisorTransports {
     profile_runtime: ProfileIoRuntime,
     login_tcp: TcpListener,
     messenger_tcp: TcpListener,
+    xun_sidecar_tcp: TcpListener,
+    data_raw_manifest: Option<DataRawManifest>,
     udp: UdpRuntime,
     wire_operations: WireOperationGate,
 }
@@ -2309,6 +2369,8 @@ async fn run_supervisor(
         mut profile_runtime,
         login_tcp,
         messenger_tcp,
+        xun_sidecar_tcp,
+        data_raw_manifest,
         mut udp,
         wire_operations,
     } = transports;
@@ -2317,9 +2379,12 @@ async fn run_supervisor(
         profile_io.clone(),
         reward_persistence_worker_limit(config.max_login_sessions),
     );
-    let profiles = ProfileCoordinator::new_with_emblems(profile_io, catalog, emblems);
+    let xun_sidecar = XunSidecarHandle::new(data_raw_manifest);
+    let profiles =
+        ProfileCoordinator::new_with_emblems(profile_io, catalog, emblems, xun_sidecar.clone());
     let login_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let messenger_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
+    let xun_sidecar_session_permits = Arc::new(Semaphore::new(config.max_login_sessions));
     let mut sessions = JoinSet::new();
     let login_runtime = LoginSessionRuntime {
         config: config.clone(),
@@ -2364,6 +2429,35 @@ async fn run_supervisor(
                     &messenger,
                 ) {
                     break Err(error);
+                }
+            }
+            accepted = xun_sidecar_tcp.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        if let Ok(permit) = Arc::clone(&xun_sidecar_session_permits)
+                            .try_acquire_owned()
+                        {
+                            spawn_xun_sidecar_session(
+                                &mut sessions,
+                                stream,
+                                peer,
+                                permit,
+                                &xun_sidecar,
+                            );
+                        } else {
+                            tracing::debug!(
+                                %peer,
+                                maximum = config.max_login_sessions,
+                                "XUN sidecar session limit reached; rejecting connection"
+                            );
+                        }
+                    }
+                    Err(source) => {
+                        break Err(ServerError::ListenerIo {
+                            service: "XUN sidecar TCP",
+                            source,
+                        });
+                    }
                 }
             }
             completed = sessions.join_next(), if !sessions.is_empty() => {
@@ -2644,6 +2738,7 @@ mod tests {
             game_udp: endpoint,
             p2p_udp: endpoint,
             messenger_tcp: endpoint,
+            xun_sidecar_tcp: endpoint,
         }
     }
 
@@ -2705,6 +2800,7 @@ mod tests {
         )?;
         let login_tcp = TcpListener::bind((loopback, 0)).await?;
         let messenger_tcp = TcpListener::bind((loopback, 0)).await?;
+        let xun_sidecar_tcp = TcpListener::bind((loopback, 0)).await?;
         let (messenger, messenger_task) =
             MessengerServiceHandle::spawn(messenger_runtime_config(&config))?;
         let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
@@ -2721,6 +2817,8 @@ mod tests {
                 profile_runtime,
                 login_tcp,
                 messenger_tcp,
+                xun_sidecar_tcp,
+                data_raw_manifest: None,
                 udp,
                 wire_operations: supervisor_wire_operations,
             },
@@ -3694,6 +3792,8 @@ mod tests {
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            xun_sidecar_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            data_raw_manifest: None,
         };
 
         let server = bound.start().unwrap();
@@ -4018,6 +4118,8 @@ mod tests {
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            xun_sidecar_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            data_raw_manifest: None,
         };
         let server = bound.start().unwrap();
         let endpoints = server.endpoints();
@@ -4456,6 +4558,8 @@ mod tests {
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            xun_sidecar_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            data_raw_manifest: None,
         };
         let server = bound.start().unwrap();
         let endpoints = server.endpoints();
@@ -4765,6 +4869,8 @@ mod tests {
             login_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
             p2p_udp: UdpSocket::bind((loopback, 0)).await.unwrap(),
             messenger_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            xun_sidecar_tcp: TcpListener::bind((loopback, 0)).await.unwrap(),
+            data_raw_manifest: None,
         };
         (bound.start().unwrap(), maximum)
     }
